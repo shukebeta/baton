@@ -1,0 +1,8 @@
+[package]
+name = "baton"
+version = "0.1.0"
+edition = "2024"
+description = "An AI-to-AI harness focused on structured agent communication."
+readme = "README.md"
+
+[dependencies]
