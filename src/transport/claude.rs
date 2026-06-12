@@ -407,4 +407,30 @@ mod tests {
             BatonError::Decode(_)
         ));
     }
+
+    /// A fake transport that always returns a transport-level error.
+    struct FailingHttp;
+
+    impl HttpClient for FailingHttp {
+        fn post_json(
+            &self,
+            _url: &str,
+            _headers: &[(&str, &str)],
+            _body: &str,
+        ) -> Result<crate::transport::http::HttpResponse> {
+            Err(BatonError::Transport("connection timed out".to_string()))
+        }
+    }
+
+    #[test]
+    fn timeout_transport_error() {
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            FailingHttp,
+        );
+        match client.send(&Prompt::new("hi")).unwrap_err() {
+            BatonError::Transport(msg) => assert!(msg.contains("timed out")),
+            other => panic!("expected Transport, got {other:?}"),
+        }
+    }
 }
