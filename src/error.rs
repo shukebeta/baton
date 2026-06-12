@@ -1,8 +1,9 @@
 //! Error types shared across Baton's runtime surfaces.
 //!
-//! This phase only needs to distinguish configuration failures from transport
-//! failures. Later tickets extend [`BatonError`] as new surfaces (the Messages
-//! client, the CLI) introduce their own failure modes.
+//! Configuration failures and the provider transport's failure modes are
+//! modelled as distinct variants so callers can react to them explicitly. The
+//! Messages client maps HTTP and decode failures onto these variants rather
+//! than collapsing everything into a single opaque error.
 
 use std::fmt;
 
@@ -15,10 +16,35 @@ pub enum BatonError {
     /// Configuration could not be loaded or was invalid (e.g. a missing or
     /// malformed environment variable).
     Config(String),
-    /// A transport-level failure while talking to a provider. The transport
-    /// implementation itself lands in a later ticket; the variant exists now so
-    /// the boundary is stable.
+    /// A transport-level failure with no HTTP response: connection refused,
+    /// DNS failure, TLS error, timeout, etc.
     Transport(String),
+    /// The provider rejected the credentials (HTTP 401).
+    Auth(String),
+    /// The provider rate-limited the request (HTTP 429).
+    RateLimited(String),
+    /// The provider returned a server-side failure (HTTP 5xx).
+    Server {
+        /// The HTTP status code.
+        status: u16,
+        /// The provider's error message, or the raw body when it could not be
+        /// parsed.
+        message: String,
+    },
+    /// The provider returned some other non-success status (e.g. 400 Bad
+    /// Request) that does not map to a more specific variant.
+    Api {
+        /// The HTTP status code.
+        status: u16,
+        /// The provider's error message, or the raw body when it could not be
+        /// parsed.
+        message: String,
+    },
+    /// A 2xx response could not be decoded into an [`AssistantReply`], because
+    /// the body was malformed, partial, or carried no assistant text.
+    ///
+    /// [`AssistantReply`]: crate::model::AssistantReply
+    Decode(String),
 }
 
 impl fmt::Display for BatonError {
@@ -26,6 +52,15 @@ impl fmt::Display for BatonError {
         match self {
             BatonError::Config(msg) => write!(f, "configuration error: {msg}"),
             BatonError::Transport(msg) => write!(f, "transport error: {msg}"),
+            BatonError::Auth(msg) => write!(f, "authentication error: {msg}"),
+            BatonError::RateLimited(msg) => write!(f, "rate limited: {msg}"),
+            BatonError::Server { status, message } => {
+                write!(f, "provider server error ({status}): {message}")
+            }
+            BatonError::Api { status, message } => {
+                write!(f, "provider error ({status}): {message}")
+            }
+            BatonError::Decode(msg) => write!(f, "response decode error: {msg}"),
         }
     }
 }
