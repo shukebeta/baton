@@ -13,6 +13,9 @@ pub type Result<T> = std::result::Result<T, BatonError>;
 /// Top-level error type for Baton.
 #[derive(Debug)]
 pub enum BatonError {
+    /// A command-line argument was missing, unrecognised, or malformed. Carries
+    /// a human-readable explanation plus the one-line usage summary.
+    Usage(String),
     /// Configuration could not be loaded or was invalid (e.g. a missing or
     /// malformed environment variable).
     Config(String),
@@ -50,6 +53,7 @@ pub enum BatonError {
 impl fmt::Display for BatonError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            BatonError::Usage(msg) => write!(f, "usage error: {msg}"),
             BatonError::Config(msg) => write!(f, "configuration error: {msg}"),
             BatonError::Transport(msg) => write!(f, "transport error: {msg}"),
             BatonError::Auth(msg) => write!(f, "authentication error: {msg}"),
