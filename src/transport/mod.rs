@@ -1,9 +1,14 @@
 //! Provider transport boundary.
 //!
 //! This module defines the seam between Baton's typed model and a concrete
-//! provider client. The Claude-compatible Messages implementation lands in a
-//! later ticket; defining the trait now keeps that boundary stable and lets the
-//! CLI and tests depend on it rather than on a concrete client.
+//! provider client. [`Transport`] is the stable boundary the CLI and tests
+//! depend on; the [`claude`] submodule provides the first concrete
+//! implementation (a non-streaming Claude-compatible Messages client), and
+//! [`http`] isolates the underlying HTTP execution so the request/response
+//! logic can be tested without a network.
+
+pub mod claude;
+pub mod http;
 
 use crate::error::Result;
 use crate::model::{AssistantReply, Prompt};

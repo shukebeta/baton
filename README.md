@@ -8,9 +8,11 @@ center of the design.
 
 ## Status
 
-Early scaffolding. The crate currently establishes the module layout and typed
-runtime shape for a single-turn first-prompt / first-reply path. Sending a real
-prompt (the Messages transport and the `ask` command) lands in later tickets.
+Early scaffolding. The crate establishes the module layout and typed runtime
+shape for a single-turn first-prompt / first-reply path, plus a non-streaming
+Claude-compatible Messages client (`transport::claude::ClaudeClient`) that can
+send one prompt and decode one reply. Wiring that client into a user-facing
+`ask` command lands in a later ticket; for now it is a library surface.
 
 ## Configuration
 
@@ -36,3 +38,30 @@ cargo run
 The bare invocation loads configuration and reports that the runtime is ready.
 This is a placeholder for the `ask` command added in a later ticket; it exists
 so configuration errors surface today.
+
+## Provider transport
+
+`transport::claude::ClaudeClient` implements the `Transport` trait against a
+Claude-compatible non-streaming `POST /v1/messages` endpoint:
+
+- Authenticates with the `x-api-key` header from `ANTHROPIC_API_KEY` and pins
+  the `anthropic-version: 2023-06-01` header.
+- Sends to `{ANTHROPIC_BASE_URL}/v1/messages`, requesting the configured
+  `BATON_MODEL`.
+- Requests up to 1024 output tokens per reply (fixed for now) and extracts the
+  assistant's text from the response's `content` blocks.
+
+Failures are surfaced as explicit `BatonError` variants rather than silent
+fallbacks:
+
+| Condition                         | Error                          |
+| --------------------------------- | ------------------------------ |
+| Connection / TLS / timeout        | `Transport`                    |
+| 401 Unauthorized                  | `Auth`                         |
+| 429 Too Many Requests             | `RateLimited`                  |
+| 5xx server failure                | `Server { status, .. }`        |
+| Other non-2xx (e.g. 400)          | `Api { status, .. }`           |
+| Malformed or text-less 2xx body   | `Decode`                       |
+
+Streaming, tool calling, and multi-turn conversations are out of scope for this
+client.
