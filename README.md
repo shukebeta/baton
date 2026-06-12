@@ -11,8 +11,8 @@ center of the design.
 Early scaffolding. The crate establishes the module layout and typed runtime
 shape for a single-turn first-prompt / first-reply path, plus a non-streaming
 Claude-compatible Messages client (`transport::claude::ClaudeClient`) that can
-send one prompt and decode one reply. Wiring that client into a user-facing
-`ask` command lands in a later ticket; for now it is a library surface.
+send one prompt and decode one reply. The `baton ask` command wires that client
+to the command line for the first-reply bootstrap flow.
 
 ## Configuration
 
@@ -28,16 +28,23 @@ Baton reads its runtime configuration from environment variables:
 Missing or invalid values are surfaced as explicit configuration errors at
 startup rather than failing later.
 
-## Bootstrap
+## First reply
+
+`baton ask` sends a single prompt and prints the assistant's reply:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-...
-cargo run
+cargo run -- ask -p "hello"
 ```
 
-The bare invocation loads configuration and reports that the runtime is ready.
-This is a placeholder for the `ask` command added in a later ticket; it exists
-so configuration errors surface today.
+- One prompt in, one reply out — no REPL, conversation state, streaming, or
+  tool execution.
+- On success, **stdout contains only the assistant text** (followed by a single
+  newline). The prompt is taken from `-p` / `--prompt` (the `--prompt=<text>`
+  form is also accepted).
+- On failure (bad arguments, missing configuration, or a provider/transport
+  error) Baton prints the error to **stderr** and exits with a non-zero status;
+  stdout stays empty.
 
 ## Provider transport
 
