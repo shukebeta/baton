@@ -58,19 +58,18 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
     fn send(&self, prompt: &Prompt) -> Result<AssistantReply> {
         let body = build_request_body(&self.config.model, prompt)?;
         let url = self.endpoint();
+        // `auth_value` is bound to this stack frame so the array of header
+        // refs below can borrow from it. The OAuth case formats the bearer
+        // token once per request; the API-key case clones the key (also
+        // once per request). No heap allocation for the headers themselves.
         let (auth_name, auth_value) = auth_header(&self.config.credential);
-        // The trait `HttpClient::post_json` takes `&[(&str, &str)]`, so we
-        // build a homogeneous array of owned strings here. Cheap (these are
-        // tiny headers) and avoids `String` vs `&str` mismatch.
-        let headers: [(&str, String); 3] = [
-            (auth_name, auth_value),
-            ("anthropic-version", ANTHROPIC_VERSION.to_string()),
-            ("content-type", "application/json".to_string()),
+        let headers = [
+            (auth_name, auth_value.as_str()),
+            ("anthropic-version", ANTHROPIC_VERSION),
+            ("content-type", "application/json"),
         ];
-        let header_refs: Vec<(&str, &str)> =
-            headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-        let response = self.http.post_json(&url, &header_refs, &body)?;
+        let response = self.http.post_json(&url, &headers, &body)?;
         parse_response(response.status, &response.body)
     }
 }
@@ -80,6 +79,10 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
 /// The credential is read from the already-resolved config (no env lookup
 /// happens per request) and converted into the matching name/value pair:
 /// `ApiKey` -> `x-api-key`, `OAuth` -> `Authorization: Bearer <token>`.
+///
+/// Returns an owned value for the auth header so it can live on the caller's
+/// stack frame and be borrowed into the `&[(&str, &str)]` slice that
+/// `HttpClient::post_json` requires.
 fn auth_header(credential: &Credential) -> (&'static str, String) {
     match credential {
         Credential::ApiKey(key) => ("x-api-key", key.clone()),

@@ -38,18 +38,6 @@ pub enum Credential {
     OAuth(String),
 }
 
-impl Credential {
-    /// Returns the inner secret as a borrowed string slice.
-    ///
-    /// Used by the transport to read the credential value without exposing
-    /// ownership; the lifetime is tied to the `Credential` itself.
-    pub fn secret(&self) -> &str {
-        match self {
-            Credential::ApiKey(value) | Credential::OAuth(value) => value,
-        }
-    }
-}
-
 /// Runtime configuration for Baton's first-reply path.
 #[derive(Debug, Clone)]
 pub struct BatonConfig {
