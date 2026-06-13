@@ -48,6 +48,28 @@ pub enum BatonError {
     ///
     /// [`AssistantReply`]: crate::model::AssistantReply
     Decode(String),
+    /// A local I/O operation failed (e.g. opening the configured event log).
+    Io(String),
+}
+
+impl BatonError {
+    /// A stable, machine-readable class for this error.
+    ///
+    /// Used by structured event recording so consumers can branch on the
+    /// failure kind without parsing the human-readable message.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            BatonError::Usage(_) => "usage",
+            BatonError::Config(_) => "config",
+            BatonError::Transport(_) => "transport",
+            BatonError::Auth(_) => "auth",
+            BatonError::RateLimited(_) => "rate_limited",
+            BatonError::Server { .. } => "server",
+            BatonError::Api { .. } => "api",
+            BatonError::Decode(_) => "decode",
+            BatonError::Io(_) => "io",
+        }
+    }
 }
 
 impl fmt::Display for BatonError {
@@ -65,6 +87,7 @@ impl fmt::Display for BatonError {
                 write!(f, "provider error ({status}): {message}")
             }
             BatonError::Decode(msg) => write!(f, "response decode error: {msg}"),
+            BatonError::Io(msg) => write!(f, "io error: {msg}"),
         }
     }
 }
