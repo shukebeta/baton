@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::BatonConfig;
+use crate::config::{BatonConfig, Credential};
 use crate::error::{BatonError, Result};
 use crate::model::{AssistantReply, Prompt};
 use crate::transport::Transport;
@@ -58,14 +58,32 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
     fn send(&self, prompt: &Prompt) -> Result<AssistantReply> {
         let body = build_request_body(&self.config.model, prompt)?;
         let url = self.endpoint();
-        let headers = [
-            ("x-api-key", self.config.api_key.as_str()),
-            ("anthropic-version", ANTHROPIC_VERSION),
-            ("content-type", "application/json"),
+        let (auth_name, auth_value) = auth_header(&self.config.credential);
+        // The trait `HttpClient::post_json` takes `&[(&str, &str)]`, so we
+        // build a homogeneous array of owned strings here. Cheap (these are
+        // tiny headers) and avoids `String` vs `&str` mismatch.
+        let headers: [(&str, String); 3] = [
+            (auth_name, auth_value),
+            ("anthropic-version", ANTHROPIC_VERSION.to_string()),
+            ("content-type", "application/json".to_string()),
         ];
+        let header_refs: Vec<(&str, &str)> =
+            headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-        let response = self.http.post_json(&url, &headers, &body)?;
+        let response = self.http.post_json(&url, &header_refs, &body)?;
         parse_response(response.status, &response.body)
+    }
+}
+
+/// Maps the resolved [`Credential`] onto the wire-level auth header pair.
+///
+/// The credential is read from the already-resolved config (no env lookup
+/// happens per request) and converted into the matching name/value pair:
+/// `ApiKey` -> `x-api-key`, `OAuth` -> `Authorization: Bearer <token>`.
+fn auth_header(credential: &Credential) -> (&'static str, String) {
+    match credential {
+        Credential::ApiKey(key) => ("x-api-key", key.clone()),
+        Credential::OAuth(token) => ("Authorization", format!("Bearer {token}")),
     }
 }
 
@@ -181,6 +199,7 @@ struct ErrorDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Credential;
     use std::cell::RefCell;
     use std::time::Duration;
 
@@ -227,8 +246,16 @@ mod tests {
     }
 
     fn config_with(base_url: &str, model: &str) -> BatonConfig {
+        config_with_credential(
+            base_url,
+            model,
+            Credential::ApiKey("secret-key".to_string()),
+        )
+    }
+
+    fn config_with_credential(base_url: &str, model: &str, credential: Credential) -> BatonConfig {
         BatonConfig {
-            api_key: "secret-key".to_string(),
+            credential,
             base_url: base_url.to_string(),
             model: model.to_string(),
             timeout: Duration::from_secs(60),
@@ -307,6 +334,43 @@ mod tests {
         assert_eq!(value["max_tokens"], DEFAULT_MAX_TOKENS);
         assert_eq!(value["messages"][0]["role"], "user");
         assert_eq!(value["messages"][0]["content"], "hello world");
+    }
+
+    #[test]
+    fn request_oauth_credential_emits_bearer_header_and_no_api_key() {
+        let http = FakeHttp::new(200, SUCCESS_BODY);
+        let client = ClaudeClient::with_http(
+            config_with_credential(
+                "https://api.anthropic.com",
+                "claude-sonnet-4-6",
+                Credential::OAuth("tok-123".to_string()),
+            ),
+            http,
+        );
+        client
+            .send(&Prompt::new("hello world"))
+            .expect("should succeed");
+
+        let FakeHttp { last_headers, .. } = &client.http;
+        let headers = last_headers.borrow();
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| k == "Authorization" && v == "Bearer tok-123"),
+            "expected `Authorization: Bearer tok-123` header, got: {headers:?}"
+        );
+        assert!(
+            !headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("x-api-key")),
+            "OAuth credential must not emit an `x-api-key` header, got: {headers:?}"
+        );
+        // The other pinned headers still ride along.
+        assert!(headers.contains(&(
+            "anthropic-version".to_string(),
+            ANTHROPIC_VERSION.to_string()
+        )));
+        assert!(headers.contains(&("content-type".to_string(), "application/json".to_string())));
     }
 
     #[test]

@@ -15,7 +15,7 @@ use std::net::TcpListener;
 use std::thread;
 use std::time::Duration;
 
-use baton::config::BatonConfig;
+use baton::config::{BatonConfig, Credential};
 use baton::error::BatonError;
 use baton::model::Prompt;
 use baton::transport::Transport;
@@ -127,8 +127,16 @@ fn status_text(status: u16) -> &'static str {
 }
 
 fn config_for(base_url: &str, timeout_secs: u64) -> BatonConfig {
+    config_for_credential(
+        base_url,
+        timeout_secs,
+        Credential::ApiKey("test-key".to_string()),
+    )
+}
+
+fn config_for_credential(base_url: &str, timeout_secs: u64, credential: Credential) -> BatonConfig {
     BatonConfig {
-        api_key: "test-key".to_string(),
+        credential,
         base_url: base_url.to_string(),
         model: "claude-test-model".to_string(),
         timeout: Duration::from_secs(timeout_secs),
@@ -282,5 +290,79 @@ fn request_carries_expected_headers() {
         )),
         "anthropic version header: {request}"
     );
+    assert!(lower.contains("content-type: application/json"));
+}
+
+/// Companion to `request_carries_expected_headers`: an OAuth-credentialed
+/// client must emit `Authorization: Bearer <token>` on the wire, and must
+/// not emit an `x-api-key` header. The captured raw request gives us the
+/// same view of the wire the server actually saw.
+#[test]
+fn request_carries_bearer_auth_header_for_oauth_credential() {
+    use std::sync::{Arc, Mutex};
+
+    let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let captured_for_thread = Arc::clone(&captured);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let base_url = format!("http://{addr}");
+
+    let _server = thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            *captured_for_thread.lock().unwrap() = Some(String::from_utf8_lossy(&buf).into_owned());
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 content-type: application/json\r\n\
+                 content-length: {}\r\n\
+                 connection: close\r\n\
+                 \r\n\
+                 {SUCCESS_BODY}",
+                SUCCESS_BODY.len(),
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let client = baton::transport::claude::ClaudeClient::from_config(config_for_credential(
+        &base_url,
+        5,
+        Credential::OAuth("oauth-test-token".to_string()),
+    ));
+    let _ = client.send(&Prompt::new("verify me"));
+
+    let request = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server should have captured the request");
+    let lower = request.to_lowercase();
+    assert!(
+        lower.contains("authorization: bearer oauth-test-token"),
+        "bearer header missing: {request}"
+    );
+    assert!(
+        !lower
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("x-api-key")),
+        "OAuth credential must not emit an x-api-key header: {request}"
+    );
+    // The other pinned headers still ride along.
+    assert!(lower.contains(&format!(
+        "anthropic-version: {}",
+        ANTHROPIC_VERSION.to_lowercase()
+    )));
     assert!(lower.contains("content-type: application/json"));
 }
