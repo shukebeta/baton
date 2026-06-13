@@ -26,6 +26,7 @@ Baton reads its runtime configuration from environment variables:
 | `ANTHROPIC_BASE_URL`         | no       | `https://api.anthropic.com` | Base URL for the Claude-compatible Messages API.     |
 | `BATON_MODEL`                | no       | `claude-sonnet-4-6`         | Model id to request.                                 |
 | `BATON_TIMEOUT_SECS`         | no       | `60`                        | Per-request timeout in seconds (non-negative integer). |
+| `BATON_EVENT_LOG`            | no       | — (disabled)                | File path for the JSONL exchange-event trail (see below). |
 
 Exactly one credential variable is required. The first one that is set (in
 precedence `ANTHROPIC_API_KEY` > `ANTHROPIC_AUTH_TOKEN` > `CLAUDE_CODE_OAUTH_TOKEN`)
@@ -92,6 +93,50 @@ fallbacks:
 
 Streaming, tool calling, and multi-turn conversations are out of scope for this
 client.
+
+## Structured exchange events
+
+Baton can record each `ask` exchange as a machine-readable trail so a single
+request/response can be programmatically inspected or replayed, and so failures
+are captured explicitly rather than lost in human-oriented output.
+
+Recording is **opt-in**: set `BATON_EVENT_LOG` to a file path. Each run appends
+its events to that file, so successive runs accumulate one trail.
+
+```bash
+export ANTHROPIC_API_KEY=sk-...
+export BATON_EVENT_LOG=baton-events.jsonl
+cargo run -- ask -p "hello"
+cat baton-events.jsonl
+```
+
+The format is [JSONL](https://jsonlines.org/): one JSON object per line. Each
+line carries a `schema` discriminator (`baton.exchange/v1`), an `event` tag, and
+a `ts_ms` wall-clock timestamp (Unix epoch milliseconds). One exchange emits a
+`request` line followed by exactly one outcome line (`response_ok` or
+`response_error`):
+
+```jsonl
+{"event":"request","schema":"baton.exchange/v1","ts_ms":1700000000000,"model":"claude-sonnet-4-6","base_url":"https://api.anthropic.com","prompt":"hello"}
+{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":1700000000420,"duration_ms":418,"reply":"Hi there!"}
+```
+
+| `event`          | Fields beyond `schema` / `ts_ms`            | Meaning                                              |
+| ---------------- | ------------------------------------------- | ---------------------------------------------------- |
+| `request`        | `model`, `base_url`, `prompt`               | Emitted before the call; carries enough to replay it. |
+| `response_ok`    | `duration_ms`, `reply`                      | The call succeeded.                                  |
+| `response_error` | `duration_ms`, `kind`, `message`            | The call failed; `kind` is the stable machine class. |
+
+`kind` mirrors the `BatonError` variants (`transport`, `auth`, `rate_limited`,
+`server`, `api`, `decode`, `io`, `config`, `usage`), so consumers can branch on
+the failure class without parsing the human-readable `message`.
+
+**Consumption model.** Read the file line by line; parse each line as a
+standalone JSON object (a partial trailing line, if any, can be skipped). The
+event trail is auxiliary observability — it is written to the configured file
+only, never to stdout, and a failed log write degrades to a stderr warning
+rather than failing the command. Scope is single-turn: there is no session or
+multi-turn state in the schema.
 
 ## Development
 

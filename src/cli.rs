@@ -5,19 +5,32 @@
 //! first-prompt / first-reply path via the [`Transport`] boundary.
 //!
 //! The only command today is `baton ask -p "..."`: one prompt in, one reply
-//! out. Argument parsing ([`parse_args`]) and reply formatting ([`execute_ask`])
-//! are kept pure and transport-agnostic so every branch is unit-testable without
-//! a network or real environment — mirroring
+//! out. Argument parsing ([`parse_args`]) and the exchange itself
+//! ([`execute_ask`]) are kept transport-agnostic and sink-agnostic so every
+//! branch is unit-testable without a network or real environment — mirroring
 //! [`BatonConfig::from_lookup`](crate::config::BatonConfig::from_lookup).
+//!
+//! Each exchange is also recorded as structured JSONL via an [`EventSink`] when
+//! `BATON_EVENT_LOG` names a file (see [`open_event_sink`]). Recording is
+//! auxiliary: stdout stays "assistant text and nothing else", and a failed
+//! event write degrades to a stderr warning rather than failing the command.
 //!
 //! Scope is deliberately narrow: no REPL, no conversation state, no streaming,
 //! no tool execution.
 
+use std::fs::OpenOptions;
+use std::time::Instant;
+
 use crate::config::BatonConfig;
 use crate::error::{BatonError, Result};
+use crate::events::{EventSink, ExchangeEvent, ExchangeMeta, NoopSink, WriterSink, now_ms};
 use crate::model::Prompt;
 use crate::transport::Transport;
 use crate::transport::claude::ClaudeClient;
+
+/// Environment variable naming the JSONL event-log file. Unset or blank ⇒
+/// recording is disabled.
+pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
 pub const USAGE: &str = "usage: baton ask -p|--prompt <text>";
@@ -39,21 +52,78 @@ pub fn run() -> Result<()> {
     match parse_args(&args)? {
         Command::Ask { prompt } => {
             let config = BatonConfig::from_env()?;
+            let meta = ExchangeMeta {
+                model: config.model.clone(),
+                base_url: config.base_url.clone(),
+            };
+            let mut sink = open_event_sink()?;
             let client = ClaudeClient::from_config(config);
-            let reply = execute_ask(&client, &prompt)?;
+            let reply = execute_ask(&client, sink.as_mut(), &meta, &prompt)?;
             println!("{reply}");
             Ok(())
         }
     }
 }
 
-/// Sends `prompt` over `transport` and returns only the assistant text.
+/// Runs one exchange: records the request event, times the call, records the
+/// outcome event, and returns only the assistant text.
 ///
-/// Split out so the "stdout is the assistant text and nothing else" contract can
-/// be exercised against a fake transport, without a network or real config.
-fn execute_ask(transport: &impl Transport, prompt: &str) -> Result<String> {
-    let reply = transport.send(&Prompt::new(prompt))?;
-    Ok(reply.text)
+/// Split out — and parameterised over a [`Transport`] and an [`EventSink`] — so
+/// the "stdout is the assistant text and nothing else" contract and the event
+/// trail can both be exercised with fakes, without a network or real config. A
+/// failed event write is reported on stderr but never changes the exchange
+/// result.
+fn execute_ask(
+    transport: &impl Transport,
+    sink: &mut dyn EventSink,
+    meta: &ExchangeMeta,
+    prompt: &str,
+) -> Result<String> {
+    emit(sink, &ExchangeEvent::request(now_ms(), meta, prompt));
+
+    let start = Instant::now();
+    let result = transport.send(&Prompt::new(prompt));
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    let event = match &result {
+        Ok(reply) => ExchangeEvent::response_ok(now_ms(), duration_ms, &reply.text),
+        Err(err) => ExchangeEvent::response_error(now_ms(), duration_ms, err),
+    };
+    emit(sink, &event);
+
+    result.map(|reply| reply.text)
+}
+
+/// Records `event`, downgrading a persistence failure to a stderr warning.
+///
+/// The event trail is observability, not the user's result — a log write that
+/// fails must not abort the command or pollute the stdout reply contract.
+fn emit(sink: &mut dyn EventSink, event: &ExchangeEvent) {
+    if let Err(err) = sink.record(event) {
+        eprintln!("warning: failed to record exchange event: {err}");
+    }
+}
+
+/// Opens the event sink described by [`EVENT_LOG_ENV`].
+///
+/// A non-blank path is opened for appending (created if absent), so successive
+/// runs accumulate one exchange trail. An unset or blank value disables
+/// recording. A genuine open failure is surfaced — recording was explicitly
+/// requested, so silently dropping it would be wrong.
+fn open_event_sink() -> Result<Box<dyn EventSink>> {
+    match std::env::var(EVENT_LOG_ENV) {
+        Ok(path) if !path.trim().is_empty() => {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|err| {
+                    BatonError::Io(format!("failed to open {EVENT_LOG_ENV} {path:?}: {err}"))
+                })?;
+            Ok(Box::new(WriterSink::new(file)))
+        }
+        _ => Ok(Box::new(NoopSink)),
+    }
 }
 
 /// Parses CLI arguments (already stripped of the binary name) into a [`Command`].
@@ -214,22 +284,109 @@ mod tests {
         }
     }
 
+    /// An [`EventSink`] that captures every recorded event in order.
+    struct RecordingSink {
+        events: Vec<ExchangeEvent>,
+    }
+
+    impl RecordingSink {
+        fn new() -> Self {
+            Self { events: Vec::new() }
+        }
+    }
+
+    impl EventSink for RecordingSink {
+        fn record(&mut self, event: &ExchangeEvent) -> std::io::Result<()> {
+            self.events.push(event.clone());
+            Ok(())
+        }
+    }
+
+    /// An [`EventSink`] whose every write fails, to prove recording errors are
+    /// swallowed rather than aborting the exchange.
+    struct FailingSink;
+
+    impl EventSink for FailingSink {
+        fn record(&mut self, _event: &ExchangeEvent) -> std::io::Result<()> {
+            Err(std::io::Error::other("sink is broken"))
+        }
+    }
+
+    fn test_meta() -> ExchangeMeta {
+        ExchangeMeta {
+            model: "claude-test-model".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+        }
+    }
+
     #[test]
     fn execute_ask_returns_only_reply_text_and_forwards_prompt() {
         let transport = OkTransport {
             text: "the answer".to_string(),
             seen: RefCell::new(None),
         };
-        let out = execute_ask(&transport, "the question").expect("should succeed");
+        let mut sink = NoopSink;
+        let out = execute_ask(&transport, &mut sink, &test_meta(), "the question")
+            .expect("should succeed");
         assert_eq!(out, "the answer");
         assert_eq!(transport.seen.borrow().as_deref(), Some("the question"));
     }
 
     #[test]
     fn execute_ask_propagates_transport_error() {
+        let mut sink = NoopSink;
         assert!(matches!(
-            execute_ask(&ErrTransport, "hi").unwrap_err(),
+            execute_ask(&ErrTransport, &mut sink, &test_meta(), "hi").unwrap_err(),
             BatonError::Transport(_)
         ));
+    }
+
+    #[test]
+    fn execute_ask_records_request_then_success_outcome() {
+        let transport = OkTransport {
+            text: "the answer".to_string(),
+            seen: RefCell::new(None),
+        };
+        let mut sink = RecordingSink::new();
+        execute_ask(&transport, &mut sink, &test_meta(), "the question").expect("should succeed");
+
+        assert_eq!(sink.events.len(), 2, "request + outcome");
+        match &sink.events[0] {
+            ExchangeEvent::Request { prompt, model, .. } => {
+                assert_eq!(prompt, "the question");
+                assert_eq!(model, "claude-test-model");
+            }
+            other => panic!("expected Request, got {other:?}"),
+        }
+        match &sink.events[1] {
+            ExchangeEvent::ResponseOk { reply, .. } => assert_eq!(reply, "the answer"),
+            other => panic!("expected ResponseOk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_ask_records_error_outcome_even_on_failure() {
+        let mut sink = RecordingSink::new();
+        execute_ask(&ErrTransport, &mut sink, &test_meta(), "hi").expect_err("transport fails");
+
+        assert_eq!(sink.events.len(), 2, "request + error outcome");
+        assert!(matches!(sink.events[0], ExchangeEvent::Request { .. }));
+        match &sink.events[1] {
+            ExchangeEvent::ResponseError { kind, .. } => assert_eq!(*kind, "transport"),
+            other => panic!("expected ResponseError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_ask_succeeds_even_when_event_recording_fails() {
+        let transport = OkTransport {
+            text: "the answer".to_string(),
+            seen: RefCell::new(None),
+        };
+        let mut sink = FailingSink;
+        // A sink that fails on every write must not change the exchange result.
+        let out = execute_ask(&transport, &mut sink, &test_meta(), "the question")
+            .expect("recording failure must not abort the exchange");
+        assert_eq!(out, "the answer");
     }
 }
