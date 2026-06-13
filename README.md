@@ -18,23 +18,41 @@ to the command line for the first-reply bootstrap flow.
 
 Baton reads its runtime configuration from environment variables:
 
-| Variable               | Required | Default                     | Purpose                                              |
-| ---------------------- | -------- | --------------------------- | ---------------------------------------------------- |
-| `ANTHROPIC_API_KEY`    | yes      | —                           | Provider API key. Must be set and non-empty.         |
-| `ANTHROPIC_BASE_URL`   | no       | `https://api.anthropic.com` | Base URL for the Claude-compatible Messages API.     |
-| `BATON_MODEL`          | no       | `claude-sonnet-4-6`         | Model id to request.                                 |
-| `BATON_TIMEOUT_SECS`   | no       | `60`                        | Per-request timeout in seconds (non-negative integer). |
-| `BATON_EVENT_LOG`      | no       | — (disabled)                | File path for the JSONL exchange-event trail (see below). |
+| Variable                     | Required | Default                     | Purpose                                              |
+| ---------------------------- | -------- | --------------------------- | ---------------------------------------------------- |
+| `ANTHROPIC_API_KEY`          | one of three | —                       | Provider API key. Must be set and non-empty.         |
+| `ANTHROPIC_AUTH_TOKEN`       | one of three | —                       | OAuth bearer token. Must be set and non-empty.       |
+| `CLAUDE_CODE_OAUTH_TOKEN`    | one of three | —                       | OAuth bearer token (Claude Code subscription).       |
+| `ANTHROPIC_BASE_URL`         | no       | `https://api.anthropic.com` | Base URL for the Claude-compatible Messages API.     |
+| `BATON_MODEL`                | no       | `claude-sonnet-4-6`         | Model id to request.                                 |
+| `BATON_TIMEOUT_SECS`         | no       | `60`                        | Per-request timeout in seconds (non-negative integer). |
+| `BATON_EVENT_LOG`            | no       | — (disabled)                | File path for the JSONL exchange-event trail (see below). |
+
+Exactly one credential variable is required. The first one that is set (in
+precedence `ANTHROPIC_API_KEY` > `ANTHROPIC_AUTH_TOKEN` > `CLAUDE_CODE_OAUTH_TOKEN`)
+wins; the others are ignored. A credential variable that is exported but blank
+or whitespace-only is an error, even if a later candidate is valid — exporting
+an empty value is almost always a misconfiguration rather than an explicit
+"skip me" signal.
 
 Missing or invalid values are surfaced as explicit configuration errors at
 startup rather than failing later.
 
 ## First reply
 
-`baton ask` sends a single prompt and prints the assistant's reply:
+`baton ask` sends a single prompt and prints the assistant's reply.
+
+With an Anthropic API key:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-...
+cargo run -- ask -p "hello"
+```
+
+With an OAuth bearer token (Claude Code subscription or `ANTHROPIC_AUTH_TOKEN`):
+
+```bash
+export CLAUDE_CODE_OAUTH_TOKEN=...
 cargo run -- ask -p "hello"
 ```
 
@@ -52,8 +70,10 @@ cargo run -- ask -p "hello"
 `transport::claude::ClaudeClient` implements the `Transport` trait against a
 Claude-compatible non-streaming `POST /v1/messages` endpoint:
 
-- Authenticates with the `x-api-key` header from `ANTHROPIC_API_KEY` and pins
-  the `anthropic-version: 2023-06-01` header.
+- Authenticates with the `x-api-key` header when the resolved credential is
+  an API key, or with `Authorization: Bearer <token>` when the resolved
+  credential is an OAuth token. Pins the `anthropic-version: 2023-06-01`
+  header in either case.
 - Sends to `{ANTHROPIC_BASE_URL}/v1/messages`, requesting the configured
   `BATON_MODEL`.
 - Requests up to 1024 output tokens per reply (fixed for now) and extracts the
@@ -117,3 +137,14 @@ event trail is auxiliary observability — it is written to the configured file
 only, never to stdout, and a failed log write degrades to a stderr warning
 rather than failing the command. Scope is single-turn: there is no session or
 multi-turn state in the schema.
+
+## Development
+
+CI runs the following gates; run them locally before opening a PR:
+
+- `cargo fmt --all -- --check` — formatting must be clean.
+- `cargo clippy --all-targets -- -D warnings` — no lints allowed.
+- `cargo build --verbose` — workspace must build.
+- `cargo test --verbose` — runs unit and integration tests; the integration
+  tests in `tests/integration_test.rs` spin up an in-process mock HTTP server
+  on `127.0.0.1` and need no network access or API credentials.
