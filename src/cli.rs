@@ -302,6 +302,16 @@ mod tests {
         }
     }
 
+    /// An [`EventSink`] whose every write fails, to prove recording errors are
+    /// swallowed rather than aborting the exchange.
+    struct FailingSink;
+
+    impl EventSink for FailingSink {
+        fn record(&mut self, _event: &ExchangeEvent) -> std::io::Result<()> {
+            Err(std::io::Error::other("sink is broken"))
+        }
+    }
+
     fn test_meta() -> ExchangeMeta {
         ExchangeMeta {
             model: "claude-test-model".to_string(),
@@ -365,5 +375,18 @@ mod tests {
             ExchangeEvent::ResponseError { kind, .. } => assert_eq!(*kind, "transport"),
             other => panic!("expected ResponseError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn execute_ask_succeeds_even_when_event_recording_fails() {
+        let transport = OkTransport {
+            text: "the answer".to_string(),
+            seen: RefCell::new(None),
+        };
+        let mut sink = FailingSink;
+        // A sink that fails on every write must not change the exchange result.
+        let out = execute_ask(&transport, &mut sink, &test_meta(), "the question")
+            .expect("recording failure must not abort the exchange");
+        assert_eq!(out, "the answer");
     }
 }
