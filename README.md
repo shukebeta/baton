@@ -26,6 +26,7 @@ Baton reads its runtime configuration from environment variables:
 | `ANTHROPIC_BASE_URL`         | no       | `https://api.anthropic.com` | Base URL for the Claude-compatible Messages API.     |
 | `BATON_MODEL`                | no       | `claude-sonnet-4-6`         | Model id to request.                                 |
 | `BATON_TIMEOUT_SECS`         | no       | `60`                        | Per-request timeout in seconds (non-negative integer). |
+| `BATON_MAX_TOKENS`           | no       | `1024`                      | Maximum output tokens to request per reply (positive integer; zero is rejected). |
 | `BATON_SYSTEM_PROMPT`        | no       | — (no system prompt)        | Path to a markdown file whose content is sent as the request's `system` field. Missing/unreadable file is a startup error. |
 | `BATON_EVENT_LOG`            | no       | — (disabled)                | File path for the JSONL exchange-event trail (see below). |
 
@@ -85,8 +86,8 @@ Claude-compatible non-streaming `POST /v1/messages` endpoint:
   header in either case.
 - Sends to `{ANTHROPIC_BASE_URL}/v1/messages`, requesting the configured
   `BATON_MODEL`.
-- Requests up to 1024 output tokens per reply (fixed for now) and extracts the
-  assistant's text from the response's `content` blocks.
+- Requests up to `BATON_MAX_TOKENS` output tokens per reply (default 1024) and
+  extracts the assistant's text from the response's `content` blocks.
 
 Failures are surfaced as explicit `BatonError` variants rather than silent
 fallbacks:

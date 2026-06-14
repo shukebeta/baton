@@ -17,7 +17,7 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use baton::config::{BatonConfig, Credential};
+use baton::config::{BatonConfig, Credential, DEFAULT_MAX_TOKENS};
 use baton::error::BatonError;
 use baton::model::Prompt;
 use baton::transport::Transport;
@@ -142,6 +142,7 @@ fn config_for_credential(base_url: &str, timeout_secs: u64, credential: Credenti
         base_url: base_url.to_string(),
         model: "claude-test-model".to_string(),
         timeout: Duration::from_secs(timeout_secs),
+        max_tokens: DEFAULT_MAX_TOKENS,
         system_prompt: None,
     }
 }

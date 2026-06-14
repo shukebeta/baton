@@ -25,6 +25,9 @@ pub const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 /// Default request timeout in seconds when `BATON_TIMEOUT_SECS` is unset.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
+/// Default `max_tokens` requested per reply when `BATON_MAX_TOKENS` is unset.
+pub const DEFAULT_MAX_TOKENS: u32 = 1024;
+
 /// An authentication credential accepted by the provider transport.
 ///
 /// Variants map 1:1 onto the wire-format header the transport emits:
@@ -51,6 +54,10 @@ pub struct BatonConfig {
     /// Per-request timeout. Derived from `BATON_TIMEOUT_SECS`, defaulting to
     /// [`DEFAULT_TIMEOUT_SECS`].
     pub timeout: Duration,
+    /// Maximum output tokens to request per reply. From `BATON_MAX_TOKENS`,
+    /// defaulting to [`DEFAULT_MAX_TOKENS`]. Must be a positive integer; zero is
+    /// rejected because the API rejects it.
+    pub max_tokens: u32,
     /// Optional system prompt. When `BATON_SYSTEM_PROMPT` names a readable file,
     /// this holds its content; the transport then sends it as the request's
     /// `system` field. Unset or blank leaves this `None` and omits the field.
@@ -83,6 +90,23 @@ impl BatonConfig {
             None => DEFAULT_TIMEOUT_SECS,
         };
 
+        let max_tokens = match non_empty(lookup("BATON_MAX_TOKENS")) {
+            Some(raw) => {
+                let parsed = raw.parse::<u32>().map_err(|_| {
+                    BatonError::Config(format!(
+                        "BATON_MAX_TOKENS must be a positive integer, got {raw:?}"
+                    ))
+                })?;
+                if parsed == 0 {
+                    return Err(BatonError::Config(
+                        "BATON_MAX_TOKENS must be greater than zero".to_string(),
+                    ));
+                }
+                parsed
+            }
+            None => DEFAULT_MAX_TOKENS,
+        };
+
         let system_prompt = resolve_system_prompt(non_empty(lookup("BATON_SYSTEM_PROMPT")))?;
 
         Ok(Self {
@@ -90,6 +114,7 @@ impl BatonConfig {
             base_url,
             model,
             timeout: Duration::from_secs(timeout_secs),
+            max_tokens,
             system_prompt,
         })
     }
@@ -364,6 +389,65 @@ mod tests {
             }
             other => panic!("expected Config, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn max_tokens_defaults_when_unset() {
+        let cfg = BatonConfig::from_lookup(lookup_from(&[("ANTHROPIC_API_KEY", "secret")]))
+            .expect("config should load");
+        assert_eq!(cfg.max_tokens, DEFAULT_MAX_TOKENS);
+    }
+
+    #[test]
+    fn max_tokens_override_is_honored() {
+        let cfg = BatonConfig::from_lookup(lookup_from(&[
+            ("ANTHROPIC_API_KEY", "secret"),
+            ("BATON_MAX_TOKENS", "4096"),
+        ]))
+        .expect("config should load");
+        assert_eq!(cfg.max_tokens, 4096);
+    }
+
+    #[test]
+    fn non_numeric_max_tokens_errors_naming_the_var() {
+        let err = BatonConfig::from_lookup(lookup_from(&[
+            ("ANTHROPIC_API_KEY", "secret"),
+            ("BATON_MAX_TOKENS", "lots"),
+        ]))
+        .unwrap_err();
+        match err {
+            BatonError::Config(msg) => assert!(
+                msg.contains("BATON_MAX_TOKENS"),
+                "message should name the variable, got: {msg}"
+            ),
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_max_tokens_errors_naming_the_var() {
+        let err = BatonConfig::from_lookup(lookup_from(&[
+            ("ANTHROPIC_API_KEY", "secret"),
+            ("BATON_MAX_TOKENS", "0"),
+        ]))
+        .unwrap_err();
+        match err {
+            BatonError::Config(msg) => assert!(
+                msg.contains("BATON_MAX_TOKENS"),
+                "message should name the variable, got: {msg}"
+            ),
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blank_max_tokens_falls_back_to_default() {
+        let cfg = BatonConfig::from_lookup(lookup_from(&[
+            ("ANTHROPIC_API_KEY", "secret"),
+            ("BATON_MAX_TOKENS", "   "),
+        ]))
+        .expect("config should load");
+        assert_eq!(cfg.max_tokens, DEFAULT_MAX_TOKENS);
     }
 
     #[test]
