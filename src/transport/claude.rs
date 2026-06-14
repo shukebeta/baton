@@ -17,13 +17,6 @@ use crate::transport::http::{HttpClient, UreqHttpClient};
 /// The Messages API version pinned by this client.
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 
-/// Maximum tokens requested per reply.
-///
-/// Fixed for this phase: a configurable limit is deferred until a ticket needs
-/// it. 1024 is enough for a single first reply without risking silent
-/// truncation of short answers.
-pub const DEFAULT_MAX_TOKENS: u32 = 1024;
-
 /// A Claude-compatible Messages client over an arbitrary [`HttpClient`].
 pub struct ClaudeClient<H: HttpClient> {
     config: BatonConfig,
@@ -58,6 +51,7 @@ impl<H: HttpClient> Transport for ClaudeClient<H> {
     fn send(&self, prompt: &Prompt) -> Result<AssistantReply> {
         let body = build_request_body(
             &self.config.model,
+            self.config.max_tokens,
             prompt,
             self.config.system_prompt.as_deref(),
         )?;
@@ -99,10 +93,15 @@ fn auth_header(credential: &Credential) -> (&'static str, String) {
 /// When `system_prompt` is `Some`, it is emitted as the request's `system`
 /// field; `None` omits the field entirely, leaving the body byte-identical to
 /// the no-system case.
-fn build_request_body(model: &str, prompt: &Prompt, system_prompt: Option<&str>) -> Result<String> {
+fn build_request_body(
+    model: &str,
+    max_tokens: u32,
+    prompt: &Prompt,
+    system_prompt: Option<&str>,
+) -> Result<String> {
     let request = MessagesRequest {
         model,
-        max_tokens: DEFAULT_MAX_TOKENS,
+        max_tokens,
         system: system_prompt,
         messages: vec![RequestMessage {
             role: "user",
@@ -213,7 +212,7 @@ struct ErrorDetail {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Credential;
+    use crate::config::{Credential, DEFAULT_MAX_TOKENS};
     use std::cell::RefCell;
     use std::time::Duration;
 
@@ -273,6 +272,7 @@ mod tests {
             base_url: base_url.to_string(),
             model: model.to_string(),
             timeout: Duration::from_secs(60),
+            max_tokens: DEFAULT_MAX_TOKENS,
             system_prompt: None,
         }
     }
@@ -349,6 +349,19 @@ mod tests {
         assert_eq!(value["max_tokens"], DEFAULT_MAX_TOKENS);
         assert_eq!(value["messages"][0]["role"], "user");
         assert_eq!(value["messages"][0]["content"], "hello world");
+    }
+
+    #[test]
+    fn request_carries_configured_max_tokens() {
+        let mut config = config_with("https://api.anthropic.com", "claude-sonnet-4-6");
+        config.max_tokens = 4096;
+        let client = ClaudeClient::with_http(config, FakeHttp::new(200, SUCCESS_BODY));
+        client.send(&Prompt::new("hi")).expect("should succeed");
+
+        let sent = client.http.last_body.borrow();
+        let value: serde_json::Value =
+            serde_json::from_str(sent.as_deref().unwrap()).expect("body is json");
+        assert_eq!(value["max_tokens"], 4096);
     }
 
     #[test]
