@@ -56,7 +56,11 @@ impl<H: HttpClient> ClaudeClient<H> {
 
 impl<H: HttpClient> Transport for ClaudeClient<H> {
     fn send(&self, prompt: &Prompt) -> Result<AssistantReply> {
-        let body = build_request_body(&self.config.model, prompt)?;
+        let body = build_request_body(
+            &self.config.model,
+            prompt,
+            self.config.system_prompt.as_deref(),
+        )?;
         let url = self.endpoint();
         // `auth_value` is bound to this stack frame so the array of header
         // refs below can borrow from it. The OAuth case formats the bearer
@@ -91,10 +95,15 @@ fn auth_header(credential: &Credential) -> (&'static str, String) {
 }
 
 /// Serializes a Messages request body for `model` carrying a single user turn.
-fn build_request_body(model: &str, prompt: &Prompt) -> Result<String> {
+///
+/// When `system_prompt` is `Some`, it is emitted as the request's `system`
+/// field; `None` omits the field entirely, leaving the body byte-identical to
+/// the no-system case.
+fn build_request_body(model: &str, prompt: &Prompt, system_prompt: Option<&str>) -> Result<String> {
     let request = MessagesRequest {
         model,
         max_tokens: DEFAULT_MAX_TOKENS,
+        system: system_prompt,
         messages: vec![RequestMessage {
             role: "user",
             content: &prompt.text,
@@ -166,6 +175,8 @@ fn extract_error_message(body: &str) -> String {
 struct MessagesRequest<'a> {
     model: &'a str,
     max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<&'a str>,
     messages: Vec<RequestMessage<'a>>,
 }
 
@@ -262,6 +273,7 @@ mod tests {
             base_url: base_url.to_string(),
             model: model.to_string(),
             timeout: Duration::from_secs(60),
+            system_prompt: None,
         }
     }
 
@@ -337,6 +349,37 @@ mod tests {
         assert_eq!(value["max_tokens"], DEFAULT_MAX_TOKENS);
         assert_eq!(value["messages"][0]["role"], "user");
         assert_eq!(value["messages"][0]["content"], "hello world");
+    }
+
+    #[test]
+    fn request_omits_system_field_when_system_prompt_is_none() {
+        let http = FakeHttp::new(200, SUCCESS_BODY);
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            http,
+        );
+        client.send(&Prompt::new("hi")).expect("should succeed");
+
+        let sent = client.http.last_body.borrow();
+        let value: serde_json::Value =
+            serde_json::from_str(sent.as_deref().unwrap()).expect("body is json");
+        assert!(
+            value.get("system").is_none(),
+            "system field must be absent when system_prompt is None, got: {value}"
+        );
+    }
+
+    #[test]
+    fn request_includes_system_field_when_system_prompt_is_some() {
+        let mut config = config_with("https://api.anthropic.com", "claude-sonnet-4-6");
+        config.system_prompt = Some("You are a terse agent.".to_string());
+        let client = ClaudeClient::with_http(config, FakeHttp::new(200, SUCCESS_BODY));
+        client.send(&Prompt::new("hi")).expect("should succeed");
+
+        let sent = client.http.last_body.borrow();
+        let value: serde_json::Value =
+            serde_json::from_str(sent.as_deref().unwrap()).expect("body is json");
+        assert_eq!(value["system"], "You are a terse agent.");
     }
 
     #[test]

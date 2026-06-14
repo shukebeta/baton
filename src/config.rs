@@ -51,6 +51,10 @@ pub struct BatonConfig {
     /// Per-request timeout. Derived from `BATON_TIMEOUT_SECS`, defaulting to
     /// [`DEFAULT_TIMEOUT_SECS`].
     pub timeout: Duration,
+    /// Optional system prompt. When `BATON_SYSTEM_PROMPT` names a readable file,
+    /// this holds its content; the transport then sends it as the request's
+    /// `system` field. Unset or blank leaves this `None` and omits the field.
+    pub system_prompt: Option<String>,
 }
 
 impl BatonConfig {
@@ -79,13 +83,35 @@ impl BatonConfig {
             None => DEFAULT_TIMEOUT_SECS,
         };
 
+        let system_prompt = resolve_system_prompt(non_empty(lookup("BATON_SYSTEM_PROMPT")))?;
+
         Ok(Self {
             credential,
             base_url,
             model,
             timeout: Duration::from_secs(timeout_secs),
+            system_prompt,
         })
     }
+}
+
+/// Resolves the optional system prompt from the `BATON_SYSTEM_PROMPT` path.
+///
+/// `path` is the already-trimmed value of the variable (or `None` when unset or
+/// blank). When present, the file at that path is read and its content returned;
+/// a missing or unreadable file is a [`BatonError::Config`] naming both the
+/// variable and the path, so the command fails at startup before any network
+/// call. An unset or blank variable yields `None`, preserving the no-system
+/// behaviour.
+fn resolve_system_prompt(path: Option<String>) -> Result<Option<String>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    std::fs::read_to_string(&path).map(Some).map_err(|err| {
+        BatonError::Config(format!(
+            "BATON_SYSTEM_PROMPT points to a file that could not be read ({path}): {err}"
+        ))
+    })
 }
 
 /// Resolves the provider credential with the documented precedence.
@@ -274,6 +300,70 @@ mod tests {
         ]))
         .expect("config should load");
         assert_eq!(cfg.model, DEFAULT_MODEL);
+    }
+
+    /// Writes `content` to a uniquely-named file under the temp dir and returns
+    /// its path. The name embeds the process id and a caller-supplied tag so
+    /// concurrent tests never collide.
+    fn write_temp(tag: &str, content: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("baton-sysprompt-{}-{tag}.md", std::process::id()));
+        std::fs::write(&path, content).expect("write temp system prompt");
+        path
+    }
+
+    #[test]
+    fn system_prompt_unset_is_none() {
+        let cfg = BatonConfig::from_lookup(lookup_from(&[("ANTHROPIC_API_KEY", "secret")]))
+            .expect("config should load");
+        assert_eq!(cfg.system_prompt, None);
+    }
+
+    #[test]
+    fn system_prompt_blank_is_none() {
+        let cfg = BatonConfig::from_lookup(lookup_from(&[
+            ("ANTHROPIC_API_KEY", "secret"),
+            ("BATON_SYSTEM_PROMPT", "   "),
+        ]))
+        .expect("config should load");
+        assert_eq!(cfg.system_prompt, None);
+    }
+
+    #[test]
+    fn system_prompt_valid_path_reads_file_content() {
+        let path = write_temp("valid", "You are a helpful agent.\n");
+        let cfg = BatonConfig::from_lookup(lookup_from(&[
+            ("ANTHROPIC_API_KEY", "secret"),
+            ("BATON_SYSTEM_PROMPT", path.to_str().unwrap()),
+        ]))
+        .expect("config should load");
+        assert_eq!(
+            cfg.system_prompt.as_deref(),
+            Some("You are a helpful agent.\n")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn system_prompt_missing_file_errors_naming_var_and_path() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("baton-sysprompt-{}-missing.md", std::process::id()));
+        let _ = std::fs::remove_file(&path); // ensure absent
+        let path_str = path.to_str().unwrap().to_string();
+        let err = BatonConfig::from_lookup(lookup_from(&[
+            ("ANTHROPIC_API_KEY", "secret"),
+            ("BATON_SYSTEM_PROMPT", &path_str),
+        ]))
+        .unwrap_err();
+        match err {
+            BatonError::Config(msg) => {
+                assert!(
+                    msg.contains("BATON_SYSTEM_PROMPT") && msg.contains(&path_str),
+                    "message should name the variable and the path, got: {msg}"
+                );
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
     }
 
     #[test]

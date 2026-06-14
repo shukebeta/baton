@@ -26,6 +26,7 @@ Baton reads its runtime configuration from environment variables:
 | `ANTHROPIC_BASE_URL`         | no       | `https://api.anthropic.com` | Base URL for the Claude-compatible Messages API.     |
 | `BATON_MODEL`                | no       | `claude-sonnet-4-6`         | Model id to request.                                 |
 | `BATON_TIMEOUT_SECS`         | no       | `60`                        | Per-request timeout in seconds (non-negative integer). |
+| `BATON_SYSTEM_PROMPT`        | no       | — (no system prompt)        | Path to a markdown file whose content is sent as the request's `system` field. Missing/unreadable file is a startup error. |
 | `BATON_EVENT_LOG`            | no       | — (disabled)                | File path for the JSONL exchange-event trail (see below). |
 
 Exactly one credential variable is required. The first one that is set (in
@@ -37,6 +38,14 @@ an empty value is almost always a misconfiguration rather than an explicit
 
 Missing or invalid values are surfaced as explicit configuration errors at
 startup rather than failing later.
+
+`BATON_SYSTEM_PROMPT` gives an agent an identity, role constraints, or
+output-format instructions. It is a **file path**, not a raw string — system
+prompts are usually multi-paragraph documents better kept under version control
+than squeezed into an environment variable. The file is read at startup; its
+content becomes the request's `system` field. Unset or blank means no system
+field is sent (the prior behaviour). A path to a missing or unreadable file is a
+configuration error that fails before any network call.
 
 ## First reply
 
