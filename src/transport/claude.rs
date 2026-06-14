@@ -1,16 +1,16 @@
 //! A non-streaming Claude-compatible Messages client.
 //!
-//! [`ClaudeClient`] implements [`Transport`] against `POST /v1/messages`. It is
-//! single-turn only: one user prompt in, one assistant reply out — no
-//! streaming, tool use, or message history (those are out of scope for this
-//! phase). The request building and response parsing are pure functions so they
-//! can be tested without a network via a fake [`HttpClient`].
+//! [`ClaudeClient`] implements [`Transport`] against `POST /v1/messages`. It
+//! sends a full conversation history (one or more role-tagged turns) and decodes
+//! one assistant reply — no streaming or tool use (those remain out of scope).
+//! The request building and response parsing are pure functions so they can be
+//! tested without a network via a fake [`HttpClient`].
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::{BatonConfig, Credential};
 use crate::error::{BatonError, Result};
-use crate::model::{AssistantReply, Prompt};
+use crate::model::{AssistantReply, Message};
 use crate::transport::Transport;
 use crate::transport::http::{HttpClient, UreqHttpClient};
 
@@ -48,11 +48,11 @@ impl<H: HttpClient> ClaudeClient<H> {
 }
 
 impl<H: HttpClient> Transport for ClaudeClient<H> {
-    fn send(&self, prompt: &Prompt) -> Result<AssistantReply> {
+    fn send_conversation(&self, messages: &[Message]) -> Result<AssistantReply> {
         let body = build_request_body(
             &self.config.model,
             self.config.max_tokens,
-            prompt,
+            messages,
             self.config.system_prompt.as_deref(),
         )?;
         let url = self.endpoint();
@@ -88,25 +88,29 @@ fn auth_header(credential: &Credential) -> (&'static str, String) {
     }
 }
 
-/// Serializes a Messages request body for `model` carrying a single user turn.
+/// Serializes a Messages request body for `model` carrying `messages` in order.
 ///
-/// When `system_prompt` is `Some`, it is emitted as the request's `system`
-/// field; `None` omits the field entirely, leaving the body byte-identical to
-/// the no-system case.
+/// Each turn's [`Role`](crate::model::Role) is emitted as its wire `role` value,
+/// preserving order so multi-turn history reaches the provider intact. When
+/// `system_prompt` is `Some`, it is emitted as the request's `system` field;
+/// `None` omits the field entirely.
 fn build_request_body(
     model: &str,
     max_tokens: u32,
-    prompt: &Prompt,
+    messages: &[Message],
     system_prompt: Option<&str>,
 ) -> Result<String> {
     let request = MessagesRequest {
         model,
         max_tokens,
         system: system_prompt,
-        messages: vec![RequestMessage {
-            role: "user",
-            content: &prompt.text,
-        }],
+        messages: messages
+            .iter()
+            .map(|message| RequestMessage {
+                role: message.role.as_str(),
+                content: &message.content,
+            })
+            .collect(),
     };
     serde_json::to_string(&request)
         .map_err(|err| BatonError::Transport(format!("failed to serialize request: {err}")))
@@ -213,6 +217,7 @@ struct ErrorDetail {
 mod tests {
     use super::*;
     use crate::config::{Credential, DEFAULT_MAX_TOKENS};
+    use crate::model::Prompt;
     use std::cell::RefCell;
     use std::time::Duration;
 
@@ -362,6 +367,32 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(sent.as_deref().unwrap()).expect("body is json");
         assert_eq!(value["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn send_conversation_serializes_full_history_in_order() {
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            FakeHttp::new(200, SUCCESS_BODY),
+        );
+        let history = [
+            Message::user("first"),
+            Message::assistant("reply one"),
+            Message::user("second"),
+        ];
+        client.send_conversation(&history).expect("should succeed");
+
+        let sent = client.http.last_body.borrow();
+        let value: serde_json::Value =
+            serde_json::from_str(sent.as_deref().unwrap()).expect("body is json");
+        let messages = value["messages"].as_array().expect("messages is an array");
+        assert_eq!(messages.len(), 3, "the full history is sent, got: {value}");
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "first");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "reply one");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], "second");
     }
 
     #[test]

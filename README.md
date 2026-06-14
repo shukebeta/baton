@@ -9,10 +9,11 @@ center of the design.
 ## Status
 
 Early scaffolding. The crate establishes the module layout and typed runtime
-shape for a single-turn first-prompt / first-reply path, plus a non-streaming
-Claude-compatible Messages client (`transport::claude::ClaudeClient`) that can
-send one prompt and decode one reply. The `baton ask` command wires that client
-to the command line for the first-reply bootstrap flow.
+shape around a non-streaming Claude-compatible Messages client
+(`transport::claude::ClaudeClient`). Two commands wire it to the command line:
+`baton ask` for a single-turn first-prompt / first-reply, and `baton session`
+for an interactive multi-turn REPL that accumulates conversation history across
+turns.
 
 ## Configuration
 
@@ -75,6 +76,39 @@ cargo run -- ask -p "hello"
   error) Baton prints the error to **stderr** and exits with a non-zero status;
   stdout stays empty.
 
+## Multi-turn session
+
+`baton session` is an interactive REPL that keeps a conversation in memory and
+resends the full history on every request, so the assistant has the context of
+all prior turns.
+
+```bash
+export ANTHROPIC_API_KEY=sk-...
+cargo run -- session
+```
+
+```text
+baton session — type a message and press enter; Ctrl-D or /exit to quit
+who won the 1998 world cup?
+France.
+and who did they beat in the final?
+Brazil, 3–0.
+/exit
+```
+
+- Each line you enter is appended to the history as a `user` turn; the
+  assistant's reply is printed and appended as an `assistant` turn. Turn N's
+  request carries every prior user and assistant turn.
+- `BATON_SYSTEM_PROMPT` (if set) is sent as the `system` field on **every**
+  request, same as the `ask` path.
+- A blank line is ignored. The session ends — cleanly, with exit code 0 — on
+  EOF (`Ctrl-D`) or a lone `/exit` line.
+- A turn that fails (rate limit, transport error, …) is **not** fatal: the
+  error is printed to stderr, the failed turn is dropped from the history, and
+  the REPL continues so you can retry.
+- History lives only in memory: it is not persisted across process restarts,
+  and there are no named sessions or session IDs yet.
+
 ## Provider transport
 
 `transport::claude::ClaudeClient` implements the `Transport` trait against a
@@ -101,14 +135,16 @@ fallbacks:
 | Other non-2xx (e.g. 400)          | `Api { status, .. }`           |
 | Malformed or text-less 2xx body   | `Decode`                       |
 
-Streaming, tool calling, and multi-turn conversations are out of scope for this
-client.
+The client sends one or more conversation turns and decodes one reply;
+`baton session` builds the multi-turn history on top of it. Streaming and tool
+calling remain out of scope for this client.
 
 ## Structured exchange events
 
-Baton can record each `ask` exchange as a machine-readable trail so a single
+Baton can record each exchange as a machine-readable trail so a single
 request/response can be programmatically inspected or replayed, and so failures
-are captured explicitly rather than lost in human-oriented output.
+are captured explicitly rather than lost in human-oriented output. Both `ask`
+and `session` record; a session emits one `request`/outcome pair per turn.
 
 Recording is **opt-in**: set `BATON_EVENT_LOG` to a file path. Each run appends
 its events to that file, so successive runs accumulate one trail.
@@ -145,8 +181,10 @@ the failure class without parsing the human-readable `message`.
 standalone JSON object (a partial trailing line, if any, can be skipped). The
 event trail is auxiliary observability — it is written to the configured file
 only, never to stdout, and a failed log write degrades to a stderr warning
-rather than failing the command. Scope is single-turn: there is no session or
-multi-turn state in the schema.
+rather than failing the command. The schema is per-exchange: each line is one
+request or one outcome, and a session turn's `request` carries that turn's user
+input as `prompt` (the full accumulated history is not aggregated into a single
+schema object).
 
 ## Development
 
