@@ -706,3 +706,156 @@ fn session_runs_multi_turn_and_records_a_pair_per_turn() {
     assert_eq!(lines[2]["prompt"], "second turn");
     assert_eq!(lines[3]["event"], "response_ok");
 }
+
+// ---------------------------------------------------------------------------
+// `baton log show` / `baton log replay` end-to-end.
+//
+// The unit tests in `src/log.rs` / `src/cli.rs` cover `parse_jsonl`, exchange
+// selection, and rendering with in-memory buffers. These subprocess tests add
+// confidence that the compiled binary reads a real JSONL file from `--file`,
+// renders it, and — for replay — re-sends the recorded exchange over a real
+// `ureq` round-trip and appends a fresh exchange to `BATON_EVENT_LOG`.
+// ---------------------------------------------------------------------------
+
+/// Runs `baton log <args...>` with the deterministic credential environment.
+/// `event_log` controls `BATON_EVENT_LOG` (the replay sink); the source log is
+/// passed via `--file` in `args`.
+fn run_baton_log(args: &[&str], event_log: Option<&Path>) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_baton"));
+    cmd.arg("log").args(args);
+    cmd.env("ANTHROPIC_API_KEY", "test-key");
+    cmd.env("BATON_MODEL", "claude-test-model");
+    cmd.env("BATON_TIMEOUT_SECS", "5");
+    cmd.env_remove("ANTHROPIC_AUTH_TOKEN");
+    cmd.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+    match event_log {
+        Some(path) => {
+            cmd.env("BATON_EVENT_LOG", path);
+        }
+        None => {
+            cmd.env_remove("BATON_EVENT_LOG");
+        }
+    }
+    cmd.output().expect("run baton log")
+}
+
+#[test]
+fn log_show_renders_recorded_exchanges_from_file() {
+    let temp = TempEventLog::new("show");
+    let trail = concat!(
+        r#"{"event":"request","schema":"baton.exchange/v1","ts_ms":1700000000000,"model":"claude-sonnet-4-6","base_url":"https://api.anthropic.com","prompt":"who won the 1998 world cup?"}"#,
+        "\n",
+        r#"{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":1700000000420,"duration_ms":418,"reply":"France."}"#,
+        "\n",
+    );
+    std::fs::write(&temp.file, trail).expect("write trail");
+
+    let out = run_baton_log(&["show", "--file", temp.file.to_str().unwrap()], None);
+    assert!(
+        out.status.success(),
+        "show should succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("2023-11-14T22:13:20Z"),
+        "timestamp: {stdout}"
+    );
+    assert!(stdout.contains("claude-sonnet-4-6"), "model: {stdout}");
+    assert!(
+        stdout.contains("who won the 1998 world cup?"),
+        "prompt: {stdout}"
+    );
+    assert!(stdout.contains("France."), "reply: {stdout}");
+}
+
+#[test]
+fn log_show_without_source_is_usage_error() {
+    // No --file and no BATON_EVENT_LOG ⇒ nothing to read ⇒ non-zero exit.
+    let out = run_baton_log(&["show"], None);
+    assert!(!out.status.success(), "missing source should exit non-zero");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("BATON_EVENT_LOG") || stderr.contains("--file"),
+        "stderr should name the missing source: {stderr}"
+    );
+}
+
+#[test]
+fn log_replay_resends_last_exchange_and_appends_fresh_events() {
+    let server = MockServer::spawn(200, SUCCESS_BODY);
+    let source = TempEventLog::new("replay-src");
+    let sink = TempEventLog::new("replay-sink");
+
+    // The recorded request points at the mock server, so replay re-sends there.
+    let trail = format!(
+        concat!(
+            r#"{{"event":"request","schema":"baton.exchange/v1","ts_ms":1700000000000,"model":"claude-test-model","base_url":"{base}","prompt":"replay me"}}"#,
+            "\n",
+            r#"{{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":1700000000420,"duration_ms":418,"reply":"old reply"}}"#,
+            "\n",
+        ),
+        base = server.base_url(),
+    );
+    std::fs::write(&source.file, trail).expect("write source trail");
+
+    let out = run_baton_log(
+        &["replay", "--file", source.file.to_str().unwrap()],
+        Some(&sink.file),
+    );
+    assert!(
+        out.status.success(),
+        "replay should succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // stdout is the fresh reply and nothing else — same contract as `ask`.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "hello from the mock server"
+    );
+
+    // A fresh request/response_ok pair is appended to BATON_EVENT_LOG, carrying
+    // the replayed prompt.
+    let lines = read_jsonl(&sink.file);
+    assert_eq!(
+        lines.len(),
+        2,
+        "replay appends one fresh exchange: {lines:?}"
+    );
+    assert_eq!(lines[0]["event"], "request");
+    assert_eq!(lines[0]["prompt"], "replay me");
+    assert_eq!(lines[1]["event"], "response_ok");
+    assert_eq!(lines[1]["reply"], "hello from the mock server");
+}
+
+#[test]
+fn log_replay_out_of_range_index_is_error() {
+    let source = TempEventLog::new("replay-range");
+    let trail = concat!(
+        r#"{"event":"request","ts_ms":1,"model":"claude-test-model","base_url":"https://api.anthropic.com","prompt":"only"}"#,
+        "\n",
+        r#"{"event":"response_ok","ts_ms":2,"duration_ms":1,"reply":"r"}"#,
+        "\n",
+    );
+    std::fs::write(&source.file, trail).expect("write trail");
+
+    let out = run_baton_log(
+        &[
+            "replay",
+            "--index",
+            "5",
+            "--file",
+            source.file.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(
+        !out.status.success(),
+        "out-of-range index should exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("1..=1"),
+        "stderr names the valid range: {stderr}"
+    );
+}

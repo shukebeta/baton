@@ -8,6 +8,7 @@
 //! - [`model`] — typed prompt/reply structures.
 //! - [`transport`] — the provider transport boundary.
 //! - [`events`] — structured JSONL recording of each exchange.
+//! - [`log`] — reading and rendering the recorded exchange trail.
 //! - [`error`] — shared error and result types.
 //! - [`cli`] — the command-line entry surface.
 
@@ -15,5 +16,6 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod events;
+pub mod log;
 pub mod model;
 pub mod transport;

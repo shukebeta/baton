@@ -50,6 +50,10 @@ pub enum BatonError {
     Decode(String),
     /// A local I/O operation failed (e.g. opening the configured event log).
     Io(String),
+    /// A recorded exchange-log line could not be parsed (malformed JSON, or a
+    /// known event missing required fields). Distinct from [`BatonError::Io`]
+    /// (the read succeeded) and [`BatonError::Decode`] (a provider response).
+    Log(String),
 }
 
 impl BatonError {
@@ -68,6 +72,7 @@ impl BatonError {
             BatonError::Api { .. } => "api",
             BatonError::Decode(_) => "decode",
             BatonError::Io(_) => "io",
+            BatonError::Log(_) => "log",
         }
     }
 }
@@ -88,6 +93,7 @@ impl fmt::Display for BatonError {
             }
             BatonError::Decode(msg) => write!(f, "response decode error: {msg}"),
             BatonError::Io(msg) => write!(f, "io error: {msg}"),
+            BatonError::Log(msg) => write!(f, "log error: {msg}"),
         }
     }
 }
