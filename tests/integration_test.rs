@@ -13,7 +13,7 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -51,6 +51,46 @@ impl MockServer {
     /// response, so the client must rely on its own timeout.
     fn spawn_silent() -> Self {
         Self::spawn_with(0, "", true)
+    }
+
+    /// Spawn a server that answers every incoming connection with the same
+    /// `status` + `body`, looping until the process exits. A `baton session`
+    /// run opens one connection per turn (the response sets `connection:
+    /// close`), so a multi-turn session needs a server that serves more than
+    /// once.
+    fn spawn_repeating(status: u16, body: &'static str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let addr = listener.local_addr().expect("read local_addr");
+        let base_url = format!("http://{addr}");
+
+        let handle = thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut stream) = conn else { break };
+                // Drain the request so the client's `send` returns, then write
+                // the canned response. One request/response per connection.
+                let mut buf = [0u8; 4096];
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let _ = stream.read(&mut buf);
+
+                let response = format!(
+                    "HTTP/1.1 {status} {}\r\n\
+                     content-type: application/json\r\n\
+                     content-length: {}\r\n\
+                     connection: close\r\n\
+                     \r\n\
+                     {body}",
+                    status_text(status),
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        Self {
+            base_url,
+            handle: Some(handle),
+        }
     }
 
     fn spawn_with(status: u16, body: &'static str, hold_open: bool) -> Self {
@@ -575,5 +615,94 @@ fn successive_runs_append_to_event_file() {
     assert_eq!(lines[0]["event"], "request");
     assert_eq!(lines[1]["event"], "response_ok");
     assert_eq!(lines[2]["event"], "request");
+    assert_eq!(lines[3]["event"], "response_ok");
+}
+
+// ---------------------------------------------------------------------------
+// `baton session` end-to-end.
+//
+// The unit tests in `src/cli.rs` drive `execute_session` with in-memory buffers
+// and a fake transport. This subprocess test adds confidence that the compiled
+// binary parses the `session` command, reads turns from stdin until EOF, sends
+// each turn over a real `ureq` round-trip, and records a `request` +
+// `response_ok` pair per turn to `BATON_EVENT_LOG`.
+// ---------------------------------------------------------------------------
+
+/// Runs the real `baton session` binary against `base_url`, piping `input` to
+/// its stdin (closed after writing, which the REPL sees as EOF). Mirrors the
+/// deterministic environment of [`run_baton_ask`].
+fn run_baton_session(
+    base_url: &str,
+    input: &str,
+    event_log: Option<&Path>,
+) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_baton"));
+    cmd.arg("session");
+    cmd.env("ANTHROPIC_API_KEY", "test-key");
+    cmd.env("ANTHROPIC_BASE_URL", base_url);
+    cmd.env("BATON_MODEL", "claude-test-model");
+    cmd.env("BATON_TIMEOUT_SECS", "5");
+    cmd.env_remove("ANTHROPIC_AUTH_TOKEN");
+    cmd.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+    match event_log {
+        Some(path) => {
+            cmd.env("BATON_EVENT_LOG", path);
+        }
+        None => {
+            cmd.env_remove("BATON_EVENT_LOG");
+        }
+    }
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("spawn baton session");
+    child
+        .stdin
+        .take()
+        .expect("session stdin is piped")
+        .write_all(input.as_bytes())
+        .expect("write session input");
+    // Dropping the taken stdin (end of the statement above) closes the pipe,
+    // so the REPL reads EOF and exits.
+    child.wait_with_output().expect("wait for baton session")
+}
+
+#[test]
+fn session_runs_multi_turn_and_records_a_pair_per_turn() {
+    let server = MockServer::spawn_repeating(200, SUCCESS_BODY);
+    let temp = TempEventLog::new("session");
+
+    let out = run_baton_session(
+        server.base_url(),
+        "first turn\nsecond turn\n",
+        Some(&temp.file),
+    );
+    assert!(
+        out.status.success(),
+        "session should exit 0 on EOF; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The assistant reply is printed once per turn.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let reply_count = stdout.matches("hello from the mock server").count();
+    assert_eq!(
+        reply_count, 2,
+        "one reply printed per turn; stdout: {stdout}"
+    );
+
+    // Two turns ⇒ two request/response_ok pairs in order.
+    let lines = read_jsonl(&temp.file);
+    assert_eq!(
+        lines.len(),
+        4,
+        "two turns × (request + response_ok), got {lines:?}"
+    );
+    assert_eq!(lines[0]["event"], "request");
+    assert_eq!(lines[0]["prompt"], "first turn");
+    assert_eq!(lines[1]["event"], "response_ok");
+    assert_eq!(lines[2]["event"], "request");
+    assert_eq!(lines[2]["prompt"], "second turn");
     assert_eq!(lines[3]["event"], "response_ok");
 }
