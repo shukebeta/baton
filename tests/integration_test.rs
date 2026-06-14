@@ -142,6 +142,7 @@ fn config_for_credential(base_url: &str, timeout_secs: u64, credential: Credenti
         base_url: base_url.to_string(),
         model: "claude-test-model".to_string(),
         timeout: Duration::from_secs(timeout_secs),
+        system_prompt: None,
     }
 }
 
