@@ -21,13 +21,14 @@
 //!
 //! Streaming and tool execution remain out of scope.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Write};
 use std::time::Instant;
 
 use crate::config::BatonConfig;
 use crate::error::{BatonError, Result};
 use crate::events::{EventSink, ExchangeEvent, ExchangeMeta, NoopSink, WriterSink, now_ms};
+use crate::log::{self, Exchange};
 use crate::model::{AssistantReply, Conversation, Prompt};
 use crate::transport::Transport;
 use crate::transport::claude::ClaudeClient;
@@ -37,7 +38,7 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton log show|replay [--file <path>] [--index <N>]";
 
 /// The in-session command that ends the REPL cleanly (alongside EOF).
 const SESSION_EXIT_COMMAND: &str = "/exit";
@@ -49,6 +50,13 @@ enum Command {
     Ask { prompt: String },
     /// Start an interactive multi-turn REPL.
     Session,
+    /// Pretty-print the recorded exchange trail.
+    LogShow { file: Option<String> },
+    /// Re-run a recorded exchange. `index` is 1-based; `None` ⇒ the last one.
+    LogReplay {
+        file: Option<String>,
+        index: Option<usize>,
+    },
 }
 
 /// Process entry point: parse arguments and dispatch.
@@ -77,7 +85,95 @@ pub fn run() -> Result<()> {
             let stdout = std::io::stdout();
             execute_session(&client, sink.as_mut(), &meta, stdin.lock(), stdout.lock())
         }
+        Command::LogShow { file } => {
+            let exchanges = read_log(file.as_deref())?;
+            let stdout = std::io::stdout();
+            execute_log_show(&exchanges, stdout.lock())
+        }
+        Command::LogReplay { file, index } => {
+            let exchanges = read_log(file.as_deref())?;
+            let request = &select_exchange(&exchanges, index)?.request;
+
+            // Replay targets the logged exchange's model + base_url, but uses
+            // the *current* credential (and timeout / max_tokens / system
+            // prompt) from the environment — so a replay re-runs with today's
+            // auth, not a credential that was never recorded.
+            let mut config = BatonConfig::from_env()?;
+            config.model = request.model.clone();
+            config.base_url = request.base_url.clone();
+
+            let meta = exchange_meta(&config);
+            let prompt = request.prompt.clone();
+            let mut sink = open_event_sink()?;
+            let client = ClaudeClient::from_config(config);
+            let reply = execute_ask(&client, sink.as_mut(), &meta, &prompt)?;
+            println!("{reply}");
+            Ok(())
+        }
     }
+}
+
+/// Resolves the log path and parses it into exchanges.
+///
+/// The path is `--file` when given, else [`EVENT_LOG_ENV`]; with neither set,
+/// there is nothing to read, which is a usage error. A path that cannot be
+/// opened is an [`BatonError::Io`].
+fn read_log(file: Option<&str>) -> Result<Vec<Exchange>> {
+    let path = resolve_log_path(file)?;
+    let handle = File::open(&path)
+        .map_err(|err| BatonError::Io(format!("failed to open log file {path:?}: {err}")))?;
+    log::parse_jsonl(handle)
+}
+
+/// Resolves the log file path: `--file` takes precedence, then [`EVENT_LOG_ENV`].
+///
+/// A blank value (in either source) is treated as absent. With no usable path
+/// from either source, there is nothing to read — a usage error rather than a
+/// silent empty result.
+fn resolve_log_path(file: Option<&str>) -> Result<String> {
+    if let Some(path) = file.filter(|p| !p.trim().is_empty()) {
+        return Ok(path.to_string());
+    }
+    match std::env::var(EVENT_LOG_ENV) {
+        Ok(path) if !path.trim().is_empty() => Ok(path),
+        _ => Err(usage(&format!(
+            "no log file: pass --file <path> or set {EVENT_LOG_ENV}"
+        ))),
+    }
+}
+
+/// Selects the exchange to replay: 1-based `index`, or the last when `None`.
+///
+/// An empty log, or an index outside `1..=len`, is an error naming the valid
+/// range so the user can correct it.
+fn select_exchange(exchanges: &[Exchange], index: Option<usize>) -> Result<&Exchange> {
+    if exchanges.is_empty() {
+        return Err(BatonError::Usage(
+            "log contains no complete exchanges to replay".to_string(),
+        ));
+    }
+    let position = match index {
+        None => exchanges.len() - 1,
+        Some(n) if (1..=exchanges.len()).contains(&n) => n - 1,
+        Some(n) => {
+            return Err(usage(&format!(
+                "--index {n} is out of range; valid range is 1..={}",
+                exchanges.len()
+            )));
+        }
+    };
+    Ok(&exchanges[position])
+}
+
+/// Writes each exchange as a human-readable block to `output`.
+///
+/// Parameterised over [`Write`] so the rendering is unit-testable with an
+/// in-memory buffer. An empty log produces no output.
+fn execute_log_show(exchanges: &[Exchange], mut output: impl Write) -> Result<()> {
+    for (i, exchange) in exchanges.iter().enumerate() {
+        write!(output, "{}", log::format_exchange(i + 1, exchange)).map_err(io_err)?;
+    }
+    Ok(())
 }
 
 /// Builds the replay-relevant [`ExchangeMeta`] shared by every exchange in a
@@ -248,8 +344,90 @@ fn parse_args(args: &[String]) -> Result<Command> {
     match command.as_str() {
         "ask" => parse_ask(iter),
         "session" => parse_session(iter),
+        "log" => parse_log(iter),
         other => Err(usage(&format!("unknown command {other:?}"))),
     }
+}
+
+/// Parses the arguments following the `log` command.
+///
+/// Requires a `show` or `replay` subcommand; anything else (including a missing
+/// subcommand) is a usage error.
+fn parse_log<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mode = iter
+        .next()
+        .ok_or_else(|| usage("log requires a subcommand: show or replay"))?;
+    match mode.as_str() {
+        "show" => {
+            let file = parse_log_options(iter, false)?.file;
+            Ok(Command::LogShow { file })
+        }
+        "replay" => {
+            let opts = parse_log_options(iter, true)?;
+            Ok(Command::LogReplay {
+                file: opts.file,
+                index: opts.index,
+            })
+        }
+        other => Err(usage(&format!("unknown log subcommand {other:?}"))),
+    }
+}
+
+/// Parsed options shared by `log show` / `log replay`.
+struct LogOptions {
+    file: Option<String>,
+    index: Option<usize>,
+}
+
+/// Parses `--file <path>` (both subcommands) and, when `allow_index` is set,
+/// `--index <N>` (replay only). The `--flag=value` form is accepted for both.
+///
+/// `--index` on `show`, an unknown flag, or a non-positive-integer index are all
+/// usage errors.
+fn parse_log_options<'a>(
+    mut iter: impl Iterator<Item = &'a String>,
+    allow_index: bool,
+) -> Result<LogOptions> {
+    let mut file: Option<String> = None;
+    let mut index: Option<usize> = None;
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--file" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| usage("--file requires a value"))?;
+                file = Some(value.clone());
+            }
+            other if other.starts_with("--file=") => {
+                file = Some(other["--file=".len()..].to_string());
+            }
+            "--index" if allow_index => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| usage("--index requires a value"))?;
+                index = Some(parse_index(value)?);
+            }
+            other if allow_index && other.starts_with("--index=") => {
+                index = Some(parse_index(&other["--index=".len()..])?);
+            }
+            other => return Err(usage(&format!("unexpected argument {other:?}"))),
+        }
+    }
+
+    Ok(LogOptions { file, index })
+}
+
+/// Parses a 1-based `--index` value: a positive integer. Zero and non-numeric
+/// values are usage errors (the range itself is validated against the log later).
+fn parse_index(raw: &str) -> Result<usize> {
+    let parsed = raw
+        .parse::<usize>()
+        .map_err(|_| usage(&format!("--index must be a positive integer, got {raw:?}")))?;
+    if parsed == 0 {
+        return Err(usage("--index is 1-based; 0 is not a valid exchange"));
+    }
+    Ok(parsed)
 }
 
 /// Parses the arguments following the `ask` subcommand.
@@ -567,6 +745,169 @@ mod tests {
         let out = execute_ask(&transport, &mut sink, &test_meta(), "the question")
             .expect("recording failure must not abort the exchange");
         assert_eq!(out, "the answer");
+    }
+
+    #[test]
+    fn parses_log_show_with_and_without_file() {
+        assert_eq!(
+            parse_args(&argv(&["log", "show"])).expect("parses"),
+            Command::LogShow { file: None }
+        );
+        assert_eq!(
+            parse_args(&argv(&["log", "show", "--file", "/tmp/x.jsonl"])).expect("parses"),
+            Command::LogShow {
+                file: Some("/tmp/x.jsonl".to_string())
+            }
+        );
+        assert_eq!(
+            parse_args(&argv(&["log", "show", "--file=/tmp/y.jsonl"])).expect("parses"),
+            Command::LogShow {
+                file: Some("/tmp/y.jsonl".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_log_replay_with_index() {
+        assert_eq!(
+            parse_args(&argv(&["log", "replay"])).expect("parses"),
+            Command::LogReplay {
+                file: None,
+                index: None
+            }
+        );
+        assert_eq!(
+            parse_args(&argv(&[
+                "log", "replay", "--index", "3", "--file", "/tmp/x"
+            ]))
+            .expect("parses"),
+            Command::LogReplay {
+                file: Some("/tmp/x".to_string()),
+                index: Some(3),
+            }
+        );
+        assert_eq!(
+            parse_args(&argv(&["log", "replay", "--index=2"])).expect("parses"),
+            Command::LogReplay {
+                file: None,
+                index: Some(2),
+            }
+        );
+    }
+
+    #[test]
+    fn log_without_subcommand_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&["log"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn unknown_log_subcommand_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&["log", "diff"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn index_flag_on_show_is_usage_error() {
+        // `--index` is replay-only; on show it is an unexpected argument.
+        assert!(matches!(
+            parse_args(&argv(&["log", "show", "--index", "1"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn non_positive_or_non_numeric_index_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&["log", "replay", "--index", "0"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+        assert!(matches!(
+            parse_args(&argv(&["log", "replay", "--index", "two"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    /// Builds a minimal Ok exchange carrying `prompt`, for selection tests.
+    fn ok_exchange(prompt: &str) -> Exchange {
+        use crate::log::{Outcome, RequestRecord};
+        Exchange {
+            request: RequestRecord {
+                ts_ms: 0,
+                model: "m".to_string(),
+                base_url: "u".to_string(),
+                prompt: prompt.to_string(),
+            },
+            outcome: Outcome::Ok {
+                ts_ms: 0,
+                duration_ms: 1,
+                reply: "r".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn select_exchange_defaults_to_last() {
+        let exchanges = vec![ok_exchange("first"), ok_exchange("second")];
+        let selected = select_exchange(&exchanges, None).expect("selects");
+        assert_eq!(selected.request.prompt, "second");
+    }
+
+    #[test]
+    fn select_exchange_is_one_based() {
+        let exchanges = vec![ok_exchange("first"), ok_exchange("second")];
+        assert_eq!(
+            select_exchange(&exchanges, Some(1))
+                .expect("selects")
+                .request
+                .prompt,
+            "first"
+        );
+        assert_eq!(
+            select_exchange(&exchanges, Some(2))
+                .expect("selects")
+                .request
+                .prompt,
+            "second"
+        );
+    }
+
+    #[test]
+    fn select_exchange_out_of_range_names_the_valid_range() {
+        let exchanges = vec![ok_exchange("only")];
+        match select_exchange(&exchanges, Some(2)).unwrap_err() {
+            BatonError::Usage(msg) => assert!(msg.contains("1..=1"), "got: {msg}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn select_exchange_on_empty_log_errors() {
+        assert!(matches!(
+            select_exchange(&[], None).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn execute_log_show_writes_a_block_per_exchange() {
+        let exchanges = vec![ok_exchange("first"), ok_exchange("second")];
+        let mut out: Vec<u8> = Vec::new();
+        execute_log_show(&exchanges, &mut out).expect("renders");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("#1") && text.contains("first"));
+        assert!(text.contains("#2") && text.contains("second"));
+    }
+
+    #[test]
+    fn execute_log_show_on_empty_log_writes_nothing() {
+        let mut out: Vec<u8> = Vec::new();
+        execute_log_show(&[], &mut out).expect("renders");
+        assert!(out.is_empty());
     }
 
     #[test]

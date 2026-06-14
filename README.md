@@ -10,10 +10,10 @@ center of the design.
 
 Early scaffolding. The crate establishes the module layout and typed runtime
 shape around a non-streaming Claude-compatible Messages client
-(`transport::claude::ClaudeClient`). Two commands wire it to the command line:
-`baton ask` for a single-turn first-prompt / first-reply, and `baton session`
-for an interactive multi-turn REPL that accumulates conversation history across
-turns.
+(`transport::claude::ClaudeClient`). Three commands wire it to the command line:
+`baton ask` for a single-turn first-prompt / first-reply, `baton session` for an
+interactive multi-turn REPL that accumulates conversation history across turns,
+and `baton log` for inspecting and replaying the recorded exchange trail.
 
 ## Configuration
 
@@ -185,6 +185,48 @@ rather than failing the command. The schema is per-exchange: each line is one
 request or one outcome, and a session turn's `request` carries that turn's user
 input as `prompt` (the full accumulated history is not aggregated into a single
 schema object).
+
+## Inspecting and replaying the trail
+
+`baton log` makes the recorded trail a first-class artefact — no `jq` or
+hand-rolled parser required. Both subcommands read the JSONL file named by
+`--file <path>`, falling back to `BATON_EVENT_LOG` when `--file` is absent; with
+neither set there is nothing to read and the command exits with a usage error.
+
+**`baton log show`** pretty-prints each exchange — a `request` paired with its
+single outcome — as a human-readable block: a 1-based index, a UTC timestamp,
+the model, the call duration, and a truncated prompt with either a truncated
+reply or the failure (`kind: message`).
+
+```bash
+export BATON_EVENT_LOG=baton-events.jsonl
+baton log show
+```
+
+```text
+#1  2023-11-14T22:13:20Z  claude-sonnet-4-6  (418ms)
+    prompt: who won the 1998 world cup?
+    reply:  France.
+```
+
+**`baton log replay [--index <N>]`** re-runs a recorded exchange. It reads the
+`model`, `base_url`, and `prompt` from the chosen `request` event and sends a
+fresh single-turn request with the **current** credential (and timeout /
+`max_tokens` / system prompt from the environment) — so a replay re-runs with
+today's auth, not a credential that was never recorded. `N` is 1-based and
+defaults to the last exchange; an out-of-range `N` errors and names the valid
+range. The reply is printed to stdout (same contract as `baton ask`), and the
+replay itself is appended to `BATON_EVENT_LOG` as a new exchange.
+
+```bash
+baton log replay              # re-run the last recorded exchange
+baton log replay --index 1    # re-run the first
+```
+
+Unknown `event` tags are skipped when reading (forward-compatibility with a
+newer writer), but a line that is not valid JSON is a hard parse error naming
+the offending line. Diffing, filtering, and non-JSONL export remain out of
+scope.
 
 ## Development
 
