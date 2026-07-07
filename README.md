@@ -173,9 +173,13 @@ a `ts_ms` wall-clock timestamp (Unix epoch milliseconds). One exchange emits a
 | `response_ok`    | `duration_ms`, `reply`                      | The call succeeded.                                  |
 | `response_error` | `duration_ms`, `kind`, `message`            | The call failed; `kind` is the stable machine class. |
 
-`kind` mirrors the `BatonError` variants (`transport`, `auth`, `rate_limited`,
-`server`, `api`, `decode`, `io`, `config`, `usage`), so consumers can branch on
-the failure class without parsing the human-readable `message`.
+A `response_error` event's `kind` is one of the six classes an exchange can
+actually fail with (`transport`, `auth`, `rate_limited`, `server`, `api`,
+`decode`), so consumers can branch on the failure class without parsing the
+human-readable `message`. The other `BatonError` kinds (`config`, `usage`, `io`,
+`log`) arise only outside an exchange — at startup, CLI parsing, REPL
+stdin/stdout I/O, or event-log parsing — where no `response_error` event is
+emitted, so a trail consumer will never see them in `kind`.
 
 **Consumption model.** Read the file line by line; parse each line as a
 standalone JSON object (a partial trailing line, if any, can be skipped). The
