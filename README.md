@@ -182,8 +182,11 @@ stdin/stdout I/O, or event-log parsing — where no `response_error` event is
 emitted, so a trail consumer will never see them in `kind`.
 
 **Consumption model.** Read the file line by line; parse each line as a
-standalone JSON object (a partial trailing line, if any, can be skipped). The
-event trail is auxiliary observability — it is written to the configured file
+standalone JSON object. A trailing partial line — one with no terminating
+newline, left behind when a `baton ask`/`session` process is killed mid-write —
+can be skipped; `baton log` itself does this (emitting a stderr warning naming
+the line), so an unclean shutdown never bricks the whole trail. The event trail
+is auxiliary observability — it is written to the configured file
 only, never to stdout, and a failed log write degrades to a stderr warning
 rather than failing the command. The schema is per-exchange: each line is one
 request or one outcome, and a session turn's `request` carries that turn's user
@@ -228,9 +231,11 @@ baton log replay --index 1    # re-run the first
 ```
 
 Unknown `event` tags are skipped when reading (forward-compatibility with a
-newer writer), but a line that is not valid JSON is a hard parse error naming
-the offending line. Diffing, filtering, and non-JSONL export remain out of
-scope.
+newer writer). A line that is not valid JSON is a hard parse error naming the
+offending line — except a trailing partial line (no terminating newline, the sign
+of a `baton ask`/`session` process killed mid-write), which is skipped with a
+stderr warning so one unclean shutdown can't brick the whole trail. Diffing,
+filtering, and non-JSONL export remain out of scope.
 
 ## Development
 

@@ -859,3 +859,105 @@ fn log_replay_out_of_range_index_is_error() {
         "stderr names the valid range: {stderr}"
     );
 }
+
+/// A truncated trailing line (no terminating newline — what a killed
+/// `baton ask`/`session` leaves behind) does not brick `baton log show`: every
+/// complete exchange before it is rendered, exit is 0, and a stderr warning
+/// names the skipped partial line.
+#[test]
+fn log_show_tolerates_trailing_partial_line() {
+    let temp = TempEventLog::new("show-partial");
+    let trail = concat!(
+        r#"{"event":"request","schema":"baton.exchange/v1","ts_ms":1700000000000,"model":"claude-sonnet-4-6","base_url":"https://api.anthropic.com","prompt":"first exchange"}"#,
+        "\n",
+        r#"{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":1700000000420,"duration_ms":418,"reply":"first reply"}"#,
+        "\n",
+        r#"{"event":"request","schema":"baton.exchange/v1","ts_ms":1700000001000,"model":"claude-sonnet-4-6","base_url":"https://api.anthropic.com","prompt":"second exchange"}"#,
+        "\n",
+        r#"{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":1700000001420,"duration_ms":418,"reply":"second reply"}"#,
+        "\n",
+        // Truncated trailing `request` with no terminating newline — an unclean
+        // shutdown artefact. Without tolerance this hard-errors the whole file.
+        r#"{"event":"request","schema":"baton.exchange/v1","ts_ms":1700000002000,"model":"m","base_url":"u","prom"#,
+    );
+    std::fs::write(&temp.file, trail).expect("write trail");
+
+    let out = run_baton_log(&["show", "--file", temp.file.to_str().unwrap()], None);
+    assert!(
+        out.status.success(),
+        "show should succeed despite the trailing partial; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("first exchange"),
+        "first exchange rendered: {stdout}"
+    );
+    assert!(
+        stdout.contains("first reply"),
+        "first reply rendered: {stdout}"
+    );
+    assert!(
+        stdout.contains("second exchange"),
+        "second exchange rendered: {stdout}"
+    );
+    assert!(
+        stdout.contains("second reply"),
+        "second reply rendered: {stdout}"
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("warning") && stderr.contains("line 5"),
+        "stderr warns about the skipped partial line: {stderr}"
+    );
+}
+
+/// `baton log replay` also tolerates a truncated trailing line and replays the
+/// complete exchange that precedes it.
+#[test]
+fn log_replay_tolerates_trailing_partial_line() {
+    let server = MockServer::spawn(200, SUCCESS_BODY);
+    let source = TempEventLog::new("replay-partial-src");
+    let sink = TempEventLog::new("replay-partial-sink");
+
+    // The recorded request points at the mock server, so replay re-sends there.
+    let trail = format!(
+        concat!(
+            r#"{{"event":"request","schema":"baton.exchange/v1","ts_ms":1700000000000,"model":"claude-test-model","base_url":"{base}","prompt":"replay me"}}"#,
+            "\n",
+            r#"{{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":1700000000420,"duration_ms":418,"reply":"old reply"}}"#,
+            "\n",
+            // Truncated trailing line with no terminating newline.
+            r#"{{"event":"request","schema":"baton.exchange/v1","ts_ms":1700000001000,"trunc"#,
+        ),
+        base = server.base_url(),
+    );
+    std::fs::write(&source.file, trail).expect("write source trail");
+
+    let out = run_baton_log(
+        &[
+            "replay",
+            "--index",
+            "1",
+            "--file",
+            source.file.to_str().unwrap(),
+        ],
+        Some(&sink.file),
+    );
+    assert!(
+        out.status.success(),
+        "replay should succeed despite the trailing partial; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // stdout is the fresh reply and nothing else — same contract as `ask`.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "hello from the mock server"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("warning") && stderr.contains("line 3"),
+        "stderr warns about the skipped partial line: {stderr}"
+    );
+}
