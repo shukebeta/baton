@@ -52,7 +52,8 @@ pub struct BatonConfig {
     /// Model id to request. From `BATON_MODEL`, defaulting to [`DEFAULT_MODEL`].
     pub model: String,
     /// Per-request timeout. Derived from `BATON_TIMEOUT_SECS`, defaulting to
-    /// [`DEFAULT_TIMEOUT_SECS`].
+    /// [`DEFAULT_TIMEOUT_SECS`]. Must be a positive integer; zero is rejected
+    /// because a zero deadline fails every request immediately.
     pub timeout: Duration,
     /// Maximum output tokens to request per reply. From `BATON_MAX_TOKENS`,
     /// defaulting to [`DEFAULT_MAX_TOKENS`]. Must be a positive integer; zero is
@@ -82,11 +83,19 @@ impl BatonConfig {
         let model = non_empty(lookup("BATON_MODEL")).unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
         let timeout_secs = match non_empty(lookup("BATON_TIMEOUT_SECS")) {
-            Some(raw) => raw.parse::<u64>().map_err(|_| {
-                BatonError::Config(format!(
-                    "BATON_TIMEOUT_SECS must be a non-negative integer, got {raw:?}"
-                ))
-            })?,
+            Some(raw) => {
+                let parsed = raw.parse::<u64>().map_err(|_| {
+                    BatonError::Config(format!(
+                        "BATON_TIMEOUT_SECS must be a positive integer, got {raw:?}"
+                    ))
+                })?;
+                if parsed == 0 {
+                    return Err(BatonError::Config(
+                        "BATON_TIMEOUT_SECS must be greater than zero".to_string(),
+                    ));
+                }
+                parsed
+            }
             None => DEFAULT_TIMEOUT_SECS,
         };
 
@@ -451,12 +460,34 @@ mod tests {
     }
 
     #[test]
-    fn non_numeric_timeout_errors() {
+    fn non_numeric_timeout_errors_naming_the_var() {
         let err = BatonConfig::from_lookup(lookup_from(&[
             ("ANTHROPIC_API_KEY", "secret"),
             ("BATON_TIMEOUT_SECS", "soon"),
         ]))
         .unwrap_err();
-        assert!(matches!(err, BatonError::Config(_)));
+        match err {
+            BatonError::Config(msg) => assert!(
+                msg.contains("BATON_TIMEOUT_SECS"),
+                "message should name the variable, got: {msg}"
+            ),
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_timeout_errors_naming_the_var() {
+        let err = BatonConfig::from_lookup(lookup_from(&[
+            ("ANTHROPIC_API_KEY", "secret"),
+            ("BATON_TIMEOUT_SECS", "0"),
+        ]))
+        .unwrap_err();
+        match err {
+            BatonError::Config(msg) => assert!(
+                msg.contains("BATON_TIMEOUT_SECS"),
+                "message should name the variable, got: {msg}"
+            ),
+            other => panic!("expected Config, got {other:?}"),
+        }
     }
 }

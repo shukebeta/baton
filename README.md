@@ -26,7 +26,7 @@ Baton reads its runtime configuration from environment variables:
 | `CLAUDE_CODE_OAUTH_TOKEN`    | one of three | —                       | OAuth bearer token (Claude Code subscription).       |
 | `ANTHROPIC_BASE_URL`         | no       | `https://api.anthropic.com` | Base URL for the Claude-compatible Messages API.     |
 | `BATON_MODEL`                | no       | `claude-sonnet-4-6`         | Model id to request.                                 |
-| `BATON_TIMEOUT_SECS`         | no       | `60`                        | Per-request timeout in seconds (non-negative integer). |
+| `BATON_TIMEOUT_SECS`         | no       | `60`                        | Per-request timeout in seconds (positive integer; zero is rejected). |
 | `BATON_MAX_TOKENS`           | no       | `1024`                      | Maximum output tokens to request per reply (positive integer; zero is rejected). |
 | `BATON_SYSTEM_PROMPT`        | no       | — (no system prompt)        | Path to a markdown file whose content is sent as the request's `system` field. Missing/unreadable file is a startup error. |
 | `BATON_EVENT_LOG`            | no       | — (disabled)                | File path for the JSONL exchange-event trail (see below). |
