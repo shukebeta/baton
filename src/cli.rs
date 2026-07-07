@@ -117,12 +117,18 @@ pub fn run() -> Result<()> {
 ///
 /// The path is `--file` when given, else [`EVENT_LOG_ENV`]; with neither set,
 /// there is nothing to read, which is a usage error. A path that cannot be
-/// opened is an [`BatonError::Io`].
+/// opened is an [`BatonError::Io`]. Non-fatal warnings collected by
+/// [`log::parse_jsonl`] (e.g. a tolerated trailing partial line) are surfaced on
+/// stderr here, keeping `parse_jsonl` pure over its reader.
 fn read_log(file: Option<&str>) -> Result<Vec<Exchange>> {
     let path = resolve_log_path(file)?;
     let handle = File::open(&path)
         .map_err(|err| BatonError::Io(format!("failed to open log file {path:?}: {err}")))?;
-    log::parse_jsonl(handle)
+    let report = log::parse_jsonl(handle)?;
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
+    }
+    Ok(report.exchanges)
 }
 
 /// Resolves the log file path: `--file` takes precedence, then [`EVENT_LOG_ENV`].
