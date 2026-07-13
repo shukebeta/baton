@@ -72,6 +72,12 @@ pub enum Outcome {
         duration_ms: u64,
         /// The assistant reply text.
         reply: String,
+        /// Provider-reported input (prompt) tokens; omitted when unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_tokens: Option<u64>,
+        /// Provider-reported output (completion) tokens; omitted when unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_tokens: Option<u64>,
     },
     /// The call failed; `kind` is the stable machine class.
     #[serde(rename = "response_error")]
@@ -93,6 +99,10 @@ struct OkRecord {
     ts_ms: u64,
     duration_ms: u64,
     reply: String,
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
 }
 
 /// Deserialization mirror of a `response_error` line.
@@ -197,6 +207,8 @@ pub fn parse_jsonl<R: Read>(reader: R) -> Result<ParseReport> {
                             ts_ms: ok.ts_ms,
                             duration_ms: ok.duration_ms,
                             reply: ok.reply,
+                            input_tokens: ok.input_tokens,
+                            output_tokens: ok.output_tokens,
                         },
                     });
                 }
@@ -261,13 +273,18 @@ pub fn format_exchange(n: usize, exchange: &Exchange) -> String {
     let request = &exchange.request;
     let mut out = match &exchange.outcome {
         Outcome::Ok {
-            duration_ms, reply, ..
+            duration_ms,
+            reply,
+            input_tokens,
+            output_tokens,
+            ..
         } => format!(
-            "#{n}  {}  {}  ({duration_ms}ms)\n    prompt: {}\n    reply:  {}",
+            "#{n}  {}  {}  ({duration_ms}ms)\n    prompt: {}\n    reply:  {}\n    tokens: {}",
             format_ts(request.ts_ms),
             request.model,
             excerpt(&request.prompt, MAX),
             excerpt(reply, MAX),
+            format_tokens(*input_tokens, *output_tokens),
         ),
         Outcome::Error {
             duration_ms,
@@ -284,6 +301,21 @@ pub fn format_exchange(n: usize, exchange: &Exchange) -> String {
     };
     out.push('\n');
     out
+}
+
+/// Formats the reported token counts for a `response_ok` block.
+///
+/// Each count renders as its number, or `?` when the provider did not report
+/// it; a fully absent usage block renders as `unknown` so the line never
+/// silently implies a zero-token call.
+fn format_tokens(input_tokens: Option<u64>, output_tokens: Option<u64>) -> String {
+    match (input_tokens, output_tokens) {
+        (None, None) => "unknown".to_string(),
+        (input, output) => {
+            let fmt = |t: Option<u64>| t.map_or_else(|| "?".to_string(), |n| n.to_string());
+            format!("{} in, {} out", fmt(input), fmt(output))
+        }
+    }
 }
 
 /// Collapses newlines to spaces and truncates `s` to at most `max` characters,
@@ -364,6 +396,30 @@ mod tests {
                 ts_ms: 1_700_000_000_420,
                 duration_ms: 418,
                 reply: "hi there".to_string(),
+                input_tokens: None,
+                output_tokens: None,
+            }
+        );
+    }
+
+    /// A `response_ok` line carrying a usage block parses the token counts back.
+    #[test]
+    fn parses_response_ok_token_usage() {
+        let log = concat!(
+            r#"{"event":"request","schema":"baton.exchange/v1","ts_ms":1700000000000,"model":"m","base_url":"u","prompt":"hello"}"#,
+            "\n",
+            r#"{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":1700000000420,"duration_ms":418,"reply":"hi","input_tokens":12,"output_tokens":34}"#,
+            "\n",
+        );
+        let exchanges = parse_jsonl(Cursor::new(log)).expect("parses").exchanges;
+        assert_eq!(
+            exchanges[0].outcome,
+            Outcome::Ok {
+                ts_ms: 1_700_000_000_420,
+                duration_ms: 418,
+                reply: "hi".to_string(),
+                input_tokens: Some(12),
+                output_tokens: Some(34),
             }
         );
     }
@@ -566,6 +622,8 @@ mod tests {
                 ts_ms: 1_700_000_000_420,
                 duration_ms: 418,
                 reply: "the answer".to_string(),
+                input_tokens: Some(12),
+                output_tokens: Some(34),
             },
         };
         let rendered = format_exchange(1, &ex);
@@ -575,6 +633,28 @@ mod tests {
         assert!(rendered.contains("the question"));
         assert!(rendered.contains("the answer"));
         assert!(rendered.contains("418ms"));
+        assert!(rendered.contains("12 in, 34 out"), "got: {rendered}");
+    }
+
+    #[test]
+    fn format_exchange_renders_unknown_tokens_when_usage_absent() {
+        let ex = Exchange {
+            request: RequestRecord {
+                ts_ms: 1_700_000_000_000,
+                model: "claude-sonnet-4-6".to_string(),
+                base_url: "https://api.anthropic.com".to_string(),
+                prompt: "q".to_string(),
+            },
+            outcome: Outcome::Ok {
+                ts_ms: 1_700_000_000_420,
+                duration_ms: 418,
+                reply: "a".to_string(),
+                input_tokens: None,
+                output_tokens: None,
+            },
+        };
+        let rendered = format_exchange(1, &ex);
+        assert!(rendered.contains("tokens: unknown"), "got: {rendered}");
     }
 
     #[test]

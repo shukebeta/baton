@@ -164,14 +164,20 @@ a `ts_ms` wall-clock timestamp (Unix epoch milliseconds). One exchange emits a
 
 ```jsonl
 {"event":"request","schema":"baton.exchange/v1","ts_ms":1700000000000,"model":"claude-sonnet-4-6","base_url":"https://api.anthropic.com","prompt":"hello"}
-{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":1700000000420,"duration_ms":418,"reply":"Hi there!"}
+{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":1700000000420,"duration_ms":418,"reply":"Hi there!","input_tokens":9,"output_tokens":3}
 ```
 
-| `event`          | Fields beyond `schema` / `ts_ms`            | Meaning                                              |
-| ---------------- | ------------------------------------------- | ---------------------------------------------------- |
-| `request`        | `model`, `base_url`, `prompt`               | Emitted before the call; carries enough to replay it. |
-| `response_ok`    | `duration_ms`, `reply`                      | The call succeeded.                                  |
-| `response_error` | `duration_ms`, `kind`, `message`            | The call failed; `kind` is the stable machine class. |
+| `event`          | Fields beyond `schema` / `ts_ms`                          | Meaning                                              |
+| ---------------- | --------------------------------------------------------- | ---------------------------------------------------- |
+| `request`        | `model`, `base_url`, `prompt`                             | Emitted before the call; carries enough to replay it. |
+| `response_ok`    | `duration_ms`, `reply`, `input_tokens`, `output_tokens`   | The call succeeded.                                  |
+| `response_error` | `duration_ms`, `kind`, `message`                          | The call failed; `kind` is the stable machine class. |
+
+`input_tokens` / `output_tokens` are the provider-reported token counts for the
+call. They are **optional**: a `2xx` response that omits the `usage` block (or a
+field within it) still succeeds, and the missing count is simply left off the
+`response_ok` line rather than failing the exchange — so a consumer must treat
+either field as possibly absent.
 
 A `response_error` event's `kind` is one of the six classes an exchange can
 actually fail with (`transport`, `auth`, `rate_limited`, `server`, `api`,
@@ -203,7 +209,7 @@ neither set there is nothing to read and the command exits with a usage error.
 **`baton log show`** pretty-prints each exchange — a `request` paired with its
 single outcome — as a human-readable block: a 1-based index, a UTC timestamp,
 the model, the call duration, and a truncated prompt with either a truncated
-reply or the failure (`kind: message`).
+reply plus its token counts or the failure (`kind: message`).
 
 ```bash
 export BATON_EVENT_LOG=baton-events.jsonl
@@ -214,7 +220,11 @@ baton log show
 #1  2023-11-14T22:13:20Z  claude-sonnet-4-6  (418ms)
     prompt: who won the 1998 world cup?
     reply:  France.
+    tokens: 9 in, 3 out
 ```
+
+The `tokens:` line shows the reported input/output counts; a call whose response
+carried no usage renders `tokens: unknown`.
 
 **`baton log replay [--index <N>]`** re-runs a recorded exchange. It reads the
 `model`, `base_url`, and `prompt` from the chosen `request` event and sends a
@@ -298,7 +308,9 @@ the resulting exchange under `exchange`, a self-describing object pairing the
         "event": "response_ok",
         "ts_ms": 1700000000420,
         "duration_ms": 418,
-        "reply": "France."
+        "reply": "France.",
+        "input_tokens": 9,
+        "output_tokens": 3
       }
     }
   }

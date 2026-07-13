@@ -120,17 +120,44 @@ impl Prompt {
     }
 }
 
+/// Provider-reported token usage for a single call.
+///
+/// Each count is optional: a `2xx` response may omit the `usage` block (or a
+/// field within it) entirely, in which case that count is `None` (unknown)
+/// rather than an error. This is the token-accounting surface the exchange
+/// trail records for cost/observability and the future budget governor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    /// Input (prompt) tokens the provider billed, if reported.
+    pub input_tokens: Option<u64>,
+    /// Output (completion) tokens the provider billed, if reported.
+    pub output_tokens: Option<u64>,
+}
+
 /// A single assistant reply returned by the provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssistantReply {
     /// The reply text.
     pub text: String,
+    /// Provider-reported token usage for the call, when available.
+    pub usage: TokenUsage,
 }
 
 impl AssistantReply {
-    /// Creates a reply from anything string-like.
+    /// Creates a reply from anything string-like, with no usage recorded.
     pub fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into() }
+        Self {
+            text: text.into(),
+            usage: TokenUsage::default(),
+        }
+    }
+
+    /// Creates a reply carrying the provider's reported token usage.
+    pub fn with_usage(text: impl Into<String>, usage: TokenUsage) -> Self {
+        Self {
+            text: text.into(),
+            usage,
+        }
     }
 }
 
