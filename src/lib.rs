@@ -10,6 +10,7 @@
 //! - [`transport`] — the provider transport boundary.
 //! - [`events`] — structured JSONL recording of each exchange.
 //! - [`log`] — reading and rendering the recorded exchange trail.
+//! - [`mailbox`] — the crash-safe file-mailbox backing `baton serve`.
 //! - [`message`] — the `baton.message/v1` A2A peer-message envelope.
 //! - [`participant`] — the envelope-in / envelope-out participant seam.
 //! - [`error`] — shared error and result types.
@@ -21,6 +22,7 @@ pub mod converse;
 pub mod error;
 pub mod events;
 pub mod log;
+pub mod mailbox;
 pub mod message;
 pub mod model;
 pub mod participant;
