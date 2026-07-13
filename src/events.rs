@@ -86,7 +86,11 @@ pub enum ExchangeEvent {
         /// Time spent before the failure resolved, milliseconds.
         duration_ms: u64,
         /// Stable machine-readable error class (see [`BatonError::kind`]).
-        kind: &'static str,
+        ///
+        /// Owned (not `&'static str`) so this event can be rebuilt from a
+        /// recorded [`crate::log::Outcome`] via [`ExchangeEvent::from_outcome`],
+        /// whose kind is an owned `String`; the wire value is identical.
+        kind: String,
         /// Human-readable error description.
         message: String,
     },
@@ -122,8 +126,46 @@ impl ExchangeEvent {
             schema: SCHEMA,
             ts_ms,
             duration_ms,
-            kind: err.kind(),
+            kind: err.kind().to_string(),
             message: err.to_string(),
+        }
+    }
+
+    /// Builds the terminal outcome event from an already-recorded
+    /// [`Outcome`](crate::log::Outcome).
+    ///
+    /// Lets a caller that already holds a completed `baton.exchange/v1` record —
+    /// e.g. the nested record on an A2A response envelope — mirror it into the
+    /// event trail without re-timing or re-deriving the call, so the trail and
+    /// the in-band record stay one source of truth.
+    pub fn from_outcome(outcome: &crate::log::Outcome) -> Self {
+        match outcome {
+            crate::log::Outcome::Ok {
+                ts_ms,
+                duration_ms,
+                reply,
+                input_tokens,
+                output_tokens,
+            } => ExchangeEvent::ResponseOk {
+                schema: SCHEMA,
+                ts_ms: *ts_ms,
+                duration_ms: *duration_ms,
+                reply: reply.clone(),
+                input_tokens: *input_tokens,
+                output_tokens: *output_tokens,
+            },
+            crate::log::Outcome::Error {
+                ts_ms,
+                duration_ms,
+                kind,
+                message,
+            } => ExchangeEvent::ResponseError {
+                schema: SCHEMA,
+                ts_ms: *ts_ms,
+                duration_ms: *duration_ms,
+                kind: kind.clone(),
+                message: message.clone(),
+            },
         }
     }
 }
