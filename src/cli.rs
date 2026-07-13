@@ -9,10 +9,11 @@
 //! and resending the full history each turn; `baton exchange` is the A2A
 //! request/reply verb (one `baton.message/v1` envelope in, one out); `baton log
 //! show`/`replay` inspects and re-runs the recorded trail. Argument parsing
-//! ([`parse_args`]) and the exchanges themselves ([`execute_ask`],
-//! [`execute_session`], [`execute_exchange`]) are kept transport-agnostic and
-//! sink-agnostic so every branch is unit-testable without a network or real
-//! environment — mirroring
+//! ([`parse_args`]) and the exchanges themselves are kept abstract over their
+//! collaborators and sink-agnostic so every branch is unit-testable without a
+//! network or real environment: [`execute_ask`] / [`execute_session`] over a
+//! [`Transport`], and [`execute_exchange`] over a
+//! [`Participant`](crate::participant::Participant) — mirroring
 //! [`BatonConfig::from_lookup`](crate::config::BatonConfig::from_lookup).
 //!
 //! Each exchange is also recorded as structured JSONL via an [`EventSink`] when
@@ -30,9 +31,10 @@ use std::time::Instant;
 use crate::config::BatonConfig;
 use crate::error::{BatonError, Result};
 use crate::events::{EventSink, ExchangeEvent, ExchangeMeta, NoopSink, WriterSink, now_ms};
-use crate::log::{self, Exchange, Outcome, RequestRecord};
-use crate::message::{MessageEnvelope, MessageKind, WrappedExchange};
+use crate::log::{self, Exchange};
+use crate::message::MessageEnvelope;
 use crate::model::{AssistantReply, Conversation, Prompt};
+use crate::participant::{LocalParticipant, Participant};
 use crate::transport::Transport;
 use crate::transport::claude::ClaudeClient;
 
@@ -100,13 +102,14 @@ pub fn run() -> Result<()> {
             let meta = exchange_meta(&config);
             let mut sink = open_event_sink()?;
             let client = ClaudeClient::from_config(config);
+            let participant = LocalParticipant::new(client, meta.clone());
 
             // Read the request first. A malformed or unreadable request envelope
             // is a usage/IO error that exits non-zero having written *nothing*
             // to the response sink — the response is emitted only after a
             // completed exchange.
             let request = read_request_envelope(open_input(in_path.as_deref())?)?;
-            let response = execute_exchange(&client, sink.as_mut(), &meta, &request);
+            let response = execute_exchange(&participant, sink.as_mut(), &meta, &request);
             write_response_envelope(&response, open_output(out_path.as_deref())?)
         }
         Command::LogShow { file } => {
@@ -233,91 +236,41 @@ fn execute_ask(
         .map(|reply| reply.text)
 }
 
-/// Runs one A2A exchange: sends the request envelope's `body` through the
-/// provider and builds the `baton.message/v1` response envelope.
+/// Runs one A2A exchange: delegates the request→response envelope
+/// transformation to `participant`, then mirrors the completed call into the
+/// `BATON_EVENT_LOG` side trail.
 ///
 /// Always returns an envelope — a provider failure is a *delivered* `error`
 /// response, not a propagated error (the delivered-error contract; only a
 /// malformed request or a usage/IO error, handled before this is called, exits
-/// non-zero). The response preserves `conversation_id`, links `in_reply_to` to
-/// the request, swaps addressing (`from`/`to`), and wraps the provider call as
-/// an in-band `baton.exchange/v1` record so the call — and its token usage — is
-/// observable without reading the side trail.
+/// non-zero). The envelope shape (addressing swap, `in_reply_to`, nested
+/// `baton.exchange/v1` record) is entirely [`Participant::respond`]'s
+/// responsibility — this function owns only the side-trail wiring.
 ///
-/// Parameterised over [`Transport`]/[`EventSink`] so it is unit-testable with
-/// fakes. The call is routed through [`timed_exchange`] so the `BATON_EVENT_LOG`
-/// request→outcome pair records exactly as `ask`/`session`; it is timed again
-/// here for the in-band outcome, whose timestamps therefore differ from the
-/// trail's by microseconds.
+/// The `request` event is emitted *before* the call so the trail records the
+/// attempt even if the provider hangs or the process dies mid-exchange (the
+/// forensic value of `BATON_EVENT_LOG`). The terminal outcome event is then
+/// *derived* from the response's nested record — one timing, shared by the trail
+/// and the in-band record, so the two never diverge. A participant that ran no
+/// call (nests no record) emits no outcome line.
+///
+/// Parameterised over [`Participant`]/[`EventSink`] so it is unit-testable with
+/// fakes.
 fn execute_exchange(
-    transport: &impl Transport,
+    participant: &impl Participant,
     sink: &mut dyn EventSink,
     meta: &ExchangeMeta,
     request: &MessageEnvelope,
 ) -> MessageEnvelope {
-    let request_ts = now_ms();
-    let start = Instant::now();
-    let result = timed_exchange(sink, meta, &request.body, || {
-        transport.send(&Prompt::new(request.body.as_str()))
-    });
-    let duration_ms = start.elapsed().as_millis() as u64;
-    let outcome_ts = now_ms();
-
-    let request_record = RequestRecord {
-        ts_ms: request_ts,
-        model: meta.model.clone(),
-        base_url: meta.base_url.clone(),
-        prompt: request.body.clone(),
-    };
-
-    let (kind, body, outcome) = match result {
-        Ok(reply) => {
-            let outcome = Outcome::Ok {
-                ts_ms: outcome_ts,
-                duration_ms,
-                reply: reply.text.clone(),
-                input_tokens: reply.usage.input_tokens,
-                output_tokens: reply.usage.output_tokens,
-            };
-            (MessageKind::Response, reply.text, outcome)
-        }
-        Err(err) => {
-            let outcome = Outcome::Error {
-                ts_ms: outcome_ts,
-                duration_ms,
-                kind: err.kind().to_string(),
-                message: err.to_string(),
-            };
-            (MessageKind::Error, err.to_string(), outcome)
-        }
-    };
-
-    // Addressing swaps: the reply is from the request's recipient, to its sender.
-    let mut response = MessageEnvelope::new(
-        fresh_message_id(&request.conversation_id, outcome_ts),
-        request.conversation_id.clone(),
-        request.to.clone(),
-        request.from.clone(),
-        kind,
-        body,
-        outcome_ts,
-    );
-    response.in_reply_to = Some(request.message_id.clone());
-    response.exchange = Some(WrappedExchange::new(Exchange {
-        request: request_record,
-        outcome,
-    }));
+    emit(sink, &ExchangeEvent::request(now_ms(), meta, &request.body));
+    let response = participant.respond(request);
+    if let Some(wrapped) = &response.exchange {
+        emit(
+            sink,
+            &ExchangeEvent::from_outcome(&wrapped.exchange.outcome),
+        );
+    }
     response
-}
-
-/// Builds a fresh `message_id` for a response without adding a dependency.
-///
-/// Derived from the conversation id and the response timestamp: one
-/// `baton exchange` process emits exactly one response, so a per-process
-/// collision is impossible, and `baton.message/v1` places no format constraint
-/// on the id beyond uniqueness.
-fn fresh_message_id(conversation_id: &str, ts_ms: u64) -> String {
-    format!("{conversation_id}-r-{ts_ms}")
 }
 
 /// Opens the exchange request source: `--in <path>` when given, else stdin.
@@ -434,10 +387,12 @@ fn execute_session(
 /// Records the request event, times `call`, records the matching outcome event,
 /// and returns the call's result.
 ///
-/// The single place the `request` → `response_ok`/`response_error` event pair is
-/// emitted, shared by `ask` and every session turn. `event_prompt` is the user
-/// text recorded on the `request` event (the turn's input). A failed event write
-/// is downgraded to a stderr warning and never changes the exchange result.
+/// Emits the `request` → `response_ok`/`response_error` event pair for the
+/// `ask` and session paths, whose orchestration lives here. (`baton exchange`
+/// does not route through this: it delegates the call to a [`Participant`] and
+/// wires its own trail in [`execute_exchange`].) `event_prompt` is the user text
+/// recorded on the `request` event (the turn's input). A failed event write is
+/// downgraded to a stderr warning and never changes the exchange result.
 fn timed_exchange(
     sink: &mut dyn EventSink,
     meta: &ExchangeMeta,
@@ -671,6 +626,7 @@ fn usage(detail: &str) -> BatonError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::MessageKind;
     use crate::model::Message;
     use std::cell::RefCell;
     use std::io::Cursor;
@@ -1316,111 +1272,69 @@ mod tests {
         )
     }
 
-    #[test]
-    fn execute_exchange_success_builds_response_envelope() {
-        let transport = OkTransport::new("four");
-        let mut sink = NoopSink;
-        let request = request_envelope();
-
-        let response = execute_exchange(&transport, &mut sink, &test_meta(), &request);
-
-        assert_eq!(response.kind, MessageKind::Response);
-        assert_eq!(response.body, "four");
-        assert_eq!(response.conversation_id, "conv-42");
-        assert_eq!(response.in_reply_to.as_deref(), Some("m-req-1"));
-        // Addressing swaps: reply is from the request's recipient, to its sender.
-        assert_eq!(response.from, "agent-b");
-        assert_eq!(response.to, "agent-a");
-        // A fresh id, distinct from the request it answers.
-        assert_ne!(response.message_id, request.message_id);
-        // The provider call is wrapped in-band as a baton.exchange/v1 record.
-        let wrapped = response
-            .exchange
-            .as_ref()
-            .expect("wrapped exchange present");
-        assert_eq!(wrapped.schema, crate::events::SCHEMA);
-        match &wrapped.exchange.outcome {
-            Outcome::Ok { reply, .. } => assert_eq!(reply, "four"),
-            other => panic!("expected Ok outcome, got {other:?}"),
-        }
-        assert_eq!(wrapped.exchange.request.prompt, "what is 2+2?");
+    /// Wraps a transport as the in-process participant `baton exchange` uses,
+    /// so the wiring tests exercise the same delegation as production.
+    fn participant_over(transport: impl Transport) -> LocalParticipant<impl Transport> {
+        LocalParticipant::new(transport, test_meta())
     }
 
     #[test]
-    fn execute_exchange_wraps_reported_token_usage() {
-        use crate::model::TokenUsage;
-
-        /// A transport whose reply carries provider token usage.
-        struct UsageTransport;
-        impl Transport for UsageTransport {
-            fn send_conversation(&self, _messages: &[Message]) -> Result<AssistantReply> {
-                Ok(AssistantReply::with_usage(
-                    "hi",
-                    TokenUsage {
-                        input_tokens: Some(7),
-                        output_tokens: Some(11),
-                    },
-                ))
-            }
-        }
-
+    fn execute_exchange_returns_the_participants_response() {
         let mut sink = NoopSink;
+        let request = request_envelope();
+
+        // execute_exchange owns only the trail wiring; the envelope it returns is
+        // the participant's, unchanged. (The transformation itself is covered in
+        // `participant`'s own tests.)
         let response = execute_exchange(
-            &UsageTransport,
+            &participant_over(OkTransport::new("four")),
+            &mut sink,
+            &test_meta(),
+            &request,
+        );
+
+        assert_eq!(response.kind, MessageKind::Response);
+        assert_eq!(response.body, "four");
+        assert_eq!(response.in_reply_to.as_deref(), Some("m-req-1"));
+        assert!(response.exchange.is_some(), "provider call nested in-band");
+    }
+
+    #[test]
+    fn execute_exchange_records_request_then_ok_outcome_pair() {
+        let mut sink = RecordingSink::new();
+        execute_exchange(
+            &participant_over(OkTransport::new("four")),
             &mut sink,
             &test_meta(),
             &request_envelope(),
         );
-        match &response.exchange.expect("wrapped").exchange.outcome {
-            Outcome::Ok {
-                input_tokens,
-                output_tokens,
-                ..
-            } => {
-                assert_eq!(*input_tokens, Some(7));
-                assert_eq!(*output_tokens, Some(11));
-            }
-            other => panic!("expected Ok outcome, got {other:?}"),
-        }
-    }
 
-    #[test]
-    fn execute_exchange_provider_failure_is_delivered_error() {
-        let mut sink = NoopSink;
-        // A provider failure is a *delivered* error envelope, not a propagated
-        // error — execute_exchange returns an envelope, never a Result::Err.
-        let response =
-            execute_exchange(&ErrTransport, &mut sink, &test_meta(), &request_envelope());
-
-        assert_eq!(response.kind, MessageKind::Error);
-        assert_eq!(response.in_reply_to.as_deref(), Some("m-req-1"));
-        assert_eq!(response.conversation_id, "conv-42");
-        assert!(
-            response.body.contains("network down"),
-            "error body carries the failure description: {}",
-            response.body
-        );
-        match &response
-            .exchange
-            .expect("wrapped failed exchange")
-            .exchange
-            .outcome
-        {
-            Outcome::Error { kind, .. } => assert_eq!(kind, "transport"),
-            other => panic!("expected Error outcome, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn execute_exchange_records_the_trail_pair() {
-        let transport = OkTransport::new("four");
-        let mut sink = RecordingSink::new();
-        execute_exchange(&transport, &mut sink, &test_meta(), &request_envelope());
-
-        // Same request → outcome trail pair as `ask`/`session`.
+        // The `request` line is emitted before the call; the outcome line is
+        // derived from the response's nested record.
         assert_eq!(sink.events.len(), 2, "request + outcome");
         assert!(matches!(sink.events[0], ExchangeEvent::Request { .. }));
         assert!(matches!(sink.events[1], ExchangeEvent::ResponseOk { .. }));
+    }
+
+    #[test]
+    fn execute_exchange_records_request_then_error_outcome_pair() {
+        let mut sink = RecordingSink::new();
+        // A delivered-error envelope still yields a well-formed request → error
+        // trail pair, derived from the nested failure record.
+        let response = execute_exchange(
+            &participant_over(ErrTransport),
+            &mut sink,
+            &test_meta(),
+            &request_envelope(),
+        );
+
+        assert_eq!(response.kind, MessageKind::Error);
+        assert_eq!(sink.events.len(), 2, "request + outcome");
+        assert!(matches!(sink.events[0], ExchangeEvent::Request { .. }));
+        match &sink.events[1] {
+            ExchangeEvent::ResponseError { kind, .. } => assert_eq!(kind, "transport"),
+            other => panic!("expected ResponseError, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1434,9 +1348,13 @@ mod tests {
 
     #[test]
     fn write_then_read_response_envelope_round_trips() {
-        let transport = OkTransport::new("four");
         let mut sink = NoopSink;
-        let response = execute_exchange(&transport, &mut sink, &test_meta(), &request_envelope());
+        let response = execute_exchange(
+            &participant_over(OkTransport::new("four")),
+            &mut sink,
+            &test_meta(),
+            &request_envelope(),
+        );
 
         let mut buf: Vec<u8> = Vec::new();
         write_response_envelope(&response, &mut buf).expect("writes");
