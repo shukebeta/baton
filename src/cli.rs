@@ -4,11 +4,13 @@
 //! parses arguments, loads configuration, and drives the exchange via the
 //! [`Transport`] boundary.
 //!
-//! Two commands exist. `baton ask -p "..."` is single-turn: one prompt in, one
-//! reply out. `baton session` is an interactive REPL that accumulates a
-//! [`Conversation`] across turns and resends the full history on every request.
-//! Argument parsing ([`parse_args`]) and the exchanges themselves
-//! ([`execute_ask`], [`execute_session`]) are kept transport-agnostic and
+//! The commands: `baton ask -p "..."` is single-turn (one prompt in, one reply
+//! out); `baton session` is an interactive REPL accumulating a [`Conversation`]
+//! and resending the full history each turn; `baton exchange` is the A2A
+//! request/reply verb (one `baton.message/v1` envelope in, one out); `baton log
+//! show`/`replay` inspects and re-runs the recorded trail. Argument parsing
+//! ([`parse_args`]) and the exchanges themselves ([`execute_ask`],
+//! [`execute_session`], [`execute_exchange`]) are kept transport-agnostic and
 //! sink-agnostic so every branch is unit-testable without a network or real
 //! environment — mirroring
 //! [`BatonConfig::from_lookup`](crate::config::BatonConfig::from_lookup).
@@ -22,13 +24,14 @@
 //! Streaming and tool execution remain out of scope.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::time::Instant;
 
 use crate::config::BatonConfig;
 use crate::error::{BatonError, Result};
 use crate::events::{EventSink, ExchangeEvent, ExchangeMeta, NoopSink, WriterSink, now_ms};
-use crate::log::{self, Exchange};
+use crate::log::{self, Exchange, Outcome, RequestRecord};
+use crate::message::{MessageEnvelope, MessageKind, WrappedExchange};
 use crate::model::{AssistantReply, Conversation, Prompt};
 use crate::transport::Transport;
 use crate::transport::claude::ClaudeClient;
@@ -38,7 +41,7 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton log show|replay [--file <path>] [--index <N>]";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton log show|replay [--file <path>] [--index <N>]";
 
 /// The in-session command that ends the REPL cleanly (alongside EOF).
 const SESSION_EXIT_COMMAND: &str = "/exit";
@@ -50,6 +53,13 @@ enum Command {
     Ask { prompt: String },
     /// Start an interactive multi-turn REPL.
     Session,
+    /// Run one A2A envelope exchange: read a `baton.message/v1` request
+    /// envelope, run the provider call, and write one response envelope.
+    /// `in_path`/`out_path` default to stdin/stdout when `None`.
+    Exchange {
+        in_path: Option<String>,
+        out_path: Option<String>,
+    },
     /// Pretty-print the recorded exchange trail.
     LogShow { file: Option<String> },
     /// Re-run a recorded exchange. `index` is 1-based; `None` ⇒ the last one.
@@ -84,6 +94,20 @@ pub fn run() -> Result<()> {
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
             execute_session(&client, sink.as_mut(), &meta, stdin.lock(), stdout.lock())
+        }
+        Command::Exchange { in_path, out_path } => {
+            let config = BatonConfig::from_env()?;
+            let meta = exchange_meta(&config);
+            let mut sink = open_event_sink()?;
+            let client = ClaudeClient::from_config(config);
+
+            // Read the request first. A malformed or unreadable request envelope
+            // is a usage/IO error that exits non-zero having written *nothing*
+            // to the response sink — the response is emitted only after a
+            // completed exchange.
+            let request = read_request_envelope(open_input(in_path.as_deref())?)?;
+            let response = execute_exchange(&client, sink.as_mut(), &meta, &request);
+            write_response_envelope(&response, open_output(out_path.as_deref())?)
         }
         Command::LogShow { file } => {
             let exchanges = read_log(file.as_deref())?;
@@ -207,6 +231,138 @@ fn execute_ask(
 ) -> Result<String> {
     timed_exchange(sink, meta, prompt, || transport.send(&Prompt::new(prompt)))
         .map(|reply| reply.text)
+}
+
+/// Runs one A2A exchange: sends the request envelope's `body` through the
+/// provider and builds the `baton.message/v1` response envelope.
+///
+/// Always returns an envelope — a provider failure is a *delivered* `error`
+/// response, not a propagated error (the delivered-error contract; only a
+/// malformed request or a usage/IO error, handled before this is called, exits
+/// non-zero). The response preserves `conversation_id`, links `in_reply_to` to
+/// the request, swaps addressing (`from`/`to`), and wraps the provider call as
+/// an in-band `baton.exchange/v1` record so the call — and its token usage — is
+/// observable without reading the side trail.
+///
+/// Parameterised over [`Transport`]/[`EventSink`] so it is unit-testable with
+/// fakes. The call is routed through [`timed_exchange`] so the `BATON_EVENT_LOG`
+/// request→outcome pair records exactly as `ask`/`session`; it is timed again
+/// here for the in-band outcome, whose timestamps therefore differ from the
+/// trail's by microseconds.
+fn execute_exchange(
+    transport: &impl Transport,
+    sink: &mut dyn EventSink,
+    meta: &ExchangeMeta,
+    request: &MessageEnvelope,
+) -> MessageEnvelope {
+    let request_ts = now_ms();
+    let start = Instant::now();
+    let result = timed_exchange(sink, meta, &request.body, || {
+        transport.send(&Prompt::new(request.body.as_str()))
+    });
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let outcome_ts = now_ms();
+
+    let request_record = RequestRecord {
+        ts_ms: request_ts,
+        model: meta.model.clone(),
+        base_url: meta.base_url.clone(),
+        prompt: request.body.clone(),
+    };
+
+    let (kind, body, outcome) = match result {
+        Ok(reply) => {
+            let outcome = Outcome::Ok {
+                ts_ms: outcome_ts,
+                duration_ms,
+                reply: reply.text.clone(),
+                input_tokens: reply.usage.input_tokens,
+                output_tokens: reply.usage.output_tokens,
+            };
+            (MessageKind::Response, reply.text, outcome)
+        }
+        Err(err) => {
+            let outcome = Outcome::Error {
+                ts_ms: outcome_ts,
+                duration_ms,
+                kind: err.kind().to_string(),
+                message: err.to_string(),
+            };
+            (MessageKind::Error, err.to_string(), outcome)
+        }
+    };
+
+    // Addressing swaps: the reply is from the request's recipient, to its sender.
+    let mut response = MessageEnvelope::new(
+        fresh_message_id(&request.conversation_id, outcome_ts),
+        request.conversation_id.clone(),
+        request.to.clone(),
+        request.from.clone(),
+        kind,
+        body,
+        outcome_ts,
+    );
+    response.in_reply_to = Some(request.message_id.clone());
+    response.exchange = Some(WrappedExchange::new(Exchange {
+        request: request_record,
+        outcome,
+    }));
+    response
+}
+
+/// Builds a fresh `message_id` for a response without adding a dependency.
+///
+/// Derived from the conversation id and the response timestamp: one
+/// `baton exchange` process emits exactly one response, so a per-process
+/// collision is impossible, and `baton.message/v1` places no format constraint
+/// on the id beyond uniqueness.
+fn fresh_message_id(conversation_id: &str, ts_ms: u64) -> String {
+    format!("{conversation_id}-r-{ts_ms}")
+}
+
+/// Opens the exchange request source: `--in <path>` when given, else stdin.
+fn open_input(path: Option<&str>) -> Result<Box<dyn Read>> {
+    match path {
+        Some(path) => {
+            let file = File::open(path).map_err(|err| {
+                BatonError::Io(format!("failed to open --in file {path:?}: {err}"))
+            })?;
+            Ok(Box::new(file))
+        }
+        None => Ok(Box::new(io::stdin())),
+    }
+}
+
+/// Opens the exchange response sink: `--out <path>` when given (created,
+/// truncated), else stdout.
+fn open_output(path: Option<&str>) -> Result<Box<dyn Write>> {
+    match path {
+        Some(path) => {
+            let file = File::create(path).map_err(|err| {
+                BatonError::Io(format!("failed to create --out file {path:?}: {err}"))
+            })?;
+            Ok(Box::new(file))
+        }
+        None => Ok(Box::new(io::stdout())),
+    }
+}
+
+/// Reads one `baton.message/v1` request envelope from `input`.
+///
+/// The whole source is parsed as a single JSON object (not line-oriented like
+/// `session`). A read or JSON-parse failure is a usage error, so the caller
+/// writes nothing to the response sink and exits non-zero — the
+/// malformed-request contract.
+fn read_request_envelope(input: impl Read) -> Result<MessageEnvelope> {
+    serde_json::from_reader(input)
+        .map_err(|err| usage(&format!("could not parse request envelope: {err}")))
+}
+
+/// Writes `envelope` as one JSON line to `output`.
+fn write_response_envelope(envelope: &MessageEnvelope, mut output: impl Write) -> Result<()> {
+    let line = serde_json::to_string(envelope)
+        .map_err(|err| BatonError::Io(format!("could not serialize response envelope: {err}")))?;
+    writeln!(output, "{line}").map_err(io_err)
 }
 
 /// Drives an interactive multi-turn REPL over `input`/`output`.
@@ -350,6 +506,7 @@ fn parse_args(args: &[String]) -> Result<Command> {
     match command.as_str() {
         "ask" => parse_ask(iter),
         "session" => parse_session(iter),
+        "exchange" => parse_exchange(iter),
         "log" => parse_log(iter),
         other => Err(usage(&format!("unknown command {other:?}"))),
     }
@@ -472,6 +629,38 @@ fn parse_session<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comma
         return Err(usage(&format!("unexpected argument {arg:?}")));
     }
     Ok(Command::Session)
+}
+
+/// Parses the arguments following the `exchange` subcommand.
+///
+/// Accepts optional `--in <path>` / `--out <path>` (and the `--flag=value`
+/// form); with neither, the request is read from stdin and the response written
+/// to stdout. A flag without a value, or any other token, is a usage error.
+fn parse_exchange<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut in_path: Option<String> = None;
+    let mut out_path: Option<String> = None;
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--in" => {
+                let value = iter.next().ok_or_else(|| usage("--in requires a value"))?;
+                in_path = Some(value.clone());
+            }
+            other if other.starts_with("--in=") => {
+                in_path = Some(other["--in=".len()..].to_string());
+            }
+            "--out" => {
+                let value = iter.next().ok_or_else(|| usage("--out requires a value"))?;
+                out_path = Some(value.clone());
+            }
+            other if other.starts_with("--out=") => {
+                out_path = Some(other["--out=".len()..].to_string());
+            }
+            other => return Err(usage(&format!("unexpected argument {other:?}"))),
+        }
+    }
+
+    Ok(Command::Exchange { in_path, out_path })
 }
 
 /// Builds a usage error carrying `detail` and the one-line usage summary.
@@ -1058,5 +1247,204 @@ mod tests {
             ExchangeEvent::ResponseError { .. }
         ));
         assert!(matches!(sink.events[3], ExchangeEvent::ResponseOk { .. }));
+    }
+
+    // -- baton exchange ----------------------------------------------------
+
+    #[test]
+    fn parses_exchange_defaults_to_std_streams() {
+        assert_eq!(
+            parse_args(&argv(&["exchange"])).expect("parses"),
+            Command::Exchange {
+                in_path: None,
+                out_path: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_exchange_with_in_and_out_paths() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "exchange",
+                "--in",
+                "/tmp/req.json",
+                "--out",
+                "/tmp/resp.json"
+            ]))
+            .expect("parses"),
+            Command::Exchange {
+                in_path: Some("/tmp/req.json".to_string()),
+                out_path: Some("/tmp/resp.json".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_args(&argv(&["exchange", "--in=/tmp/a", "--out=/tmp/b"])).expect("parses"),
+            Command::Exchange {
+                in_path: Some("/tmp/a".to_string()),
+                out_path: Some("/tmp/b".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn exchange_flag_without_value_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&["exchange", "--in"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn exchange_unexpected_argument_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&["exchange", "--who"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    /// Builds a `request`-kind envelope for the exchange tests.
+    fn request_envelope() -> MessageEnvelope {
+        MessageEnvelope::new(
+            "m-req-1",
+            "conv-42",
+            "agent-a",
+            "agent-b",
+            MessageKind::Request,
+            "what is 2+2?",
+            1_700_000_000_000,
+        )
+    }
+
+    #[test]
+    fn execute_exchange_success_builds_response_envelope() {
+        let transport = OkTransport::new("four");
+        let mut sink = NoopSink;
+        let request = request_envelope();
+
+        let response = execute_exchange(&transport, &mut sink, &test_meta(), &request);
+
+        assert_eq!(response.kind, MessageKind::Response);
+        assert_eq!(response.body, "four");
+        assert_eq!(response.conversation_id, "conv-42");
+        assert_eq!(response.in_reply_to.as_deref(), Some("m-req-1"));
+        // Addressing swaps: reply is from the request's recipient, to its sender.
+        assert_eq!(response.from, "agent-b");
+        assert_eq!(response.to, "agent-a");
+        // A fresh id, distinct from the request it answers.
+        assert_ne!(response.message_id, request.message_id);
+        // The provider call is wrapped in-band as a baton.exchange/v1 record.
+        let wrapped = response
+            .exchange
+            .as_ref()
+            .expect("wrapped exchange present");
+        assert_eq!(wrapped.schema, crate::events::SCHEMA);
+        match &wrapped.exchange.outcome {
+            Outcome::Ok { reply, .. } => assert_eq!(reply, "four"),
+            other => panic!("expected Ok outcome, got {other:?}"),
+        }
+        assert_eq!(wrapped.exchange.request.prompt, "what is 2+2?");
+    }
+
+    #[test]
+    fn execute_exchange_wraps_reported_token_usage() {
+        use crate::model::TokenUsage;
+
+        /// A transport whose reply carries provider token usage.
+        struct UsageTransport;
+        impl Transport for UsageTransport {
+            fn send_conversation(&self, _messages: &[Message]) -> Result<AssistantReply> {
+                Ok(AssistantReply::with_usage(
+                    "hi",
+                    TokenUsage {
+                        input_tokens: Some(7),
+                        output_tokens: Some(11),
+                    },
+                ))
+            }
+        }
+
+        let mut sink = NoopSink;
+        let response = execute_exchange(
+            &UsageTransport,
+            &mut sink,
+            &test_meta(),
+            &request_envelope(),
+        );
+        match &response.exchange.expect("wrapped").exchange.outcome {
+            Outcome::Ok {
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                assert_eq!(*input_tokens, Some(7));
+                assert_eq!(*output_tokens, Some(11));
+            }
+            other => panic!("expected Ok outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_exchange_provider_failure_is_delivered_error() {
+        let mut sink = NoopSink;
+        // A provider failure is a *delivered* error envelope, not a propagated
+        // error — execute_exchange returns an envelope, never a Result::Err.
+        let response =
+            execute_exchange(&ErrTransport, &mut sink, &test_meta(), &request_envelope());
+
+        assert_eq!(response.kind, MessageKind::Error);
+        assert_eq!(response.in_reply_to.as_deref(), Some("m-req-1"));
+        assert_eq!(response.conversation_id, "conv-42");
+        assert!(
+            response.body.contains("network down"),
+            "error body carries the failure description: {}",
+            response.body
+        );
+        match &response
+            .exchange
+            .expect("wrapped failed exchange")
+            .exchange
+            .outcome
+        {
+            Outcome::Error { kind, .. } => assert_eq!(kind, "transport"),
+            other => panic!("expected Error outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_exchange_records_the_trail_pair() {
+        let transport = OkTransport::new("four");
+        let mut sink = RecordingSink::new();
+        execute_exchange(&transport, &mut sink, &test_meta(), &request_envelope());
+
+        // Same request → outcome trail pair as `ask`/`session`.
+        assert_eq!(sink.events.len(), 2, "request + outcome");
+        assert!(matches!(sink.events[0], ExchangeEvent::Request { .. }));
+        assert!(matches!(sink.events[1], ExchangeEvent::ResponseOk { .. }));
+    }
+
+    #[test]
+    fn read_request_envelope_rejects_malformed_json() {
+        let malformed = b"not a json envelope".as_slice();
+        assert!(matches!(
+            read_request_envelope(malformed).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn write_then_read_response_envelope_round_trips() {
+        let transport = OkTransport::new("four");
+        let mut sink = NoopSink;
+        let response = execute_exchange(&transport, &mut sink, &test_meta(), &request_envelope());
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_response_envelope(&response, &mut buf).expect("writes");
+        // Exactly one JSON line.
+        let text = String::from_utf8(buf).expect("utf8");
+        assert_eq!(text.lines().count(), 1, "one envelope, one line");
+
+        let back = read_request_envelope(text.as_bytes()).expect("parses back");
+        assert_eq!(back, response);
     }
 }

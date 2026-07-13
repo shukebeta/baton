@@ -321,6 +321,54 @@ The nested `outcome` uses the same `event` tags as the exchange trail
 (`response_ok` / `response_error`). As with that trail, unknown/extra fields are
 skipped on read (forward-compatibility) rather than treated as errors.
 
+## Exchanging envelopes (`baton exchange`)
+
+`baton exchange` is the structured request/reply verb: it reads exactly one
+`baton.message/v1` request envelope, runs the provider call for its `body`, and
+writes exactly one response envelope. Unlike `ask` (prose on stdout), both sides
+of `exchange` are machine-readable envelopes — this is the primitive one Baton
+process uses to reach another over pipes, with no tmux and no daemon.
+
+```
+baton exchange [--in <path>] [--out <path>]
+```
+
+The request is read from `--in <path>` when given, else stdin; the response is
+written to `--out <path>` when given, else stdout. `BATON_SYSTEM_PROMPT` applies
+exactly as on `ask`, so a spawned `baton exchange` is an independently-configured
+participant.
+
+```bash
+echo '{"schema":"baton.message/v1","message_id":"m-1","conversation_id":"c-1","from":"agent-a","to":"agent-b","in_reply_to":null,"kind":"request","body":"who won the 1998 world cup?","ts_ms":1700000000000,"exchange":null}' \
+  | baton exchange
+```
+
+The response envelope:
+
+- is `kind: "response"` on success (its `body` is the assistant reply) or
+  `kind: "error"` when the provider call fails (its `body` is the error
+  description);
+- preserves the request's `conversation_id`, sets `in_reply_to` to the request's
+  `message_id`, and carries a fresh `message_id`;
+- **swaps addressing** — the reply's `from` is the request's `to`, and its `to`
+  is the request's `from`;
+- wraps the provider call it ran under `exchange` (the `baton.exchange/v1` record
+  with its token usage), so the call is observable in-band, not only in the
+  `BATON_EVENT_LOG` trail (which still records the same request→outcome pair as
+  `ask`).
+
+### Delivered-error exit semantics
+
+A provider failure is a *delivered response*, not a process failure: a
+well-formed request whose provider call fails writes a `kind: "error"` response
+envelope to stdout and **exits 0**. The caller reads the outcome from the
+envelope, not from the exit code. Only a malformed or unreadable request
+envelope — or a usage/CLI error — exits **non-zero**, with a stderr diagnostic
+and nothing on stdout.
+
+`send` / `serve` (asynchronous, addressable mailbox delivery) are reserved for a
+later slice; `exchange` is the synchronous round-trip only.
+
 ## Development
 
 CI runs the following gates; run them locally before opening a PR:
