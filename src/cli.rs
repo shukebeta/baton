@@ -295,7 +295,7 @@ fn timed_exchange(
     let duration_ms = start.elapsed().as_millis() as u64;
 
     let event = match &result {
-        Ok(reply) => ExchangeEvent::response_ok(now_ms(), duration_ms, &reply.text),
+        Ok(reply) => ExchangeEvent::response_ok(now_ms(), duration_ms, &reply.text, &reply.usage),
         Err(err) => ExchangeEvent::response_error(now_ms(), duration_ms, err),
     };
     emit(sink, &event);
@@ -731,6 +731,39 @@ mod tests {
     }
 
     #[test]
+    fn execute_ask_records_token_usage_from_reply() {
+        use crate::model::TokenUsage;
+
+        /// A transport that returns a reply carrying token usage.
+        struct UsageTransport;
+        impl Transport for UsageTransport {
+            fn send_conversation(&self, _messages: &[Message]) -> Result<AssistantReply> {
+                Ok(AssistantReply::with_usage(
+                    "hi",
+                    TokenUsage {
+                        input_tokens: Some(12),
+                        output_tokens: Some(34),
+                    },
+                ))
+            }
+        }
+
+        let mut sink = RecordingSink::new();
+        execute_ask(&UsageTransport, &mut sink, &test_meta(), "q").expect("should succeed");
+        match &sink.events[1] {
+            ExchangeEvent::ResponseOk {
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                assert_eq!(*input_tokens, Some(12));
+                assert_eq!(*output_tokens, Some(34));
+            }
+            other => panic!("expected ResponseOk, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn execute_ask_records_error_outcome_even_on_failure() {
         let mut sink = RecordingSink::new();
         execute_ask(&ErrTransport, &mut sink, &test_meta(), "hi").expect_err("transport fails");
@@ -852,6 +885,8 @@ mod tests {
                 ts_ms: 0,
                 duration_ms: 1,
                 reply: "r".to_string(),
+                input_tokens: None,
+                output_tokens: None,
             },
         }
     }

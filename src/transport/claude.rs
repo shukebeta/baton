@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{BatonConfig, Credential};
 use crate::error::{BatonError, Result};
-use crate::model::{AssistantReply, Message};
+use crate::model::{AssistantReply, Message, TokenUsage};
 use crate::transport::Transport;
 use crate::transport::http::{HttpClient, UreqHttpClient};
 
@@ -157,7 +157,16 @@ fn parse_success(body: &str) -> Result<AssistantReply> {
         ));
     }
 
-    Ok(AssistantReply::new(text))
+    // A missing `usage` block (or a missing field within it) is recorded as
+    // `None`, not an error — usage is observability, never a decode failure.
+    let usage = response
+        .usage
+        .map_or_else(TokenUsage::default, |u| TokenUsage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+        });
+
+    Ok(AssistantReply::with_usage(text, usage))
 }
 
 /// Pulls `error.message` out of a Claude error body, falling back to the raw
@@ -193,6 +202,18 @@ struct RequestMessage<'a> {
 struct MessagesResponse {
     #[serde(default)]
     content: Vec<ContentBlock>,
+    #[serde(default)]
+    usage: Option<UsageBlock>,
+}
+
+/// The provider's `usage` object. Each count is optional so a partial or absent
+/// block degrades to `None` per field rather than failing the decode.
+#[derive(Deserialize)]
+struct UsageBlock {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -298,6 +319,50 @@ mod tests {
         );
         let reply = client.send(&Prompt::new("hi")).expect("should succeed");
         assert_eq!(reply.text, "Hello there");
+    }
+
+    #[test]
+    fn decodes_token_usage_from_response() {
+        let body = r#"{
+            "content": [{"type": "text", "text": "hi"}],
+            "usage": {"input_tokens": 12, "output_tokens": 34}
+        }"#;
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            FakeHttp::new(200, body),
+        );
+        let reply = client.send(&Prompt::new("hi")).expect("should succeed");
+        assert_eq!(reply.usage.input_tokens, Some(12));
+        assert_eq!(reply.usage.output_tokens, Some(34));
+    }
+
+    #[test]
+    fn success_without_usage_block_records_absent_tokens() {
+        // SUCCESS_BODY carries no `usage`: the reply still succeeds and usage is
+        // recorded as unknown (None), never a decode error.
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            FakeHttp::new(200, SUCCESS_BODY),
+        );
+        let reply = client.send(&Prompt::new("hi")).expect("should succeed");
+        assert_eq!(reply.text, "Hello there");
+        assert_eq!(reply.usage.input_tokens, None);
+        assert_eq!(reply.usage.output_tokens, None);
+    }
+
+    #[test]
+    fn partial_usage_block_records_present_field_only() {
+        let body = r#"{
+            "content": [{"type": "text", "text": "hi"}],
+            "usage": {"input_tokens": 7}
+        }"#;
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            FakeHttp::new(200, body),
+        );
+        let reply = client.send(&Prompt::new("hi")).expect("should succeed");
+        assert_eq!(reply.usage.input_tokens, Some(7));
+        assert_eq!(reply.usage.output_tokens, None);
     }
 
     #[test]

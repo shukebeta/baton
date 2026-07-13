@@ -165,6 +165,8 @@ mod tests {
                 ts_ms: 1_700_000_000_420,
                 duration_ms: 418,
                 reply: "hi there".to_string(),
+                input_tokens: None,
+                output_tokens: None,
             },
         })
     }

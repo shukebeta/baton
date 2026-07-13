@@ -22,6 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::error::BatonError;
+use crate::model::TokenUsage;
 
 /// Schema discriminator stamped on every event line.
 ///
@@ -68,6 +69,12 @@ pub enum ExchangeEvent {
         duration_ms: u64,
         /// The assistant reply text.
         reply: String,
+        /// Provider-reported input (prompt) tokens; omitted when unknown.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_tokens: Option<u64>,
+        /// Provider-reported output (completion) tokens; omitted when unknown.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_tokens: Option<u64>,
     },
     /// Emitted when the provider call fails. The failure is recorded explicitly
     /// rather than surfaced only on stderr.
@@ -97,13 +104,15 @@ impl ExchangeEvent {
         }
     }
 
-    /// Builds the success outcome event.
-    pub fn response_ok(ts_ms: u64, duration_ms: u64, reply: &str) -> Self {
+    /// Builds the success outcome event, carrying any reported token usage.
+    pub fn response_ok(ts_ms: u64, duration_ms: u64, reply: &str, usage: &TokenUsage) -> Self {
         ExchangeEvent::ResponseOk {
             schema: SCHEMA,
             ts_ms,
             duration_ms,
             reply: reply.to_string(),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
         }
     }
 
@@ -199,13 +208,33 @@ mod tests {
     }
 
     #[test]
-    fn response_ok_event_serializes_with_reply_and_duration() {
-        let event = ExchangeEvent::response_ok(1_700_000_000_001, 42, "hi there");
+    fn response_ok_event_serializes_with_reply_duration_and_tokens() {
+        let usage = TokenUsage {
+            input_tokens: Some(12),
+            output_tokens: Some(34),
+        };
+        let event = ExchangeEvent::response_ok(1_700_000_000_001, 42, "hi there", &usage);
         let value: Value = serde_json::to_value(&event).expect("serializes");
         assert_eq!(value["event"], "response_ok");
         assert_eq!(value["schema"], SCHEMA);
         assert_eq!(value["duration_ms"], 42);
         assert_eq!(value["reply"], "hi there");
+        assert_eq!(value["input_tokens"], 12);
+        assert_eq!(value["output_tokens"], 34);
+    }
+
+    #[test]
+    fn response_ok_event_omits_token_fields_when_usage_absent() {
+        let event = ExchangeEvent::response_ok(1_700_000_000_001, 42, "hi", &TokenUsage::default());
+        let value: Value = serde_json::to_value(&event).expect("serializes");
+        assert!(
+            value.get("input_tokens").is_none(),
+            "absent usage must omit input_tokens, got: {value}"
+        );
+        assert!(
+            value.get("output_tokens").is_none(),
+            "absent usage must omit output_tokens, got: {value}"
+        );
     }
 
     #[test]
@@ -226,8 +255,13 @@ mod tests {
             let mut sink = WriterSink::new(&mut buf);
             sink.record(&ExchangeEvent::request(1, &meta(), "q"))
                 .expect("records request");
-            sink.record(&ExchangeEvent::response_ok(2, 3, "a"))
-                .expect("records response");
+            sink.record(&ExchangeEvent::response_ok(
+                2,
+                3,
+                "a",
+                &TokenUsage::default(),
+            ))
+            .expect("records response");
         }
         let text = String::from_utf8(buf).expect("utf8");
         let lines: Vec<&str> = text.lines().collect();

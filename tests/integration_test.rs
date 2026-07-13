@@ -29,7 +29,8 @@ const SUCCESS_BODY: &str = r#"{
     "type": "message",
     "role": "assistant",
     "content": [{"type": "text", "text": "hello from the mock server"}],
-    "stop_reason": "end_turn"
+    "stop_reason": "end_turn",
+    "usage": {"input_tokens": 9, "output_tokens": 3}
 }"#;
 
 /// A single-shot mock HTTP server bound to a kernel-assigned port on
@@ -527,6 +528,9 @@ fn event_log_records_request_then_response_ok_to_file() {
         response["duration_ms"].is_u64(),
         "response_ok carries a numeric duration_ms"
     );
+    // The provider's token usage is recorded end-to-end.
+    assert_eq!(response["input_tokens"], 9);
+    assert_eq!(response["output_tokens"], 3);
 }
 
 #[test]
