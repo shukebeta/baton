@@ -864,6 +864,140 @@ fn log_replay_out_of_range_index_is_error() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// `baton exchange` end-to-end.
+//
+// The unit tests in `src/cli.rs` drive `execute_exchange` with a fake transport
+// and in-memory buffers. These subprocess tests add confidence that the
+// compiled binary parses the `exchange` command, reads one `baton.message/v1`
+// request envelope from stdin, runs a real `ureq` round-trip, and writes one
+// response envelope to stdout — including the delivered-error exit-0 contract.
+// ---------------------------------------------------------------------------
+
+/// Runs the real `baton exchange` binary against `base_url`, piping `request`
+/// (a JSON envelope) to its stdin. Mirrors the deterministic environment of
+/// [`run_baton_ask`].
+fn run_baton_exchange(base_url: &str, request: &str) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_baton"));
+    cmd.arg("exchange");
+    cmd.env("ANTHROPIC_API_KEY", "test-key");
+    cmd.env("ANTHROPIC_BASE_URL", base_url);
+    cmd.env("BATON_MODEL", "claude-test-model");
+    cmd.env("BATON_TIMEOUT_SECS", "5");
+    cmd.env_remove("ANTHROPIC_AUTH_TOKEN");
+    cmd.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+    cmd.env_remove("BATON_EVENT_LOG");
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("spawn baton exchange");
+    child
+        .stdin
+        .take()
+        .expect("exchange stdin is piped")
+        .write_all(request.as_bytes())
+        .expect("write exchange request");
+    child.wait_with_output().expect("wait for baton exchange")
+}
+
+/// A well-formed `request` envelope, addressed a→b, on conversation `conv-1`.
+const REQUEST_ENVELOPE: &str = r#"{
+    "schema": "baton.message/v1",
+    "message_id": "m-1",
+    "conversation_id": "conv-1",
+    "from": "agent-a",
+    "to": "agent-b",
+    "in_reply_to": null,
+    "kind": "request",
+    "body": "hi",
+    "ts_ms": 1700000000000,
+    "exchange": null
+}"#;
+
+#[test]
+fn exchange_round_trips_a_response_envelope() {
+    let server = MockServer::spawn(200, SUCCESS_BODY);
+    let out = run_baton_exchange(server.base_url(), REQUEST_ENVELOPE);
+
+    assert!(
+        out.status.success(),
+        "a successful exchange should exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.lines().count(), 1, "exactly one envelope: {stdout}");
+
+    let resp: serde_json::Value = serde_json::from_str(stdout.trim()).expect("stdout is JSON");
+    assert_eq!(resp["schema"], "baton.message/v1");
+    assert_eq!(resp["kind"], "response");
+    assert_eq!(resp["conversation_id"], "conv-1");
+    assert_eq!(resp["in_reply_to"], "m-1");
+    // Addressing swaps.
+    assert_eq!(resp["from"], "agent-b");
+    assert_eq!(resp["to"], "agent-a");
+    assert_eq!(resp["body"], "hello from the mock server");
+    // Fresh message id, distinct from the request.
+    assert_ne!(resp["message_id"], "m-1");
+    // The provider call is wrapped in-band, carrying #37 token usage.
+    assert_eq!(resp["exchange"]["schema"], "baton.exchange/v1");
+    assert_eq!(
+        resp["exchange"]["exchange"]["outcome"]["event"],
+        "response_ok"
+    );
+    assert_eq!(resp["exchange"]["exchange"]["outcome"]["input_tokens"], 9);
+    assert_eq!(resp["exchange"]["exchange"]["outcome"]["output_tokens"], 3);
+}
+
+#[test]
+fn exchange_delivers_provider_error_as_envelope_and_exits_zero() {
+    let body =
+        r#"{"type":"error","error":{"type":"authentication_error","message":"bad api key"}}"#;
+    let server = MockServer::spawn(401, body);
+    let out = run_baton_exchange(server.base_url(), REQUEST_ENVELOPE);
+
+    // Delivered-error contract: a provider failure is a *delivered response*,
+    // so the process still exits 0 with the error envelope on stdout.
+    assert!(
+        out.status.success(),
+        "a delivered provider error still exits 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let resp: serde_json::Value = serde_json::from_str(stdout.trim()).expect("stdout is JSON");
+    assert_eq!(resp["kind"], "error");
+    assert_eq!(resp["in_reply_to"], "m-1");
+    assert_eq!(
+        resp["exchange"]["exchange"]["outcome"]["event"],
+        "response_error"
+    );
+    assert_eq!(resp["exchange"]["exchange"]["outcome"]["kind"], "auth");
+}
+
+#[test]
+fn exchange_malformed_request_exits_non_zero_with_empty_stdout() {
+    // No provider call is made, so no server is needed. A malformed request
+    // envelope is a usage error: non-zero exit, a stderr diagnostic, and
+    // *nothing* on stdout (the response is emitted only after a completed
+    // exchange).
+    let out = run_baton_exchange("http://127.0.0.1:1", "this is not an envelope");
+
+    assert!(
+        !out.status.success(),
+        "a malformed request must exit non-zero"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "malformed request writes nothing to stdout, got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("request envelope"),
+        "stderr diagnoses the malformed request: {stderr}"
+    );
+}
+
 /// A truncated trailing line (no terminating newline — what a killed
 /// `baton ask`/`session` leaves behind) does not brick `baton log show`: every
 /// complete exchange before it is rendered, exit is 0, and a stderr warning
