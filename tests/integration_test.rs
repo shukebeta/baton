@@ -998,6 +998,59 @@ fn exchange_malformed_request_exits_non_zero_with_empty_stdout() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// `SubprocessParticipant` driving the real compiled `baton exchange` binary.
+//
+// The unit tests in `src/participant.rs` drive the impl against `sh -c` stubs.
+// This test adds confidence that the real spawn / stdin-write / stdout-read
+// plumbing correlates a response envelope end-to-end, using the same
+// in-process mock server the other exchange tests use. Credentials/base_url are
+// passed as env overrides (API-key precedence pins the mock), so the spawned
+// child talks only to the mock.
+#[test]
+fn subprocess_participant_round_trips_via_real_binary() {
+    use baton::message::{MessageEnvelope, MessageKind};
+    use baton::participant::{Participant, SubprocessParticipant};
+
+    let server = MockServer::spawn(200, SUCCESS_BODY);
+    let participant = SubprocessParticipant::new(
+        env!("CARGO_BIN_EXE_baton"),
+        ["exchange"],
+        [
+            ("ANTHROPIC_API_KEY", "test-key"),
+            ("ANTHROPIC_BASE_URL", server.base_url()),
+            ("BATON_MODEL", "claude-test-model"),
+            ("BATON_TIMEOUT_SECS", "5"),
+        ],
+        Duration::from_secs(10),
+    );
+
+    let request = MessageEnvelope::new(
+        "m-1",
+        "conv-1",
+        "agent-a",
+        "agent-b",
+        MessageKind::Request,
+        "hi",
+        1_700_000_000_000,
+    );
+    let response = participant.respond(&request);
+
+    assert_eq!(response.kind, MessageKind::Response);
+    assert_eq!(response.conversation_id, "conv-1");
+    assert_eq!(response.in_reply_to.as_deref(), Some("m-1"));
+    // Addressing swaps, and the body is the mock's reply.
+    assert_eq!(response.from, "agent-b");
+    assert_eq!(response.to, "agent-a");
+    assert_eq!(response.body, "hello from the mock server");
+    assert_ne!(response.message_id, "m-1");
+    // The child's provider call rides along in-band.
+    assert!(
+        response.exchange.is_some(),
+        "child nests its provider call record"
+    );
+}
+
 /// A truncated trailing line (no terminating newline — what a killed
 /// `baton ask`/`session` leaves behind) does not brick `baton log show`: every
 /// complete exchange before it is rendered, exit is 0, and a stderr warning
