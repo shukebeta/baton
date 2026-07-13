@@ -2,6 +2,10 @@
 name = "baton"
 version = "0.1.0"
 edition = "2024"
+# The file-lock API (`File::try_lock`/`unlock`) used by the serve mailbox
+# stabilized in std at 1.89.0. `edition = "2024"` already floors the toolchain
+# above this, so the pin is a declaration of the real minimum, not a bump.
+rust-version = "1.89"
 description = "An AI-to-AI harness focused on structured agent communication."
 readme = "README.md"
 
