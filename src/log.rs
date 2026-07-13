@@ -20,13 +20,20 @@
 
 use std::io::{BufRead, BufReader, Read};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{BatonError, Result};
 
 /// One request paired with its single outcome — the unit `baton log` operates on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Also serves as the owned exchange value nested inside a `baton.message/v1`
+/// envelope (see [`crate::message::WrappedExchange`]): the `Serialize` /
+/// `Deserialize` derives exist for that embedding. The on-disk JSONL trail is
+/// written by [`crate::events`] as two separate lines and read back via the
+/// dedicated `OkRecord`/`ErrRecord` mirrors below — it does not use these
+/// derives, so their tags are free to describe the *nested* object shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Exchange {
     /// The recorded request (carries everything needed to replay it).
     pub request: RequestRecord,
@@ -35,7 +42,7 @@ pub struct Exchange {
 }
 
 /// The replay-relevant fields of a `request` event, read back from the log.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestRecord {
     /// Wall-clock emission time, Unix epoch milliseconds.
     pub ts_ms: u64,
@@ -48,9 +55,16 @@ pub struct RequestRecord {
 }
 
 /// The terminal outcome of an exchange, read back from the log.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// When serialized (only as part of a nested [`Exchange`] inside a
+/// `baton.message/v1` envelope), the `event` tag reads `response_ok` /
+/// `response_error`, matching the on-disk trail's outcome tags in
+/// [`crate::events`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event")]
 pub enum Outcome {
     /// The call succeeded.
+    #[serde(rename = "response_ok")]
     Ok {
         /// Wall-clock emission time, Unix epoch milliseconds.
         ts_ms: u64,
@@ -60,6 +74,7 @@ pub enum Outcome {
         reply: String,
     },
     /// The call failed; `kind` is the stable machine class.
+    #[serde(rename = "response_error")]
     Error {
         /// Wall-clock emission time, Unix epoch milliseconds.
         ts_ms: u64,

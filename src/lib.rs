@@ -9,6 +9,7 @@
 //! - [`transport`] — the provider transport boundary.
 //! - [`events`] — structured JSONL recording of each exchange.
 //! - [`log`] — reading and rendering the recorded exchange trail.
+//! - [`message`] — the `baton.message/v1` A2A peer-message envelope.
 //! - [`error`] — shared error and result types.
 //! - [`cli`] — the command-line entry surface.
 
@@ -17,5 +18,6 @@ pub mod config;
 pub mod error;
 pub mod events;
 pub mod log;
+pub mod message;
 pub mod model;
 pub mod transport;
