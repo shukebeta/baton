@@ -29,10 +29,11 @@ use std::io::{self, BufRead, Read, Write};
 use std::time::Instant;
 
 use crate::config::BatonConfig;
+use crate::converse::{self, Governance, Transcript};
 use crate::error::{BatonError, Result};
 use crate::events::{EventSink, ExchangeEvent, ExchangeMeta, NoopSink, WriterSink, now_ms};
 use crate::log::{self, Exchange};
-use crate::message::MessageEnvelope;
+use crate::message::{MessageEnvelope, MessageKind};
 use crate::model::{AssistantReply, Conversation, Prompt};
 use crate::participant::{LocalParticipant, Participant};
 use crate::transport::Transport;
@@ -43,7 +44,7 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton log show|replay [--file <path>] [--index <N>]";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] (--seed <text> | --seed-file <path>) [--out <path>] | baton log show|replay [--file <path>] [--index <N>]";
 
 /// The in-session command that ends the REPL cleanly (alongside EOF).
 const SESSION_EXIT_COMMAND: &str = "/exit";
@@ -62,6 +63,19 @@ enum Command {
         in_path: Option<String>,
         out_path: Option<String>,
     },
+    /// Drive a governed two-participant conversation from a seed. Each side is
+    /// an in-process participant configured from the environment, overridden
+    /// per side by its optional system-prompt file and model. The full
+    /// `baton.message/v1` trail is written as JSONL to `out_path` (stdout when
+    /// `None`).
+    Converse {
+        a_system: Option<String>,
+        b_system: Option<String>,
+        a_model: Option<String>,
+        b_model: Option<String>,
+        seed: SeedSource,
+        out_path: Option<String>,
+    },
     /// Pretty-print the recorded exchange trail.
     LogShow { file: Option<String> },
     /// Re-run a recorded exchange. `index` is 1-based; `None` ⇒ the last one.
@@ -69,6 +83,17 @@ enum Command {
         file: Option<String>,
         index: Option<usize>,
     },
+}
+
+/// Where the `converse` seed message comes from: inline text or a file path.
+/// Resolved to the opening body only in [`run`], keeping [`parse_args`] free of
+/// I/O.
+#[derive(Debug, PartialEq, Eq)]
+enum SeedSource {
+    /// Inline `--seed <text>`.
+    Text(String),
+    /// `--seed-file <path>`, read at run time.
+    File(String),
 }
 
 /// Process entry point: parse arguments and dispatch.
@@ -111,6 +136,40 @@ pub fn run() -> Result<()> {
             let request = read_request_envelope(open_input(in_path.as_deref())?)?;
             let response = execute_exchange(&participant, sink.as_mut(), &meta, &request);
             write_response_envelope(&response, open_output(out_path.as_deref())?)
+        }
+        Command::Converse {
+            a_system,
+            b_system,
+            a_model,
+            b_model,
+            seed,
+            out_path,
+        } => {
+            let base = BatonConfig::from_env()?;
+            let governance = Governance::from_lookup(|key| std::env::var(key).ok())?;
+            let seed_body = resolve_seed(&seed)?;
+
+            // Each side is the base config with its own system prompt / model
+            // laid over the top; the credential and base URL are shared.
+            let config_a = participant_config(&base, a_system.as_deref(), a_model)?;
+            let config_b = participant_config(&base, b_system.as_deref(), b_model)?;
+            let participant_a = LocalParticipant::new(
+                ClaudeClient::from_config(config_a.clone()),
+                exchange_meta(&config_a),
+            );
+            let participant_b = LocalParticipant::new(
+                ClaudeClient::from_config(config_b.clone()),
+                exchange_meta(&config_b),
+            );
+
+            let transcript = converse::converse(
+                &participant_a,
+                &participant_b,
+                build_seed_envelope(&seed_body),
+                &governance,
+            );
+            eprintln!("conversation ended: {:?}", transcript.reason);
+            write_transcript(&transcript, open_output(out_path.as_deref())?)
         }
         Command::LogShow { file } => {
             let exchanges = read_log(file.as_deref())?;
@@ -318,6 +377,73 @@ fn write_response_envelope(envelope: &MessageEnvelope, mut output: impl Write) -
     writeln!(output, "{line}").map_err(io_err)
 }
 
+/// Resolves the `converse` seed body: inline text as-is, or the content of the
+/// named file. A blank inline seed or an unreadable file is a usage/IO error.
+fn resolve_seed(seed: &SeedSource) -> Result<String> {
+    match seed {
+        SeedSource::Text(text) => {
+            if text.trim().is_empty() {
+                return Err(usage("--seed must not be empty"));
+            }
+            Ok(text.clone())
+        }
+        SeedSource::File(path) => std::fs::read_to_string(path)
+            .map_err(|err| BatonError::Io(format!("failed to read --seed-file {path:?}: {err}"))),
+    }
+}
+
+/// Builds one side's config: the base environment config with an optional
+/// system-prompt file and model laid over the top. The credential and base URL
+/// stay shared, so the two sides differ only in identity and model — the point
+/// of the per-side flags.
+fn participant_config(
+    base: &BatonConfig,
+    system_path: Option<&str>,
+    model: Option<String>,
+) -> Result<BatonConfig> {
+    let mut config = base.clone();
+    if let Some(path) = system_path {
+        let prompt = std::fs::read_to_string(path).map_err(|err| {
+            BatonError::Config(format!("failed to read system-prompt file {path:?}: {err}"))
+        })?;
+        config.system_prompt = Some(prompt);
+    }
+    if let Some(model) = model {
+        config.model = model;
+    }
+    Ok(config)
+}
+
+/// Builds the seed request envelope: participant A's opening message addressed
+/// to B. Ids are derived from the emission time so a run needs no external id
+/// source; `baton.message/v1` places no format constraint on them beyond
+/// uniqueness.
+fn build_seed_envelope(body: &str) -> MessageEnvelope {
+    let ts_ms = now_ms();
+    let conversation_id = format!("conv-{ts_ms}");
+    let message_id = format!("{conversation_id}-m0");
+    MessageEnvelope::new(
+        message_id,
+        conversation_id,
+        "agent-a",
+        "agent-b",
+        MessageKind::Request,
+        body,
+        ts_ms,
+    )
+}
+
+/// Writes the conversation trail as JSONL — one `baton.message/v1` envelope per
+/// line, in turn order (seed first, then each reply).
+fn write_transcript(transcript: &Transcript, mut output: impl Write) -> Result<()> {
+    for envelope in &transcript.trail {
+        let line = serde_json::to_string(envelope)
+            .map_err(|err| BatonError::Io(format!("could not serialize trail envelope: {err}")))?;
+        writeln!(output, "{line}").map_err(io_err)?;
+    }
+    Ok(())
+}
+
 /// Drives an interactive multi-turn REPL over `input`/`output`.
 ///
 /// Each line read from `input` becomes a user turn appended to the in-memory
@@ -462,6 +588,7 @@ fn parse_args(args: &[String]) -> Result<Command> {
         "ask" => parse_ask(iter),
         "session" => parse_session(iter),
         "exchange" => parse_exchange(iter),
+        "converse" => parse_converse(iter),
         "log" => parse_log(iter),
         other => Err(usage(&format!("unknown command {other:?}"))),
     }
@@ -616,6 +743,84 @@ fn parse_exchange<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comm
     }
 
     Ok(Command::Exchange { in_path, out_path })
+}
+
+/// Parses the arguments following the `converse` subcommand.
+///
+/// Accepts optional `--a-system`/`--b-system` (per-side system-prompt files),
+/// `--a-model`/`--b-model` (per-side model overrides), `--out`, and the seed —
+/// exactly one of `--seed <text>` or `--seed-file <path>` is required. Every
+/// flag also accepts the `--flag=value` form. A flag without a value, both seed
+/// forms together, a missing seed, or any other token is a usage error.
+fn parse_converse<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut a_system: Option<String> = None;
+    let mut b_system: Option<String> = None;
+    let mut a_model: Option<String> = None;
+    let mut b_model: Option<String> = None;
+    let mut out_path: Option<String> = None;
+    let mut seed_text: Option<String> = None;
+    let mut seed_file: Option<String> = None;
+
+    while let Some(arg) = iter.next() {
+        let mut take = |flag: &str| -> Result<String> {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| usage(&format!("{flag} requires a value")))
+        };
+        match arg.as_str() {
+            "--a-system" => a_system = Some(take("--a-system")?),
+            other if other.starts_with("--a-system=") => {
+                a_system = Some(other["--a-system=".len()..].to_string());
+            }
+            "--b-system" => b_system = Some(take("--b-system")?),
+            other if other.starts_with("--b-system=") => {
+                b_system = Some(other["--b-system=".len()..].to_string());
+            }
+            "--a-model" => a_model = Some(take("--a-model")?),
+            other if other.starts_with("--a-model=") => {
+                a_model = Some(other["--a-model=".len()..].to_string());
+            }
+            "--b-model" => b_model = Some(take("--b-model")?),
+            other if other.starts_with("--b-model=") => {
+                b_model = Some(other["--b-model=".len()..].to_string());
+            }
+            "--seed" => seed_text = Some(take("--seed")?),
+            other if other.starts_with("--seed=") => {
+                seed_text = Some(other["--seed=".len()..].to_string());
+            }
+            "--seed-file" => seed_file = Some(take("--seed-file")?),
+            other if other.starts_with("--seed-file=") => {
+                seed_file = Some(other["--seed-file=".len()..].to_string());
+            }
+            "--out" => out_path = Some(take("--out")?),
+            other if other.starts_with("--out=") => {
+                out_path = Some(other["--out=".len()..].to_string());
+            }
+            other => return Err(usage(&format!("unexpected argument {other:?}"))),
+        }
+    }
+
+    let seed = match (seed_text, seed_file) {
+        (Some(_), Some(_)) => {
+            return Err(usage("--seed and --seed-file are mutually exclusive"));
+        }
+        (Some(text), None) => SeedSource::Text(text),
+        (None, Some(path)) => SeedSource::File(path),
+        (None, None) => {
+            return Err(usage(
+                "missing seed: pass --seed <text> or --seed-file <path>",
+            ));
+        }
+    };
+
+    Ok(Command::Converse {
+        a_system,
+        b_system,
+        a_model,
+        b_model,
+        seed,
+        out_path,
+    })
 }
 
 /// Builds a usage error carrying `detail` and the one-line usage summary.
@@ -1257,6 +1462,111 @@ mod tests {
             parse_args(&argv(&["exchange", "--who"])).unwrap_err(),
             BatonError::Usage(_)
         ));
+    }
+
+    // -- baton converse ----------------------------------------------------
+
+    #[test]
+    fn parses_converse_with_inline_seed_and_defaults() {
+        assert_eq!(
+            parse_args(&argv(&["converse", "--seed", "hello"])).expect("parses"),
+            Command::Converse {
+                a_system: None,
+                b_system: None,
+                a_model: None,
+                b_model: None,
+                seed: SeedSource::Text("hello".to_string()),
+                out_path: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_converse_with_all_flags_and_equals_forms() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "converse",
+                "--a-system=/tmp/a.txt",
+                "--b-system",
+                "/tmp/b.txt",
+                "--a-model=model-a",
+                "--b-model",
+                "model-b",
+                "--seed-file=/tmp/seed.txt",
+                "--out",
+                "/tmp/trail.jsonl",
+            ]))
+            .expect("parses"),
+            Command::Converse {
+                a_system: Some("/tmp/a.txt".to_string()),
+                b_system: Some("/tmp/b.txt".to_string()),
+                a_model: Some("model-a".to_string()),
+                b_model: Some("model-b".to_string()),
+                seed: SeedSource::File("/tmp/seed.txt".to_string()),
+                out_path: Some("/tmp/trail.jsonl".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn converse_missing_seed_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&["converse", "--a-model", "m"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn converse_both_seed_forms_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&[
+                "converse",
+                "--seed",
+                "hi",
+                "--seed-file",
+                "/tmp/s"
+            ]))
+            .unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn converse_flag_without_value_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&["converse", "--seed"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn converse_unexpected_argument_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&["converse", "--who"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn resolve_seed_rejects_blank_inline_and_reads_file() {
+        assert!(matches!(
+            resolve_seed(&SeedSource::Text("   ".to_string())).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+        assert_eq!(
+            resolve_seed(&SeedSource::Text("go".to_string())).expect("ok"),
+            "go"
+        );
+    }
+
+    #[test]
+    fn build_seed_envelope_is_an_a_to_b_request() {
+        let seed = build_seed_envelope("kick off");
+        assert_eq!(seed.kind, MessageKind::Request);
+        assert_eq!(seed.from, "agent-a");
+        assert_eq!(seed.to, "agent-b");
+        assert_eq!(seed.body, "kick off");
+        assert!(seed.in_reply_to.is_none());
     }
 
     /// Builds a `request`-kind envelope for the exchange tests.

@@ -10,10 +10,13 @@ center of the design.
 
 Early scaffolding. The crate establishes the module layout and typed runtime
 shape around a non-streaming Claude-compatible Messages client
-(`transport::claude::ClaudeClient`). Three commands wire it to the command line:
+(`transport::claude::ClaudeClient`). Its commands wire it to the command line:
 `baton ask` for a single-turn first-prompt / first-reply, `baton session` for an
 interactive multi-turn REPL that accumulates conversation history across turns,
-and `baton log` for inspecting and replaying the recorded exchange trail.
+`baton exchange` for one structured `baton.message/v1` request/reply round-trip,
+`baton converse` for a governed two-participant conversation driven to a terminal
+condition, and `baton log` for inspecting and replaying the recorded exchange
+trail.
 
 ## Configuration
 
@@ -29,6 +32,8 @@ Baton reads its runtime configuration from environment variables:
 | `BATON_TIMEOUT_SECS`         | no       | `60`                        | Per-request timeout in seconds (positive integer; zero is rejected). |
 | `BATON_MAX_TOKENS`           | no       | `1024`                      | Maximum output tokens to request per reply (positive integer; zero is rejected). |
 | `BATON_SYSTEM_PROMPT`        | no       | — (no system prompt)        | Path to a markdown file whose content is sent as the request's `system` field. Missing/unreadable file is a startup error. |
+| `BATON_MAX_TURNS`            | no       | `8`                         | `baton converse` hard turn-cap: the maximum number of reply turns before the run ends (positive integer; zero is rejected). |
+| `BATON_TOKEN_BUDGET`         | no       | — (disabled)                | `baton converse` cumulative token budget across all replies' reported usage; the run ends once it is exceeded (positive integer; zero is rejected). Unset disables the arm. |
 | `BATON_EVENT_LOG`            | no       | — (disabled)                | File path for the JSONL exchange-event trail (see below). |
 
 Exactly one credential variable is required. The first one that is set (in
@@ -368,6 +373,65 @@ and nothing on stdout.
 
 `send` / `serve` (asynchronous, addressable mailbox delivery) are reserved for a
 later slice; `exchange` is the synchronous round-trip only.
+
+## Conversing (`baton converse`)
+
+`baton converse` is the governed two-participant driver: given a seed message it
+alternates two participants — each participant's reply becomes the next
+participant's request — recording every turn as a `baton.message/v1` envelope,
+until the first terminal condition trips. Where `exchange` is one round-trip,
+`converse` is a *sustained, bounded* conversation with termination guaranteed.
+
+```
+baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] (--seed <text> | --seed-file <path>) [--out <path>]
+```
+
+Each side is an in-process participant built from the shared environment
+configuration (one credential, one `ANTHROPIC_BASE_URL`), differing only by its
+identity and model:
+
+- `--a-system <path>` / `--b-system <path>` — each side's system-prompt file (its
+  identity); omitted, a side falls back to `BATON_SYSTEM_PROMPT`.
+- `--a-model <id>` / `--b-model <id>` — each side's model, overriding
+  `BATON_MODEL` for that side only.
+- `--seed <text>` or `--seed-file <path>` (exactly one) — the opening message.
+  Participant A sends it to B first.
+- `--out <path>` — where the trail is written; stdout when omitted.
+
+The full trail is written as **JSONL**, one `baton.message/v1` envelope per line
+in turn order: the seed request first, then each reply. Each reply preserves the
+`conversation_id`, links `in_reply_to`, swaps addressing (so a reply's `from`
+names its speaker), and wraps the provider call it ran under `exchange` — so per
+turn token usage is observable in-band. The terminal reason is printed to stderr.
+
+### Terminal conditions
+
+Whichever trips first ends the run:
+
+- **turn-cap** — `BATON_MAX_TURNS` (default `8`): the hard, always-enforced
+  guarantee. Even two participants that would loop forever stop here.
+- **token-budget** — `BATON_TOKEN_BUDGET` (optional): ends the run once the
+  accumulated reported usage exceeds the budget. When usage is unavailable the
+  run still terminates on the turn-cap.
+- **unilateral `done`** — a participant emitting a `kind: "done"` reply ends the
+  conversation before the caps. (Today's LLM-backed participants emit only
+  `response`/`error`; `done` is honored if a participant returns it.)
+- **delivered error** — a `kind: "error"` reply is recorded as the terminal turn
+  and ends the run.
+
+```bash
+baton converse \
+  --a-system prompts/interviewer.md \
+  --b-system prompts/candidate.md \
+  --seed "Introduce yourself in one sentence." \
+  --out /tmp/trail.jsonl
+```
+
+Because the driver depends only on the participant boundary, the same driver can
+be pointed at two independent `baton exchange` **processes** rather than
+in-process participants — the vertical proof in `tests/integration_test.rs`
+(`converse_drives_two_independent_processes_to_turn_cap`) drives two spawned
+children against loopback mock servers, no external network.
 
 ## Development
 
