@@ -371,8 +371,8 @@ envelope, not from the exit code. Only a malformed or unreadable request
 envelope — or a usage/CLI error — exits **non-zero**, with a stderr diagnostic
 and nothing on stdout.
 
-`send` / `serve` (asynchronous, addressable mailbox delivery) are reserved for a
-later slice; `exchange` is the synchronous round-trip only.
+`exchange` is the synchronous round-trip only; for asynchronous, addressable
+mailbox delivery see [`baton serve`](#serving-a-mailbox-baton-serve).
 
 ## Conversing (`baton converse`)
 
@@ -432,6 +432,66 @@ be pointed at two independent `baton exchange` **processes** rather than
 in-process participants — the vertical proof in `tests/integration_test.rs`
 (`converse_drives_two_independent_processes_to_turn_cap`) drives two spawned
 children against loopback mock servers, no external network.
+
+## Serving a mailbox (`baton serve`)
+
+Where `exchange` is a synchronous round-trip over pipes, `baton serve` gives that
+exchange an **asynchronous, addressable** home on disk: a sender drops a
+`baton.message/v1` request file into an inbox, and a long-lived `serve` process
+picks it up later, answers it through the same participant seam, and writes the
+reply to an outbox. Everything is a file — the reach is the filesystem, not a
+socket.
+
+```
+baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once]
+```
+
+- `--inbox <dir>` — the mailbox root. `serve` manages `pending/`, `claimed/`, and
+  `done/` subdirectories under it.
+- `--outbox <dir>` — where response envelopes are written.
+- `--poll-ms <n>` — inbox poll interval in milliseconds (default `500`).
+- `--once` — drain everything currently pending, then exit (cron-friendly);
+  omitted, `serve` polls the inbox until terminated.
+
+Each side configures the answering participant exactly as `exchange`/`ask` do
+(`BATON_MODEL`, `BATON_SYSTEM_PROMPT`, the credential env, `BATON_EVENT_LOG`), so
+a served message runs the identical exchange and records the same trail.
+
+### Delivery: atomic, addressable, crash-safe
+
+A sender delivers by writing a temp file and `rename(2)`-ing it into the inbox,
+so `serve` never observes a partial envelope. Each message then moves through one
+atomic rename per state: `pending → claimed → done`. A crash mid-answer leaves
+the message in `claimed/`; the next start **reclaims** it back to `pending/`, so
+no in-flight message is lost. The response is written to
+`<outbox>/<request message_id>.json` — keyed by the *request* id (the reply's
+`in_reply_to`), so a reprocessed message overwrites its own not-yet-consumed
+reply instead of leaving a second file.
+
+### Single instance
+
+`serve` takes an exclusive advisory lock (std `File::try_lock`, stable since Rust
+1.89) on the mailbox root at startup; a second `serve` on the same root exits
+non-zero rather than running concurrently. This is what makes reclaim safe —
+reclaim runs only in the one live instance, so it can never move a `claimed/`
+message another daemon is mid-answer on. The lock is advisory and per-host:
+reliable on a local filesystem, **not** across NFS/network filesystems (a mailbox
+shared between hosts reintroduces the race and is out of scope).
+
+### At-least-once semantics
+
+Processing is **at-least-once**, not exactly-once. An abrupt kill (SIGKILL / OOM
+/ power loss) between answering and marking `done` is safe for *delivery* — the
+message is reclaimed and reprocessed — but that reprocess is a repeat provider
+call and may emit a **second** response envelope. Consumers must therefore
+correlate/dedup on `in_reply_to` / `conversation_id`. Keyed outbox writes shrink
+the common (unconsumed) case to a single file; they do not make it exactly-once.
+
+Out of scope this slice: **graceful signal-clean shutdown** (finish the in-flight
+message on `SIGTERM`, then exit `0`) is tracked separately — the crash-safe FSM
+already guarantees no *loss*, and graceful shutdown is only a reprocess-rate
+optimization on top. There is also no zero-downtime handover: a restart has a
+brief window where the second `serve` is refused until the first exits.
 
 ## Development
 

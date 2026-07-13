@@ -26,13 +26,15 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
-use std::time::Instant;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::config::BatonConfig;
 use crate::converse::{self, Governance, Transcript};
 use crate::error::{BatonError, Result};
 use crate::events::{EventSink, ExchangeEvent, ExchangeMeta, NoopSink, WriterSink, now_ms};
 use crate::log::{self, Exchange};
+use crate::mailbox::Mailbox;
 use crate::message::{MessageEnvelope, MessageKind};
 use crate::model::{AssistantReply, Conversation, Prompt};
 use crate::participant::{LocalParticipant, Participant};
@@ -44,7 +46,11 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] (--seed <text> | --seed-file <path>) [--out <path>] | baton log show|replay [--file <path>] [--index <N>]";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] (--seed <text> | --seed-file <path>) [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] | baton log show|replay [--file <path>] [--index <N>]";
+
+/// Default `baton serve` inbox poll interval, in milliseconds, when `--poll-ms`
+/// is unset.
+const DEFAULT_SERVE_POLL_MS: u64 = 500;
 
 /// The in-session command that ends the REPL cleanly (alongside EOF).
 const SESSION_EXIT_COMMAND: &str = "/exit";
@@ -75,6 +81,15 @@ enum Command {
         b_model: Option<String>,
         seed: SeedSource,
         out_path: Option<String>,
+    },
+    /// Serve a file-mailbox: drain `inbox`'s `pending/` requests through the
+    /// participant seam, writing each reply to `outbox`. `once` drains a single
+    /// pass and exits; otherwise the inbox is polled every `poll_ms`.
+    Serve {
+        inbox: String,
+        outbox: String,
+        poll_ms: u64,
+        once: bool,
     },
     /// Pretty-print the recorded exchange trail.
     LogShow { file: Option<String> },
@@ -170,6 +185,39 @@ pub fn run() -> Result<()> {
             );
             eprintln!("conversation ended: {:?}", transcript.reason);
             write_transcript(&transcript, open_output(out_path.as_deref())?)
+        }
+        Command::Serve {
+            inbox,
+            outbox,
+            poll_ms,
+            once,
+        } => {
+            let config = BatonConfig::from_env()?;
+            let meta = exchange_meta(&config);
+            let mut sink = open_event_sink()?;
+            let client = ClaudeClient::from_config(config);
+            let participant = LocalParticipant::new(client, meta.clone());
+
+            // Lock first, then reclaim: with the single-instance lock held, no
+            // other daemon is mid-answer, so returning abandoned `claimed/`
+            // messages to `pending/` cannot race a concurrent processor.
+            let mailbox = Mailbox::open(&inbox)?;
+            mailbox.reclaim_stale()?;
+            let outbox = Path::new(&outbox);
+
+            let poll = Duration::from_millis(poll_ms);
+            loop {
+                let processed =
+                    drain_mailbox(&mailbox, outbox, &participant, sink.as_mut(), &meta)?;
+                if once {
+                    break;
+                }
+                // Nothing waiting — sleep before the next scan rather than spin.
+                if processed == 0 {
+                    std::thread::sleep(poll);
+                }
+            }
+            Ok(())
         }
         Command::LogShow { file } => {
             let exchanges = read_log(file.as_deref())?;
@@ -330,6 +378,32 @@ fn execute_exchange(
         );
     }
     response
+}
+
+/// Drains every currently-claimable request from `mailbox` through one
+/// participant, writing each reply to `outbox` keyed by the request id, and
+/// returns how many were processed.
+///
+/// Each message runs the same [`execute_exchange`] path as `baton exchange` — so
+/// the response envelope and the `BATON_EVENT_LOG` trail are produced identically
+/// — then advances `claimed → done`. Parameterised over [`Participant`] /
+/// [`EventSink`] so it is unit-testable with fakes and a tempdir mailbox, no
+/// network. A single pass: the caller decides whether to loop.
+fn drain_mailbox(
+    mailbox: &Mailbox,
+    outbox: &Path,
+    participant: &impl Participant,
+    sink: &mut dyn EventSink,
+    meta: &ExchangeMeta,
+) -> Result<usize> {
+    let mut processed = 0;
+    while let Some(claimed) = mailbox.claim_next()? {
+        let response = execute_exchange(participant, sink, meta, &claimed.request);
+        mailbox.deliver_response(outbox, &claimed.key, &response)?;
+        mailbox.complete(claimed)?;
+        processed += 1;
+    }
+    Ok(processed)
 }
 
 /// Opens the exchange request source: `--in <path>` when given, else stdin.
@@ -589,6 +663,7 @@ fn parse_args(args: &[String]) -> Result<Command> {
         "session" => parse_session(iter),
         "exchange" => parse_exchange(iter),
         "converse" => parse_converse(iter),
+        "serve" => parse_serve(iter),
         "log" => parse_log(iter),
         other => Err(usage(&format!("unknown command {other:?}"))),
     }
@@ -821,6 +896,75 @@ fn parse_converse<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comm
         seed,
         out_path,
     })
+}
+
+/// Parses the arguments following the `serve` subcommand.
+///
+/// Requires `--inbox <dir>` and `--outbox <dir>` (both non-blank); accepts an
+/// optional `--poll-ms <n>` (positive integer, default [`DEFAULT_SERVE_POLL_MS`])
+/// and the `--once` flag. Every valued flag also accepts the `--flag=value` form.
+/// A flag without a value, a blank/missing required dir, a non-positive
+/// `--poll-ms`, or any other token is a usage error.
+fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut inbox: Option<String> = None;
+    let mut outbox: Option<String> = None;
+    let mut poll_ms: Option<u64> = None;
+    let mut once = false;
+
+    while let Some(arg) = iter.next() {
+        let mut take = |flag: &str| -> Result<String> {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| usage(&format!("{flag} requires a value")))
+        };
+        match arg.as_str() {
+            "--inbox" => inbox = Some(take("--inbox")?),
+            other if other.starts_with("--inbox=") => {
+                inbox = Some(other["--inbox=".len()..].to_string());
+            }
+            "--outbox" => outbox = Some(take("--outbox")?),
+            other if other.starts_with("--outbox=") => {
+                outbox = Some(other["--outbox=".len()..].to_string());
+            }
+            "--poll-ms" => poll_ms = Some(parse_poll_ms(&take("--poll-ms")?)?),
+            other if other.starts_with("--poll-ms=") => {
+                poll_ms = Some(parse_poll_ms(&other["--poll-ms=".len()..])?);
+            }
+            "--once" => once = true,
+            other => return Err(usage(&format!("unexpected argument {other:?}"))),
+        }
+    }
+
+    let inbox = require_dir(inbox, "--inbox")?;
+    let outbox = require_dir(outbox, "--outbox")?;
+    Ok(Command::Serve {
+        inbox,
+        outbox,
+        poll_ms: poll_ms.unwrap_or(DEFAULT_SERVE_POLL_MS),
+        once,
+    })
+}
+
+/// Requires a non-blank directory value for `flag`.
+fn require_dir(value: Option<String>, flag: &str) -> Result<String> {
+    match value {
+        Some(v) if !v.trim().is_empty() => Ok(v),
+        _ => Err(usage(&format!("{flag} <dir> is required"))),
+    }
+}
+
+/// Parses `--poll-ms`: a positive integer of milliseconds (zero is rejected — a
+/// zero interval would busy-spin the poll loop).
+fn parse_poll_ms(raw: &str) -> Result<u64> {
+    raw.trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|&n| n > 0)
+        .ok_or_else(|| {
+            usage(&format!(
+                "--poll-ms must be a positive integer, got {raw:?}"
+            ))
+        })
 }
 
 /// Builds a usage error carrying `detail` and the one-line usage summary.
@@ -1674,5 +1818,188 @@ mod tests {
 
         let back = read_request_envelope(text.as_bytes()).expect("parses back");
         assert_eq!(back, response);
+    }
+
+    // -- serve / parse_serve ------------------------------------------------
+
+    #[test]
+    fn parse_serve_requires_inbox_and_outbox() {
+        assert_eq!(
+            parse_args(&argv(&["serve", "--inbox=/tmp/in", "--outbox=/tmp/out"])).expect("parses"),
+            Command::Serve {
+                inbox: "/tmp/in".to_string(),
+                outbox: "/tmp/out".to_string(),
+                poll_ms: DEFAULT_SERVE_POLL_MS,
+                once: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_serve_accepts_poll_ms_and_once() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "serve",
+                "--inbox",
+                "/tmp/in",
+                "--outbox",
+                "/tmp/out",
+                "--poll-ms",
+                "50",
+                "--once",
+            ]))
+            .expect("parses"),
+            Command::Serve {
+                inbox: "/tmp/in".to_string(),
+                outbox: "/tmp/out".to_string(),
+                poll_ms: 50,
+                once: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_serve_missing_required_dir_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&["serve", "--outbox=/tmp/out"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+        assert!(matches!(
+            parse_args(&argv(&["serve", "--inbox=/tmp/in"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_serve_blank_dir_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&["serve", "--inbox=  ", "--outbox=/tmp/out"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_serve_non_positive_poll_ms_is_usage_error() {
+        for bad in ["0", "-1", "abc"] {
+            assert!(
+                matches!(
+                    parse_args(&argv(&[
+                        "serve",
+                        "--inbox=/tmp/in",
+                        "--outbox=/tmp/out",
+                        "--poll-ms",
+                        bad
+                    ]))
+                    .unwrap_err(),
+                    BatonError::Usage(_)
+                ),
+                "--poll-ms {bad:?} must be a usage error"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_serve_flag_without_value_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&["serve", "--inbox"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    /// A unique self-cleaning temp dir, mirroring the mailbox unit tests.
+    struct TempRoot {
+        path: std::path::PathBuf,
+    }
+
+    impl TempRoot {
+        fn new(tag: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("baton-serve-{}-{}", std::process::id(), tag));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create temp serve dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn json_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.ends_with(".json"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// End-to-end drain over a real mailbox and the in-process participant: one
+    /// request in `pending/` yields one correlated reply in the outbox keyed by
+    /// the request id, moves the request to `done/`, and a second drain is a
+    /// no-op (dedup). Network-free — `OkTransport` stands in for the provider.
+    #[test]
+    fn drain_mailbox_answers_and_dedups() {
+        let root = TempRoot::new("drain");
+        let inbox = root.path.join("inbox");
+        let outbox = root.path.join("outbox");
+
+        let mailbox = Mailbox::open(&inbox).expect("open mailbox");
+        mailbox.deliver(&request_envelope()).expect("deliver");
+
+        let participant = participant_over(OkTransport::new("four"));
+        let mut sink = NoopSink;
+
+        let n =
+            drain_mailbox(&mailbox, &outbox, &participant, &mut sink, &test_meta()).expect("drain");
+        assert_eq!(n, 1, "one request drained");
+
+        // The reply is keyed by the request id (m-req-1), not the fresh response id.
+        assert_eq!(json_files(&outbox), vec!["m-req-1.json".to_string()]);
+        assert_eq!(
+            json_files(&inbox.join("done")).len(),
+            1,
+            "request completed"
+        );
+        assert!(json_files(&inbox.join("pending")).is_empty());
+
+        // Re-running is a no-op: the id is in `done/`.
+        let n2 = drain_mailbox(&mailbox, &outbox, &participant, &mut sink, &test_meta())
+            .expect("second drain");
+        assert_eq!(n2, 0, "already-done id is not reprocessed");
+    }
+
+    /// A reclaimed in-flight message re-drains to the *same* outbox filename —
+    /// one file, overwritten, not two (the keyed-outbox guarantee end-to-end).
+    #[test]
+    fn drain_mailbox_reprocess_keeps_single_outbox_file() {
+        let root = TempRoot::new("reprocess");
+        let inbox = root.path.join("inbox");
+        let outbox = root.path.join("outbox");
+
+        let mailbox = Mailbox::open(&inbox).expect("open mailbox");
+        let participant = participant_over(OkTransport::new("four"));
+        let mut sink = NoopSink;
+
+        // First delivery + drain writes one reply.
+        mailbox.deliver(&request_envelope()).expect("deliver");
+        drain_mailbox(&mailbox, &outbox, &participant, &mut sink, &test_meta()).expect("drain");
+        assert_eq!(json_files(&outbox).len(), 1);
+
+        // Simulate a reprocess: re-deliver the same request id and drain again.
+        // (A real reclaim moves `claimed/ → pending/`; re-delivery is the same
+        // effect on the outbox key.) It must overwrite, not append.
+        std::fs::remove_file(inbox.join("done").join("m-req-1.json")).expect("clear done");
+        mailbox.deliver(&request_envelope()).expect("re-deliver");
+        drain_mailbox(&mailbox, &outbox, &participant, &mut sink, &test_meta()).expect("re-drain");
+        assert_eq!(
+            json_files(&outbox).len(),
+            1,
+            "keyed by request id ⇒ reprocess overwrites, single outbox file"
+        );
     }
 }
