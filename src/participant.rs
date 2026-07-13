@@ -340,13 +340,36 @@ pub mod testing {
     use std::collections::VecDeque;
 
     use super::Participant;
-    use crate::message::{MessageEnvelope, MessageKind};
+    use crate::log::{Exchange, Outcome, RequestRecord};
+    use crate::message::{MessageEnvelope, MessageKind, WrappedExchange};
+
+    /// Builds a reply correlated to `request` with a deterministic id/timestamp
+    /// (so tests need no wall clock): preserved `conversation_id`, `in_reply_to`
+    /// set, and addressing swapped — the reply is from the request's recipient,
+    /// to its sender. Shared by every fake here so they correlate identically to
+    /// [`super::LocalParticipant`].
+    fn correlated_reply(
+        request: &MessageEnvelope,
+        kind: MessageKind,
+        body: impl Into<String>,
+    ) -> MessageEnvelope {
+        let mut response = MessageEnvelope::new(
+            format!("{}-r-{}", request.conversation_id, request.message_id),
+            request.conversation_id.clone(),
+            request.to.clone(),
+            request.from.clone(),
+            kind,
+            body,
+            request.ts_ms + 1,
+        );
+        response.in_reply_to = Some(request.message_id.clone());
+        response
+    }
 
     /// A [`Participant`] that replies from a scripted queue with no network.
     ///
     /// Each `respond` pops the next scripted body and wraps it in a
-    /// `kind: "response"` envelope correlated to the request (preserved
-    /// `conversation_id`, `in_reply_to` set, addressing swapped). Unlike
+    /// `kind: "response"` envelope correlated to the request. Unlike
     /// [`super::LocalParticipant`] it nests no `baton.exchange/v1` record — it
     /// runs no provider call. An exhausted queue yields a `kind: "error"`
     /// envelope so a driver test sees a well-formed reply rather than a panic.
@@ -365,23 +388,74 @@ pub mod testing {
 
     impl Participant for ScriptedParticipant {
         fn respond(&self, request: &MessageEnvelope) -> MessageEnvelope {
-            let (kind, body) = match self.replies.borrow_mut().pop_front() {
-                Some(body) => (MessageKind::Response, body),
-                None => (MessageKind::Error, "no scripted reply".to_string()),
-            };
-            // Deterministic id/timestamp derived from the request, so tests need
-            // no wall clock.
-            let mut response = MessageEnvelope::new(
-                format!("{}-r-{}", request.conversation_id, request.message_id),
-                request.conversation_id.clone(),
-                request.to.clone(),
-                request.from.clone(),
-                kind,
-                body,
-                request.ts_ms + 1,
-            );
-            response.in_reply_to = Some(request.message_id.clone());
-            response
+            match self.replies.borrow_mut().pop_front() {
+                Some(body) => correlated_reply(request, MessageKind::Response, body),
+                None => correlated_reply(request, MessageKind::Error, "no scripted reply"),
+            }
+        }
+    }
+
+    /// A [`Participant`] that always replies with the same body and never stops
+    /// on its own — the shape a turn-cap guarantee test needs (only the cap can
+    /// end it). Optionally carries nested token usage so a token-budget test can
+    /// accumulate a running total.
+    pub struct LoopingParticipant {
+        body: String,
+        usage: Option<(u64, u64)>,
+    }
+
+    impl LoopingParticipant {
+        /// A looping participant whose replies nest no usage (contribute zero to
+        /// a token budget).
+        pub fn new(body: impl Into<String>) -> Self {
+            Self {
+                body: body.into(),
+                usage: None,
+            }
+        }
+
+        /// A looping participant whose replies nest `(input, output)` token
+        /// usage on a `response_ok` record.
+        pub fn with_usage(body: impl Into<String>, input: u64, output: u64) -> Self {
+            Self {
+                body: body.into(),
+                usage: Some((input, output)),
+            }
+        }
+    }
+
+    impl Participant for LoopingParticipant {
+        fn respond(&self, request: &MessageEnvelope) -> MessageEnvelope {
+            let mut reply = correlated_reply(request, MessageKind::Response, self.body.clone());
+            if let Some((input, output)) = self.usage {
+                reply.exchange = Some(WrappedExchange::new(Exchange {
+                    request: RequestRecord {
+                        ts_ms: request.ts_ms,
+                        model: "fake-model".to_string(),
+                        base_url: "fake-base-url".to_string(),
+                        prompt: request.body.clone(),
+                    },
+                    outcome: Outcome::Ok {
+                        ts_ms: request.ts_ms + 1,
+                        duration_ms: 0,
+                        reply: self.body.clone(),
+                        input_tokens: Some(input),
+                        output_tokens: Some(output),
+                    },
+                }));
+            }
+            reply
+        }
+    }
+
+    /// A [`Participant`] that always emits a `kind: "done"` reply — the
+    /// unilateral-completion terminal condition, unreachable from today's real
+    /// participants (which emit only `response`/`error`).
+    pub struct DoneParticipant;
+
+    impl Participant for DoneParticipant {
+        fn respond(&self, request: &MessageEnvelope) -> MessageEnvelope {
+            correlated_reply(request, MessageKind::Done, "done")
         }
     }
 }

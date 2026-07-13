@@ -1051,6 +1051,153 @@ fn subprocess_participant_round_trips_via_real_binary() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Vertical proof: `baton::converse` driving two *independent OS processes*.
+//
+// The M3c headline. The driver is handed two `SubprocessParticipant`s, each of
+// which spawns a real `baton exchange` child per turn. The two children are
+// pointed at two separate loopback mock servers (`127.0.0.1`, dummy API key),
+// so a bounded conversation runs to a terminal condition with no external
+// network and no in-process trait double — two genuinely independent agents
+// driven over the envelope boundary.
+#[test]
+fn converse_drives_two_independent_processes_to_turn_cap() {
+    use baton::converse::{Governance, TerminalReason, converse};
+    use baton::message::{MessageEnvelope, MessageKind};
+    use baton::participant::SubprocessParticipant;
+
+    // One mock per side; each child talks only to its own mock.
+    let server_a = MockServer::spawn_repeating(200, SUCCESS_BODY);
+    let server_b = MockServer::spawn_repeating(200, SUCCESS_BODY);
+
+    let make = |base_url: &str, model: &'static str| {
+        SubprocessParticipant::new(
+            env!("CARGO_BIN_EXE_baton"),
+            ["exchange"],
+            [
+                ("ANTHROPIC_API_KEY", "test-key"),
+                ("ANTHROPIC_BASE_URL", base_url),
+                ("BATON_MODEL", model),
+                ("BATON_TIMEOUT_SECS", "5"),
+            ],
+            Duration::from_secs(10),
+        )
+    };
+    let participant_a = make(server_a.base_url(), "model-a");
+    let participant_b = make(server_b.base_url(), "model-b");
+
+    let seed = MessageEnvelope::new(
+        "conv-1-m0",
+        "conv-1",
+        "agent-a",
+        "agent-b",
+        MessageKind::Request,
+        "kick off",
+        1_700_000_000_000,
+    );
+
+    // The mock always returns 200, so neither child ever emits done/error; only
+    // the turn-cap can stop the run — the termination guarantee proven across
+    // real process boundaries.
+    let governance = Governance {
+        max_turns: 3,
+        token_budget: None,
+    };
+    let transcript = converse(&participant_a, &participant_b, seed, &governance);
+
+    assert_eq!(transcript.reason, TerminalReason::TurnCap);
+    // Seed + exactly 3 replies.
+    assert_eq!(transcript.trail.len(), 4);
+
+    // Per-turn addressing coherence pinned end-to-end: each reply's `from` names
+    // its actual speaker, alternating B, A, B (a double swap would mislabel it).
+    assert_eq!(transcript.trail[0].from, "agent-a"); // the seed: A asks B
+    assert_eq!(transcript.trail[0].to, "agent-b");
+    assert_eq!(transcript.trail[1].from, "agent-b");
+    assert_eq!(transcript.trail[1].to, "agent-a");
+    assert_eq!(transcript.trail[2].from, "agent-a");
+    assert_eq!(transcript.trail[2].to, "agent-b");
+    assert_eq!(transcript.trail[3].from, "agent-b");
+    assert_eq!(transcript.trail[3].to, "agent-a");
+
+    // Every reply is a well-formed response carrying its child's provider call
+    // in-band, and links to the request it answered.
+    for reply in &transcript.trail[1..] {
+        assert_eq!(reply.kind, MessageKind::Response);
+        assert!(
+            reply.exchange.is_some(),
+            "each reply nests its child's call"
+        );
+        assert!(reply.in_reply_to.is_some(), "each reply links its request");
+        assert_eq!(reply.conversation_id, "conv-1");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `baton converse` end-to-end.
+//
+// The driver logic is unit-tested in `src/converse.rs` and the two-process
+// proof above; this test drives the compiled binary itself — it parses the
+// `converse` command, builds two in-process participants from the environment,
+// runs the governed loop against a repeating loopback mock, and writes the
+// JSONL trail to stdout, ending on the turn-cap.
+// ---------------------------------------------------------------------------
+#[test]
+fn converse_command_writes_jsonl_trail_and_ends_on_turn_cap() {
+    let server = MockServer::spawn_repeating(200, SUCCESS_BODY);
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_baton"));
+    cmd.args(["converse", "--seed", "kick off"]);
+    cmd.env("ANTHROPIC_API_KEY", "test-key");
+    cmd.env("ANTHROPIC_BASE_URL", server.base_url());
+    cmd.env("BATON_MODEL", "claude-test-model");
+    cmd.env("BATON_TIMEOUT_SECS", "5");
+    cmd.env("BATON_MAX_TURNS", "2");
+    cmd.env_remove("ANTHROPIC_AUTH_TOKEN");
+    cmd.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+    cmd.env_remove("BATON_TOKEN_BUDGET");
+    cmd.env_remove("BATON_EVENT_LOG");
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let out = cmd.output().expect("spawn baton converse");
+    assert!(
+        out.status.success(),
+        "converse should exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    // Seed + 2 replies (BATON_MAX_TURNS=2).
+    assert_eq!(lines.len(), 3, "seed + 2 reply turns: {stdout}");
+
+    let seed: serde_json::Value = serde_json::from_str(lines[0]).expect("seed is JSON");
+    assert_eq!(seed["kind"], "request");
+    assert_eq!(seed["from"], "agent-a");
+    assert_eq!(seed["to"], "agent-b");
+    assert_eq!(seed["body"], "kick off");
+
+    // Replies alternate speaker B, A and carry the mock's reply body in-band.
+    let reply1: serde_json::Value = serde_json::from_str(lines[1]).expect("reply is JSON");
+    assert_eq!(reply1["kind"], "response");
+    assert_eq!(reply1["from"], "agent-b");
+    assert_eq!(reply1["to"], "agent-a");
+    assert_eq!(reply1["body"], "hello from the mock server");
+    assert_eq!(reply1["exchange"]["schema"], "baton.exchange/v1");
+
+    let reply2: serde_json::Value = serde_json::from_str(lines[2]).expect("reply is JSON");
+    assert_eq!(reply2["from"], "agent-a");
+    assert_eq!(reply2["to"], "agent-b");
+
+    // The terminal reason is reported on stderr.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("TurnCap"),
+        "stderr names the terminal reason: {stderr}"
+    );
+}
+
 /// A truncated trailing line (no terminating newline — what a killed
 /// `baton ask`/`session` leaves behind) does not brick `baton log show`: every
 /// complete exchange before it is rendered, exit is 0, and a stderr warning

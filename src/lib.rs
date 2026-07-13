@@ -5,6 +5,7 @@
 //! tickets extend it rather than rework it:
 //!
 //! - [`config`] — environment-backed runtime configuration.
+//! - [`converse`] — the governed two-participant conversation driver.
 //! - [`model`] — typed prompt/reply structures.
 //! - [`transport`] — the provider transport boundary.
 //! - [`events`] — structured JSONL recording of each exchange.
@@ -16,6 +17,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod converse;
 pub mod error;
 pub mod events;
 pub mod log;
