@@ -237,6 +237,78 @@ of a `baton ask`/`session` process killed mid-write), which is skipped with a
 stderr warning so one unclean shutdown can't brick the whole trail. Diffing,
 filtering, and non-JSONL export remain out of scope.
 
+## A2A message envelope (`baton.message/v1`)
+
+Where `baton.exchange/v1` (above) describes a single provider *call*,
+`baton.message/v1` describes an agent-to-agent *peer message* — the lingua franca
+the exchange verb and driver share. It is a contract only: the envelope types
+carry no transport, I/O, or addressing semantics.
+
+An envelope carries a `schema` discriminator (`baton.message/v1`), a
+`message_id`, the `conversation_id` it belongs to, `from` / `to` addresses, a
+nullable `in_reply_to` linking it to the message it answers, a `kind`, a `body`,
+and a `ts_ms` wall-clock timestamp (Unix epoch milliseconds).
+
+| Field           | Type              | Meaning                                                        |
+| --------------- | ----------------- | -------------------------------------------------------------- |
+| `schema`        | string            | Discriminator, `baton.message/v1`.                             |
+| `message_id`    | string            | Unique id of this message.                                     |
+| `conversation_id` | string          | The conversation this message belongs to.                      |
+| `from` / `to`   | string            | Sender / recipient address.                                    |
+| `in_reply_to`   | string \| null    | The `message_id` this replies to, or `null`.                   |
+| `kind`          | string            | One of `request`, `response`, `done`, `error` (see below).     |
+| `body`          | string            | The message body.                                              |
+| `ts_ms`         | number            | Emission time, Unix epoch milliseconds.                        |
+| `exchange`      | object \| null    | The wrapped provider call, or `null` (see nesting below).      |
+
+`kind` is one of four variants: `request` (asks the peer to act), `response`
+(answers a prior `request`), and the terminal markers `done` (turn complete) and
+`error` (turn failed). (`notify` is intentionally not part of this slice; the
+unknown-field skip below lets it be added later without a schema break.)
+
+### Nesting over `baton.exchange/v1`
+
+The envelope is nested **over** the exchange trail: one peer message may wrap
+zero-or-one provider-call record. A message that triggered an LLM call carries
+the resulting exchange under `exchange`, a self-describing object pairing the
+`baton.exchange/v1` discriminator with that call's `request` and terminal
+`outcome`; a message that triggered no call leaves `exchange` as `null`.
+
+```json
+{
+  "schema": "baton.message/v1",
+  "message_id": "m-1",
+  "conversation_id": "c-1",
+  "from": "agent-a",
+  "to": "agent-b",
+  "in_reply_to": null,
+  "kind": "response",
+  "body": "France.",
+  "ts_ms": 1700000000420,
+  "exchange": {
+    "schema": "baton.exchange/v1",
+    "exchange": {
+      "request": {
+        "ts_ms": 1700000000000,
+        "model": "claude-sonnet-4-6",
+        "base_url": "https://api.anthropic.com",
+        "prompt": "who won the 1998 world cup?"
+      },
+      "outcome": {
+        "event": "response_ok",
+        "ts_ms": 1700000000420,
+        "duration_ms": 418,
+        "reply": "France."
+      }
+    }
+  }
+}
+```
+
+The nested `outcome` uses the same `event` tags as the exchange trail
+(`response_ok` / `response_error`). As with that trail, unknown/extra fields are
+skipped on read (forward-compatibility) rather than treated as errors.
+
 ## Development
 
 CI runs the following gates; run them locally before opening a PR:
