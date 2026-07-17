@@ -1,14 +1,30 @@
-//! The conversation driver: alternate two participants to a terminal condition.
+//! The conversation driver: sequence a ring of N ≥ 2 participants to a terminal
+//! condition.
 //!
 //! Where [`crate::participant`] answers *one* envelope, this module sustains a
-//! *bounded, governed* exchange between two [`Participant`]s. Given a seed
-//! request, [`converse`] alternates turns — each reply's body becomes the next
-//! participant's request — recording every turn as a `baton.message/v1`
-//! [`MessageEnvelope`] until the first terminal condition trips.
+//! *bounded, governed* exchange among participants. Given a seed request,
+//! [`converse_ring`] takes turns around a fixed ring in **driver-decided**
+//! round-robin order — each reply's body becomes the next member's request —
+//! recording every turn as a `baton.message/v1` [`MessageEnvelope`] until the
+//! first terminal condition trips. [`converse`] is the two-party case, preserved
+//! as a named entry point.
 //!
-//! Termination is guaranteed: the turn-cap is always enforced, so even two
-//! participants that would loop forever stop. The other conditions
-//! ([`TerminalReason`]) end the run earlier when they apply.
+//! The driver — not any participant — chooses who speaks next: turns advance by
+//! ring position, never by a reply's addressing. This is deliberate; the
+//! participant seam cannot express third-party routing (a reply's `to` is
+//! hardcoded to its asker), so round-robin is the only ordering the current
+//! contract can honor. Governance authority stays in one place: one linear
+//! trail, one authoritative turn counter.
+//!
+//! **Context semantic (relay chain, not shared transcript):** each turn's request
+//! body is only its *immediate predecessor's* reply body — turn N sees turn N-1's
+//! body, not the whole trail. Participants are stateless across turns; the
+//! envelope is the entire boundary. Full-transcript / shared-context propagation
+//! is a non-goal.
+//!
+//! Termination is guaranteed: the turn-cap is always enforced across all N
+//! speakers, so even participants that would loop forever stop. The other
+//! conditions ([`TerminalReason`]) end the run earlier when they apply.
 //!
 //! The driver depends only on the [`Participant`] trait, so the same code drives
 //! in-process participants (the `baton converse` verb) or independent OS
@@ -112,32 +128,72 @@ pub struct Transcript {
     pub reason: TerminalReason,
 }
 
-/// Alternates `a` and `b` from `seed` until the first terminal condition trips.
+/// A named participant in a conversation ring.
 ///
-/// `seed` is participant A's opening request, addressed to B, so B replies
-/// first, then A, alternating. Each reply is appended to the trail; the next
-/// request reuses the reply's `from`/`to` **verbatim** (the participant already
-/// swapped addressing on its reply, so the driver must not swap again — a double
-/// swap would mislabel each reply's speaker) and only flips the kind to
-/// `request`.
+/// `name` is the participant's envelope address: the value the driver writes to a
+/// request's `to` when it is this member's turn, which the member's reply then
+/// carries back as its `from` (the participant swaps addressing on reply, see
+/// [`crate::participant`]). Ring order is the slice order.
+pub struct RingMember<'a> {
+    /// The participant's address (envelope `from`/`to`).
+    pub name: String,
+    /// The participant that answers on this member's turn.
+    pub participant: &'a dyn Participant,
+}
+
+impl<'a> RingMember<'a> {
+    /// Pairs a name with the participant that answers under it.
+    pub fn new(name: impl Into<String>, participant: &'a dyn Participant) -> Self {
+        Self {
+            name: name.into(),
+            participant,
+        }
+    }
+}
+
+/// Drives `ring` (N ≥ 2 participants) in fixed round-robin order from `seed`
+/// until the first terminal condition trips.
+///
+/// `seed` is addressed to `ring[1]`, so `ring[1]` answers first, then `ring[2]`,
+/// … wrapping past `ring[0]`. The driver decides the next speaker purely by ring
+/// position (`(idx + 1) % ring.len()`), independent of a reply's addressing. Each
+/// reply is recorded verbatim: its `from` — set by the participant's own
+/// addressing swap — is the authoritative speaker, which the driver never
+/// re-derives. The next request reuses that `from` as its sender and sets its
+/// recipient to the next ring member *by position* (see [`next_ring_request`]),
+/// never the reply's `to`; a driver-side re-swap here would silently mislabel
+/// every speaker while the termination tests still passed (the double-swap trap).
 ///
 /// Terminal checks, per reply, in order: a `done` reply ends the run; an `error`
-/// reply is recorded and ends it; the accumulated nested token usage ending it
-/// once it exceeds `governance.token_budget`; otherwise the run ends when the
-/// recorded reply count reaches `governance.max_turns`. A reply carrying no
-/// nested usage (a fake, or a synthesized machinery error) contributes zero, so
-/// with usage absent the run still terminates on the turn-cap.
-pub fn converse(
-    a: &dyn Participant,
-    b: &dyn Participant,
+/// reply is recorded and ends it; accumulated nested token usage ends it once it
+/// exceeds `governance.token_budget`; otherwise the run ends when the recorded
+/// reply count reaches `governance.max_turns` (always enforced, across all N
+/// speakers on the one counter). A reply carrying no nested usage contributes
+/// zero, so with usage absent the run still terminates on the turn-cap.
+///
+/// A ring of fewer than two members has no peer to converse with. Rosters are
+/// validated upstream (the routing registry rejects an unknown name); this guards
+/// the driver against a degenerate ring by ending immediately with
+/// [`TerminalReason::Error`], recording nothing beyond the seed, rather than
+/// indexing out of bounds.
+pub fn converse_ring(
+    ring: &[RingMember],
     seed: MessageEnvelope,
     governance: &Governance,
 ) -> Transcript {
     let mut trail = vec![seed.clone()];
+
+    if ring.len() < 2 {
+        return Transcript {
+            trail,
+            reason: TerminalReason::Error,
+        };
+    }
+
     let mut request = seed;
-    // The seed is addressed to B, so B is the first responder; the two then
-    // alternate.
-    let mut responder_is_b = true;
+    // The seed is addressed to ring[1], so ring[1] is the first responder; turns
+    // then advance around the ring by position.
+    let mut next_idx = 1usize;
     let mut turns = 0usize;
     let mut token_total: u64 = 0;
 
@@ -146,8 +202,7 @@ pub fn converse(
             break TerminalReason::TurnCap;
         }
 
-        let responder: &dyn Participant = if responder_is_b { b } else { a };
-        let reply = responder.respond(&request);
+        let reply = ring[next_idx].participant.respond(&request);
         turns += 1;
         trail.push(reply.clone());
 
@@ -164,11 +219,32 @@ pub fn converse(
             }
         }
 
-        request = next_request(&reply);
-        responder_is_b = !responder_is_b;
+        next_idx = (next_idx + 1) % ring.len();
+        request = next_ring_request(&reply, &ring[next_idx].name);
     };
 
     Transcript { trail, reason }
+}
+
+/// Alternates `a` and `b` from `seed` until the first terminal condition trips —
+/// the two-party case of [`converse_ring`], preserved as a named entry point.
+///
+/// `seed` is participant A's opening request, addressed to B, so B replies first,
+/// then A, alternating. This is exactly a ring of `[a, b]` named by the seed's
+/// `from`/`to`, so the trail — including addressing — is identical to driving the
+/// two directly. (In a two-member ring the "next member" is always the prior
+/// asker, so the round-robin recipient choice reproduces the old verbatim reuse.)
+pub fn converse(
+    a: &dyn Participant,
+    b: &dyn Participant,
+    seed: MessageEnvelope,
+    governance: &Governance,
+) -> Transcript {
+    let ring = [
+        RingMember::new(seed.from.clone(), a),
+        RingMember::new(seed.to.clone(), b),
+    ];
+    converse_ring(&ring, seed, governance)
 }
 
 /// Sums a reply's nested provider usage (input + output tokens), treating an
@@ -189,15 +265,20 @@ fn reply_tokens(reply: &MessageEnvelope) -> u64 {
     }
 }
 
-/// Builds the next request from a reply: same conversation, addressing reused
-/// as-is (the participant already swapped it), `in_reply_to` linked, and the
-/// kind flipped to `request` so the peer answers it.
-fn next_request(reply: &MessageEnvelope) -> MessageEnvelope {
+/// Builds the next request from a reply and the next ring member's name: same
+/// conversation, `in_reply_to` linked, kind flipped to `request`, sender =
+/// `reply.from` (the speaker who just replied — authoritative, never re-derived),
+/// and recipient = `next_name` (the driver's ring choice, **not** `reply.to`).
+/// Choosing the recipient by ring position is what lets the conversation reach a
+/// third party; reusing `reply.to` would ping-pong between the two most-recent
+/// speakers. For a two-member ring the next member *is* the prior asker, so this
+/// reproduces the two-party addressing exactly.
+fn next_ring_request(reply: &MessageEnvelope, next_name: &str) -> MessageEnvelope {
     let mut request = MessageEnvelope::new(
         format!("{}-q-{}", reply.conversation_id, reply.message_id),
         reply.conversation_id.clone(),
         reply.from.clone(),
-        reply.to.clone(),
+        next_name.to_string(),
         MessageKind::Request,
         reply.body.clone(),
         reply.ts_ms + 1,
@@ -281,6 +362,83 @@ mod tests {
         assert_eq!(transcript.trail[3].to, "agent-a");
         // Each reply links to the request it answered.
         assert!(transcript.trail[1].in_reply_to.is_some());
+    }
+
+    /// A three-party ring speaks in driver-decided round-robin order. The seed
+    /// addresses B, so replies come from B, C, A, B, … Asserting the speaker
+    /// *sequence* — not just the length — is the guard a double addressing-swap
+    /// would break: the driver must pick the next member by ring position, never
+    /// by the reply's `to`. This doubles as the turn-cap guarantee at N (a
+    /// non-stopping ring cut off at exactly `max_turns` replies).
+    #[test]
+    fn ring_speaks_in_round_robin_order() {
+        let a = LoopingParticipant::new("a-says");
+        let b = LoopingParticipant::new("b-says");
+        let c = LoopingParticipant::new("c-says");
+        let ring = [
+            RingMember::new("agent-a", &a),
+            RingMember::new("agent-b", &b),
+            RingMember::new("agent-c", &c),
+        ];
+
+        let transcript = converse_ring(&ring, seed(), &gov(6, None));
+
+        assert_eq!(transcript.reason, TerminalReason::TurnCap);
+        // Seed + exactly 6 replies.
+        assert_eq!(transcript.trail.len(), 7);
+        // trail[0] is the seed: A asks B.
+        assert_eq!(transcript.trail[0].from, "agent-a");
+        assert_eq!(transcript.trail[0].to, "agent-b");
+        // Replies cycle B, C, A, B, C, A in ring order.
+        let speakers: Vec<&str> = transcript.trail[1..]
+            .iter()
+            .map(|m| m.from.as_str())
+            .collect();
+        assert_eq!(
+            speakers,
+            [
+                "agent-b", "agent-c", "agent-a", "agent-b", "agent-c", "agent-a"
+            ]
+        );
+        // The first reply answers the seed's asker (A); addressing stays coherent.
+        assert_eq!(transcript.trail[1].to, "agent-a");
+    }
+
+    /// A `done` reply ends an N-party run before the cap, recorded as the
+    /// terminal turn — the terminal conditions are counter-level, not
+    /// two-party-specific.
+    #[test]
+    fn ring_done_reply_ends_conversation() {
+        // Seed addresses B (loops); C emits done on turn 2.
+        let a = LoopingParticipant::new("a-says");
+        let b = LoopingParticipant::new("b-says");
+        let c = DoneParticipant;
+        let ring = [
+            RingMember::new("agent-a", &a),
+            RingMember::new("agent-b", &b),
+            RingMember::new("agent-c", &c),
+        ];
+
+        let transcript = converse_ring(&ring, seed(), &gov(8, None));
+
+        assert_eq!(transcript.reason, TerminalReason::Done);
+        // Seed, B's reply, C's done.
+        assert_eq!(transcript.trail.len(), 3);
+        assert_eq!(transcript.trail.last().unwrap().kind, MessageKind::Done);
+    }
+
+    /// A ring with fewer than two members has no peer to converse with: the
+    /// driver ends immediately with `Error`, recording nothing beyond the seed
+    /// and calling no participant.
+    #[test]
+    fn ring_below_two_members_ends_immediately() {
+        let a = LoopingParticipant::new("a-says");
+        let ring = [RingMember::new("agent-a", &a)];
+
+        let transcript = converse_ring(&ring, seed(), &gov(8, None));
+
+        assert_eq!(transcript.reason, TerminalReason::Error);
+        assert_eq!(transcript.trail.len(), 1); // seed only
     }
 
     /// A `done` reply ends the run before the caps, recorded as the terminal
