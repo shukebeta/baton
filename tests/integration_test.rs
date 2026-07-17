@@ -1521,3 +1521,92 @@ fn converse_b_mailbox_times_out_when_no_peer_answers() {
         "stderr names the terminal reason: {stderr}"
     );
 }
+
+/// The operator quickstart (`scripts/quickstart.sh`) runs the full A2A loop
+/// against the loopback mock — no network, no credential — and exits 0 having
+/// written both trails. This keeps the shipped demo artifact CI-covered.
+///
+/// The mock lives under `examples/`, for which cargo exposes no
+/// `CARGO_BIN_EXE_*`; the test builds it explicitly and derives its path from
+/// the `baton` bin's directory, so the run never depends on cargo's example
+/// build-ordering.
+#[test]
+fn quickstart_script_runs_full_loop_against_mock() {
+    // Build the mock example explicitly (idempotent / cached) so its compiled
+    // path is guaranteed present before the script runs.
+    let cargo = option_env!("CARGO").unwrap_or("cargo");
+    let built = Command::new(cargo)
+        .args(["build", "--example", "mock_provider"])
+        .status()
+        .expect("build mock_provider example");
+    assert!(built.success(), "mock_provider example builds");
+
+    let baton_bin = PathBuf::from(env!("CARGO_BIN_EXE_baton"));
+    // `<target>/<profile>/baton` -> `<target>/<profile>/examples/mock_provider`.
+    let mock_bin = baton_bin
+        .parent()
+        .expect("baton bin has a parent dir")
+        .join("examples")
+        .join("mock_provider");
+    assert!(mock_bin.exists(), "mock_provider at {}", mock_bin.display());
+
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("quickstart.sh");
+
+    let out_dir = std::env::temp_dir().join(format!("baton-quickstart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out_dir);
+
+    // The script configures its own provider env; strip any host leakage so the
+    // run is deterministic regardless of the developer's shell.
+    let out = Command::new("bash")
+        .arg(&script)
+        .env("BATON_BIN", &baton_bin)
+        .env("BATON_MOCK_BIN", &mock_bin)
+        .env("QUICKSTART_OUT", &out_dir)
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env_remove("ANTHROPIC_BASE_URL")
+        .env_remove("BATON_EVENT_LOG")
+        .output()
+        .expect("run quickstart.sh");
+
+    assert!(
+        out.status.success(),
+        "quickstart.sh exits 0; stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // Both trails exist, are non-empty, and the printed paths name them.
+    let converse_trail = out_dir.join("converse-trail.jsonl");
+    let reply_trail = out_dir.join("serve-send-reply.jsonl");
+    for trail in [&converse_trail, &reply_trail] {
+        let bytes =
+            std::fs::read(trail).unwrap_or_else(|e| panic!("read {}: {e}", trail.display()));
+        assert!(!bytes.is_empty(), "{} is non-empty", trail.display());
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(converse_trail.to_str().unwrap()),
+        "stdout names the converse trail path: {stdout}"
+    );
+    assert!(
+        stdout.contains(reply_trail.to_str().unwrap()),
+        "stdout names the serve+send reply path: {stdout}"
+    );
+
+    // The consumed reply is a well-formed, correlated response envelope.
+    let reply_line = std::fs::read_to_string(&reply_trail).expect("read reply trail");
+    let reply: serde_json::Value =
+        serde_json::from_str(reply_line.trim()).expect("reply is one JSON line");
+    assert_eq!(reply["kind"], "response");
+    assert!(
+        reply["in_reply_to"].is_string(),
+        "the consumed reply correlates to the sent request"
+    );
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
