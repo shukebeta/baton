@@ -30,7 +30,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::config::BatonConfig;
-use crate::converse::{self, Governance, Transcript};
+use crate::converse::{self, Governance, RingMember, Transcript};
 use crate::error::{BatonError, Result};
 use crate::events::{EventSink, ExchangeEvent, ExchangeMeta, NoopSink, WriterSink, now_ms};
 use crate::log::{self, Exchange};
@@ -38,6 +38,7 @@ use crate::mailbox::{self, Mailbox};
 use crate::message::{MessageEnvelope, MessageKind};
 use crate::model::{AssistantReply, Conversation, Prompt};
 use crate::participant::{LocalParticipant, MailboxParticipant, Participant};
+use crate::registry::Registry;
 use crate::transport::Transport;
 use crate::transport::claude::ClaudeClient;
 
@@ -46,7 +47,7 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] | baton serve --stop --inbox <dir> | baton send --inbox <dir> (--body <text> | --in <path>) [--to <id>] [--from <id>] [--conversation <id>] [--await --outbox <dir> [--timeout-ms <n>]] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>...";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] | baton serve --stop --inbox <dir> | baton send --inbox <dir> (--body <text> | --in <path>) [--to <id>] [--from <id>] [--conversation <id>] [--await --outbox <dir> [--timeout-ms <n>]] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>...";
 
 /// Default `baton serve` inbox poll interval, in milliseconds, when `--poll-ms`
 /// is unset.
@@ -103,6 +104,22 @@ enum Command {
         b_outbox: Option<String>,
         b_await_ms: u64,
         seed: SeedSource,
+        out_path: Option<String>,
+    },
+    /// Drive an N-party (N ≥ 2) round-robin ring whose members are all remote
+    /// mailbox peers. `registry` is a JSON file mapping each participant name to
+    /// its `{inbox, outbox}` pair; `roster` is the ring order (comma-separated on
+    /// the command line). Every roster name is resolved against the registry at
+    /// startup — an unknown name is a fail-fast error before any turn runs — and
+    /// each becomes a [`MailboxParticipant`] awaiting replies for `await_ms`. The
+    /// seed is addressed from `roster[0]` to `roster[1]`, so `roster[1]` answers
+    /// first (see [`converse::converse_ring`]). The full trail is written as JSONL
+    /// to `out_path` (stdout when `None`).
+    ConverseRing {
+        registry: String,
+        roster: Vec<String>,
+        seed: SeedSource,
+        await_ms: u64,
         out_path: Option<String>,
     },
     /// Serve a file-mailbox: drain `inbox`'s `pending/` requests through the
@@ -262,6 +279,47 @@ pub fn run() -> Result<()> {
                 build_seed_envelope(&seed_body),
                 &governance,
             );
+            eprintln!("conversation ended: {:?}", transcript.reason);
+            write_transcript(&transcript, open_output(out_path.as_deref())?)
+        }
+        Command::ConverseRing {
+            registry,
+            roster,
+            seed,
+            await_ms,
+            out_path,
+        } => {
+            let governance = Governance::from_lookup(|key| std::env::var(key).ok())?;
+            let seed_body = resolve_seed(&seed)?;
+
+            // Load the registry once at startup and resolve every roster name up
+            // front, so an unroutable name fails before any turn runs. All ring
+            // members are remote mailbox peers (a `baton serve` daemon each); the
+            // driver holds no local participant and runs no provider call itself.
+            let registry = Registry::from_path(Path::new(&registry))?;
+            let await_timeout = Duration::from_millis(await_ms);
+            let poll = Duration::from_millis(SEND_POLL_INTERVAL_MS);
+            let participants = roster
+                .iter()
+                .map(|name| {
+                    let mailbox = registry.resolve(name)?;
+                    Ok(MailboxParticipant::new(
+                        mailbox.inbox.clone(),
+                        mailbox.outbox.clone(),
+                        await_timeout,
+                        poll,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let ring: Vec<RingMember> = roster
+                .iter()
+                .zip(&participants)
+                .map(|(name, participant)| RingMember::new(name.clone(), participant))
+                .collect();
+
+            // Seed is addressed roster[0] -> roster[1]; guaranteed ≥2 by the parser.
+            let seed_envelope = build_ring_seed_envelope(&seed_body, &roster[0], &roster[1]);
+            let transcript = converse::converse_ring(&ring, seed_envelope, &governance);
             eprintln!("conversation ended: {:?}", transcript.reason);
             write_transcript(&transcript, open_output(out_path.as_deref())?)
         }
@@ -817,14 +875,22 @@ fn participant_config(
 /// source; `baton.message/v1` places no format constraint on them beyond
 /// uniqueness.
 fn build_seed_envelope(body: &str) -> MessageEnvelope {
+    build_ring_seed_envelope(body, "agent-a", "agent-b")
+}
+
+/// Builds the seed request envelope for an N-party ring: `from`'s opening message
+/// addressed to `to` (the first responder). Ids are derived from the emission
+/// time, exactly as [`build_seed_envelope`]; the only difference is that the ring
+/// names the two endpoints explicitly rather than defaulting to `agent-a`/`agent-b`.
+fn build_ring_seed_envelope(body: &str, from: &str, to: &str) -> MessageEnvelope {
     let ts_ms = now_ms();
     let conversation_id = format!("conv-{ts_ms}");
     let message_id = format!("{conversation_id}-m0");
     MessageEnvelope::new(
         message_id,
         conversation_id,
-        "agent-a",
-        "agent-b",
+        from,
+        to,
         MessageKind::Request,
         body,
         ts_ms,
@@ -987,6 +1053,7 @@ fn parse_args(args: &[String]) -> Result<Command> {
         "session" => parse_session(iter),
         "exchange" => parse_exchange(iter),
         "converse" => parse_converse(iter),
+        "converse-ring" => parse_converse_ring(iter),
         "serve" => parse_serve(iter),
         "send" => parse_send(iter),
         "log" => parse_log(iter),
@@ -1313,6 +1380,110 @@ fn parse_converse<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comm
         seed,
         out_path,
     })
+}
+
+/// Parses the arguments following the `converse-ring` subcommand.
+///
+/// Requires `--registry <path>` and `--roster <a,b,c>` (comma-separated, ≥2
+/// members, trimmed, no blank and no duplicate names), plus exactly one of
+/// `--seed <text>` / `--seed-file <path>`. Accepts an optional `--await-ms <n>`
+/// (positive integer, default [`DEFAULT_CONVERSE_AWAIT_MS`]) and `--out <path>`.
+/// Every flag also accepts the `--flag=value` form. A flag without a value, both
+/// seed forms together, a missing required flag, a roster with fewer than two
+/// distinct members, or any other token is a usage error.
+fn parse_converse_ring<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut registry: Option<String> = None;
+    let mut roster_raw: Option<String> = None;
+    let mut await_ms: Option<u64> = None;
+    let mut out_path: Option<String> = None;
+    let mut seed_text: Option<String> = None;
+    let mut seed_file: Option<String> = None;
+
+    while let Some(arg) = iter.next() {
+        let mut take = |flag: &str| -> Result<String> {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| usage(&format!("{flag} requires a value")))
+        };
+        match arg.as_str() {
+            "--registry" => registry = Some(take("--registry")?),
+            other if other.starts_with("--registry=") => {
+                registry = Some(other["--registry=".len()..].to_string());
+            }
+            "--roster" => roster_raw = Some(take("--roster")?),
+            other if other.starts_with("--roster=") => {
+                roster_raw = Some(other["--roster=".len()..].to_string());
+            }
+            "--await-ms" => await_ms = Some(parse_timeout_ms(&take("--await-ms")?)?),
+            other if other.starts_with("--await-ms=") => {
+                await_ms = Some(parse_timeout_ms(&other["--await-ms=".len()..])?);
+            }
+            "--seed" => seed_text = Some(take("--seed")?),
+            other if other.starts_with("--seed=") => {
+                seed_text = Some(other["--seed=".len()..].to_string());
+            }
+            "--seed-file" => seed_file = Some(take("--seed-file")?),
+            other if other.starts_with("--seed-file=") => {
+                seed_file = Some(other["--seed-file=".len()..].to_string());
+            }
+            "--out" => out_path = Some(take("--out")?),
+            other if other.starts_with("--out=") => {
+                out_path = Some(other["--out=".len()..].to_string());
+            }
+            other => return Err(usage(&format!("unexpected argument {other:?}"))),
+        }
+    }
+
+    let registry = match registry {
+        Some(path) if !path.trim().is_empty() => path,
+        _ => return Err(usage("--registry <path> is required")),
+    };
+    let roster = parse_roster(roster_raw.as_deref())?;
+
+    let seed = match (seed_text, seed_file) {
+        (Some(_), Some(_)) => {
+            return Err(usage("--seed and --seed-file are mutually exclusive"));
+        }
+        (Some(text), None) => SeedSource::Text(text),
+        (None, Some(path)) => SeedSource::File(path),
+        (None, None) => {
+            return Err(usage(
+                "missing seed: pass --seed <text> or --seed-file <path>",
+            ));
+        }
+    };
+
+    Ok(Command::ConverseRing {
+        registry,
+        roster,
+        seed,
+        await_ms: await_ms.unwrap_or(DEFAULT_CONVERSE_AWAIT_MS),
+        out_path,
+    })
+}
+
+/// Parses `--roster`: a comma-separated list of participant names in ring order.
+///
+/// Each name is trimmed; an empty name is rejected. The ring needs at least two
+/// members to have a peer to converse with, and a duplicated name would give one
+/// participant two ring positions, so both are usage errors.
+fn parse_roster(raw: Option<&str>) -> Result<Vec<String>> {
+    let raw = raw.ok_or_else(|| usage("--roster <a,b,c> is required"))?;
+    let mut names = Vec::new();
+    for part in raw.split(',') {
+        let name = part.trim();
+        if name.is_empty() {
+            return Err(usage("--roster names must not be empty"));
+        }
+        if names.iter().any(|existing: &String| existing == name) {
+            return Err(usage(&format!("--roster has a duplicate name: {name:?}")));
+        }
+        names.push(name.to_string());
+    }
+    if names.len() < 2 {
+        return Err(usage("--roster needs at least two participants"));
+    }
+    Ok(names)
 }
 
 /// Parses the arguments following the `serve` subcommand.
@@ -2415,6 +2586,147 @@ mod tests {
             parse_args(&argv(&["converse", "--who"])).unwrap_err(),
             BatonError::Usage(_)
         ));
+    }
+
+    // -- baton converse-ring -----------------------------------------------
+
+    #[test]
+    fn parses_converse_ring_with_defaults() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "converse-ring",
+                "--registry",
+                "/tmp/reg.json",
+                "--roster",
+                "alice,bob,carol",
+                "--seed",
+                "hello",
+            ]))
+            .expect("parses"),
+            Command::ConverseRing {
+                registry: "/tmp/reg.json".to_string(),
+                roster: vec!["alice".to_string(), "bob".to_string(), "carol".to_string(),],
+                seed: SeedSource::Text("hello".to_string()),
+                await_ms: DEFAULT_CONVERSE_AWAIT_MS,
+                out_path: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_converse_ring_with_all_flags_and_equals_forms() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "converse-ring",
+                "--registry=/tmp/reg.json",
+                "--roster= alice , bob ",
+                "--await-ms=90000",
+                "--seed-file",
+                "/tmp/seed.txt",
+                "--out=/tmp/trail.jsonl",
+            ]))
+            .expect("parses"),
+            Command::ConverseRing {
+                registry: "/tmp/reg.json".to_string(),
+                roster: vec!["alice".to_string(), "bob".to_string()],
+                seed: SeedSource::File("/tmp/seed.txt".to_string()),
+                await_ms: 90_000,
+                out_path: Some("/tmp/trail.jsonl".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn converse_ring_incoherent_combinations_are_usage_errors() {
+        let cases: &[&[&str]] = &[
+            // Missing --registry.
+            &["converse-ring", "--roster", "a,b", "--seed", "hi"],
+            // Blank --registry.
+            &[
+                "converse-ring",
+                "--registry",
+                "   ",
+                "--roster",
+                "a,b",
+                "--seed",
+                "hi",
+            ],
+            // Missing --roster.
+            &["converse-ring", "--registry", "/r", "--seed", "hi"],
+            // Roster with a single member.
+            &[
+                "converse-ring",
+                "--registry",
+                "/r",
+                "--roster",
+                "solo",
+                "--seed",
+                "hi",
+            ],
+            // Roster with a blank name.
+            &[
+                "converse-ring",
+                "--registry",
+                "/r",
+                "--roster",
+                "a,,b",
+                "--seed",
+                "hi",
+            ],
+            // Roster with a duplicate name.
+            &[
+                "converse-ring",
+                "--registry",
+                "/r",
+                "--roster",
+                "a,b,a",
+                "--seed",
+                "hi",
+            ],
+            // Missing seed.
+            &["converse-ring", "--registry", "/r", "--roster", "a,b"],
+            // Both seed forms.
+            &[
+                "converse-ring",
+                "--registry",
+                "/r",
+                "--roster",
+                "a,b",
+                "--seed",
+                "hi",
+                "--seed-file",
+                "/s",
+            ],
+            // Flag without a value.
+            &["converse-ring", "--registry"],
+            // Unknown token.
+            &[
+                "converse-ring",
+                "--registry",
+                "/r",
+                "--roster",
+                "a,b",
+                "--seed",
+                "hi",
+                "--who",
+            ],
+        ];
+        for case in cases {
+            assert!(
+                matches!(parse_args(&argv(case)).unwrap_err(), BatonError::Usage(_)),
+                "expected usage error for {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_ring_seed_envelope_names_both_endpoints() {
+        let seed = build_ring_seed_envelope("kick off", "alice", "bob");
+        assert_eq!(seed.kind, MessageKind::Request);
+        assert_eq!(seed.from, "alice");
+        assert_eq!(seed.to, "bob");
+        assert_eq!(seed.body, "kick off");
+        assert!(seed.in_reply_to.is_none());
     }
 
     #[test]

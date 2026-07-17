@@ -26,4 +26,5 @@ pub mod mailbox;
 pub mod message;
 pub mod model;
 pub mod participant;
+pub mod registry;
 pub mod transport;
