@@ -76,6 +76,42 @@ pub enum ExchangeEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         output_tokens: Option<u64>,
     },
+    /// Emitted by `baton send` when a request is delivered into a mailbox.
+    ///
+    /// A mailbox producer runs no provider call, so this records the *delivery*
+    /// (addressing + ids) rather than a request/outcome pair. It rides the same
+    /// [`SCHEMA`] trail as every other event; the read path
+    /// ([`crate::log::parse_jsonl`]) skips its unknown tag, so `log show`/`replay`
+    /// are unaffected.
+    MessageSent {
+        /// Schema discriminator ([`SCHEMA`]).
+        schema: &'static str,
+        /// Wall-clock emission time, Unix epoch milliseconds.
+        ts_ms: u64,
+        /// Id of the delivered message.
+        message_id: String,
+        /// Conversation the message belongs to.
+        conversation_id: String,
+        /// Sender address.
+        from: String,
+        /// Recipient address.
+        to: String,
+    },
+    /// Emitted by `baton send --await` when a correlated reply is consumed
+    /// (renamed out of the outbox). Records the reply's ids for correlation.
+    ReplyConsumed {
+        /// Schema discriminator ([`SCHEMA`]).
+        schema: &'static str,
+        /// Wall-clock emission time, Unix epoch milliseconds.
+        ts_ms: u64,
+        /// Id of the consumed reply message.
+        message_id: String,
+        /// The request `message_id` this reply answers.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        in_reply_to: Option<String>,
+        /// Conversation the reply belongs to.
+        conversation_id: String,
+    },
     /// Emitted when the provider call fails. The failure is recorded explicitly
     /// rather than surfaced only on stderr.
     ResponseError {
@@ -117,6 +153,29 @@ impl ExchangeEvent {
             reply: reply.to_string(),
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
+        }
+    }
+
+    /// Builds the delivery event for a message posted by `baton send`.
+    pub fn message_sent(ts_ms: u64, envelope: &crate::message::MessageEnvelope) -> Self {
+        ExchangeEvent::MessageSent {
+            schema: SCHEMA,
+            ts_ms,
+            message_id: envelope.message_id.clone(),
+            conversation_id: envelope.conversation_id.clone(),
+            from: envelope.from.clone(),
+            to: envelope.to.clone(),
+        }
+    }
+
+    /// Builds the consume event for a reply claimed by `baton send --await`.
+    pub fn reply_consumed(ts_ms: u64, reply: &crate::message::MessageEnvelope) -> Self {
+        ExchangeEvent::ReplyConsumed {
+            schema: SCHEMA,
+            ts_ms,
+            message_id: reply.message_id.clone(),
+            in_reply_to: reply.in_reply_to.clone(),
+            conversation_id: reply.conversation_id.clone(),
         }
     }
 
@@ -288,6 +347,50 @@ mod tests {
         assert_eq!(value["kind"], "auth");
         assert_eq!(value["duration_ms"], 7);
         assert_eq!(value["message"], err.to_string());
+    }
+
+    #[test]
+    fn message_sent_event_serializes_with_addressing_and_ids() {
+        use crate::message::{MessageEnvelope, MessageKind};
+        let env = MessageEnvelope::new(
+            "m-1",
+            "conv-1",
+            "agent-a",
+            "agent-b",
+            MessageKind::Request,
+            "hi",
+            1_700_000_000_000,
+        );
+        let event = ExchangeEvent::message_sent(1_700_000_000_000, &env);
+        let value: Value = serde_json::to_value(&event).expect("serializes");
+        assert_eq!(value["event"], "message_sent");
+        assert_eq!(value["schema"], SCHEMA);
+        assert_eq!(value["message_id"], "m-1");
+        assert_eq!(value["conversation_id"], "conv-1");
+        assert_eq!(value["from"], "agent-a");
+        assert_eq!(value["to"], "agent-b");
+    }
+
+    #[test]
+    fn reply_consumed_event_serializes_with_correlation_ids() {
+        use crate::message::{MessageEnvelope, MessageKind};
+        let mut reply = MessageEnvelope::new(
+            "r-1",
+            "conv-1",
+            "agent-b",
+            "agent-a",
+            MessageKind::Response,
+            "hello",
+            1_700_000_000_001,
+        );
+        reply.in_reply_to = Some("m-1".to_string());
+        let event = ExchangeEvent::reply_consumed(1_700_000_000_001, &reply);
+        let value: Value = serde_json::to_value(&event).expect("serializes");
+        assert_eq!(value["event"], "reply_consumed");
+        assert_eq!(value["schema"], SCHEMA);
+        assert_eq!(value["message_id"], "r-1");
+        assert_eq!(value["in_reply_to"], "m-1");
+        assert_eq!(value["conversation_id"], "conv-1");
     }
 
     #[test]

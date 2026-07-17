@@ -34,7 +34,7 @@ use crate::converse::{self, Governance, Transcript};
 use crate::error::{BatonError, Result};
 use crate::events::{EventSink, ExchangeEvent, ExchangeMeta, NoopSink, WriterSink, now_ms};
 use crate::log::{self, Exchange};
-use crate::mailbox::Mailbox;
+use crate::mailbox::{self, Mailbox};
 use crate::message::{MessageEnvelope, MessageKind};
 use crate::model::{AssistantReply, Conversation, Prompt};
 use crate::participant::{LocalParticipant, Participant};
@@ -46,11 +46,20 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] (--seed <text> | --seed-file <path>) [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] | baton log show|replay [--file <path>] [--index <N>]";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] (--seed <text> | --seed-file <path>) [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] | baton send --inbox <dir> (--body <text> | --in <path>) [--to <id>] [--from <id>] [--conversation <id>] [--await --outbox <dir> [--timeout-ms <n>]] | baton log show|replay [--file <path>] [--index <N>]";
 
 /// Default `baton serve` inbox poll interval, in milliseconds, when `--poll-ms`
 /// is unset.
 const DEFAULT_SERVE_POLL_MS: u64 = 500;
+
+/// Default `baton send --await` timeout, in milliseconds, when `--timeout-ms` is
+/// unset.
+const DEFAULT_SEND_TIMEOUT_MS: u64 = 30_000;
+
+/// Interval between `baton send --await` polls of the outbox, in milliseconds.
+/// Fixed (not user-tunable): the await is bounded by `--timeout-ms`, and a tight
+/// interval keeps a local round-trip responsive without a flag for it.
+const SEND_POLL_INTERVAL_MS: u64 = 50;
 
 /// The in-session command that ends the REPL cleanly (alongside EOF).
 const SESSION_EXIT_COMMAND: &str = "/exit";
@@ -91,6 +100,20 @@ enum Command {
         poll_ms: u64,
         once: bool,
     },
+    /// Post a `baton.message/v1` request into a mailbox's `pending/` (the
+    /// producer over the atomic deliver path), optionally awaiting the correlated
+    /// reply from `outbox`. The message is built from `--body` (+ optional
+    /// addressing) or read whole from `--in`. `await_reply` requires `outbox`.
+    Send {
+        inbox: String,
+        source: SendSource,
+        to: Option<String>,
+        from: Option<String>,
+        conversation: Option<String>,
+        await_reply: bool,
+        outbox: Option<String>,
+        timeout_ms: u64,
+    },
     /// Pretty-print the recorded exchange trail.
     LogShow { file: Option<String> },
     /// Re-run a recorded exchange. `index` is 1-based; `None` ⇒ the last one.
@@ -109,6 +132,17 @@ enum SeedSource {
     Text(String),
     /// `--seed-file <path>`, read at run time.
     File(String),
+}
+
+/// Where a `baton send` message comes from: an inline body (from which a full
+/// envelope is constructed) or a path to a complete `baton.message/v1` envelope.
+/// Resolved to the envelope only in [`run`], keeping [`parse_args`] free of I/O.
+#[derive(Debug, PartialEq, Eq)]
+enum SendSource {
+    /// `--body <text>`: construct a request envelope around this body.
+    Body(String),
+    /// `--in <path>`: read a complete envelope from this path at run time.
+    Envelope(String),
 }
 
 /// Process entry point: parse arguments and dispatch.
@@ -218,6 +252,32 @@ pub fn run() -> Result<()> {
                 }
             }
             Ok(())
+        }
+        Command::Send {
+            inbox,
+            source,
+            to,
+            from,
+            conversation,
+            await_reply,
+            outbox,
+            timeout_ms,
+        } => {
+            // A producer runs no provider call, so `send` needs no credential —
+            // it does not load `BatonConfig`. Only the event sink is wired.
+            let mut sink = open_event_sink()?;
+            let envelope = build_send_envelope(&source, to, from, conversation)?;
+            let stdout = std::io::stdout();
+            execute_send(
+                Path::new(&inbox),
+                outbox.as_deref().map(Path::new),
+                &envelope,
+                await_reply,
+                Duration::from_millis(timeout_ms),
+                Duration::from_millis(SEND_POLL_INTERVAL_MS),
+                sink.as_mut(),
+                stdout.lock(),
+            )
         }
         Command::LogShow { file } => {
             let exchanges = read_log(file.as_deref())?;
@@ -404,6 +464,125 @@ fn drain_mailbox(
         processed += 1;
     }
     Ok(processed)
+}
+
+/// Delivers `envelope` into `inbox`'s `pending/` (lock-free producer), records
+/// the send, and — when `await_reply` — consumes the correlated reply from
+/// `outbox` and writes it to `out`.
+///
+/// The delivery goes through [`mailbox::deliver_to`], which does **not** take the
+/// single-instance lock, so it posts to a mailbox a live `baton serve` owns.
+/// Without `--await`, the sent `message_id` is written to `out` (the command's
+/// result) and the function returns. With `--await`, `out` instead carries the
+/// reply envelope (one JSON line); the `message_id` confirmation goes to stderr
+/// so a consumer piping stdout parses only the reply.
+///
+/// The await is bounded to this single invocation by `timeout`: on expiry the
+/// request stays in the mailbox and this returns an error. A consumed reply must
+/// carry `in_reply_to == message_id`; a mismatch is a hard error, not a silent
+/// accept. At-least-once means a later reclaim-driven second reply reappears as a
+/// fresh outbox file — a subsequent `--await` would consume it, so consumers
+/// dedup on `in_reply_to` / `conversation_id`.
+///
+/// Parameterised over [`EventSink`] / [`Write`] so it is unit-testable with a
+/// tempdir mailbox and no network. `outbox` is `Some` whenever `await_reply` is
+/// set (guaranteed by [`parse_send`]).
+#[allow(clippy::too_many_arguments)]
+fn execute_send(
+    inbox: &Path,
+    outbox: Option<&Path>,
+    envelope: &MessageEnvelope,
+    await_reply: bool,
+    timeout: Duration,
+    poll_interval: Duration,
+    sink: &mut dyn EventSink,
+    mut out: impl Write,
+) -> Result<()> {
+    mailbox::deliver_to(inbox, envelope)?;
+    emit(sink, &ExchangeEvent::message_sent(now_ms(), envelope));
+
+    let Some(outbox) = outbox.filter(|_| await_reply) else {
+        writeln!(out, "{}", envelope.message_id).map_err(io_err)?;
+        return Ok(());
+    };
+
+    eprintln!("sent {} — awaiting reply", envelope.message_id);
+    let reply = await_response(outbox, &envelope.message_id, timeout, poll_interval)?;
+
+    // Correlation check: the consumed reply must answer *this* request.
+    if reply.in_reply_to.as_deref() != Some(envelope.message_id.as_str()) {
+        return Err(BatonError::Io(format!(
+            "consumed reply {:?} has in_reply_to {:?}, expected {:?}",
+            reply.message_id, reply.in_reply_to, envelope.message_id
+        )));
+    }
+
+    emit(sink, &ExchangeEvent::reply_consumed(now_ms(), &reply));
+    write_response_envelope(&reply, out)
+}
+
+/// Polls `outbox` for the reply keyed by `key`, claiming it atomically, until it
+/// appears or `timeout` elapses.
+///
+/// Each poll is a single [`mailbox::try_claim_response`] (an atomic rename that
+/// claims ownership); `Ok(None)` means keep waiting. The reply is checked before
+/// the deadline each iteration, so one that lands exactly at the deadline is
+/// still claimed. On timeout the request is left in the mailbox and a diagnostic
+/// error is returned. The sleep is clamped to the remaining time so a short
+/// timeout is honoured tightly.
+fn await_response(
+    outbox: &Path,
+    key: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<MessageEnvelope> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(reply) = mailbox::try_claim_response(outbox, key)? {
+            return Ok(reply);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(BatonError::Io(format!(
+                "timed out after {}ms awaiting a reply to {key:?}; the request remains in the mailbox",
+                timeout.as_millis()
+            )));
+        }
+        std::thread::sleep(poll_interval.min(remaining));
+    }
+}
+
+/// Resolves the `send` message to deliver: builds a request envelope from
+/// `--body` (with optional addressing overrides), or reads a complete envelope
+/// from `--in`.
+///
+/// The `--body` ids are derived from the emission time plus the process id so a
+/// send needs no external id source and two rapid invocations never collide on a
+/// mailbox filename. For `--in`, the addressing arguments are absent (rejected by
+/// [`parse_send`]), so the envelope is taken verbatim.
+fn build_send_envelope(
+    source: &SendSource,
+    to: Option<String>,
+    from: Option<String>,
+    conversation: Option<String>,
+) -> Result<MessageEnvelope> {
+    match source {
+        SendSource::Body(body) => {
+            let ts_ms = now_ms();
+            let conversation_id = conversation.unwrap_or_else(|| format!("conv-{ts_ms}"));
+            let message_id = format!("{conversation_id}-{ts_ms}-{}", std::process::id());
+            Ok(MessageEnvelope::new(
+                message_id,
+                conversation_id,
+                from.unwrap_or_else(|| "agent-a".to_string()),
+                to.unwrap_or_else(|| "agent-b".to_string()),
+                MessageKind::Request,
+                body.clone(),
+                ts_ms,
+            ))
+        }
+        SendSource::Envelope(path) => read_request_envelope(open_input(Some(path))?),
+    }
 }
 
 /// Opens the exchange request source: `--in <path>` when given, else stdin.
@@ -664,6 +843,7 @@ fn parse_args(args: &[String]) -> Result<Command> {
         "exchange" => parse_exchange(iter),
         "converse" => parse_converse(iter),
         "serve" => parse_serve(iter),
+        "send" => parse_send(iter),
         "log" => parse_log(iter),
         other => Err(usage(&format!("unknown command {other:?}"))),
     }
@@ -943,6 +1123,136 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
         poll_ms: poll_ms.unwrap_or(DEFAULT_SERVE_POLL_MS),
         once,
     })
+}
+
+/// Parses the arguments following the `send` subcommand.
+///
+/// Requires `--inbox <dir>` and exactly one message source (`--body <text>` xor
+/// `--in <path>`). `--to`/`--from`/`--conversation` describe a `--body`-built
+/// message and are rejected alongside `--in` (a full envelope carries its own).
+/// `--await` requires `--outbox <dir>`; `--outbox` and `--timeout-ms` are valid
+/// only with `--await`. Every valued flag also accepts the `--flag=value` form.
+/// A blank body, a missing/blank required dir, a non-positive `--timeout-ms`, or
+/// any other token is a usage error.
+fn parse_send<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut inbox: Option<String> = None;
+    let mut body: Option<String> = None;
+    let mut in_path: Option<String> = None;
+    let mut to: Option<String> = None;
+    let mut from: Option<String> = None;
+    let mut conversation: Option<String> = None;
+    let mut await_reply = false;
+    let mut outbox: Option<String> = None;
+    let mut timeout_ms: Option<u64> = None;
+
+    while let Some(arg) = iter.next() {
+        let mut take = |flag: &str| -> Result<String> {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| usage(&format!("{flag} requires a value")))
+        };
+        match arg.as_str() {
+            "--inbox" => inbox = Some(take("--inbox")?),
+            other if other.starts_with("--inbox=") => {
+                inbox = Some(other["--inbox=".len()..].to_string());
+            }
+            "--body" => body = Some(take("--body")?),
+            other if other.starts_with("--body=") => {
+                body = Some(other["--body=".len()..].to_string());
+            }
+            "--in" => in_path = Some(take("--in")?),
+            other if other.starts_with("--in=") => {
+                in_path = Some(other["--in=".len()..].to_string());
+            }
+            "--to" => to = Some(take("--to")?),
+            other if other.starts_with("--to=") => {
+                to = Some(other["--to=".len()..].to_string());
+            }
+            "--from" => from = Some(take("--from")?),
+            other if other.starts_with("--from=") => {
+                from = Some(other["--from=".len()..].to_string());
+            }
+            "--conversation" => conversation = Some(take("--conversation")?),
+            other if other.starts_with("--conversation=") => {
+                conversation = Some(other["--conversation=".len()..].to_string());
+            }
+            "--await" => await_reply = true,
+            "--outbox" => outbox = Some(take("--outbox")?),
+            other if other.starts_with("--outbox=") => {
+                outbox = Some(other["--outbox=".len()..].to_string());
+            }
+            "--timeout-ms" => timeout_ms = Some(parse_timeout_ms(&take("--timeout-ms")?)?),
+            other if other.starts_with("--timeout-ms=") => {
+                timeout_ms = Some(parse_timeout_ms(&other["--timeout-ms=".len()..])?);
+            }
+            other => return Err(usage(&format!("unexpected argument {other:?}"))),
+        }
+    }
+
+    let inbox = require_dir(inbox, "--inbox")?;
+
+    let source = match (body, in_path) {
+        (Some(_), Some(_)) => return Err(usage("--body and --in are mutually exclusive")),
+        (Some(body), None) => {
+            if body.trim().is_empty() {
+                return Err(usage("--body must not be empty"));
+            }
+            SendSource::Body(body)
+        }
+        (None, Some(path)) => {
+            if to.is_some() || from.is_some() || conversation.is_some() {
+                return Err(usage(
+                    "--to/--from/--conversation apply to --body; --in supplies a complete envelope",
+                ));
+            }
+            SendSource::Envelope(path)
+        }
+        (None, None) => {
+            return Err(usage("missing message: pass --body <text> or --in <path>"));
+        }
+    };
+
+    if await_reply && outbox.is_none() {
+        return Err(usage("--await requires --outbox <dir>"));
+    }
+    if !await_reply && outbox.is_some() {
+        return Err(usage("--outbox is only valid with --await"));
+    }
+    if !await_reply && timeout_ms.is_some() {
+        return Err(usage("--timeout-ms is only valid with --await"));
+    }
+    let outbox = match outbox {
+        Some(dir) if dir.trim().is_empty() => {
+            return Err(usage("--outbox <dir> must not be empty"));
+        }
+        other => other,
+    };
+
+    Ok(Command::Send {
+        inbox,
+        source,
+        to,
+        from,
+        conversation,
+        await_reply,
+        outbox,
+        timeout_ms: timeout_ms.unwrap_or(DEFAULT_SEND_TIMEOUT_MS),
+    })
+}
+
+/// Parses `--timeout-ms`: a positive integer of milliseconds (zero is rejected —
+/// a zero-length await would time out before the first poll could observe a
+/// reply).
+fn parse_timeout_ms(raw: &str) -> Result<u64> {
+    raw.trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|&n| n > 0)
+        .ok_or_else(|| {
+            usage(&format!(
+                "--timeout-ms must be a positive integer, got {raw:?}"
+            ))
+        })
 }
 
 /// Requires a non-blank directory value for `flag`.
@@ -2000,6 +2310,294 @@ mod tests {
             json_files(&outbox).len(),
             1,
             "keyed by request id ⇒ reprocess overwrites, single outbox file"
+        );
+    }
+
+    // ---- `baton send` --------------------------------------------------------
+
+    fn send_request(id: &str) -> MessageEnvelope {
+        MessageEnvelope::new(
+            id,
+            "conv-9",
+            "agent-a",
+            "agent-b",
+            MessageKind::Request,
+            "ping",
+            1_700_000_000_000,
+        )
+    }
+
+    fn reply_to(request_id: &str) -> MessageEnvelope {
+        let mut r = MessageEnvelope::new(
+            "r-1",
+            "conv-9",
+            "agent-b",
+            "agent-a",
+            MessageKind::Response,
+            "pong",
+            1_700_000_000_001,
+        );
+        r.in_reply_to = Some(request_id.to_string());
+        r
+    }
+
+    /// Writes a reply into `outbox` keyed by `key`, as `serve`'s
+    /// `deliver_response` would, so `try_claim_response` finds it.
+    fn seed_reply(outbox: &Path, key: &str, reply: &MessageEnvelope) {
+        std::fs::create_dir_all(outbox).expect("create outbox");
+        let json = serde_json::to_string(reply).expect("serialize reply");
+        std::fs::write(outbox.join(format!("{key}.json")), json).expect("seed reply");
+    }
+
+    #[test]
+    fn parses_send_body_minimal() {
+        assert_eq!(
+            parse_args(&argv(&["send", "--inbox", "/tmp/mb", "--body", "hi"])).expect("parses"),
+            Command::Send {
+                inbox: "/tmp/mb".to_string(),
+                source: SendSource::Body("hi".to_string()),
+                to: None,
+                from: None,
+                conversation: None,
+                await_reply: false,
+                outbox: None,
+                timeout_ms: DEFAULT_SEND_TIMEOUT_MS,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_send_await_with_outbox_and_timeout() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "send",
+                "--inbox=/tmp/mb",
+                "--in=/tmp/env.json",
+                "--await",
+                "--outbox=/tmp/ob",
+                "--timeout-ms=1500",
+            ]))
+            .expect("parses"),
+            Command::Send {
+                inbox: "/tmp/mb".to_string(),
+                source: SendSource::Envelope("/tmp/env.json".to_string()),
+                to: None,
+                from: None,
+                conversation: None,
+                await_reply: true,
+                outbox: Some("/tmp/ob".to_string()),
+                timeout_ms: 1500,
+            }
+        );
+    }
+
+    #[test]
+    fn send_source_and_dependency_rules_are_usage_errors() {
+        let cases: &[&[&str]] = &[
+            &["send", "--body", "hi"],                        // missing --inbox
+            &["send", "--inbox", "/tmp/mb"],                  // missing source
+            &["send", "--inbox", "/tmp/mb", "--body", "   "], // blank body
+            &["send", "--inbox", "/tmp/mb", "--body", "hi", "--in", "/p"], // both sources
+            &["send", "--inbox", "/tmp/mb", "--in", "/p", "--to", "x"], // addressing with --in
+            &["send", "--inbox", "/tmp/mb", "--body", "hi", "--await"], // --await sans --outbox
+            &[
+                "send", "--inbox", "/tmp/mb", "--body", "hi", "--outbox", "/ob",
+            ], // --outbox sans --await
+            &[
+                "send",
+                "--inbox",
+                "/tmp/mb",
+                "--body",
+                "hi",
+                "--timeout-ms",
+                "10",
+            ], // --timeout-ms sans --await
+            &[
+                "send",
+                "--inbox",
+                "/tmp/mb",
+                "--body",
+                "hi",
+                "--await",
+                "--outbox",
+                "/ob",
+                "--timeout-ms",
+                "0",
+            ], // zero timeout
+        ];
+        for case in cases {
+            assert!(
+                matches!(parse_args(&argv(case)).unwrap_err(), BatonError::Usage(_)),
+                "expected usage error for {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_send_envelope_from_body_applies_addressing_overrides() {
+        let env = build_send_envelope(
+            &SendSource::Body("hi".to_string()),
+            Some("recipient".to_string()),
+            Some("sender".to_string()),
+            Some("c-1".to_string()),
+        )
+        .expect("builds");
+        assert_eq!(env.to, "recipient");
+        assert_eq!(env.from, "sender");
+        assert_eq!(env.conversation_id, "c-1");
+        assert_eq!(env.kind, MessageKind::Request);
+        assert_eq!(env.body, "hi");
+        assert!(
+            env.message_id.starts_with("c-1-"),
+            "id derived from conversation: {}",
+            env.message_id
+        );
+    }
+
+    #[test]
+    fn build_send_envelope_reads_full_envelope_from_in() {
+        let root = TempRoot::new("send-in");
+        let path = root.path.join("env.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&send_request("m-in-1")).unwrap(),
+        )
+        .expect("write envelope");
+        let env = build_send_envelope(
+            &SendSource::Envelope(path.to_string_lossy().into_owned()),
+            None,
+            None,
+            None,
+        )
+        .expect("reads");
+        assert_eq!(env.message_id, "m-in-1");
+        assert_eq!(env.body, "ping");
+    }
+
+    #[test]
+    fn execute_send_delivers_and_prints_message_id() {
+        let root = TempRoot::new("send-noawait");
+        let env = send_request("m-send-1");
+        let mut sink = RecordingSink::new();
+        let mut out: Vec<u8> = Vec::new();
+
+        execute_send(
+            &root.path,
+            None,
+            &env,
+            false,
+            Duration::from_millis(0),
+            Duration::from_millis(1),
+            &mut sink,
+            &mut out,
+        )
+        .expect("delivers");
+
+        assert_eq!(
+            json_files(&root.path.join("pending")),
+            vec!["m-send-1.json".to_string()],
+            "request landed in pending/"
+        );
+        assert_eq!(String::from_utf8(out).unwrap().trim(), "m-send-1");
+        assert_eq!(sink.events.len(), 1, "only the send event");
+        assert!(matches!(sink.events[0], ExchangeEvent::MessageSent { .. }));
+    }
+
+    #[test]
+    fn execute_send_await_consumes_correlated_reply() {
+        let root = TempRoot::new("send-await-ok");
+        let outbox = root.path.join("outbox");
+        let env = send_request("m-send-2");
+        seed_reply(&outbox, "m-send-2", &reply_to("m-send-2"));
+
+        let mut sink = RecordingSink::new();
+        let mut out: Vec<u8> = Vec::new();
+        execute_send(
+            &root.path,
+            Some(&outbox),
+            &env,
+            true,
+            Duration::from_millis(500),
+            Duration::from_millis(1),
+            &mut sink,
+            &mut out,
+        )
+        .expect("consumes reply");
+
+        let printed = String::from_utf8(out).unwrap();
+        let parsed: MessageEnvelope = serde_json::from_str(printed.trim()).expect("reply is json");
+        assert_eq!(parsed.body, "pong");
+        assert_eq!(parsed.in_reply_to.as_deref(), Some("m-send-2"));
+
+        assert!(matches!(sink.events[0], ExchangeEvent::MessageSent { .. }));
+        assert!(matches!(
+            sink.events[1],
+            ExchangeEvent::ReplyConsumed { .. }
+        ));
+        assert!(
+            json_files(&outbox).is_empty(),
+            "the claimed reply is renamed out of the outbox"
+        );
+    }
+
+    #[test]
+    fn execute_send_await_rejects_mismatched_reply() {
+        let root = TempRoot::new("send-await-mismatch");
+        let outbox = root.path.join("outbox");
+        let env = send_request("m-send-3");
+        // Reply is filed under the right key but answers a different request.
+        seed_reply(&outbox, "m-send-3", &reply_to("some-other-id"));
+
+        let mut sink = RecordingSink::new();
+        let mut out: Vec<u8> = Vec::new();
+        let err = execute_send(
+            &root.path,
+            Some(&outbox),
+            &env,
+            true,
+            Duration::from_millis(500),
+            Duration::from_millis(1),
+            &mut sink,
+            &mut out,
+        )
+        .expect_err("mismatch is a hard error");
+        assert!(matches!(err, BatonError::Io(_)));
+        // The send was recorded; the mismatched reply is not accepted.
+        assert!(matches!(sink.events[0], ExchangeEvent::MessageSent { .. }));
+        assert!(
+            !sink
+                .events
+                .iter()
+                .any(|e| matches!(e, ExchangeEvent::ReplyConsumed { .. })),
+            "a mismatched reply is never recorded as consumed"
+        );
+    }
+
+    #[test]
+    fn execute_send_await_times_out_leaving_request_in_mailbox() {
+        let root = TempRoot::new("send-timeout");
+        let outbox = root.path.join("outbox");
+        std::fs::create_dir_all(&outbox).expect("outbox");
+        let env = send_request("m-send-4");
+
+        let mut sink = NoopSink;
+        let mut out: Vec<u8> = Vec::new();
+        let err = execute_send(
+            &root.path,
+            Some(&outbox),
+            &env,
+            true,
+            Duration::from_millis(10),
+            Duration::from_millis(2),
+            &mut sink,
+            &mut out,
+        )
+        .expect_err("times out with no reply");
+        assert!(matches!(err, BatonError::Io(_)));
+        assert_eq!(
+            json_files(&root.path.join("pending")),
+            vec!["m-send-4.json".to_string()],
+            "the request remains in the mailbox after a timeout"
         );
     }
 }
