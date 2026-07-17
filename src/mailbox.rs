@@ -51,6 +51,12 @@ use crate::message::MessageEnvelope;
 /// Name of the lockfile at the mailbox root guarding single-instance access.
 const LOCK_FILE: &str = "serve.lock";
 
+/// Name of the cooperative-stop sentinel at the mailbox root. A `baton serve
+/// --stop` drops this file; the live daemon consumes it between messages and
+/// exits 0 (Option C graceful shutdown). It sits at the root — never inside
+/// `pending/` — so the message scanners never mistake it for an envelope.
+const STOP_FILE: &str = "serve.stop";
+
 /// Process-local sequence making temp filenames unique, so two writes to the
 /// same key never collide on their pre-`rename` temp file.
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -61,6 +67,9 @@ pub struct Mailbox {
     pending: PathBuf,
     claimed: PathBuf,
     done: PathBuf,
+    /// The cooperative-stop sentinel path (`<root>/serve.stop`), consumed by
+    /// [`poll_stop`](Mailbox::poll_stop).
+    stop: PathBuf,
     /// The locked lockfile handle. Held only to keep the advisory lock alive;
     /// dropping the [`Mailbox`] closes it and releases the lock.
     _lock: File,
@@ -123,8 +132,30 @@ impl Mailbox {
             pending,
             claimed,
             done,
+            stop: root.join(STOP_FILE),
             _lock: lock,
         })
+    }
+
+    /// Checks for and consumes the cooperative-stop sentinel in one atomic step,
+    /// returning whether it was present.
+    ///
+    /// The single `remove_file` *is* the check-and-consume: `Ok(())` means the
+    /// sentinel existed (and is now gone), `NotFound` means it never did. There
+    /// is no TOCTOU gap between an existence test and the removal, and — because
+    /// the caller holds the single-instance lock — no other process removes it
+    /// concurrently. `serve` calls this once at startup to discard any stale
+    /// sentinel, then between messages so a stop is observed without ever
+    /// interrupting an in-flight `respond()`.
+    pub fn poll_stop(&self) -> Result<bool> {
+        match fs::remove_file(&self.stop) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(BatonError::Io(format!(
+                "could not consume stop sentinel {:?}: {err}",
+                self.stop
+            ))),
+        }
     }
 
     /// Delivers `envelope` into `pending/` atomically (temp file, then `rename`).
@@ -220,6 +251,67 @@ impl Mailbox {
         })?;
         let json = serialize(response)?;
         atomic_write(outbox, &file_name(&key), &json)
+    }
+}
+
+/// The outcome of a cooperative [`request_stop`].
+pub enum StopRequest {
+    /// A live `serve` holds the lock; the stop sentinel was dropped for it to
+    /// observe between messages.
+    Signalled,
+    /// No live `serve` holds the lock on this root, so no sentinel was written.
+    NoDaemon,
+}
+
+/// Requests a cooperative shutdown of the `serve` daemon on `root`, if one is
+/// running.
+///
+/// A live daemon is detected by probing the single-instance lock, *not* by
+/// looking for a process: if the lock is free the caller acquires (and at once
+/// releases) it, which proves no daemon is running — so it drops **no** sentinel
+/// and returns [`StopRequest::NoDaemon`]. This is what keeps a fresh `serve`
+/// from being killed by a stale stop file: a stop is only ever written while a
+/// daemon holds the lock. If the lock is held ([`TryLockError::WouldBlock`]) a
+/// daemon is live, so the sentinel is written and [`StopRequest::Signalled`]
+/// returned. Either outcome is a success — cooperative stop is idempotent, so a
+/// supervisor's stop hook never fails just because the daemon already exited.
+///
+/// A root that does not exist yet (so the lockfile's parent is missing) likewise
+/// means no daemon has ever run there, and so resolves to [`StopRequest::NoDaemon`]
+/// rather than an error — `--stop` never creates the mailbox it is stopping.
+pub fn request_stop(root: impl AsRef<Path>) -> Result<StopRequest> {
+    let root = root.as_ref();
+    let lock_path = root.join(LOCK_FILE);
+    let lock = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(lock) => lock,
+        // No mailbox directory ⇒ nothing was ever served here.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StopRequest::NoDaemon);
+        }
+        Err(err) => {
+            return Err(BatonError::Io(format!(
+                "could not open mailbox lock {lock_path:?}: {err}"
+            )));
+        }
+    };
+    match lock.try_lock() {
+        // Lock acquired ⇒ no live daemon; nothing to stop. Dropping `lock`
+        // releases it as this returns.
+        Ok(()) => Ok(StopRequest::NoDaemon),
+        // Lock held ⇒ a daemon is live; drop the sentinel for it.
+        Err(TryLockError::WouldBlock) => {
+            atomic_write(root, STOP_FILE, "")?;
+            Ok(StopRequest::Signalled)
+        }
+        Err(TryLockError::Error(err)) => Err(BatonError::Io(format!(
+            "could not probe mailbox lock {root:?}: {err}"
+        ))),
     }
 }
 
@@ -608,5 +700,80 @@ mod tests {
         let outbox = dir.path.join("outbox");
         fs::create_dir_all(&outbox).expect("outbox");
         assert!(try_claim_response(&outbox, "m-1").expect("claim").is_none());
+    }
+
+    /// `poll_stop` is `false` when no sentinel is present.
+    #[test]
+    fn poll_stop_absent_is_false() {
+        let dir = TempDir::new("stop-absent");
+        let mailbox = Mailbox::open(&dir.path).expect("open");
+        assert!(!mailbox.poll_stop().expect("poll"), "no sentinel ⇒ false");
+    }
+
+    /// `poll_stop` returns `true` once for a present sentinel, then consumes it —
+    /// a second poll is `false`, so a stop is observed exactly once.
+    #[test]
+    fn poll_stop_consumes_present_sentinel() {
+        let dir = TempDir::new("stop-present");
+        let mailbox = Mailbox::open(&dir.path).expect("open");
+        fs::write(dir.path.join(STOP_FILE), "").expect("drop sentinel");
+
+        assert!(mailbox.poll_stop().expect("poll"), "sentinel observed");
+        assert!(
+            !mailbox.poll_stop().expect("poll again"),
+            "sentinel consumed ⇒ not observed twice"
+        );
+    }
+
+    /// `request_stop` drops the sentinel for a live daemon (lock held), and the
+    /// daemon then observes it via `poll_stop`.
+    #[test]
+    fn request_stop_signals_while_daemon_holds_lock() {
+        let dir = TempDir::new("req-stop-live");
+        let daemon = Mailbox::open(&dir.path).expect("daemon holds lock");
+
+        assert!(
+            matches!(
+                request_stop(&dir.path).expect("stop"),
+                StopRequest::Signalled
+            ),
+            "a live daemon is signalled"
+        );
+        assert!(
+            daemon.poll_stop().expect("poll"),
+            "the daemon observes the dropped sentinel"
+        );
+    }
+
+    /// `request_stop` on an unlocked root reports `NoDaemon` and drops no
+    /// sentinel — a stale stop file can never kill a later fresh `serve`.
+    #[test]
+    fn request_stop_no_daemon_when_unlocked() {
+        let dir = TempDir::new("req-stop-dead");
+        // No Mailbox open ⇒ the lock is free.
+        assert!(
+            matches!(
+                request_stop(&dir.path).expect("stop"),
+                StopRequest::NoDaemon
+            ),
+            "an unlocked root has no daemon to stop"
+        );
+        assert!(
+            !dir.path.join(STOP_FILE).exists(),
+            "no sentinel is written when nothing is running"
+        );
+    }
+
+    /// `request_stop` on a root that does not exist yet is `NoDaemon`, not an
+    /// error — a cooperative stop never creates the mailbox it is stopping.
+    #[test]
+    fn request_stop_no_daemon_when_root_absent() {
+        let dir = TempDir::new("req-stop-absent");
+        let missing = dir.path.join("never-served");
+        assert!(
+            matches!(request_stop(&missing).expect("stop"), StopRequest::NoDaemon),
+            "a nonexistent root has no daemon to stop"
+        );
+        assert!(!missing.exists(), "the root is not created by --stop");
     }
 }

@@ -444,6 +444,7 @@ socket.
 
 ```
 baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once]
+baton serve --stop --inbox <dir>
 ```
 
 - `--inbox <dir>` — the mailbox root. `serve` manages `pending/`, `claimed/`, and
@@ -452,6 +453,8 @@ baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once]
 - `--poll-ms <n>` — inbox poll interval in milliseconds (default `500`).
 - `--once` — drain everything currently pending, then exit (cron-friendly);
   omitted, `serve` polls the inbox until terminated.
+- `--stop` — cooperatively stop the `serve` running on `--inbox` (see
+  [Shutdown](#shutdown-cooperative-graceful-stop)); takes only `--inbox`.
 
 Each side configures the answering participant exactly as `exchange`/`ask` do
 (`BATON_MODEL`, `BATON_SYSTEM_PROMPT`, the credential env, `BATON_EVENT_LOG`), so
@@ -487,11 +490,35 @@ call and may emit a **second** response envelope. Consumers must therefore
 correlate/dedup on `in_reply_to` / `conversation_id`. Keyed outbox writes shrink
 the common (unconsumed) case to a single file; they do not make it exactly-once.
 
-Out of scope this slice: **graceful signal-clean shutdown** (finish the in-flight
-message on `SIGTERM`, then exit `0`) is tracked separately — the crash-safe FSM
-already guarantees no *loss*, and graceful shutdown is only a reprocess-rate
-optimization on top. There is also no zero-downtime handover: a restart has a
-brief window where the second `serve` is refused until the first exits.
+### Shutdown (cooperative graceful stop)
+
+A raw `SIGTERM`/`SIGKILL` mid-answer is *safe for delivery* — the message is
+reclaimed and reprocessed on the next start — but that reprocess is a repeat
+provider call and may emit a second response envelope. To avoid that redundant
+reprocess on an *expected* stop (systemd stop, `docker stop`, deploy), stop the
+daemon cooperatively instead:
+
+```
+baton serve --stop --inbox <dir>
+```
+
+`--stop` drops a stop sentinel at the mailbox root; the running daemon consumes
+it **between messages** and exits `0`, so an in-flight `respond()` is never
+interrupted mid-call. It detects a live daemon by probing the single-instance
+lock: if no daemon holds the lock it writes nothing (so a stale sentinel can
+never kill a later fresh `serve`) and reports that nothing is running — still
+exiting `0`, since a cooperative stop is idempotent. Wire it as systemd
+`ExecStop=baton serve --stop --inbox <dir>`.
+
+`--stop` is the **only** graceful path: `serve` installs no signal handler and
+does not react to a raw `SIGTERM` (Option A semantics — the crash-safe FSM,
+without signal reaction, is the shipped default). Graceful completion is bounded
+by the supervisor's stop timeout (systemd `TimeoutStopSec`): if the in-flight
+message does not finish before it expires, the supervisor signals the daemon
+anyway and delivery falls back to the reclaim-and-reprocess path above.
+
+There is also no zero-downtime handover: a restart has a brief window where the
+second `serve` is refused until the first exits.
 
 The client side of this mailbox — posting a request and reading the correlated
 reply — is [`baton send`](#posting-to-a-mailbox-baton-send).
