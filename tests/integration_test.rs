@@ -1610,3 +1610,204 @@ fn quickstart_script_runs_full_loop_against_mock() {
 
     let _ = std::fs::remove_dir_all(&out_dir);
 }
+
+// ---------------------------------------------------------------------------
+// N-party `baton converse-ring` over a static routing registry.
+//
+// The registry maps each participant name to its `{inbox, outbox}` pair; the
+// ring driver resolves every roster name at startup and builds one live,
+// mailbox-backed peer per member. Here three independent `baton serve` daemons
+// (alice / bob / carol) answer over their own mailboxes, all provider calls met
+// by one content-agnostic repeating mock. This is the end-to-end proof that the
+// registry wires an N-party round-robin conversation.
+// ---------------------------------------------------------------------------
+
+/// Spawns a `baton serve` daemon for one ring member, consuming `<root>/inbox`
+/// and replying into `<root>/outbox`, its provider calls answered by `base_url`.
+fn spawn_ring_serve(member_root: &Path, base_url: &str, model: &str) -> std::process::Child {
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_baton"));
+    serve.args([
+        "serve",
+        "--inbox",
+        member_root.join("inbox").to_str().unwrap(),
+        "--outbox",
+        member_root.join("outbox").to_str().unwrap(),
+        "--poll-ms",
+        "20",
+    ]);
+    serve.env("ANTHROPIC_API_KEY", "test-key");
+    serve.env("ANTHROPIC_BASE_URL", base_url);
+    serve.env("BATON_MODEL", model);
+    serve.env("BATON_TIMEOUT_SECS", "5");
+    serve.env_remove("ANTHROPIC_AUTH_TOKEN");
+    serve.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+    serve.env_remove("BATON_EVENT_LOG");
+    serve.stdout(Stdio::null());
+    serve.stderr(Stdio::null());
+    serve.spawn().expect("spawn baton serve")
+}
+
+/// Cooperatively stops the `serve` daemon consuming `<root>/inbox`.
+fn stop_ring_serve(member_root: &Path) {
+    let _ = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "serve",
+            "--stop",
+            "--inbox",
+            member_root.join("inbox").to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[test]
+fn converse_ring_drives_three_live_serve_peers() {
+    let server = MockServer::spawn_repeating(200, SUCCESS_BODY);
+    let root = TempMailbox::new("ring");
+    let alice = root.path.join("alice");
+    let bob = root.path.join("bob");
+    let carol = root.path.join("carol");
+
+    // A registry mapping each roster name to its own mailbox pair (a pair, not a
+    // single path). Absolute paths so the driver resolves them regardless of cwd.
+    let registry_json = format!(
+        r#"{{
+            "participants": {{
+                "alice": {{ "inbox": "{a}/inbox", "outbox": "{a}/outbox" }},
+                "bob":   {{ "inbox": "{b}/inbox", "outbox": "{b}/outbox" }},
+                "carol": {{ "inbox": "{c}/inbox", "outbox": "{c}/outbox" }}
+            }}
+        }}"#,
+        a = alice.to_str().unwrap(),
+        b = bob.to_str().unwrap(),
+        c = carol.to_str().unwrap(),
+    );
+    let registry_path = root.path.join("registry.json");
+    std::fs::write(&registry_path, registry_json).expect("write registry");
+
+    // Three independent peers; each is a full `baton serve` daemon.
+    let mut alice_child = spawn_ring_serve(&alice, server.base_url(), "model-alice");
+    let mut bob_child = spawn_ring_serve(&bob, server.base_url(), "model-bob");
+    let mut carol_child = spawn_ring_serve(&carol, server.base_url(), "model-carol");
+
+    let mut ring = Command::new(env!("CARGO_BIN_EXE_baton"));
+    ring.args([
+        "converse-ring",
+        "--registry",
+        registry_path.to_str().unwrap(),
+        "--roster",
+        "alice,bob,carol",
+        "--seed",
+        "kick off",
+        "--await-ms",
+        "10000",
+    ]);
+    // The driver itself runs no provider call, but `Governance::from_lookup`
+    // reads the turn-cap; three turns visit bob, carol, then alice (the wrap).
+    ring.env("BATON_MAX_TURNS", "3");
+    ring.env_remove("BATON_TOKEN_BUDGET");
+    ring.env_remove("BATON_EVENT_LOG");
+    ring.stdout(Stdio::piped());
+    ring.stderr(Stdio::piped());
+
+    let out = ring.output().expect("run baton converse-ring");
+
+    // Tear all three peers down regardless of the assertions below.
+    stop_ring_serve(&alice);
+    stop_ring_serve(&bob);
+    stop_ring_serve(&carol);
+    let _ = alice_child.wait();
+    let _ = bob_child.wait();
+    let _ = carol_child.wait();
+
+    assert!(
+        out.status.success(),
+        "converse-ring should exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    // Seed + 3 reply turns (BATON_MAX_TURNS=3).
+    assert_eq!(lines.len(), 4, "seed + 3 reply turns: {stdout}");
+
+    let seed: serde_json::Value = serde_json::from_str(lines[0]).expect("seed is JSON");
+    assert_eq!(seed["kind"], "request");
+    assert_eq!(seed["from"], "alice", "seed is addressed from roster[0]");
+    assert_eq!(seed["to"], "bob", "seed is addressed to roster[1]");
+
+    // Round-robin order: each reply's authoritative speaker (`from`) advances by
+    // ring position — bob, carol, then alice on the wrap.
+    let speakers: Vec<String> = lines[1..]
+        .iter()
+        .map(|line| {
+            let reply: serde_json::Value = serde_json::from_str(line).expect("reply is JSON");
+            assert_eq!(reply["kind"], "response", "each peer answers: {line}");
+            assert_eq!(
+                reply["exchange"]["schema"], "baton.exchange/v1",
+                "each served peer nests its provider call in-band"
+            );
+            reply["from"].as_str().unwrap().to_string()
+        })
+        .collect();
+    assert_eq!(
+        speakers,
+        vec!["bob".to_string(), "carol".to_string(), "alice".to_string()],
+        "round-robin visits the ring in order, wrapping past roster[0]"
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("TurnCap"),
+        "stderr names the terminal reason: {stderr}"
+    );
+}
+
+#[test]
+fn converse_ring_unknown_roster_name_is_startup_error() {
+    // A roster name absent from the registry must fail fast at startup — before
+    // any turn runs and without needing a live peer.
+    let root = TempMailbox::new("ring-unknown");
+    let registry_json = format!(
+        r#"{{
+            "participants": {{
+                "alice": {{ "inbox": "{r}/alice/inbox", "outbox": "{r}/alice/outbox" }},
+                "bob":   {{ "inbox": "{r}/bob/inbox",   "outbox": "{r}/bob/outbox" }}
+            }}
+        }}"#,
+        r = root.path.to_str().unwrap(),
+    );
+    let registry_path = root.path.join("registry.json");
+    std::fs::write(&registry_path, registry_json).expect("write registry");
+
+    let mut ring = Command::new(env!("CARGO_BIN_EXE_baton"));
+    ring.args([
+        "converse-ring",
+        "--registry",
+        registry_path.to_str().unwrap(),
+        "--roster",
+        "alice,bob,ghost",
+        "--seed",
+        "kick off",
+    ]);
+    ring.env_remove("BATON_EVENT_LOG");
+    ring.stdout(Stdio::piped());
+    ring.stderr(Stdio::piped());
+
+    let out = ring.output().expect("run baton converse-ring");
+    assert!(
+        !out.status.success(),
+        "an unknown roster name is a startup error (non-zero exit)"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ghost"),
+        "the error names the unroutable participant: {stderr}"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "no trail is written when startup fails: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}

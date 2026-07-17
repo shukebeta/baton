@@ -426,7 +426,7 @@ fn safe_key(id: &str) -> Result<String> {
 }
 
 /// A key is safe iff it names no path component that could escape the mailbox.
-fn is_safe_key(key: &str) -> bool {
+pub(crate) fn is_safe_key(key: &str) -> bool {
     !key.is_empty() && key != "." && key != ".." && !key.contains(['/', '\\', '\0'])
 }
 

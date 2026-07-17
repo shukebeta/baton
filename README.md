@@ -15,8 +15,9 @@ shape around a non-streaming Claude-compatible Messages client
 interactive multi-turn REPL that accumulates conversation history across turns,
 `baton exchange` for one structured `baton.message/v1` request/reply round-trip,
 `baton converse` for a governed two-participant conversation driven to a terminal
-condition, `baton serve` for answering `baton.message/v1` requests from a file
-mailbox, `baton send` for posting a request into a mailbox and consuming the
+condition, `baton converse-ring` for the N-party round-robin generalisation over a
+static routing registry, `baton serve` for answering `baton.message/v1` requests
+from a file mailbox, `baton send` for posting a request into a mailbox and consuming the
 correlated reply, and `baton log` for inspecting and replaying the recorded
 exchange trail.
 
@@ -574,6 +575,89 @@ always does); a future peer that could deliver a recordless error would rely on
 the timeout-naming body as the tie-breaker. Mapping the first await-timeout
 straight to a terminal is a deliberate v1 simplification — retry/backoff within
 an await is a named follow-on.
+
+## N-party ring (`baton converse-ring`)
+
+`baton converse` drives two participants; `baton converse-ring` generalises that
+to an **N-party (N ≥ 2) round-robin ring** whose members are all live
+mailbox-backed peers. The driver takes turns around a fixed ring — `roster[1]`
+answers the seed, then `roster[2]`, … wrapping past `roster[0]` — recording every
+turn as a `baton.message/v1` envelope, bounded by the same governance
+(`BATON_MAX_TURNS` / `BATON_TOKEN_BUDGET`) as `converse`. The recipient of each
+turn is chosen purely by **ring position**, never by a reply's `to`; the registry
+below only resolves a name to a mailbox, it does not route.
+
+```
+baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>]
+```
+
+- `--registry <path>` — the routing registry (JSON, format below), loaded once at
+  startup.
+- `--roster <a,b,c>` — the ring order, a comma-separated list of participant names
+  (≥ 2, no blanks, no duplicates). Every name must exist in the registry; an
+  unknown name is a **startup error** before any turn runs.
+- `--seed <text>` / `--seed-file <path>` (exactly one) — the opening message,
+  addressed from `roster[0]` to `roster[1]`.
+- `--await-ms <n>` — how long each turn waits for its peer's reply (positive
+  integer; default `60000`), as for `converse --b-await-ms`.
+- `--out <path>` — where the JSONL trail is written; stdout when omitted.
+
+### Routing registry (name → mailbox)
+
+The registry is a **static** JSON file mapping each participant name to its
+`{inbox, outbox}` mailbox **pair** — each peer is its own [`baton serve`](#serving-a-mailbox-baton-serve)
+daemon with its own inbox and outbox. It is pure lookup: it holds **no**
+governance (the driver remains the sole governance authority) and performs no
+routing beyond name resolution. Names are validated as safe mailbox keys, so a
+name cannot escape the mailbox root via path components.
+
+```json
+{
+  "participants": {
+    "alice": { "inbox": "/tmp/alice/inbox", "outbox": "/tmp/alice/outbox" },
+    "bob":   { "inbox": "/tmp/bob/inbox",   "outbox": "/tmp/bob/outbox" },
+    "carol": { "inbox": "/tmp/carol/inbox", "outbox": "/tmp/carol/outbox" }
+  }
+}
+```
+
+| Field                    | Meaning                                                                 |
+|--------------------------|------------------------------------------------------------------------|
+| `participants`           | Object mapping each participant name to its mailbox pair.               |
+| `participants.<name>.inbox`  | The peer `serve`'s `--inbox`; requests land in `<inbox>/pending/`.  |
+| `participants.<name>.outbox` | The peer `serve`'s `--outbox`; replies are claimed keyed by request id. |
+
+### Worked example — three peers
+
+```bash
+# Three long-lived responders, one per ring member:
+baton serve --inbox /tmp/alice/inbox --outbox /tmp/alice/outbox --poll-ms 20 &
+baton serve --inbox /tmp/bob/inbox   --outbox /tmp/bob/outbox   --poll-ms 20 &
+baton serve --inbox /tmp/carol/inbox --outbox /tmp/carol/outbox --poll-ms 20 &
+
+# Drive the ring from the registry above (saved as /tmp/roster.json):
+baton converse-ring \
+  --registry /tmp/roster.json \
+  --roster alice,bob,carol \
+  --seed "Introduce yourself in one sentence." \
+  --await-ms 10000 \
+  --out /tmp/ring-trail.jsonl
+```
+
+The trail's replies advance by ring position — `bob`, `carol`, then `alice` on
+the wrap — each carrying its peer's nested `baton.exchange/v1` provider call. The
+end-to-end proof is `converse_ring_drives_three_live_serve_peers` in
+`tests/integration_test.rs`, which drives three independent daemons against
+loopback mock servers with no external network.
+
+**Non-goals (v1).** The registry is deliberately minimal:
+
+- **No convention-derived paths** (`<root>/<name>/…`) — a possible later
+  zero-config layer over the explicit registry.
+- **No dynamic discovery** (register / heartbeat / liveness / join-leave) — the
+  roster is fixed for the run.
+- **No `to`-based routing** — the driver picks the next recipient by ring order;
+  the registry only resolves names to mailboxes.
 
 ## Serving a mailbox (`baton serve`)
 
