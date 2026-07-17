@@ -15,8 +15,63 @@ shape around a non-streaming Claude-compatible Messages client
 interactive multi-turn REPL that accumulates conversation history across turns,
 `baton exchange` for one structured `baton.message/v1` request/reply round-trip,
 `baton converse` for a governed two-participant conversation driven to a terminal
-condition, and `baton log` for inspecting and replaying the recorded exchange
-trail.
+condition, `baton serve` for answering `baton.message/v1` requests from a file
+mailbox, `baton send` for posting a request into a mailbox and consuming the
+correlated reply, and `baton log` for inspecting and replaying the recorded
+exchange trail.
+
+## Quickstart
+
+To see the whole A2A loop end-to-end — reproducibly, with no API key and no
+external network — run:
+
+```bash
+./scripts/quickstart.sh
+```
+
+It launches a loopback mock provider (`examples/mock_provider.rs`), points baton
+at it via `ANTHROPIC_BASE_URL`, and drives both A2A surfaces:
+
+1. **`baton converse`** — a governed two-agent conversation between the example
+   identities in `prompts/interviewer.md` and `prompts/candidate.md`, driven to
+   the turn-cap.
+2. **`baton serve` + `baton send --await`** — an asynchronous mailbox
+   round-trip: `serve` answers a request dropped into an inbox, and `send`
+   consumes the correlated reply.
+
+The resulting JSONL trails are written under `target/quickstart/`
+(`converse-trail.jsonl` and `serve-send-reply.jsonl`); the script prints each
+path and exits 0. It needs only a Rust toolchain — the mock stands in for the
+provider, so no credential is read and nothing leaves `127.0.0.1`.
+
+### Mock vs. a real provider
+
+The mock run proves **plumbing and reproducibility**: that the commands wire
+together and terminate deterministically. It is *not* a demonstration — every
+reply is the same canned line, so a mock-vs-mock exchange is no substitute for
+the real artifact.
+
+To **demonstrate** baton to a human, run the same two commands against a real
+provider: set a real credential (`ANTHROPIC_API_KEY`), leave `ANTHROPIC_BASE_URL`
+at its default (or point it at your gateway), and keep the two distinct system
+prompts so the agents hold a genuine conversation with real replies:
+
+```bash
+export ANTHROPIC_API_KEY=sk-...          # a real credential
+unset ANTHROPIC_BASE_URL                  # use the real Messages API
+
+baton converse \
+  --a-system prompts/interviewer.md \
+  --b-system prompts/candidate.md \
+  --seed "Introduce yourself in one sentence." \
+  --out /tmp/trail.jsonl
+
+# In one shell: a long-lived responder.
+baton serve --inbox /tmp/mbox/inbox --outbox /tmp/mbox/outbox
+# In another: post a request and read the correlated reply.
+baton send --inbox /tmp/mbox/inbox --outbox /tmp/mbox/outbox \
+  --await --body "Ping over the mailbox."
+```
 
 ## Configuration
 
