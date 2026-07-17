@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use crate::error::{BatonError, Result};
 use crate::events::{ExchangeMeta, now_ms};
 use crate::log::{Exchange, Outcome, RequestRecord};
+use crate::mailbox;
 use crate::message::{MessageEnvelope, MessageKind, WrappedExchange};
 use crate::model::Prompt;
 use crate::transport::Transport;
@@ -281,6 +282,117 @@ impl SubprocessParticipant {
 }
 
 impl Participant for SubprocessParticipant {
+    fn respond(&self, request: &MessageEnvelope) -> MessageEnvelope {
+        match self.try_respond(request) {
+            Ok(response) => response,
+            Err(err) => synthesize_error_response(request, &err.to_string()),
+        }
+    }
+}
+
+/// A mailbox-backed participant: each reply is one round-trip over a file-mailbox.
+///
+/// Where [`SubprocessParticipant`] reaches an independent agent over pipes, this
+/// impl reaches one over the *file-mailbox* (M4): a peer `baton serve` daemon.
+/// One [`respond`](Participant::respond) call delivers the request into the
+/// peer's inbox via the lock-free atomic path ([`mailbox::deliver_to`]) and then
+/// polls the outbox for the correlated reply ([`mailbox::try_claim_response`],
+/// keyed by the request id) until it appears or [`await_timeout`](Self::await_timeout)
+/// elapses. It holds no lock — the peer daemon owns the single-instance lock —
+/// so the driver is a *governed client* of a `serve` service, not a co-owner of
+/// its mailbox.
+///
+/// The trait stays infallible; the delivered-error boundary is the same one
+/// [`SubprocessParticipant`] draws, in envelope terms:
+///
+/// - A **peer-delivered reply** (whatever the outbox holds, correlated to the
+///   request) is returned *unchanged* — including a peer `kind: "error"` whose
+///   nested `baton.exchange/v1` record carries the peer's provider-call outcome,
+///   since that is a delivered response the peer vouches for.
+/// - A **machinery/transport failure** — delivery failed, no reply arrived
+///   before the deadline, or the reply did not correlate — is reconciled into a
+///   *synthesized* delivered `kind: "error"` envelope with **no** nested record
+///   ([`synthesize_error_response`]): the driver obtained no peer provider-call
+///   it can vouch for, mirroring how [`SubprocessParticipant`] synthesizes a
+///   machinery failure.
+///
+/// This is what lets the `converse` trail distinguish "the peer answered with an
+/// error" from "the driver stopped waiting": both are `kind: "error"`, but only
+/// the former nests a `baton.exchange/v1` record. That predicate rests on the
+/// peer nesting a record on every delivered reply — which holds for a `baton
+/// serve` peer, whose in-process [`LocalParticipant`] always nests one. A future
+/// peer that could deliver a recordless error would blur the two; the synthesized
+/// timeout body naming the await-timeout is the tie-breaker for that case.
+pub struct MailboxParticipant {
+    /// Root of the peer's mailbox; the request is delivered to `<inbox>/pending/`.
+    inbox: PathBuf,
+    /// Directory the correlated reply is awaited from (the peer's outbox).
+    outbox: PathBuf,
+    /// Maximum time to await the correlated reply before synthesizing a timeout.
+    await_timeout: Duration,
+    /// Interval between outbox polls while awaiting the reply.
+    poll_interval: Duration,
+}
+
+impl MailboxParticipant {
+    /// Builds a participant that delivers requests to `<inbox>/pending/` and
+    /// awaits their correlated replies from `outbox`, polling every
+    /// `poll_interval` for at most `await_timeout` before synthesizing a
+    /// transport-timeout error.
+    ///
+    /// `await_timeout` should be *generous* relative to a single `send --await`:
+    /// each reply is a full provider turn run by the peer daemon, so a short
+    /// deadline would synthesize a timeout while the peer is still answering.
+    pub fn new(
+        inbox: impl Into<PathBuf>,
+        outbox: impl Into<PathBuf>,
+        await_timeout: Duration,
+        poll_interval: Duration,
+    ) -> Self {
+        Self {
+            inbox: inbox.into(),
+            outbox: outbox.into(),
+            await_timeout,
+            poll_interval,
+        }
+    }
+
+    /// Delivers `request` and awaits its correlated reply, returning it, or an
+    /// `Err` describing the machinery failure (delivery failed, await timed out,
+    /// or the reply did not correlate). The infallible [`Participant::respond`]
+    /// reconciles that `Err` into a synthesized delivered error envelope.
+    fn try_respond(&self, request: &MessageEnvelope) -> Result<MessageEnvelope> {
+        mailbox::deliver_to(&self.inbox, request)?;
+
+        let deadline = Instant::now() + self.await_timeout;
+        let reply = loop {
+            if let Some(reply) = mailbox::try_claim_response(&self.outbox, &request.message_id)? {
+                break reply;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(BatonError::Transport(format!(
+                    "await timed out after {}ms without a correlated reply to {:?}",
+                    self.await_timeout.as_millis(),
+                    request.message_id
+                )));
+            }
+            thread::sleep(self.poll_interval.min(remaining));
+        };
+
+        // The reply is keyed by the request id, but a mis-correlated envelope
+        // filed under that key is a protocol error, not a reply to return.
+        if reply.in_reply_to.as_deref() != Some(request.message_id.as_str()) {
+            return Err(BatonError::Transport(format!(
+                "reply {:?} has in_reply_to {:?}, expected {:?}",
+                reply.message_id, reply.in_reply_to, request.message_id
+            )));
+        }
+        Ok(reply)
+    }
+}
+
+impl Participant for MailboxParticipant {
     fn respond(&self, request: &MessageEnvelope) -> MessageEnvelope {
         match self.try_respond(request) {
             Ok(response) => response,
@@ -815,5 +927,201 @@ mod tests {
             Duration::from_secs(5),
         );
         assert_synthesized_error(&participant.respond(&request_envelope()));
+    }
+
+    // -- MailboxParticipant -----------------------------------------------
+    //
+    // These drive the impl against a tempdir mailbox — no live `serve`, no
+    // network. A reply is seeded into the outbox exactly as `serve`'s
+    // `deliver_response` would key it (by the request id), so the deliver +
+    // await round-trip is exercised deterministically.
+
+    use std::path::PathBuf;
+
+    /// A unique self-cleaning temp directory, mirroring the idiom in
+    /// `mailbox`'s own tests.
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "baton-mailbox-participant-{}-{}-{tag}",
+                std::process::id(),
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Seeds `reply` into `outbox` keyed by `request_id`, as `serve`'s
+    /// `deliver_response` would, so `try_claim_response` finds it.
+    fn seed_reply(outbox: &std::path::Path, request_id: &str, reply: &MessageEnvelope) {
+        std::fs::create_dir_all(outbox).expect("create outbox");
+        let json = serde_json::to_string(reply).expect("serialize reply");
+        std::fs::write(outbox.join(format!("{request_id}.json")), json).expect("seed reply");
+    }
+
+    /// Builds a peer reply correlated to `request` (addressing swapped,
+    /// `in_reply_to` linked), optionally nesting a provider-call record — the
+    /// shape a `baton serve` peer's `LocalParticipant` delivers.
+    fn peer_reply(request: &MessageEnvelope, kind: MessageKind, nested: bool) -> MessageEnvelope {
+        let mut reply = MessageEnvelope::new(
+            "peer-reply-id",
+            request.conversation_id.clone(),
+            request.to.clone(),
+            request.from.clone(),
+            kind,
+            "pong",
+            request.ts_ms + 1,
+        );
+        reply.in_reply_to = Some(request.message_id.clone());
+        if nested {
+            reply.exchange = Some(WrappedExchange::new(Exchange {
+                request: RequestRecord {
+                    ts_ms: request.ts_ms,
+                    model: "peer-model".to_string(),
+                    base_url: "https://peer".to_string(),
+                    prompt: request.body.clone(),
+                },
+                outcome: Outcome::Ok {
+                    ts_ms: request.ts_ms + 1,
+                    duration_ms: 1,
+                    reply: "pong".to_string(),
+                    input_tokens: Some(3),
+                    output_tokens: Some(5),
+                },
+            }));
+        }
+        reply
+    }
+
+    /// A seeded, correlated reply is delivered unchanged, and the request lands
+    /// in the peer's `pending/` — the deliver + await round-trip.
+    #[test]
+    fn mailbox_returns_correlated_reply_and_delivers_request() {
+        let dir = TempDir::new("ok");
+        let inbox = dir.path.join("inbox");
+        let outbox = dir.path.join("outbox");
+        let request = request_envelope();
+        let reply = peer_reply(&request, MessageKind::Response, true);
+        seed_reply(&outbox, &request.message_id, &reply);
+
+        let participant = MailboxParticipant::new(
+            &inbox,
+            &outbox,
+            Duration::from_millis(500),
+            Duration::from_millis(1),
+        );
+        let response = participant.respond(&request);
+
+        // Returned verbatim — the peer, not the driver, owns correlation.
+        assert_eq!(response, reply);
+        // The request was delivered to the peer's inbox.
+        assert!(
+            inbox.join("pending").join("m-req-1.json").exists(),
+            "request delivered to <inbox>/pending/"
+        );
+    }
+
+    /// A peer-delivered `kind: "error"` (carrying the peer's nested record) is
+    /// passed through unchanged — a delivered response, not a machinery failure.
+    #[test]
+    fn mailbox_passes_through_peer_delivered_error() {
+        let dir = TempDir::new("peer-err");
+        let inbox = dir.path.join("inbox");
+        let outbox = dir.path.join("outbox");
+        let request = request_envelope();
+        let reply = peer_reply(&request, MessageKind::Error, true);
+        seed_reply(&outbox, &request.message_id, &reply);
+
+        let participant = MailboxParticipant::new(
+            &inbox,
+            &outbox,
+            Duration::from_millis(500),
+            Duration::from_millis(1),
+        );
+        let response = participant.respond(&request);
+
+        assert_eq!(response.kind, MessageKind::Error);
+        assert!(
+            response.exchange.is_some(),
+            "a peer-delivered error nests the peer's record"
+        );
+    }
+
+    /// No reply before the deadline yields a synthesized `kind: "error"` with no
+    /// nested record and a body naming the await-timeout — the "driver stopped
+    /// waiting" terminal, distinct from a peer-delivered error.
+    #[test]
+    fn mailbox_synthesizes_timeout_error_when_no_reply() {
+        let dir = TempDir::new("timeout");
+        let inbox = dir.path.join("inbox");
+        let outbox = dir.path.join("outbox");
+        let request = request_envelope();
+
+        let participant = MailboxParticipant::new(
+            &inbox,
+            &outbox,
+            Duration::from_millis(10),
+            Duration::from_millis(2),
+        );
+        let response = participant.respond(&request);
+
+        assert_eq!(response.kind, MessageKind::Error);
+        assert_eq!(response.conversation_id, "conv-42");
+        assert_eq!(response.in_reply_to.as_deref(), Some("m-req-1"));
+        // Addressing swaps, like a delivered reply.
+        assert_eq!(response.from, "agent-b");
+        assert_eq!(response.to, "agent-a");
+        assert!(
+            response.exchange.is_none(),
+            "a machinery/transport failure nests no record"
+        );
+        assert!(
+            response.body.contains("timed out"),
+            "body names the await-timeout: {}",
+            response.body
+        );
+        // The request is left in the peer's inbox for a later drain.
+        assert!(inbox.join("pending").join("m-req-1.json").exists());
+    }
+
+    /// A reply filed under the request key but answering a *different* request
+    /// is rejected as a machinery failure, never returned as the correlated
+    /// reply.
+    #[test]
+    fn mailbox_synthesizes_error_on_mis_correlated_reply() {
+        let dir = TempDir::new("mismatch");
+        let inbox = dir.path.join("inbox");
+        let outbox = dir.path.join("outbox");
+        let request = request_envelope();
+        let mut reply = peer_reply(&request, MessageKind::Response, true);
+        reply.in_reply_to = Some("some-other-id".to_string());
+        seed_reply(&outbox, &request.message_id, &reply);
+
+        let participant = MailboxParticipant::new(
+            &inbox,
+            &outbox,
+            Duration::from_millis(500),
+            Duration::from_millis(1),
+        );
+        let response = participant.respond(&request);
+
+        assert_eq!(response.kind, MessageKind::Error);
+        assert!(
+            response.exchange.is_none(),
+            "a mis-correlated reply is a machinery failure, nesting no record"
+        );
     }
 }

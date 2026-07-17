@@ -1299,3 +1299,225 @@ fn log_replay_tolerates_trailing_partial_line() {
         "stderr warns about the skipped partial line: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Async `baton converse` over a mailbox.
+//
+// The C1 headline: `baton converse --b-mailbox` drives a governed multi-turn
+// conversation whose side B is a *live, independent* `baton serve` daemon,
+// reached over the file-mailbox rather than in-process. A single repeating
+// loopback mock stands in for the provider both sides call (it is
+// content-agnostic, so one mock serves the converse process's side A and the
+// serve process's side B). No external network; two genuinely independent
+// processes coordinating only through `pending/` + the outbox.
+// ---------------------------------------------------------------------------
+
+/// A unique self-cleaning temp directory for a mailbox root, keyed by pid + tag.
+struct TempMailbox {
+    path: PathBuf,
+}
+
+impl TempMailbox {
+    fn new(tag: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("baton-cvmb-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create temp mailbox dir");
+        Self { path }
+    }
+}
+
+impl Drop for TempMailbox {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[test]
+fn converse_b_mailbox_drives_multi_turn_against_live_serve() {
+    let server = MockServer::spawn_repeating(200, SUCCESS_BODY);
+    let root = TempMailbox::new("async");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+
+    // Side B: a live `serve` daemon consuming `inbox`, replying into `outbox`,
+    // its provider calls answered by the mock. A tight poll keeps the driven
+    // turns responsive.
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_baton"));
+    serve.args([
+        "serve",
+        "--inbox",
+        inbox.to_str().unwrap(),
+        "--outbox",
+        outbox.to_str().unwrap(),
+        "--poll-ms",
+        "20",
+    ]);
+    serve.env("ANTHROPIC_API_KEY", "test-key");
+    serve.env("ANTHROPIC_BASE_URL", server.base_url());
+    serve.env("BATON_MODEL", "model-b");
+    serve.env("BATON_TIMEOUT_SECS", "5");
+    serve.env_remove("ANTHROPIC_AUTH_TOKEN");
+    serve.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+    serve.env_remove("BATON_EVENT_LOG");
+    serve.stdout(Stdio::null());
+    serve.stderr(Stdio::null());
+    let mut serve_child = serve.spawn().expect("spawn baton serve");
+
+    // Side A: the in-process participant inside the `converse` process. Delivery
+    // to `pending/` does not require the daemon to be up yet — the generous
+    // await covers any startup lag — so no explicit readiness handshake.
+    let mut converse = Command::new(env!("CARGO_BIN_EXE_baton"));
+    converse.args([
+        "converse",
+        "--seed",
+        "kick off",
+        "--a-model",
+        "model-a",
+        "--b-mailbox",
+        "--b-inbox",
+        inbox.to_str().unwrap(),
+        "--b-outbox",
+        outbox.to_str().unwrap(),
+        "--b-await-ms",
+        "10000",
+    ]);
+    converse.env("ANTHROPIC_API_KEY", "test-key");
+    converse.env("ANTHROPIC_BASE_URL", server.base_url());
+    converse.env("BATON_MODEL", "claude-test-model");
+    converse.env("BATON_TIMEOUT_SECS", "5");
+    converse.env("BATON_MAX_TURNS", "2");
+    converse.env_remove("ANTHROPIC_AUTH_TOKEN");
+    converse.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+    converse.env_remove("BATON_TOKEN_BUDGET");
+    converse.env_remove("BATON_EVENT_LOG");
+    converse.stdout(Stdio::piped());
+    converse.stderr(Stdio::piped());
+
+    let out = converse.output().expect("run baton converse");
+
+    // Tear the daemon down cooperatively regardless of the assertions below.
+    let _ = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["serve", "--stop", "--inbox", inbox.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = serve_child.wait();
+
+    assert!(
+        out.status.success(),
+        "converse should exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    // Seed + 2 replies (BATON_MAX_TURNS=2).
+    assert_eq!(lines.len(), 3, "seed + 2 reply turns: {stdout}");
+
+    let seed: serde_json::Value = serde_json::from_str(lines[0]).expect("seed is JSON");
+    assert_eq!(seed["kind"], "request");
+    assert_eq!(seed["from"], "agent-a");
+    assert_eq!(seed["to"], "agent-b");
+
+    // Turn 1 is B, answered over the mailbox by the live `serve` peer: a
+    // `response` carrying the peer's provider call in-band and correlated to the
+    // seed. This is the async round-trip that proves the mailbox-backed
+    // participant.
+    let reply_b: serde_json::Value = serde_json::from_str(lines[1]).expect("B reply is JSON");
+    assert_eq!(reply_b["kind"], "response");
+    assert_eq!(reply_b["from"], "agent-b");
+    assert_eq!(reply_b["to"], "agent-a");
+    assert_eq!(reply_b["body"], "hello from the mock server");
+    assert_eq!(
+        reply_b["exchange"]["schema"], "baton.exchange/v1",
+        "the served peer nests its provider call in-band"
+    );
+    assert!(
+        reply_b["in_reply_to"].is_string(),
+        "B's reply links its request"
+    );
+
+    // Turn 2 is A (in-process), completing the alternation.
+    let reply_a: serde_json::Value = serde_json::from_str(lines[2]).expect("A reply is JSON");
+    assert_eq!(reply_a["kind"], "response");
+    assert_eq!(reply_a["from"], "agent-a");
+    assert_eq!(reply_a["to"], "agent-b");
+
+    // Governance still bounds the driven conversation exactly as in-process.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("TurnCap"),
+        "stderr names the terminal reason: {stderr}"
+    );
+}
+
+/// When no `serve` peer ever answers, the mailbox-backed B synthesizes a
+/// transport-timeout terminal: the driver stops waiting after `--b-await-ms`
+/// and records a `kind:"error"` turn with **no** nested record — distinct in
+/// the trail from a peer-delivered error (which nests the peer's call).
+#[test]
+fn converse_b_mailbox_times_out_when_no_peer_answers() {
+    let server = MockServer::spawn_repeating(200, SUCCESS_BODY);
+    let root = TempMailbox::new("timeout");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+    // No `serve` daemon is started, so no reply is ever delivered.
+
+    let mut converse = Command::new(env!("CARGO_BIN_EXE_baton"));
+    converse.args([
+        "converse",
+        "--seed",
+        "kick off",
+        "--a-model",
+        "model-a",
+        "--b-mailbox",
+        "--b-inbox",
+        inbox.to_str().unwrap(),
+        "--b-outbox",
+        outbox.to_str().unwrap(),
+        "--b-await-ms",
+        "300",
+    ]);
+    converse.env("ANTHROPIC_API_KEY", "test-key");
+    converse.env("ANTHROPIC_BASE_URL", server.base_url());
+    converse.env("BATON_MODEL", "claude-test-model");
+    converse.env("BATON_TIMEOUT_SECS", "5");
+    converse.env("BATON_MAX_TURNS", "4");
+    converse.env_remove("ANTHROPIC_AUTH_TOKEN");
+    converse.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+    converse.env_remove("BATON_TOKEN_BUDGET");
+    converse.env_remove("BATON_EVENT_LOG");
+    converse.stdout(Stdio::piped());
+    converse.stderr(Stdio::piped());
+
+    let out = converse.output().expect("run baton converse");
+    assert!(
+        out.status.success(),
+        "converse exits 0 even when B times out; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    // Seed + B's synthesized timeout turn — the run ends on the error, well
+    // before the turn-cap of 4.
+    assert_eq!(lines.len(), 2, "seed + one terminal error turn: {stdout}");
+
+    let reply_b: serde_json::Value = serde_json::from_str(lines[1]).expect("B turn is JSON");
+    assert_eq!(reply_b["kind"], "error");
+    assert!(
+        reply_b["exchange"].is_null(),
+        "a driver-timeout nests no provider record (unlike a peer-delivered error)"
+    );
+    assert!(
+        reply_b["body"].as_str().unwrap().contains("timed out"),
+        "the timeout turn names the await-timeout: {}",
+        reply_b["body"]
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Error"),
+        "stderr names the terminal reason: {stderr}"
+    );
+}

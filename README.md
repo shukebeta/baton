@@ -383,7 +383,7 @@ until the first terminal condition trips. Where `exchange` is one round-trip,
 `converse` is a *sustained, bounded* conversation with termination guaranteed.
 
 ```
-baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] (--seed <text> | --seed-file <path>) [--out <path>]
+baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>]
 ```
 
 Each side is an in-process participant built from the shared environment
@@ -432,6 +432,55 @@ be pointed at two independent `baton exchange` **processes** rather than
 in-process participants — the vertical proof in `tests/integration_test.rs`
 (`converse_drives_two_independent_processes_to_turn_cap`) drives two spawned
 children against loopback mock servers, no external network.
+
+### Async: side B over a mailbox (`--b-mailbox`)
+
+The same boundary lets side B be a **live [`baton serve`](#serving-a-mailbox-baton-serve)
+daemon** reached over the file-mailbox instead of an in-process participant.
+`baton converse` becomes a *governed client* of that service: A is still driven
+in-process, but each of B's turns is delivered to the peer's inbox over the
+atomic mailbox path and its reply awaited from the outbox.
+
+```bash
+# Peer B, a long-lived responder:
+baton serve --inbox /tmp/mb --outbox /tmp/ob --poll-ms 20 &
+
+# Local governed driver, with B mailbox-backed:
+baton converse \
+  --seed "Introduce yourself in one sentence." \
+  --b-mailbox --b-inbox /tmp/mb --b-outbox /tmp/ob --b-await-ms 60000
+```
+
+- `--b-mailbox` — make side B mailbox-backed. Requires `--b-inbox` and
+  `--b-outbox`; mutually exclusive with `--b-system`/`--b-model` (the peer daemon
+  configures its own identity and model).
+- `--b-inbox <dir>` / `--b-outbox <dir>` — the peer `serve`'s `--inbox` /
+  `--outbox`. Each request lands in `<b-inbox>/pending/`; each reply is claimed
+  from `<b-outbox>`, keyed by the request id.
+- `--b-await-ms <n>` — how long a B turn waits for its reply before giving up
+  (positive integer; default `60000`). Generous by default: every B turn is a
+  full provider turn run by the peer, so a short deadline would give up mid-answer.
+
+**Topology.** This is a *local governed driver ↔ one remote responder over one
+mailbox* — a governed client of a `serve` service, **not** autonomous
+peer-daemon↔peer-daemon conversation (there is still a single central driver).
+The driver and its governance (turn-cap, token-budget) are unchanged: a
+mailbox-backed B is just another participant, so `BATON_MAX_TURNS` /
+`BATON_TOKEN_BUDGET` bound the run exactly as in-process.
+
+**Terminal semantics — "peer errored" vs "driver stopped waiting".** A B turn
+that times out (or fails to deliver, or gets a mis-correlated reply) is recorded
+as a terminal `kind: "error"` turn — but one with **no** nested
+`baton.exchange/v1` record and a body naming the await-timeout. A peer-*delivered*
+error is also `kind: "error"`, but carries the peer's nested provider-call record.
+So the trail distinguishes the two by that record: `error` **with** a nested
+record means the peer answered with an error; `error` **without** one means the
+driver stopped waiting. This distinction assumes the peer nests a record on every
+delivered reply, which holds for a `baton serve` peer (its in-process participant
+always does); a future peer that could deliver a recordless error would rely on
+the timeout-naming body as the tie-breaker. Mapping the first await-timeout
+straight to a terminal is a deliberate v1 simplification — retry/backoff within
+an await is a named follow-on.
 
 ## Serving a mailbox (`baton serve`)
 
