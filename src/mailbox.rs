@@ -130,11 +130,11 @@ impl Mailbox {
     /// Delivers `envelope` into `pending/` atomically (temp file, then `rename`).
     ///
     /// The request-side counterpart of a sender dropping a message; also the
-    /// entry point tests use to seed the mailbox.
+    /// entry point tests use to seed the mailbox. A producer that does not hold
+    /// (and must not acquire) the single-instance lock uses the free-standing
+    /// [`deliver_to`] instead — both share [`deliver_into_pending`].
     pub fn deliver(&self, envelope: &MessageEnvelope) -> Result<()> {
-        let key = safe_key(&envelope.message_id)?;
-        let json = serialize(envelope)?;
-        atomic_write(&self.pending, &file_name(&key), &json)
+        deliver_into_pending(&self.pending, envelope)
     }
 
     /// Moves any `claimed/` entry a prior crash abandoned back to `pending/`.
@@ -221,6 +221,63 @@ impl Mailbox {
         let json = serialize(response)?;
         atomic_write(outbox, &file_name(&key), &json)
     }
+}
+
+/// Delivers `envelope` into `<root>/pending/` atomically, **without** taking the
+/// single-instance lock — the producer path used by `baton send`.
+///
+/// A sender posts to a mailbox a `baton serve` consumer owns the lock on, so it
+/// must not open a [`Mailbox`] (which would be refused while the daemon is
+/// live). It creates `<root>/pending/` if absent, then uses the identical temp
+/// file + `rename(2)` write as [`Mailbox::deliver`] — the atomic delivery is
+/// single-sourced in [`deliver_into_pending`]. Producer and consumer never race
+/// on the same file: the request lands in `pending/` and `serve` claims it out.
+pub fn deliver_to(root: impl AsRef<Path>, envelope: &MessageEnvelope) -> Result<()> {
+    deliver_into_pending(&root.as_ref().join("pending"), envelope)
+}
+
+/// Attempts to claim the reply for `request_key` from `outbox`, returning the
+/// parsed envelope, or `Ok(None)` when no reply is present yet.
+///
+/// The claim is a single `rename(2)` of `<outbox>/<key>.json` to a private,
+/// `.`-prefixed non-`.json` path: the rename *is* exclusive ownership. `ENOENT`
+/// means either the reply has not appeared or a concurrent consumer (or a
+/// reappearing reclaim-driven v2 racing an earlier await) already claimed it —
+/// both resolve to `Ok(None)` so the caller keeps polling. The claim file is
+/// best-effort removed after a successful read; a crash between the rename and
+/// the removal leaves a `.`-prefixed orphan, which is expected and harmless —
+/// [`json_key`] ignores it, so no scanner ever mistakes it for a message.
+pub fn try_claim_response(outbox: &Path, request_key: &str) -> Result<Option<MessageEnvelope>> {
+    let key = safe_key(request_key)?;
+    let src = outbox.join(file_name(&key));
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let claim = outbox.join(format!(".{key}.{}.{seq}.claimed", std::process::id()));
+    match fs::rename(&src, &claim) {
+        Ok(()) => {
+            let envelope = read_envelope(&claim)?;
+            let _ = fs::remove_file(&claim);
+            Ok(Some(envelope))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(BatonError::Io(format!(
+            "could not claim response {src:?}: {err}"
+        ))),
+    }
+}
+
+/// Writes `envelope` into `pending` atomically, creating the directory if absent.
+///
+/// The single delivery implementation shared by [`Mailbox::deliver`] (locked
+/// consumer seeding its own inbox) and [`deliver_to`] (lock-free producer).
+fn deliver_into_pending(pending: &Path, envelope: &MessageEnvelope) -> Result<()> {
+    fs::create_dir_all(pending).map_err(|err| {
+        BatonError::Io(format!(
+            "could not create mailbox directory {pending:?}: {err}"
+        ))
+    })?;
+    let key = safe_key(&envelope.message_id)?;
+    let json = serialize(envelope)?;
+    atomic_write(pending, &file_name(&key), &json)
 }
 
 /// The on-disk filename for a message key.
@@ -489,5 +546,67 @@ mod tests {
         let dir = TempDir::new("unsafe");
         let mailbox = Mailbox::open(&dir.path).expect("open");
         assert!(mailbox.deliver(&request("../escape")).is_err());
+    }
+
+    /// The lock-free producer seeds `pending/` even while a consumer holds the
+    /// single-instance lock — the whole point of `baton send` posting to a live
+    /// `serve`'s inbox — and the delivered message is then claimable.
+    #[test]
+    fn deliver_to_posts_without_the_lock_while_a_consumer_holds_it() {
+        let dir = TempDir::new("deliver-to");
+        let consumer = Mailbox::open(&dir.path).expect("consumer holds the lock");
+
+        // Producer never opens the mailbox, so it never contends for the lock.
+        deliver_to(&dir.path, &request("m-1")).expect("lock-free deliver");
+        assert_eq!(count_files(&dir.path.join("pending")), 1);
+
+        let claimed = consumer.claim_next().expect("claim").expect("some");
+        assert_eq!(claimed.key, "m-1");
+    }
+
+    /// `deliver_to` creates `pending/` when the mailbox root does not exist yet
+    /// (a producer racing ahead of the first `serve`).
+    #[test]
+    fn deliver_to_creates_pending_when_absent() {
+        let dir = TempDir::new("deliver-to-fresh");
+        let root = dir.path.join("nested-root");
+        deliver_to(&root, &request("m-1")).expect("creates pending and delivers");
+        assert_eq!(count_files(&root.join("pending")), 1);
+    }
+
+    /// An unsafe message id is rejected by the lock-free producer too.
+    #[test]
+    fn deliver_to_rejects_unsafe_message_id() {
+        let dir = TempDir::new("deliver-to-unsafe");
+        assert!(deliver_to(&dir.path, &request("../escape")).is_err());
+    }
+
+    /// A present reply is claimed once: the first call returns it and renames it
+    /// out of the outbox, so a second call (a concurrent await, or a reappearing
+    /// v2 racing this one) sees nothing.
+    #[test]
+    fn try_claim_response_claims_once_then_none() {
+        let dir = TempDir::new("claim");
+        let outbox = dir.path.join("outbox");
+        let mailbox = Mailbox::open(&dir.path).expect("open");
+        mailbox
+            .deliver_response(&outbox, "m-1", &response_for("m-1"))
+            .expect("seed reply");
+
+        let first = try_claim_response(&outbox, "m-1").expect("claim");
+        assert!(first.is_some(), "the reply is claimed");
+        assert_eq!(first.unwrap().in_reply_to.as_deref(), Some("m-1"));
+
+        let second = try_claim_response(&outbox, "m-1").expect("second claim");
+        assert!(second.is_none(), "a claimed reply is not double-consumed");
+    }
+
+    /// An absent reply is `Ok(None)`, not an error — the poll-again signal.
+    #[test]
+    fn try_claim_response_absent_is_none() {
+        let dir = TempDir::new("claim-absent");
+        let outbox = dir.path.join("outbox");
+        fs::create_dir_all(&outbox).expect("outbox");
+        assert!(try_claim_response(&outbox, "m-1").expect("claim").is_none());
     }
 }

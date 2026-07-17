@@ -493,6 +493,61 @@ already guarantees no *loss*, and graceful shutdown is only a reprocess-rate
 optimization on top. There is also no zero-downtime handover: a restart has a
 brief window where the second `serve` is refused until the first exits.
 
+The client side of this mailbox — posting a request and reading the correlated
+reply — is [`baton send`](#posting-to-a-mailbox-baton-send).
+
+## Posting to a mailbox (`baton send`)
+
+`baton send` is the producer for a mailbox: it drops a `baton.message/v1` request
+into `<inbox>/pending/` over the same atomic temp-file + `rename(2)` path `serve`
+consumes, and with `--await` reads back the correlated reply. It is the reference
+client for `serve`'s at-least-once contract. Unlike `serve` it takes **no**
+single-instance lock, so it posts to an inbox a live `serve` already owns; and it
+runs no provider call, so it needs no credential.
+
+```
+baton send --inbox <dir> (--body <text> | --in <path>) [--to <id>] [--from <id>] [--conversation <id>] [--await --outbox <dir> [--timeout-ms <n>]]
+```
+
+- `--inbox <dir>` — the mailbox root; the request is written to its `pending/`.
+- `--body <text>` — build a request envelope around this body. `--to`/`--from`/
+  `--conversation` override its addressing (defaults `agent-b`/`agent-a` and a
+  time-derived conversation id); the `message_id` is derived so no external id
+  source is needed.
+- `--in <path>` — read a complete envelope from a file instead (mutually
+  exclusive with `--body`; the addressing flags do not apply — the envelope
+  carries its own).
+- `--await` — after delivering, wait for the reply and print it to stdout.
+  Requires `--outbox <dir>`.
+- `--outbox <dir>` — where `serve` writes replies (`<outbox>/<message_id>.json`).
+- `--timeout-ms <n>` — how long `--await` waits before giving up (default
+  `30000`).
+
+Without `--await`, `send` prints the sent `message_id` to stdout and exits. With
+`--await`, the `message_id` confirmation goes to stderr and **stdout carries only
+the reply envelope** (one JSON line), so a consumer can pipe it straight into a
+parser.
+
+### Await: claim, correlate, and the at-least-once caveat
+
+`--await` polls `<outbox>/<message_id>.json`; on appearance it **atomically
+renames the reply out of the outbox to claim ownership**, then reads it. The
+rename is the claim: it prevents a concurrent `--await` — or a reappearing
+reclaim-driven second response — from double-consuming the same file. (It is not
+about partial reads; the atomic write already rules those out.) The consumed
+reply's `in_reply_to` must equal the sent `message_id`, or `send` errors rather
+than accept an uncorrelated reply.
+
+The await is bounded to the single invocation: on timeout `send` exits non-zero,
+the request is left in the mailbox, and it does **not** re-await across runs.
+Because a claimed reply is renamed away, a later reclaim-driven **second**
+response (the at-least-once tail described under `serve`) reappears as a fresh
+outbox file and would be handed to a *subsequent* `--await` — so consumers dedup
+on `in_reply_to` / `conversation_id`, exactly as they must for `serve`.
+
+Both the send and the consumed reply are recorded to `BATON_EVENT_LOG` (as
+`message_sent` / `reply_consumed` lines on the same trail), when it is set.
+
 ## Development
 
 CI runs the following gates; run them locally before opening a PR:
