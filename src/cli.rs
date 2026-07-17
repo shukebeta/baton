@@ -46,7 +46,7 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] | baton serve --stop --inbox <dir> | baton send --inbox <dir> (--body <text> | --in <path>) [--to <id>] [--from <id>] [--conversation <id>] [--await --outbox <dir> [--timeout-ms <n>]] | baton log show|replay [--file <path>] [--index <N>]";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] | baton serve --stop --inbox <dir> | baton send --inbox <dir> (--body <text> | --in <path>) [--to <id>] [--from <id>] [--conversation <id>] [--await --outbox <dir> [--timeout-ms <n>]] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>...";
 
 /// Default `baton serve` inbox poll interval, in milliseconds, when `--poll-ms`
 /// is unset.
@@ -139,6 +139,13 @@ enum Command {
     LogReplay {
         file: Option<String>,
         index: Option<usize>,
+    },
+    /// Merge `baton.message/v1` envelopes sharing `conversation` across several
+    /// trail files (explicit paths; a directory expands to its files) into one
+    /// causal-chain–ordered view.
+    LogMerge {
+        paths: Vec<String>,
+        conversation: String,
     },
 }
 
@@ -360,7 +367,70 @@ pub fn run() -> Result<()> {
             println!("{reply}");
             Ok(())
         }
+        Command::LogMerge {
+            paths,
+            conversation,
+        } => {
+            let envelopes = read_message_trails(&paths)?;
+            let merged = log::merge_conversation(envelopes, &conversation);
+            let stdout = std::io::stdout();
+            execute_log_merge(&merged, stdout.lock())
+        }
     }
+}
+
+/// Reads every `baton.message/v1` envelope across `paths`, concatenated in the
+/// order given.
+///
+/// Each path is a trail file, or a directory whose file entries (sorted for a
+/// deterministic order) are each read as a trail — so a caller can point the
+/// merge at a whole directory of trails. Non-fatal warnings from
+/// [`log::parse_message_trail`] (a skipped malformed line in one trail) are
+/// surfaced on stderr, keeping the merge robust to one corrupt line without
+/// bricking the unified view.
+fn read_message_trails(paths: &[String]) -> Result<Vec<MessageEnvelope>> {
+    let mut envelopes = Vec::new();
+    for path in paths {
+        for file in trail_files_at(path)? {
+            let handle = File::open(&file).map_err(|err| {
+                BatonError::Io(format!("failed to open trail file {file:?}: {err}"))
+            })?;
+            let report = log::parse_message_trail(handle)?;
+            for warning in &report.warnings {
+                eprintln!("warning: {file:?}: {warning}");
+            }
+            envelopes.extend(report.envelopes);
+        }
+    }
+    Ok(envelopes)
+}
+
+/// Resolves one merge argument into the trail files to read: a directory
+/// expands to its file entries (sorted); any other path is taken verbatim.
+fn trail_files_at(path: &str) -> Result<Vec<std::path::PathBuf>> {
+    let meta = std::fs::metadata(path)
+        .map_err(|err| BatonError::Io(format!("failed to stat {path:?}: {err}")))?;
+    if !meta.is_dir() {
+        return Ok(vec![std::path::PathBuf::from(path)]);
+    }
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(path)
+        .map_err(|err| BatonError::Io(format!("failed to read directory {path:?}: {err}")))?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| p.is_file())
+        .collect();
+    files.sort();
+    Ok(files)
+}
+
+/// Writes each merged message as a human-readable block to `output`.
+///
+/// Parameterised over [`Write`] so the rendering is unit-testable with an
+/// in-memory buffer. An empty merge (no matching envelope) produces no output.
+fn execute_log_merge(merged: &[MessageEnvelope], mut output: impl Write) -> Result<()> {
+    for (i, envelope) in merged.iter().enumerate() {
+        write!(output, "{}", log::format_message(i + 1, envelope)).map_err(io_err)?;
+    }
+    Ok(())
 }
 
 /// Resolves the log path and parses it into exchanges.
@@ -944,8 +1014,52 @@ fn parse_log<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> 
                 index: opts.index,
             })
         }
+        "merge" => parse_log_merge(iter),
         other => Err(usage(&format!("unknown log subcommand {other:?}"))),
     }
+}
+
+/// Parses the arguments following `log merge`.
+///
+/// Requires `--conversation <id>` (non-blank) and at least one positional trail
+/// path; every other token is taken as a trail path. The `--conversation=<id>`
+/// form is accepted. A missing/blank conversation id, no trail paths, or a
+/// `--conversation` without a value is a usage error.
+fn parse_log_merge<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut conversation: Option<String> = None;
+    let mut paths: Vec<String> = Vec::new();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--conversation" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| usage("--conversation requires a value"))?;
+                conversation = Some(value.clone());
+            }
+            other if other.starts_with("--conversation=") => {
+                conversation = Some(other["--conversation=".len()..].to_string());
+            }
+            other if other.starts_with("--") => {
+                return Err(usage(&format!("unexpected argument {other:?}")));
+            }
+            other => paths.push(other.to_string()),
+        }
+    }
+
+    let conversation = match conversation {
+        Some(id) if !id.trim().is_empty() => id,
+        Some(_) => return Err(usage("--conversation <id> must not be empty")),
+        None => return Err(usage("log merge requires --conversation <id>")),
+    };
+    if paths.is_empty() {
+        return Err(usage("log merge requires at least one trail path"));
+    }
+
+    Ok(Command::LogMerge {
+        paths,
+        conversation,
+    })
 }
 
 /// Parsed options shared by `log show` / `log replay`.
@@ -1775,6 +1889,63 @@ mod tests {
                 index: Some(2),
             }
         );
+    }
+
+    #[test]
+    fn parses_log_merge_with_paths_and_conversation() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "log",
+                "merge",
+                "--conversation",
+                "c-1",
+                "/tmp/a.jsonl",
+                "/tmp/b.jsonl"
+            ]))
+            .expect("parses"),
+            Command::LogMerge {
+                paths: vec!["/tmp/a.jsonl".to_string(), "/tmp/b.jsonl".to_string()],
+                conversation: "c-1".to_string(),
+            }
+        );
+        // `--conversation=<id>` form, and a path given before the flag.
+        assert_eq!(
+            parse_args(&argv(&[
+                "log",
+                "merge",
+                "/tmp/a.jsonl",
+                "--conversation=c-2"
+            ]))
+            .expect("parses"),
+            Command::LogMerge {
+                paths: vec!["/tmp/a.jsonl".to_string()],
+                conversation: "c-2".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn log_merge_without_conversation_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&["log", "merge", "/tmp/a.jsonl"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn log_merge_without_paths_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&["log", "merge", "--conversation", "c-1"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn log_merge_unknown_flag_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&["log", "merge", "--conversation", "c-1", "--bogus"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
     }
 
     #[test]
