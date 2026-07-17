@@ -252,6 +252,44 @@ of a `baton ask`/`session` process killed mid-write), which is skipped with a
 stderr warning so one unclean shutdown can't brick the whole trail. Diffing,
 filtering, and non-JSONL export remain out of scope.
 
+### Cross-trail merge (`baton log merge`)
+
+The moment a conversation goes async it is split across ≥2 trails — the
+initiator's and each `baton serve` daemon's, possibly on different hosts. `baton
+log merge` reunites them: it reads the `baton.message/v1` envelopes (written by
+`converse`, `exchange`, and `send`) out of several trail files and presents every
+one sharing a `--conversation <id>` as a single turn-ordered view.
+
+```bash
+baton log merge --conversation c-1 initiator-trail.jsonl peer-trail.jsonl
+baton log merge --conversation c-1 ./trails/     # a directory expands to its files
+```
+
+```text
+#1  2023-11-14T22:13:20Z  agent-a → agent-b  Request
+    in_reply_to: —
+    body: who won the 1998 world cup?
+#2  2023-11-14T22:13:21Z  agent-b → agent-a  Response
+    in_reply_to: m-0
+    body: France
+```
+
+Ordering follows the **`in_reply_to` causal chain** as the authoritative order:
+each message is placed after the one it replies to, so envelopes from different
+source trails interleave into the one true sequence. Across trails from different
+hosts `ts_ms` is subject to clock skew and is therefore **never** trusted for
+cross-trail order — it is only a cosmetic tie-break between sibling replies to the
+same parent (falling back to `message_id`). A message whose `in_reply_to` points
+outside the collected set is treated as a root, and a `message_id` that appears in
+more than one trail (at-least-once delivery) is collapsed to its first occurrence.
+
+Each argument is a trail file, or a directory whose files are each read. Only
+`baton.message/v1` lines are considered; a line of any other schema (e.g. a
+`baton.exchange/v1` event) is ignored. Unlike `show`/`replay`, **any** malformed
+line — not just a trailing partial one — is skipped with a stderr warning rather
+than aborting, so one corrupt line in one trail never bricks the merge. Live
+tailing and cross-host trail fetch remain out of scope.
+
 ## A2A message envelope (`baton.message/v1`)
 
 Where `baton.exchange/v1` (above) describes a single provider *call*,

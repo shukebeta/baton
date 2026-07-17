@@ -18,12 +18,14 @@
 //! `baton ask`/`session` process is killed mid-write: that is tolerated and
 //! reported as a warning, so an unclean shutdown never bricks the whole trail.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{BatonError, Result};
+use crate::message::{MessageEnvelope, SCHEMA as MESSAGE_SCHEMA};
 
 /// One request paired with its single outcome — the unit `baton log` operates on.
 ///
@@ -365,6 +367,199 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
+/// The outcome of parsing a `baton.message/v1` trail for the cross-trail merge:
+/// every envelope found plus any non-fatal diagnostics.
+///
+/// Unlike [`ParseReport`] (the `baton.exchange/v1` read path), this report is
+/// tolerant of *any* bad line — not just a trailing partial one. A merge spans
+/// several independently-written trails, so a single corrupt or truncated line
+/// in one of them is skipped-with-warning rather than aborting the whole merge.
+#[derive(Debug, Default)]
+pub struct MessageParseReport {
+    /// Every `baton.message/v1` envelope found, in file order.
+    pub envelopes: Vec<MessageEnvelope>,
+    /// Non-fatal diagnostics (skipped malformed lines), in encounter order.
+    pub warnings: Vec<String>,
+}
+
+/// Parses one trail file, collecting every `baton.message/v1` envelope it holds.
+///
+/// A trail may interleave schemas — a file can carry `baton.exchange/v1` event
+/// lines beside `baton.message/v1` envelopes — so each line is first parsed as a
+/// bare JSON object and dispatched on its `schema`:
+///
+/// - `schema == "baton.message/v1"` → deserialized into a [`MessageEnvelope`].
+///   A shape mismatch here is skipped-with-warning (see below), not a hard error.
+/// - **Any other (or absent) `schema`** → silently skipped: it belongs to a
+///   different trail and is simply not this mode's concern.
+/// - **A malformed line** (invalid UTF-8 / not JSON), or a `baton.message/v1`
+///   line that fails to deserialize → skipped and recorded in
+///   [`MessageParseReport::warnings`]. This is the robustness contract for the
+///   merge: one bad line in one trail must never brick the unified view. (This
+///   is deliberately more tolerant than [`parse_jsonl`], which hard-errors on a
+///   mid-file malformed line — a single-file inspector can surface corruption,
+///   but a cross-trail merge should degrade rather than abort.)
+///
+/// Pure over its [`Read`]: warnings are returned, not printed, leaving stderr
+/// emission to the caller.
+pub fn parse_message_trail<R: Read>(reader: R) -> Result<MessageParseReport> {
+    let mut buffered = BufReader::new(reader);
+    let mut report = MessageParseReport::default();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut line_no = 0usize;
+
+    loop {
+        buf.clear();
+        let read = buffered
+            .read_until(b'\n', &mut buf)
+            .map_err(|err| BatonError::Io(format!("reading trail line {}: {err}", line_no + 1)))?;
+        if read == 0 {
+            break;
+        }
+        line_no += 1;
+
+        if buf.iter().all(|b| b.is_ascii_whitespace()) {
+            continue;
+        }
+
+        let value = match parse_line_value(&buf) {
+            Ok(value) => value,
+            Err(detail) => {
+                report
+                    .warnings
+                    .push(format!("skipped malformed trail line {line_no}: {detail}"));
+                continue;
+            }
+        };
+
+        // Only `baton.message/v1` envelopes are this mode's concern; every other
+        // schema (e.g. a `baton.exchange/v1` event) is skipped without comment.
+        if value.get("schema").and_then(Value::as_str) != Some(MESSAGE_SCHEMA) {
+            continue;
+        }
+
+        match serde_json::from_value::<MessageEnvelope>(value) {
+            Ok(envelope) => report.envelopes.push(envelope),
+            Err(err) => report.warnings.push(format!(
+                "skipped malformed trail line {line_no}: invalid {MESSAGE_SCHEMA} envelope: {err}"
+            )),
+        }
+    }
+
+    Ok(report)
+}
+
+/// Merges the envelopes of one conversation into a single causal-chain–ordered
+/// view.
+///
+/// `envelopes` is the concatenation of every source trail; this filters to
+/// `conversation_id`, deduplicates, and orders the result. The ordering rules
+/// (from the cross-trail merge contract):
+///
+/// - **`in_reply_to` is authoritative.** Ordering follows the reply chain, not
+///   the clock — across trails from different hosts `ts_ms` is subject to clock
+///   skew, so it is never trusted for cross-trail order.
+/// - **`ts_ms` is a cosmetic tie-break only**, used to order sibling replies to
+///   the same parent (and multiple roots) within a single logical step; ties on
+///   `ts_ms` fall back to `message_id` for a deterministic result.
+/// - **Duplicates are collapsed by `message_id`.** At-least-once delivery means
+///   the same envelope can appear in more than one trail; the first occurrence
+///   wins.
+/// - A **root** is an envelope whose `in_reply_to` is absent or points to a
+///   `message_id` not present in the filtered set (a dangling parent — e.g. the
+///   other side of a partially-collected exchange).
+/// - A cyclic `in_reply_to` cannot wedge the traversal (a `visited` set guards
+///   it); any envelope left unreached is appended, ordered by `(ts_ms,
+///   message_id)`, so nothing is silently dropped.
+pub fn merge_conversation(
+    envelopes: Vec<MessageEnvelope>,
+    conversation_id: &str,
+) -> Vec<MessageEnvelope> {
+    // Filter to the target conversation, collapsing duplicate message_ids
+    // (at-least-once delivery) to the first occurrence.
+    let mut seen: HashSet<String> = HashSet::new();
+    let items: Vec<MessageEnvelope> = envelopes
+        .into_iter()
+        .filter(|e| e.conversation_id == conversation_id)
+        .filter(|e| seen.insert(e.message_id.clone()))
+        .collect();
+
+    // Index by message_id so `in_reply_to` links can be resolved and roots
+    // (dangling parent) distinguished from replies within the set.
+    let index: HashMap<&str, usize> = items
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.message_id.as_str(), i))
+        .collect();
+
+    // children[parent] = its replies; roots = no parent in the set.
+    let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+    for (i, e) in items.iter().enumerate() {
+        match e.in_reply_to.as_deref().and_then(|p| index.get(p)) {
+            Some(&parent) => children.entry(parent).or_default().push(i),
+            None => roots.push(i),
+        }
+    }
+
+    // Order roots and each sibling group by the (ts_ms, message_id) tie-break.
+    let by_tiebreak = |a: &usize, b: &usize| {
+        let (ea, eb) = (&items[*a], &items[*b]);
+        ea.ts_ms
+            .cmp(&eb.ts_ms)
+            .then_with(|| ea.message_id.cmp(&eb.message_id))
+    };
+    roots.sort_by(by_tiebreak);
+    for group in children.values_mut() {
+        group.sort_by(by_tiebreak);
+    }
+
+    // Pre-order DFS along the reply chain, guarding against a cyclic link.
+    let mut ordered: Vec<usize> = Vec::with_capacity(items.len());
+    let mut visited: HashSet<usize> = HashSet::new();
+    let mut stack: Vec<usize> = roots.into_iter().rev().collect();
+    while let Some(i) = stack.pop() {
+        if !visited.insert(i) {
+            continue;
+        }
+        ordered.push(i);
+        if let Some(group) = children.get(&i) {
+            stack.extend(group.iter().rev().copied());
+        }
+    }
+
+    // Any envelope unreached (only possible under a cycle) is appended so the
+    // merge never silently drops a line.
+    let mut leftover: Vec<usize> = (0..items.len()).filter(|i| !visited.contains(i)).collect();
+    leftover.sort_by(by_tiebreak);
+    ordered.extend(leftover);
+
+    // Materialize the ordering. `items` is consumed via index, so swap each out.
+    let mut items: Vec<Option<MessageEnvelope>> = items.into_iter().map(Some).collect();
+    ordered
+        .into_iter()
+        .map(|i| items[i].take().expect("each index visited once"))
+        .collect()
+}
+
+/// Renders one merged message as a human-readable block for `baton log merge`.
+///
+/// `n` is the 1-based position in the merged view. The header carries the
+/// timestamp, `from → to` addressing, the message kind, and the `in_reply_to`
+/// link (or `—` for a root); the body follows, excerpted like an exchange block.
+pub fn format_message(n: usize, envelope: &MessageEnvelope) -> String {
+    const MAX: usize = 120;
+    let reply_to = envelope.in_reply_to.as_deref().unwrap_or("—");
+    format!(
+        "#{n}  {}  {} → {}  {:?}\n    in_reply_to: {reply_to}\n    body: {}\n",
+        format_ts(envelope.ts_ms),
+        envelope.from,
+        envelope.to,
+        envelope.kind,
+        excerpt(&envelope.body, MAX),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,5 +873,180 @@ mod tests {
         assert!(rendered.contains("error:"));
         assert!(rendered.contains("auth"));
         assert!(rendered.contains("bad api key"));
+    }
+
+    // ---- cross-trail merge (`baton log merge`) -------------------------------
+
+    use crate::message::MessageKind;
+
+    /// Builds a `baton.message/v1` envelope JSONL line with an explicit
+    /// `in_reply_to` (or `null`) for the merge tests.
+    fn msg_line(
+        message_id: &str,
+        conversation_id: &str,
+        in_reply_to: Option<&str>,
+        ts_ms: u64,
+        body: &str,
+    ) -> String {
+        let mut env = MessageEnvelope::new(
+            message_id,
+            conversation_id,
+            "agent-a",
+            "agent-b",
+            MessageKind::Request,
+            body,
+            ts_ms,
+        );
+        env.in_reply_to = in_reply_to.map(str::to_string);
+        serde_json::to_string(&env).expect("serializes")
+    }
+
+    /// Only `baton.message/v1` lines are collected; a `baton.exchange/v1` event
+    /// line interleaved in the same trail is skipped without a warning.
+    #[test]
+    fn parse_message_trail_collects_only_message_envelopes() {
+        let trail = format!(
+            "{}\n{}\n{}\n",
+            msg_line("m-1", "c-1", None, 1, "hello"),
+            r#"{"event":"request","schema":"baton.exchange/v1","ts_ms":2,"model":"m","base_url":"u","prompt":"p"}"#,
+            msg_line("m-2", "c-1", Some("m-1"), 3, "hi"),
+        );
+        let report = parse_message_trail(Cursor::new(trail)).expect("parses");
+        assert_eq!(report.envelopes.len(), 2);
+        assert!(report.warnings.is_empty(), "exchange line skipped silently");
+        assert_eq!(report.envelopes[0].message_id, "m-1");
+        assert_eq!(report.envelopes[1].message_id, "m-2");
+    }
+
+    /// A malformed line — including a mid-file one — is skipped-with-warning and
+    /// does not drop the valid envelopes around it (the merge robustness contract).
+    #[test]
+    fn parse_message_trail_tolerates_malformed_line() {
+        let trail = format!(
+            "{}\n<<<not json>>>\n{}\n",
+            msg_line("m-1", "c-1", None, 1, "a"),
+            msg_line("m-2", "c-1", Some("m-1"), 2, "b"),
+        );
+        let report = parse_message_trail(Cursor::new(trail)).expect("tolerates malformed");
+        assert_eq!(report.envelopes.len(), 2, "valid envelopes survive");
+        assert_eq!(report.warnings.len(), 1);
+        assert!(
+            report.warnings[0].contains("line 2"),
+            "{}",
+            report.warnings[0]
+        );
+    }
+
+    /// A `baton.message/v1` line that cannot deserialize into an envelope is a
+    /// skipped-with-warning line, not a hard error.
+    #[test]
+    fn parse_message_trail_warns_on_bad_message_envelope() {
+        let trail = concat!(r#"{"schema":"baton.message/v1","message_id":"m-1"}"#, "\n",);
+        let report = parse_message_trail(Cursor::new(trail)).expect("does not hard-error");
+        assert!(report.envelopes.is_empty());
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("baton.message/v1"));
+    }
+
+    /// Envelopes split across two trails interleave into one chain-ordered view,
+    /// following `in_reply_to` rather than the order the trails were concatenated.
+    #[test]
+    fn merge_interleaves_trails_in_causal_order() {
+        // Trail order deliberately shuffles the causal chain m0→m1→m2→m3.
+        let env = |id: &str, parent: Option<&str>, ts: u64| {
+            let mut e = MessageEnvelope::new(id, "c-1", "a", "b", MessageKind::Request, "x", ts);
+            e.in_reply_to = parent.map(|p| p.to_string());
+            e
+        };
+        let envelopes = vec![
+            env("m-2", Some("m-1"), 30),
+            env("m-0", None, 10),
+            env("m-3", Some("m-2"), 40),
+            env("m-1", Some("m-0"), 20),
+        ];
+        let merged = merge_conversation(envelopes, "c-1");
+        let ids: Vec<&str> = merged.iter().map(|e| e.message_id.as_str()).collect();
+        assert_eq!(ids, ["m-0", "m-1", "m-2", "m-3"]);
+    }
+
+    /// Only the selected conversation is included; other conversations drop out.
+    #[test]
+    fn merge_filters_by_conversation_id() {
+        let mut a = MessageEnvelope::new("m-1", "c-1", "a", "b", MessageKind::Request, "x", 1);
+        let mut b = MessageEnvelope::new("m-2", "c-2", "a", "b", MessageKind::Request, "y", 2);
+        a.in_reply_to = None;
+        b.in_reply_to = None;
+        let merged = merge_conversation(vec![a, b], "c-1");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].conversation_id, "c-1");
+    }
+
+    /// `ts_ms` breaks ties only among siblings sharing a parent — two replies to
+    /// the same message order by timestamp, earliest first.
+    #[test]
+    fn merge_uses_ts_ms_only_as_sibling_tiebreak() {
+        let root = MessageEnvelope::new("m-0", "c-1", "a", "b", MessageKind::Request, "root", 100);
+        let mut late =
+            MessageEnvelope::new("m-2", "c-1", "b", "a", MessageKind::Response, "late", 300);
+        let mut early =
+            MessageEnvelope::new("m-1", "c-1", "b", "a", MessageKind::Response, "early", 200);
+        late.in_reply_to = Some("m-0".to_string());
+        early.in_reply_to = Some("m-0".to_string());
+        // Feed the later sibling first; the tie-break must still order early→late.
+        let merged = merge_conversation(vec![root, late, early], "c-1");
+        let ids: Vec<&str> = merged.iter().map(|e| e.message_id.as_str()).collect();
+        assert_eq!(ids, ["m-0", "m-1", "m-2"]);
+    }
+
+    /// A `message_id` repeated across trails (at-least-once delivery) is
+    /// collapsed to its first occurrence.
+    #[test]
+    fn merge_deduplicates_repeated_message_id() {
+        let one = MessageEnvelope::new("m-1", "c-1", "a", "b", MessageKind::Request, "first", 1);
+        let dup = MessageEnvelope::new("m-1", "c-1", "a", "b", MessageKind::Request, "dup", 1);
+        let merged = merge_conversation(vec![one, dup], "c-1");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].body, "first");
+    }
+
+    /// An `in_reply_to` pointing outside the collected set (a dangling parent —
+    /// e.g. the other side of a half-collected exchange) is treated as a root,
+    /// not dropped.
+    #[test]
+    fn merge_treats_dangling_parent_as_root() {
+        let mut e =
+            MessageEnvelope::new("m-1", "c-1", "a", "b", MessageKind::Response, "orphan", 5);
+        e.in_reply_to = Some("m-absent".to_string());
+        let merged = merge_conversation(vec![e], "c-1");
+        assert_eq!(merged.len(), 1, "dangling reply still surfaces");
+        assert_eq!(merged[0].message_id, "m-1");
+    }
+
+    #[test]
+    fn format_message_includes_addressing_kind_and_reply_link() {
+        let mut e = MessageEnvelope::new(
+            "m-2",
+            "c-1",
+            "agent-b",
+            "agent-a",
+            MessageKind::Response,
+            "the answer",
+            1_700_000_000_000,
+        );
+        e.in_reply_to = Some("m-1".to_string());
+        let rendered = format_message(2, &e);
+        assert!(rendered.contains("#2"));
+        assert!(rendered.contains("2023-11-14T22:13:20Z"));
+        assert!(rendered.contains("agent-b → agent-a"));
+        assert!(rendered.contains("Response"));
+        assert!(rendered.contains("in_reply_to: m-1"));
+        assert!(rendered.contains("the answer"));
+    }
+
+    #[test]
+    fn format_message_renders_dash_for_root_reply_link() {
+        let e = MessageEnvelope::new("m-0", "c-1", "a", "b", MessageKind::Request, "seed", 0);
+        let rendered = format_message(1, &e);
+        assert!(rendered.contains("in_reply_to: —"), "got: {rendered}");
     }
 }
