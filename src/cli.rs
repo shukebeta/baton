@@ -37,7 +37,7 @@ use crate::log::{self, Exchange};
 use crate::mailbox::{self, Mailbox};
 use crate::message::{MessageEnvelope, MessageKind};
 use crate::model::{AssistantReply, Conversation, Prompt};
-use crate::participant::{LocalParticipant, Participant};
+use crate::participant::{LocalParticipant, MailboxParticipant, Participant};
 use crate::transport::Transport;
 use crate::transport::claude::ClaudeClient;
 
@@ -46,7 +46,7 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] (--seed <text> | --seed-file <path>) [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] | baton serve --stop --inbox <dir> | baton send --inbox <dir> (--body <text> | --in <path>) [--to <id>] [--from <id>] [--conversation <id>] [--await --outbox <dir> [--timeout-ms <n>]] | baton log show|replay [--file <path>] [--index <N>]";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] | baton serve --stop --inbox <dir> | baton send --inbox <dir> (--body <text> | --in <path>) [--to <id>] [--from <id>] [--conversation <id>] [--await --outbox <dir> [--timeout-ms <n>]] | baton log show|replay [--file <path>] [--index <N>]";
 
 /// Default `baton serve` inbox poll interval, in milliseconds, when `--poll-ms`
 /// is unset.
@@ -55,6 +55,12 @@ const DEFAULT_SERVE_POLL_MS: u64 = 500;
 /// Default `baton send --await` timeout, in milliseconds, when `--timeout-ms` is
 /// unset.
 const DEFAULT_SEND_TIMEOUT_MS: u64 = 30_000;
+
+/// Default `baton converse --b-mailbox` await timeout, in milliseconds, when
+/// `--b-await-ms` is unset. Generous relative to [`DEFAULT_SEND_TIMEOUT_MS`]:
+/// each mailbox-backed turn is a full provider turn run by the peer `serve`
+/// daemon, so a short deadline would synthesize a timeout mid-answer.
+const DEFAULT_CONVERSE_AWAIT_MS: u64 = 60_000;
 
 /// Interval between `baton send --await` polls of the outbox, in milliseconds.
 /// Fixed (not user-tunable): the await is bounded by `--timeout-ms`, and a tight
@@ -78,9 +84,13 @@ enum Command {
         in_path: Option<String>,
         out_path: Option<String>,
     },
-    /// Drive a governed two-participant conversation from a seed. Each side is
-    /// an in-process participant configured from the environment, overridden
-    /// per side by its optional system-prompt file and model. The full
+    /// Drive a governed two-participant conversation from a seed. Side A is an
+    /// in-process participant configured from the environment, overridden by its
+    /// optional system-prompt file and model. Side B (the first responder) is
+    /// the same in-process participant *unless* `b_mailbox` selects a
+    /// mailbox-backed participant — then B is a governed client of a live
+    /// `baton serve` peer, delivering each request to `b_inbox` and awaiting the
+    /// reply from `b_outbox` (bounded by `b_await_ms`). The full
     /// `baton.message/v1` trail is written as JSONL to `out_path` (stdout when
     /// `None`).
     Converse {
@@ -88,6 +98,10 @@ enum Command {
         b_system: Option<String>,
         a_model: Option<String>,
         b_model: Option<String>,
+        b_mailbox: bool,
+        b_inbox: Option<String>,
+        b_outbox: Option<String>,
+        b_await_ms: u64,
         seed: SeedSource,
         out_path: Option<String>,
     },
@@ -196,29 +210,48 @@ pub fn run() -> Result<()> {
             b_system,
             a_model,
             b_model,
+            b_mailbox,
+            b_inbox,
+            b_outbox,
+            b_await_ms,
             seed,
             out_path,
         } => {
-            let base = BatonConfig::from_env()?;
             let governance = Governance::from_lookup(|key| std::env::var(key).ok())?;
             let seed_body = resolve_seed(&seed)?;
 
-            // Each side is the base config with its own system prompt / model
-            // laid over the top; the credential and base URL are shared.
-            let config_a = participant_config(&base, a_system.as_deref(), a_model)?;
-            let config_b = participant_config(&base, b_system.as_deref(), b_model)?;
-            let participant_a = LocalParticipant::new(
-                ClaudeClient::from_config(config_a.clone()),
-                exchange_meta(&config_a),
-            );
-            let participant_b = LocalParticipant::new(
-                ClaudeClient::from_config(config_b.clone()),
-                exchange_meta(&config_b),
-            );
+            // Side A is always the in-process, environment-configured
+            // participant: the base config with A's system prompt / model laid
+            // over the top. A mailbox-backed side B needs no provider config of
+            // its own (the peer `serve` daemon carries that), so the base config
+            // is loaded lazily — only when a side actually runs a local call.
+            let build_local =
+                |system: Option<&str>, model: Option<String>| -> Result<Box<dyn Participant>> {
+                    let config = participant_config(&BatonConfig::from_env()?, system, model)?;
+                    Ok(Box::new(LocalParticipant::new(
+                        ClaudeClient::from_config(config.clone()),
+                        exchange_meta(&config),
+                    )))
+                };
+
+            let participant_a = build_local(a_system.as_deref(), a_model)?;
+            let participant_b: Box<dyn Participant> = if b_mailbox {
+                // Guaranteed `Some` by `parse_converse` whenever `--b-mailbox`.
+                let inbox = b_inbox.expect("--b-mailbox requires --b-inbox");
+                let outbox = b_outbox.expect("--b-mailbox requires --b-outbox");
+                Box::new(MailboxParticipant::new(
+                    inbox,
+                    outbox,
+                    Duration::from_millis(b_await_ms),
+                    Duration::from_millis(SEND_POLL_INTERVAL_MS),
+                ))
+            } else {
+                build_local(b_system.as_deref(), b_model)?
+            };
 
             let transcript = converse::converse(
-                &participant_a,
-                &participant_b,
+                participant_a.as_ref(),
+                participant_b.as_ref(),
                 build_seed_envelope(&seed_body),
                 &governance,
             );
@@ -1046,14 +1079,23 @@ fn parse_exchange<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comm
 ///
 /// Accepts optional `--a-system`/`--b-system` (per-side system-prompt files),
 /// `--a-model`/`--b-model` (per-side model overrides), `--out`, and the seed —
-/// exactly one of `--seed <text>` or `--seed-file <path>` is required. Every
-/// flag also accepts the `--flag=value` form. A flag without a value, both seed
-/// forms together, a missing seed, or any other token is a usage error.
+/// exactly one of `--seed <text>` or `--seed-file <path>` is required. Side B
+/// may instead be mailbox-backed via `--b-mailbox` (which requires `--b-inbox`
+/// and `--b-outbox`, and accepts `--b-await-ms`); the B-mailbox dirs / await are
+/// valid only with `--b-mailbox`, and `--b-system`/`--b-model` are rejected
+/// alongside it (a mailbox peer configures itself). Every flag also accepts the
+/// `--flag=value` form. A flag without a value, both seed forms together, a
+/// missing seed, an incoherent B-mailbox combination, or any other token is a
+/// usage error.
 fn parse_converse<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
     let mut a_system: Option<String> = None;
     let mut b_system: Option<String> = None;
     let mut a_model: Option<String> = None;
     let mut b_model: Option<String> = None;
+    let mut b_mailbox = false;
+    let mut b_inbox: Option<String> = None;
+    let mut b_outbox: Option<String> = None;
+    let mut b_await_ms: Option<u64> = None;
     let mut out_path: Option<String> = None;
     let mut seed_text: Option<String> = None;
     let mut seed_file: Option<String> = None;
@@ -1080,6 +1122,19 @@ fn parse_converse<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comm
             "--b-model" => b_model = Some(take("--b-model")?),
             other if other.starts_with("--b-model=") => {
                 b_model = Some(other["--b-model=".len()..].to_string());
+            }
+            "--b-mailbox" => b_mailbox = true,
+            "--b-inbox" => b_inbox = Some(take("--b-inbox")?),
+            other if other.starts_with("--b-inbox=") => {
+                b_inbox = Some(other["--b-inbox=".len()..].to_string());
+            }
+            "--b-outbox" => b_outbox = Some(take("--b-outbox")?),
+            other if other.starts_with("--b-outbox=") => {
+                b_outbox = Some(other["--b-outbox=".len()..].to_string());
+            }
+            "--b-await-ms" => b_await_ms = Some(parse_timeout_ms(&take("--b-await-ms")?)?),
+            other if other.starts_with("--b-await-ms=") => {
+                b_await_ms = Some(parse_timeout_ms(&other["--b-await-ms=".len()..])?);
             }
             "--seed" => seed_text = Some(take("--seed")?),
             other if other.starts_with("--seed=") => {
@@ -1110,11 +1165,37 @@ fn parse_converse<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comm
         }
     };
 
+    // B-mailbox coherence: the dirs / await knob describe a mailbox-backed B and
+    // are meaningless without it, and a mailbox peer configures itself, so the
+    // in-process B overrides cannot apply to it.
+    if b_mailbox {
+        if b_system.is_some() || b_model.is_some() {
+            return Err(usage(
+                "--b-system/--b-model apply to an in-process B; --b-mailbox configures its own peer",
+            ));
+        }
+        b_inbox = Some(require_dir(b_inbox, "--b-inbox")?);
+        b_outbox = Some(require_dir(b_outbox, "--b-outbox")?);
+    } else {
+        if b_inbox.is_some() || b_outbox.is_some() {
+            return Err(usage(
+                "--b-inbox/--b-outbox are only valid with --b-mailbox",
+            ));
+        }
+        if b_await_ms.is_some() {
+            return Err(usage("--b-await-ms is only valid with --b-mailbox"));
+        }
+    }
+
     Ok(Command::Converse {
         a_system,
         b_system,
         a_model,
         b_model,
+        b_mailbox,
+        b_inbox,
+        b_outbox,
+        b_await_ms: b_await_ms.unwrap_or(DEFAULT_CONVERSE_AWAIT_MS),
         seed,
         out_path,
     })
@@ -1987,6 +2068,10 @@ mod tests {
                 b_system: None,
                 a_model: None,
                 b_model: None,
+                b_mailbox: false,
+                b_inbox: None,
+                b_outbox: None,
+                b_await_ms: DEFAULT_CONVERSE_AWAIT_MS,
                 seed: SeedSource::Text("hello".to_string()),
                 out_path: None,
             }
@@ -2014,10 +2099,112 @@ mod tests {
                 b_system: Some("/tmp/b.txt".to_string()),
                 a_model: Some("model-a".to_string()),
                 b_model: Some("model-b".to_string()),
+                b_mailbox: false,
+                b_inbox: None,
+                b_outbox: None,
+                b_await_ms: DEFAULT_CONVERSE_AWAIT_MS,
                 seed: SeedSource::File("/tmp/seed.txt".to_string()),
                 out_path: Some("/tmp/trail.jsonl".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn parses_converse_with_b_mailbox() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "converse",
+                "--seed",
+                "hi",
+                "--b-mailbox",
+                "--b-inbox=/tmp/in",
+                "--b-outbox",
+                "/tmp/out",
+                "--b-await-ms=90000",
+            ]))
+            .expect("parses"),
+            Command::Converse {
+                a_system: None,
+                b_system: None,
+                a_model: None,
+                b_model: None,
+                b_mailbox: true,
+                b_inbox: Some("/tmp/in".to_string()),
+                b_outbox: Some("/tmp/out".to_string()),
+                b_await_ms: 90_000,
+                seed: SeedSource::Text("hi".to_string()),
+                out_path: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_converse_b_mailbox_defaults_await() {
+        // `--b-await-ms` omitted ⇒ the generous default.
+        match parse_args(&argv(&[
+            "converse",
+            "--seed",
+            "hi",
+            "--b-mailbox",
+            "--b-inbox=/tmp/in",
+            "--b-outbox=/tmp/out",
+        ]))
+        .expect("parses")
+        {
+            Command::Converse { b_await_ms, .. } => {
+                assert_eq!(b_await_ms, DEFAULT_CONVERSE_AWAIT_MS)
+            }
+            other => panic!("expected Converse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn converse_b_mailbox_incoherent_combinations_are_usage_errors() {
+        let cases: &[&[&str]] = &[
+            // --b-mailbox without the required dirs.
+            &["converse", "--seed", "hi", "--b-mailbox"],
+            &["converse", "--seed", "hi", "--b-mailbox", "--b-inbox=/in"],
+            &["converse", "--seed", "hi", "--b-mailbox", "--b-outbox=/out"],
+            // B-mailbox dirs / await without --b-mailbox.
+            &["converse", "--seed", "hi", "--b-inbox=/in"],
+            &["converse", "--seed", "hi", "--b-outbox=/out"],
+            &["converse", "--seed", "hi", "--b-await-ms=5000"],
+            // In-process B overrides alongside --b-mailbox.
+            &[
+                "converse",
+                "--seed",
+                "hi",
+                "--b-mailbox",
+                "--b-inbox=/in",
+                "--b-outbox=/out",
+                "--b-model=m",
+            ],
+            &[
+                "converse",
+                "--seed",
+                "hi",
+                "--b-mailbox",
+                "--b-inbox=/in",
+                "--b-outbox=/out",
+                "--b-system=/s",
+            ],
+            // Non-positive await.
+            &[
+                "converse",
+                "--seed",
+                "hi",
+                "--b-mailbox",
+                "--b-inbox=/in",
+                "--b-outbox=/out",
+                "--b-await-ms=0",
+            ],
+        ];
+        for case in cases {
+            assert!(
+                matches!(parse_args(&argv(case)).unwrap_err(), BatonError::Usage(_)),
+                "expected usage error for {case:?}"
+            );
+        }
     }
 
     #[test]
