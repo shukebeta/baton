@@ -46,7 +46,7 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] (--seed <text> | --seed-file <path>) [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] | baton send --inbox <dir> (--body <text> | --in <path>) [--to <id>] [--from <id>] [--conversation <id>] [--await --outbox <dir> [--timeout-ms <n>]] | baton log show|replay [--file <path>] [--index <N>]";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] (--seed <text> | --seed-file <path>) [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] | baton serve --stop --inbox <dir> | baton send --inbox <dir> (--body <text> | --in <path>) [--to <id>] [--from <id>] [--conversation <id>] [--await --outbox <dir> [--timeout-ms <n>]] | baton log show|replay [--file <path>] [--index <N>]";
 
 /// Default `baton serve` inbox poll interval, in milliseconds, when `--poll-ms`
 /// is unset.
@@ -100,6 +100,11 @@ enum Command {
         poll_ms: u64,
         once: bool,
     },
+    /// Cooperatively stop a running `baton serve` on `inbox` (Option C graceful
+    /// shutdown): drop a stop sentinel the daemon observes between messages, so
+    /// it finishes the in-flight message and exits 0. If no daemon holds the
+    /// lock, reports that nothing is running and still exits 0 (idempotent).
+    ServeStop { inbox: String },
     /// Post a `baton.message/v1` request into a mailbox's `pending/` (the
     /// producer over the atomic deliver path), optionally awaiting the correlated
     /// reply from `outbox`. The message is built from `--body` (+ optional
@@ -236,19 +241,37 @@ pub fn run() -> Result<()> {
             // other daemon is mid-answer, so returning abandoned `claimed/`
             // messages to `pending/` cannot race a concurrent processor.
             let mailbox = Mailbox::open(&inbox)?;
+            // Discard any stale stop sentinel so a leftover from a prior daemon
+            // cannot make this fresh start exit immediately.
+            mailbox.poll_stop()?;
             mailbox.reclaim_stale()?;
             let outbox = Path::new(&outbox);
 
             let poll = Duration::from_millis(poll_ms);
             loop {
-                let processed =
-                    drain_mailbox(&mailbox, outbox, &participant, sink.as_mut(), &meta)?;
-                if once {
-                    break;
+                match drain_mailbox(&mailbox, outbox, &participant, sink.as_mut(), &meta)? {
+                    // Cooperative stop observed between messages ⇒ exit 0.
+                    Drain::Stopped => break,
+                    Drain::Drained(processed) => {
+                        if once {
+                            break;
+                        }
+                        // Nothing waiting — sleep before the next scan rather than spin.
+                        if processed == 0 {
+                            std::thread::sleep(poll);
+                        }
+                    }
                 }
-                // Nothing waiting — sleep before the next scan rather than spin.
-                if processed == 0 {
-                    std::thread::sleep(poll);
+            }
+            Ok(())
+        }
+        Command::ServeStop { inbox } => {
+            match mailbox::request_stop(&inbox)? {
+                mailbox::StopRequest::Signalled => {
+                    println!("requested cooperative stop of baton serve on {inbox}");
+                }
+                mailbox::StopRequest::NoDaemon => {
+                    eprintln!("no running baton serve on {inbox}; nothing to stop");
                 }
             }
             Ok(())
@@ -440,9 +463,23 @@ fn execute_exchange(
     response
 }
 
+/// The result of one [`drain_mailbox`] pass.
+enum Drain {
+    /// Drained every currently-claimable request; carries how many were processed.
+    Drained(usize),
+    /// A cooperative stop sentinel was observed between messages; the caller
+    /// should exit 0 without draining further.
+    Stopped,
+}
+
 /// Drains every currently-claimable request from `mailbox` through one
 /// participant, writing each reply to `outbox` keyed by the request id, and
-/// returns how many were processed.
+/// returns how many were processed — unless a cooperative stop is observed.
+///
+/// The stop sentinel is checked **between messages** (at the top of each claim
+/// iteration), so an in-flight `respond()` is never interrupted mid-call: a stop
+/// dropped while a message is being answered is seen only after that message
+/// completes to `done`, then the pass returns [`Drain::Stopped`].
 ///
 /// Each message runs the same [`execute_exchange`] path as `baton exchange` — so
 /// the response envelope and the `BATON_EVENT_LOG` trail are produced identically
@@ -455,15 +492,20 @@ fn drain_mailbox(
     participant: &impl Participant,
     sink: &mut dyn EventSink,
     meta: &ExchangeMeta,
-) -> Result<usize> {
+) -> Result<Drain> {
     let mut processed = 0;
-    while let Some(claimed) = mailbox.claim_next()? {
+    loop {
+        if mailbox.poll_stop()? {
+            return Ok(Drain::Stopped);
+        }
+        let Some(claimed) = mailbox.claim_next()? else {
+            return Ok(Drain::Drained(processed));
+        };
         let response = execute_exchange(participant, sink, meta, &claimed.request);
         mailbox.deliver_response(outbox, &claimed.key, &response)?;
         mailbox.complete(claimed)?;
         processed += 1;
     }
-    Ok(processed)
 }
 
 /// Delivers `envelope` into `inbox`'s `pending/` (lock-free producer), records
@@ -1080,16 +1122,19 @@ fn parse_converse<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comm
 
 /// Parses the arguments following the `serve` subcommand.
 ///
-/// Requires `--inbox <dir>` and `--outbox <dir>` (both non-blank); accepts an
-/// optional `--poll-ms <n>` (positive integer, default [`DEFAULT_SERVE_POLL_MS`])
-/// and the `--once` flag. Every valued flag also accepts the `--flag=value` form.
-/// A flag without a value, a blank/missing required dir, a non-positive
-/// `--poll-ms`, or any other token is a usage error.
+/// The daemon form requires `--inbox <dir>` and `--outbox <dir>` (both
+/// non-blank) and accepts an optional `--poll-ms <n>` (positive integer, default
+/// [`DEFAULT_SERVE_POLL_MS`]) and the `--once` flag. The cooperative-stop form
+/// (`--stop`) requires only `--inbox` and rejects the daemon-only flags
+/// (`--outbox`, `--poll-ms`, `--once`). Every valued flag also accepts the
+/// `--flag=value` form. A flag without a value, a blank/missing required dir, a
+/// non-positive `--poll-ms`, or any other token is a usage error.
 fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
     let mut inbox: Option<String> = None;
     let mut outbox: Option<String> = None;
     let mut poll_ms: Option<u64> = None;
     let mut once = false;
+    let mut stop = false;
 
     while let Some(arg) = iter.next() {
         let mut take = |flag: &str| -> Result<String> {
@@ -1111,8 +1156,21 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
                 poll_ms = Some(parse_poll_ms(&other["--poll-ms=".len()..])?);
             }
             "--once" => once = true,
+            "--stop" => stop = true,
             other => return Err(usage(&format!("unexpected argument {other:?}"))),
         }
+    }
+
+    // Cooperative-stop client: only `--inbox` is meaningful; the daemon-only
+    // flags have no effect here, so reject them rather than silently ignore.
+    if stop {
+        if outbox.is_some() || poll_ms.is_some() || once {
+            return Err(usage(
+                "--stop takes only --inbox (not --outbox/--poll-ms/--once)",
+            ));
+        }
+        let inbox = require_dir(inbox, "--inbox")?;
+        return Ok(Command::ServeStop { inbox });
     }
 
     let inbox = require_dir(inbox, "--inbox")?;
@@ -2146,6 +2204,53 @@ mod tests {
     }
 
     #[test]
+    fn parse_serve_stop_requires_only_inbox() {
+        assert_eq!(
+            parse_args(&argv(&["serve", "--stop", "--inbox=/tmp/in"])).expect("parses"),
+            Command::ServeStop {
+                inbox: "/tmp/in".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_serve_stop_rejects_daemon_only_flags() {
+        // --outbox, --poll-ms, and --once have no meaning for the stop client.
+        assert!(matches!(
+            parse_args(&argv(&[
+                "serve",
+                "--stop",
+                "--inbox=/tmp/in",
+                "--outbox=/tmp/out"
+            ]))
+            .unwrap_err(),
+            BatonError::Usage(_)
+        ));
+        assert!(matches!(
+            parse_args(&argv(&["serve", "--stop", "--inbox=/tmp/in", "--once"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+        assert!(matches!(
+            parse_args(&argv(&[
+                "serve",
+                "--stop",
+                "--inbox=/tmp/in",
+                "--poll-ms=50"
+            ]))
+            .unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_serve_stop_requires_inbox() {
+        assert!(matches!(
+            parse_args(&argv(&["serve", "--stop"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
     fn parse_serve_accepts_poll_ms_and_once() {
         assert_eq!(
             parse_args(&argv(&[
@@ -2264,9 +2369,9 @@ mod tests {
         let participant = participant_over(OkTransport::new("four"));
         let mut sink = NoopSink;
 
-        let n =
+        let drained =
             drain_mailbox(&mailbox, &outbox, &participant, &mut sink, &test_meta()).expect("drain");
-        assert_eq!(n, 1, "one request drained");
+        assert!(matches!(drained, Drain::Drained(1)), "one request drained");
 
         // The reply is keyed by the request id (m-req-1), not the fresh response id.
         assert_eq!(json_files(&outbox), vec!["m-req-1.json".to_string()]);
@@ -2278,9 +2383,40 @@ mod tests {
         assert!(json_files(&inbox.join("pending")).is_empty());
 
         // Re-running is a no-op: the id is in `done/`.
-        let n2 = drain_mailbox(&mailbox, &outbox, &participant, &mut sink, &test_meta())
+        let drained2 = drain_mailbox(&mailbox, &outbox, &participant, &mut sink, &test_meta())
             .expect("second drain");
-        assert_eq!(n2, 0, "already-done id is not reprocessed");
+        assert!(
+            matches!(drained2, Drain::Drained(0)),
+            "already-done id is not reprocessed"
+        );
+    }
+
+    /// A stop sentinel dropped before a claim makes the drain pass return
+    /// `Stopped` without processing the still-pending message — the between-
+    /// messages cooperative-stop check.
+    #[test]
+    fn drain_mailbox_stops_on_sentinel_before_processing() {
+        let root = TempRoot::new("drain-stop");
+        let inbox = root.path.join("inbox");
+        let outbox = root.path.join("outbox");
+
+        let mailbox = Mailbox::open(&inbox).expect("open mailbox");
+        mailbox.deliver(&request_envelope()).expect("deliver");
+        // A cooperative stop arrives before the daemon claims the message.
+        mailbox::request_stop(&inbox).expect("request stop");
+
+        let participant = participant_over(OkTransport::new("four"));
+        let mut sink = NoopSink;
+
+        let drained =
+            drain_mailbox(&mailbox, &outbox, &participant, &mut sink, &test_meta()).expect("drain");
+        assert!(matches!(drained, Drain::Stopped), "sentinel ⇒ Stopped");
+        assert_eq!(
+            json_files(&inbox.join("pending")).len(),
+            1,
+            "the pending message is left unprocessed"
+        );
+        assert!(json_files(&outbox).is_empty(), "no reply written");
     }
 
     /// A reclaimed in-flight message re-drains to the *same* outbox filename —
