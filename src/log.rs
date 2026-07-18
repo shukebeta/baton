@@ -54,6 +54,12 @@ pub struct RequestRecord {
     pub base_url: String,
     /// The user prompt text.
     pub prompt: String,
+    /// Session this turn belonged to; absent on the single-turn `ask` path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Monotonic turn number within the session; absent on the `ask` path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_index: Option<u64>,
 }
 
 /// The terminal outcome of an exchange, read back from the log.
@@ -263,6 +269,208 @@ fn from_value<T: serde::de::DeserializeOwned>(
 fn parse_line_value(bytes: &[u8]) -> std::result::Result<Value, String> {
     let s = std::str::from_utf8(bytes).map_err(|err| format!("invalid UTF-8: {err}"))?;
     serde_json::from_str(s.trim()).map_err(|err| format!("invalid JSON: {err}"))
+}
+
+/// One turn of a session, read back from the trail: the turn's `request` (which
+/// carries `session_id` and `turn_index`) paired with its terminal outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTurn {
+    /// The request that opened this turn.
+    pub request: RequestRecord,
+    /// The turn's outcome, or `None` when the run was killed after the request
+    /// line but before its outcome landed (a torn tail) — the request still
+    /// counts as a turn; its answer just never arrived.
+    pub outcome: Option<Outcome>,
+}
+
+/// A whole session reconstructed from the trail, keyed on `session_id`.
+///
+/// Partitioning keys on `session_id` alone, not on a matched start/end pair, so
+/// a session killed mid-run (a `session_start` and turns but no `session_end`)
+/// still forms one complete [`SessionRecord`] with `ended == false`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecord {
+    /// The id shared by this session's start marker and every turn's request.
+    pub session_id: String,
+    /// Whether a `session_start` marker for this id was seen on the trail.
+    pub started: bool,
+    /// Whether a `session_end` marker for this id was seen — `false` for a
+    /// session killed mid-run.
+    pub ended: bool,
+    /// The turn count declared on the `session_end` marker, or `None` for a
+    /// session with no end marker. Compare against `turns.len()` to detect a
+    /// trail truncated before its turns were fully written.
+    pub declared_turns: Option<u64>,
+    /// The session's turns, in file (== `turn_index`) order.
+    pub turns: Vec<SessionTurn>,
+}
+
+/// The outcome of partitioning a trail into sessions: the [`SessionRecord`]s in
+/// first-seen order plus any non-fatal diagnostics (a tolerated trailing partial
+/// line), mirroring [`ParseReport`]'s shape.
+#[derive(Debug, Default)]
+pub struct SessionParseReport {
+    /// Reconstructed sessions, in the order their `session_id` was first seen.
+    pub sessions: Vec<SessionRecord>,
+    /// Non-fatal diagnostics, in encounter order.
+    pub warnings: Vec<String>,
+}
+
+/// Deserialization mirror of a `session_start` line.
+#[derive(Deserialize)]
+struct SessionStartRecord {
+    session_id: String,
+}
+
+/// Deserialization mirror of a `session_end` line.
+#[derive(Deserialize)]
+struct SessionEndRecord {
+    session_id: String,
+    turns: u64,
+}
+
+/// Partitions a JSONL trail into whole sessions, keyed on `session_id`.
+///
+/// Reads the same trail as [`parse_jsonl`], but groups by session framing rather
+/// than pairing bare exchanges: `session_start` / `session_end` markers bound a
+/// session, each session turn's `request` carries the `session_id` + `turn_index`
+/// that place it, and the following outcome line closes that turn. Behaviour at
+/// the edges mirrors [`parse_jsonl`]:
+///
+/// - **Sessionless lines** — an `ask` `request`/outcome pair, `baton.message/v1`
+///   envelopes, unknown tags — are skipped: they belong to no session.
+/// - **Partitioning keys on `session_id`, not on a start/end pair.** A session
+///   killed mid-run yields a [`SessionRecord`] with `ended == false` and its
+///   turns intact; two sequential sessions in one file separate cleanly by id.
+/// - **Trailing partial line**: the final unterminated line (an unclean
+///   shutdown's signature) that fails to parse is skipped-with-warning, exactly
+///   as in [`parse_jsonl`]; any newline-terminated malformed line stays a hard
+///   error. A torn final line after a turn's `request` leaves that turn with
+///   `outcome == None`.
+pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
+    let mut buffered = BufReader::new(reader);
+    let mut report = SessionParseReport::default();
+    // First-seen order is preserved by pushing to `report.sessions`; the map
+    // routes later lines (turns, end markers) back to the right record.
+    let mut index: HashMap<String, usize> = HashMap::new();
+    // The session turn awaiting its outcome, as (session index, turn index).
+    // Cleared by a sessionless request so a stray outcome is never misattributed.
+    let mut pending: Option<(usize, usize)> = None;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut line_no = 0usize;
+
+    loop {
+        buf.clear();
+        let read = buffered
+            .read_until(b'\n', &mut buf)
+            .map_err(|err| BatonError::Io(format!("reading log line {}: {err}", line_no + 1)))?;
+        if read == 0 {
+            break;
+        }
+        line_no += 1;
+
+        let terminated = buf.last() == Some(&b'\n');
+        if buf.iter().all(|b| b.is_ascii_whitespace()) {
+            continue;
+        }
+
+        let value = match parse_line_value(&buf) {
+            Ok(value) => value,
+            Err(detail) if !terminated => {
+                report.warnings.push(format!(
+                    "skipped partial trailing line {line_no} of the event log \
+                     (no terminating newline — likely an unclean shutdown): {detail}"
+                ));
+                continue;
+            }
+            Err(detail) => return Err(BatonError::Log(format!("line {line_no}: {detail}"))),
+        };
+
+        match value.get("event").and_then(Value::as_str) {
+            Some("session_start") => {
+                let start: SessionStartRecord = from_value(value, line_no, "session_start")?;
+                let idx = session_index(&mut report.sessions, &mut index, &start.session_id);
+                report.sessions[idx].started = true;
+                pending = None;
+            }
+            Some("session_end") => {
+                let end: SessionEndRecord = from_value(value, line_no, "session_end")?;
+                let idx = session_index(&mut report.sessions, &mut index, &end.session_id);
+                report.sessions[idx].ended = true;
+                report.sessions[idx].declared_turns = Some(end.turns);
+                pending = None;
+            }
+            Some("request") => {
+                let record: RequestRecord = from_value(value, line_no, "request")?;
+                match record.session_id.clone() {
+                    Some(session_id) => {
+                        let idx = session_index(&mut report.sessions, &mut index, &session_id);
+                        let turn_idx = report.sessions[idx].turns.len();
+                        report.sessions[idx].turns.push(SessionTurn {
+                            request: record,
+                            outcome: None,
+                        });
+                        pending = Some((idx, turn_idx));
+                    }
+                    // Sessionless (`ask`) request: not part of any session, and
+                    // its outcome must not attach to the previous session turn.
+                    None => pending = None,
+                }
+            }
+            Some("response_ok") => {
+                let ok: OkRecord = from_value(value, line_no, "response_ok")?;
+                if let Some((idx, turn_idx)) = pending.take() {
+                    report.sessions[idx].turns[turn_idx].outcome = Some(Outcome::Ok {
+                        ts_ms: ok.ts_ms,
+                        duration_ms: ok.duration_ms,
+                        reply: ok.reply,
+                        input_tokens: ok.input_tokens,
+                        output_tokens: ok.output_tokens,
+                    });
+                }
+            }
+            Some("response_error") => {
+                let err: ErrRecord = from_value(value, line_no, "response_error")?;
+                if let Some((idx, turn_idx)) = pending.take() {
+                    report.sessions[idx].turns[turn_idx].outcome = Some(Outcome::Error {
+                        ts_ms: err.ts_ms,
+                        duration_ms: err.duration_ms,
+                        kind: err.kind,
+                        message: err.message,
+                    });
+                }
+            }
+            // Unknown or absent event tag (e.g. a `baton.message/v1` envelope):
+            // skip, staying forward-compatible.
+            _ => {}
+        }
+    }
+
+    Ok(report)
+}
+
+/// Returns the index of the [`SessionRecord`] for `session_id`, creating an
+/// empty one (in first-seen order) on first sighting. Shared by the marker and
+/// turn arms of [`parse_sessions`] so every reference to an id lands on one
+/// record regardless of which line kind mentions it first.
+fn session_index(
+    sessions: &mut Vec<SessionRecord>,
+    index: &mut HashMap<String, usize>,
+    session_id: &str,
+) -> usize {
+    if let Some(&idx) = index.get(session_id) {
+        return idx;
+    }
+    let idx = sessions.len();
+    sessions.push(SessionRecord {
+        session_id: session_id.to_string(),
+        started: false,
+        ended: false,
+        declared_turns: None,
+        turns: Vec::new(),
+    });
+    index.insert(session_id.to_string(), idx);
+    idx
 }
 
 /// Renders one exchange as a human-readable multi-line block for `baton log show`.
@@ -583,6 +791,8 @@ mod tests {
                 model: "claude-sonnet-4-6".to_string(),
                 base_url: "https://api.anthropic.com".to_string(),
                 prompt: "hello".to_string(),
+                session_id: None,
+                turn_index: None,
             }
         );
         assert_eq!(
@@ -812,6 +1022,8 @@ mod tests {
                 model: "claude-sonnet-4-6".to_string(),
                 base_url: "https://api.anthropic.com".to_string(),
                 prompt: "the question".to_string(),
+                session_id: None,
+                turn_index: None,
             },
             outcome: Outcome::Ok {
                 ts_ms: 1_700_000_000_420,
@@ -839,6 +1051,8 @@ mod tests {
                 model: "claude-sonnet-4-6".to_string(),
                 base_url: "https://api.anthropic.com".to_string(),
                 prompt: "q".to_string(),
+                session_id: None,
+                turn_index: None,
             },
             outcome: Outcome::Ok {
                 ts_ms: 1_700_000_000_420,
@@ -860,6 +1074,8 @@ mod tests {
                 model: "m".to_string(),
                 base_url: "u".to_string(),
                 prompt: "p".to_string(),
+                session_id: None,
+                turn_index: None,
             },
             outcome: Outcome::Error {
                 ts_ms: 0,
@@ -1048,5 +1264,197 @@ mod tests {
         let e = MessageEnvelope::new("m-0", "c-1", "a", "b", MessageKind::Request, "seed", 0);
         let rendered = format_message(1, &e);
         assert!(rendered.contains("in_reply_to: —"), "got: {rendered}");
+    }
+
+    // -- parse_sessions ----------------------------------------------------
+
+    use crate::events::{ExchangeEvent, ExchangeMeta};
+    use crate::model::TokenUsage;
+
+    /// Serializes an event to its exact on-disk JSONL line (no trailing newline),
+    /// so these tests exercise the same bytes `WriterSink` writes.
+    fn line(event: &ExchangeEvent) -> String {
+        serde_json::to_string(event).expect("event serializes")
+    }
+
+    /// A full session frame (start, one turn, end) partitions into one session
+    /// carrying its id, the turn's index/prompt/reply, and both markers.
+    #[test]
+    fn parse_sessions_reconstructs_one_framed_session() {
+        let meta = ExchangeMeta {
+            model: "m".to_string(),
+            base_url: "u".to_string(),
+        };
+        let trail = [
+            line(&ExchangeEvent::session_start(1, "sess-A")),
+            line(&ExchangeEvent::session_request(2, &meta, "hi", "sess-A", 0)),
+            line(&ExchangeEvent::response_ok(
+                3,
+                10,
+                "hello",
+                &TokenUsage::default(),
+            )),
+            line(&ExchangeEvent::session_end(4, "sess-A", 1)),
+        ]
+        .join("\n")
+            + "\n";
+
+        let report = parse_sessions(Cursor::new(trail)).expect("parses");
+        assert_eq!(report.sessions.len(), 1);
+        let s = &report.sessions[0];
+        assert_eq!(s.session_id, "sess-A");
+        assert!(s.started && s.ended);
+        assert_eq!(s.declared_turns, Some(1));
+        assert_eq!(s.turns.len(), 1);
+        assert_eq!(s.turns[0].request.turn_index, Some(0));
+        assert_eq!(s.turns[0].request.prompt, "hi");
+        assert_eq!(
+            s.turns[0].outcome,
+            Some(Outcome::Ok {
+                ts_ms: 3,
+                duration_ms: 10,
+                reply: "hello".to_string(),
+                input_tokens: None,
+                output_tokens: None,
+            })
+        );
+    }
+
+    /// Two sessions appended to one file separate unambiguously by `session_id`
+    /// and their start/end markers — no reliance on line ordering.
+    #[test]
+    fn parse_sessions_separates_two_sequential_sessions() {
+        let meta = ExchangeMeta {
+            model: "m".to_string(),
+            base_url: "u".to_string(),
+        };
+        let trail = [
+            line(&ExchangeEvent::session_start(1, "sess-A")),
+            line(&ExchangeEvent::session_request(2, &meta, "a0", "sess-A", 0)),
+            line(&ExchangeEvent::response_ok(
+                3,
+                1,
+                "ra0",
+                &TokenUsage::default(),
+            )),
+            line(&ExchangeEvent::session_end(4, "sess-A", 1)),
+            line(&ExchangeEvent::session_start(5, "sess-B")),
+            line(&ExchangeEvent::session_request(6, &meta, "b0", "sess-B", 0)),
+            line(&ExchangeEvent::response_ok(
+                7,
+                1,
+                "rb0",
+                &TokenUsage::default(),
+            )),
+            line(&ExchangeEvent::session_request(8, &meta, "b1", "sess-B", 1)),
+            line(&ExchangeEvent::response_ok(
+                9,
+                1,
+                "rb1",
+                &TokenUsage::default(),
+            )),
+            line(&ExchangeEvent::session_end(10, "sess-B", 2)),
+        ]
+        .join("\n")
+            + "\n";
+
+        let report = parse_sessions(Cursor::new(trail)).expect("parses");
+        assert_eq!(report.sessions.len(), 2, "two distinct session_ids");
+        assert_eq!(report.sessions[0].session_id, "sess-A");
+        assert_eq!(report.sessions[0].turns.len(), 1);
+        assert_eq!(report.sessions[1].session_id, "sess-B");
+        assert_eq!(report.sessions[1].turns.len(), 2);
+        assert_eq!(report.sessions[1].turns[1].request.prompt, "b1");
+        assert_eq!(report.sessions[1].declared_turns, Some(2));
+    }
+
+    /// A session killed mid-run — a `session_start` and turns but no
+    /// `session_end` — still partitions into one whole session with
+    /// `ended == false`. Partitioning keys on `session_id`, not a matched pair.
+    #[test]
+    fn parse_sessions_keeps_killed_session_without_end_marker() {
+        let meta = ExchangeMeta {
+            model: "m".to_string(),
+            base_url: "u".to_string(),
+        };
+        let trail = [
+            line(&ExchangeEvent::session_start(1, "sess-A")),
+            line(&ExchangeEvent::session_request(2, &meta, "hi", "sess-A", 0)),
+            line(&ExchangeEvent::response_ok(
+                3,
+                1,
+                "hello",
+                &TokenUsage::default(),
+            )),
+        ]
+        .join("\n")
+            + "\n";
+
+        let report = parse_sessions(Cursor::new(trail)).expect("parses");
+        assert_eq!(report.sessions.len(), 1);
+        let s = &report.sessions[0];
+        assert!(s.started, "start marker was present");
+        assert!(!s.ended, "no end marker for a killed session");
+        assert_eq!(s.declared_turns, None);
+        assert_eq!(s.turns.len(), 1, "the completed turn is still captured");
+    }
+
+    /// A torn final `session_end` line (killed mid-`write_all`, no terminating
+    /// newline) is skipped-with-warning: the session's turns survive and the
+    /// trail stays valid, proving flush-per-line partial-trail tolerance end to
+    /// end.
+    #[test]
+    fn parse_sessions_tolerates_torn_trailing_session_end() {
+        let meta = ExchangeMeta {
+            model: "m".to_string(),
+            base_url: "u".to_string(),
+        };
+        let full_end = line(&ExchangeEvent::session_end(4, "sess-A", 1));
+        // Keep the leading `{` so the line is JSON-shaped but truncated, and drop
+        // the terminating newline — the signature of an unclean shutdown.
+        let torn_end = &full_end[..full_end.len() / 2];
+        let trail = [
+            line(&ExchangeEvent::session_start(1, "sess-A")),
+            line(&ExchangeEvent::session_request(2, &meta, "hi", "sess-A", 0)),
+            line(&ExchangeEvent::response_ok(
+                3,
+                1,
+                "hello",
+                &TokenUsage::default(),
+            )),
+        ]
+        .join("\n")
+            + "\n"
+            + torn_end; // no trailing newline
+
+        let report = parse_sessions(Cursor::new(trail)).expect("torn tail is tolerated");
+        assert_eq!(report.warnings.len(), 1, "the torn line is reported");
+        assert_eq!(report.sessions.len(), 1);
+        let s = &report.sessions[0];
+        assert!(s.started && !s.ended, "the end marker never landed");
+        assert_eq!(s.turns.len(), 1);
+        assert_eq!(
+            s.turns[0].outcome.as_ref().map(|_| ()),
+            Some(()),
+            "the completed turn's outcome survives the torn tail"
+        );
+    }
+
+    /// Sessionless `ask` lines carry no `session_id`, so `parse_sessions` skips
+    /// them: they belong to no session and their outcome never attaches to one.
+    #[test]
+    fn parse_sessions_ignores_sessionless_ask_lines() {
+        let ask = concat!(
+            r#"{"event":"request","schema":"baton.exchange/v1","ts_ms":1,"model":"m","base_url":"u","prompt":"ask"}"#,
+            "\n",
+            r#"{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":2,"duration_ms":1,"reply":"a"}"#,
+            "\n",
+        );
+        let report = parse_sessions(Cursor::new(ask)).expect("parses");
+        assert!(
+            report.sessions.is_empty(),
+            "ask lines form no session, got: {:?}",
+            report.sessions
+        );
     }
 }

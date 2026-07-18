@@ -745,8 +745,10 @@ fn execute_ask(
     meta: &ExchangeMeta,
     prompt: &str,
 ) -> Result<String> {
-    timed_exchange(sink, meta, prompt, || transport.send(&Prompt::new(prompt)))
-        .map(|reply| reply.text)
+    timed_exchange(sink, meta, prompt, None, || {
+        transport.send(&Prompt::new(prompt))
+    })
+    .map(|reply| reply.text)
 }
 
 /// Runs one A2A exchange: delegates the request→response envelope
@@ -1175,7 +1177,15 @@ fn execute_session(
         "baton session — type a message and press enter; Ctrl-D or {SESSION_EXIT_COMMAND} to quit"
     );
 
+    // Mint one id for the whole run and open the session boundary on the trail.
+    // Every turn's `request` carries this id; the matching `session_end` closes
+    // it on a clean exit. `turn_index` counts only turns whose `request` is
+    // emitted, so it is bumped after a turn is dispatched, not per input line.
+    let session_id = new_session_id();
+    emit(sink, &ExchangeEvent::session_start(now_ms(), &session_id));
+
     let mut conversation = Conversation::new();
+    let mut turn_index: u64 = 0;
     for line in input.lines() {
         let line = line.map_err(io_err)?;
         let trimmed = line.trim();
@@ -1187,9 +1197,10 @@ fn execute_session(
         }
 
         conversation.push_user(line.as_str());
-        let result = timed_exchange(sink, meta, &line, || {
+        let result = timed_exchange(sink, meta, &line, Some((&session_id, turn_index)), || {
             transport.send_conversation(conversation.messages())
         });
+        turn_index += 1;
 
         match result {
             Ok(reply) => {
@@ -1206,7 +1217,27 @@ fn execute_session(
         }
     }
 
+    // Clean exit (EOF / `/exit`): close the session boundary. A session killed
+    // mid-run never reaches here, so its trail carries a `session_start` and
+    // turns but no `session_end` — partitioning keys on `session_id`, not on a
+    // matched pair (see `crate::log::parse_sessions`).
+    emit(
+        sink,
+        &ExchangeEvent::session_end(now_ms(), &session_id, turn_index),
+    );
+
     Ok(())
+}
+
+/// Mints a session id unique to this `baton session` process.
+///
+/// Derived from the process id and the start timestamp — dependency-free, in the
+/// same spirit as the message-id derivation in [`crate::participant`]. One
+/// `session` process runs one session, so `(pid, start-ms)` cannot collide with
+/// another live session on the same host, and the value carries no format
+/// constraint beyond uniqueness.
+fn new_session_id() -> String {
+    format!("sess-{}-{}", std::process::id(), now_ms())
 }
 
 /// Records the request event, times `call`, records the matching outcome event,
@@ -1216,15 +1247,25 @@ fn execute_session(
 /// `ask` and session paths, whose orchestration lives here. (`baton exchange`
 /// does not route through this: it delegates the call to a [`Participant`] and
 /// wires its own trail in [`execute_exchange`].) `event_prompt` is the user text
-/// recorded on the `request` event (the turn's input). A failed event write is
-/// downgraded to a stderr warning and never changes the exchange result.
+/// recorded on the `request` event (the turn's input). `session` carries the
+/// run's `session_id` and this turn's `turn_index` on the session path, and is
+/// `None` on the single-turn `ask` path (whose `request` line stays unframed). A
+/// failed event write is downgraded to a stderr warning and never changes the
+/// exchange result.
 fn timed_exchange(
     sink: &mut dyn EventSink,
     meta: &ExchangeMeta,
     event_prompt: &str,
+    session: Option<(&str, u64)>,
     call: impl FnOnce() -> Result<AssistantReply>,
 ) -> Result<AssistantReply> {
-    emit(sink, &ExchangeEvent::request(now_ms(), meta, event_prompt));
+    let request = match session {
+        Some((session_id, turn_index)) => {
+            ExchangeEvent::session_request(now_ms(), meta, event_prompt, session_id, turn_index)
+        }
+        None => ExchangeEvent::request(now_ms(), meta, event_prompt),
+    };
+    emit(sink, &request);
 
     let start = Instant::now();
     let result = call();
@@ -2588,6 +2629,8 @@ mod tests {
                 model: "m".to_string(),
                 base_url: "u".to_string(),
                 prompt: prompt.to_string(),
+                session_id: None,
+                turn_index: None,
             },
             outcome: Outcome::Ok {
                 ts_ms: 0,
@@ -2699,12 +2742,45 @@ mod tests {
             ]
         );
 
-        // Each turn emits a request + response_ok pair.
-        assert_eq!(sink.events.len(), 4, "two turns × (request + outcome)");
-        assert!(matches!(sink.events[0], ExchangeEvent::Request { .. }));
-        assert!(matches!(sink.events[1], ExchangeEvent::ResponseOk { .. }));
-        assert!(matches!(sink.events[2], ExchangeEvent::Request { .. }));
-        assert!(matches!(sink.events[3], ExchangeEvent::ResponseOk { .. }));
+        // A session frames its turns with start/end markers: session_start,
+        // then two turns × (request + outcome), then session_end.
+        assert_eq!(
+            sink.events.len(),
+            6,
+            "session_start + two turns × (request + outcome) + session_end"
+        );
+        let session_id = match &sink.events[0] {
+            ExchangeEvent::SessionStart { session_id, .. } => session_id.clone(),
+            other => panic!("first event must be session_start, got: {other:?}"),
+        };
+        // Each turn's request carries the run's session_id and its 0-based index.
+        for (event_idx, expected_turn) in [(1usize, 0u64), (3, 1)] {
+            match &sink.events[event_idx] {
+                ExchangeEvent::Request {
+                    session_id: sid,
+                    turn_index,
+                    ..
+                } => {
+                    assert_eq!(sid.as_deref(), Some(session_id.as_str()));
+                    assert_eq!(*turn_index, Some(expected_turn));
+                }
+                other => panic!("event {event_idx} must be a request, got: {other:?}"),
+            }
+        }
+        assert!(matches!(sink.events[2], ExchangeEvent::ResponseOk { .. }));
+        assert!(matches!(sink.events[4], ExchangeEvent::ResponseOk { .. }));
+        // The end marker closes the same session and reports the turn count.
+        match &sink.events[5] {
+            ExchangeEvent::SessionEnd {
+                session_id: sid,
+                turns,
+                ..
+            } => {
+                assert_eq!(sid, &session_id);
+                assert_eq!(*turns, 2);
+            }
+            other => panic!("last event must be session_end, got: {other:?}"),
+        }
 
         // Both replies are printed to the REPL output.
         let printed = String::from_utf8(output).expect("utf8 output");
@@ -2759,13 +2835,34 @@ mod tests {
         // is a clean single user turn — never two consecutive user turns.
         assert_eq!(calls[1], vec![Message::user("second")]);
 
-        // Turn 1 records an error outcome; turn 2 records success.
-        assert_eq!(sink.events.len(), 4);
+        // Framed as: session_start, turn 0 (request + error), turn 1 (request +
+        // ok), session_end. A failed turn still emits its request and advances
+        // the turn index, so the end marker counts it.
+        assert_eq!(sink.events.len(), 6);
+        assert!(matches!(sink.events[0], ExchangeEvent::SessionStart { .. }));
         assert!(matches!(
-            sink.events[1],
+            &sink.events[1],
+            ExchangeEvent::Request {
+                turn_index: Some(0),
+                ..
+            }
+        ));
+        assert!(matches!(
+            sink.events[2],
             ExchangeEvent::ResponseError { .. }
         ));
-        assert!(matches!(sink.events[3], ExchangeEvent::ResponseOk { .. }));
+        assert!(matches!(
+            &sink.events[3],
+            ExchangeEvent::Request {
+                turn_index: Some(1),
+                ..
+            }
+        ));
+        assert!(matches!(sink.events[4], ExchangeEvent::ResponseOk { .. }));
+        assert!(matches!(
+            sink.events[5],
+            ExchangeEvent::SessionEnd { turns: 2, .. }
+        ));
     }
 
     // -- baton exchange ----------------------------------------------------

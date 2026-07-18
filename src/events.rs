@@ -58,6 +58,19 @@ pub enum ExchangeEvent {
         base_url: String,
         /// The user prompt text.
         prompt: String,
+        /// Session this turn belongs to, when emitted from `baton session`.
+        ///
+        /// Omitted on the single-turn `ask` path (that line stays byte-identical
+        /// to before this field existed). Present, and equal to the run's
+        /// [`SessionStart::session_id`](ExchangeEvent::SessionStart), on every
+        /// session turn — the key that partitions a shared trail back into
+        /// whole sessions.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        /// Monotonic turn number within the session, starting at 0. Omitted on
+        /// the `ask` path; present on every session turn alongside `session_id`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_index: Option<u64>,
     },
     /// Emitted when the provider call succeeds.
     ResponseOk {
@@ -130,10 +143,45 @@ pub enum ExchangeEvent {
         /// Human-readable error description.
         message: String,
     },
+    /// Emitted once by `baton session` at the start of a run, before any turn.
+    ///
+    /// Marks the opening boundary of a session on the trail and stamps the
+    /// `session_id` every turn of the run carries, so a shared append log is
+    /// unambiguously partitionable back into whole sessions. Rides the same
+    /// [`SCHEMA`] trail; the read path ([`crate::log::parse_jsonl`]) skips its
+    /// unknown tag, so `log show`/`replay` are unaffected.
+    SessionStart {
+        /// Schema discriminator ([`SCHEMA`]).
+        schema: &'static str,
+        /// Wall-clock emission time, Unix epoch milliseconds.
+        ts_ms: u64,
+        /// Stable id for this session run, carried by every turn's `request`.
+        session_id: String,
+    },
+    /// Emitted once by `baton session` on a clean exit (EOF / `/exit`), after the
+    /// last turn. Marks the closing boundary of a session.
+    ///
+    /// A session killed mid-run never emits this — partitioning therefore keys on
+    /// `session_id`, not on a matched start/end pair (see
+    /// [`crate::log::parse_sessions`]).
+    SessionEnd {
+        /// Schema discriminator ([`SCHEMA`]).
+        schema: &'static str,
+        /// Wall-clock emission time, Unix epoch milliseconds.
+        ts_ms: u64,
+        /// The session this closes; equals the matching `SessionStart.session_id`.
+        session_id: String,
+        /// Count of turns whose `request` was emitted in this session.
+        turns: u64,
+    },
 }
 
 impl ExchangeEvent {
     /// Builds the request event from the exchange metadata and prompt.
+    ///
+    /// Carries no session framing — used by the single-turn `ask` path, whose
+    /// line stays byte-identical to before session framing existed. Session
+    /// turns use [`ExchangeEvent::session_request`].
     pub fn request(ts_ms: u64, meta: &ExchangeMeta, prompt: &str) -> Self {
         ExchangeEvent::Request {
             schema: SCHEMA,
@@ -141,6 +189,48 @@ impl ExchangeEvent {
             model: meta.model.clone(),
             base_url: meta.base_url.clone(),
             prompt: prompt.to_string(),
+            session_id: None,
+            turn_index: None,
+        }
+    }
+
+    /// Builds a session turn's request event, stamped with the run's
+    /// `session_id` and this turn's `turn_index`.
+    pub fn session_request(
+        ts_ms: u64,
+        meta: &ExchangeMeta,
+        prompt: &str,
+        session_id: &str,
+        turn_index: u64,
+    ) -> Self {
+        ExchangeEvent::Request {
+            schema: SCHEMA,
+            ts_ms,
+            model: meta.model.clone(),
+            base_url: meta.base_url.clone(),
+            prompt: prompt.to_string(),
+            session_id: Some(session_id.to_string()),
+            turn_index: Some(turn_index),
+        }
+    }
+
+    /// Builds the session-start marker stamping the run's `session_id`.
+    pub fn session_start(ts_ms: u64, session_id: &str) -> Self {
+        ExchangeEvent::SessionStart {
+            schema: SCHEMA,
+            ts_ms,
+            session_id: session_id.to_string(),
+        }
+    }
+
+    /// Builds the session-end marker, recording the run's `session_id` and the
+    /// number of turns emitted.
+    pub fn session_end(ts_ms: u64, session_id: &str, turns: u64) -> Self {
+        ExchangeEvent::SessionEnd {
+            schema: SCHEMA,
+            ts_ms,
+            session_id: session_id.to_string(),
+            turns,
         }
     }
 
@@ -425,6 +515,52 @@ mod tests {
             serde_json::from_str::<Value>(lines[1]).unwrap()["event"],
             "response_ok"
         );
+    }
+
+    #[test]
+    fn request_event_omits_session_fields_on_ask_path() {
+        let event = ExchangeEvent::request(1, &meta(), "q");
+        let value: Value = serde_json::to_value(&event).expect("serializes");
+        assert!(
+            value.get("session_id").is_none(),
+            "ask request must omit session_id, got: {value}"
+        );
+        assert!(
+            value.get("turn_index").is_none(),
+            "ask request must omit turn_index, got: {value}"
+        );
+    }
+
+    #[test]
+    fn session_request_event_carries_session_id_and_turn_index() {
+        let event = ExchangeEvent::session_request(5, &meta(), "hi", "sess-1", 2);
+        let value: Value = serde_json::to_value(&event).expect("serializes");
+        assert_eq!(value["event"], "request");
+        assert_eq!(value["schema"], SCHEMA);
+        assert_eq!(value["prompt"], "hi");
+        assert_eq!(value["session_id"], "sess-1");
+        assert_eq!(value["turn_index"], 2);
+    }
+
+    #[test]
+    fn session_start_event_serializes_with_id() {
+        let event = ExchangeEvent::session_start(7, "sess-1");
+        let value: Value = serde_json::to_value(&event).expect("serializes");
+        assert_eq!(value["event"], "session_start");
+        assert_eq!(value["schema"], SCHEMA);
+        assert_eq!(value["ts_ms"], 7);
+        assert_eq!(value["session_id"], "sess-1");
+    }
+
+    #[test]
+    fn session_end_event_serializes_with_id_and_turn_count() {
+        let event = ExchangeEvent::session_end(9, "sess-1", 3);
+        let value: Value = serde_json::to_value(&event).expect("serializes");
+        assert_eq!(value["event"], "session_end");
+        assert_eq!(value["schema"], SCHEMA);
+        assert_eq!(value["ts_ms"], 9);
+        assert_eq!(value["session_id"], "sess-1");
+        assert_eq!(value["turns"], 3);
     }
 
     #[test]

@@ -160,6 +160,8 @@ mod tests {
                 model: "claude-sonnet-4-6".to_string(),
                 base_url: "https://api.anthropic.com".to_string(),
                 prompt: "hello".to_string(),
+                session_id: None,
+                turn_index: None,
             },
             outcome: Outcome::Ok {
                 ts_ms: 1_700_000_000_420,

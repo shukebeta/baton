@@ -696,19 +696,44 @@ fn session_runs_multi_turn_and_records_a_pair_per_turn() {
         "one reply printed per turn; stdout: {stdout}"
     );
 
-    // Two turns ⇒ two request/response_ok pairs in order.
+    // The session is self-delimiting: a session_start marker, then two turns ×
+    // (request + response_ok), then a session_end marker reporting the turn count.
     let lines = read_jsonl(&temp.file);
     assert_eq!(
         lines.len(),
-        4,
-        "two turns × (request + response_ok), got {lines:?}"
+        6,
+        "session_start + two turns × (request + response_ok) + session_end, got {lines:?}"
     );
-    assert_eq!(lines[0]["event"], "request");
-    assert_eq!(lines[0]["prompt"], "first turn");
-    assert_eq!(lines[1]["event"], "response_ok");
-    assert_eq!(lines[2]["event"], "request");
-    assert_eq!(lines[2]["prompt"], "second turn");
-    assert_eq!(lines[3]["event"], "response_ok");
+    assert_eq!(lines[0]["event"], "session_start");
+    let session_id = lines[0]["session_id"]
+        .as_str()
+        .expect("session_start carries a session_id")
+        .to_string();
+
+    assert_eq!(lines[1]["event"], "request");
+    assert_eq!(lines[1]["prompt"], "first turn");
+    assert_eq!(lines[1]["session_id"], session_id);
+    assert_eq!(lines[1]["turn_index"], 0);
+    assert_eq!(lines[2]["event"], "response_ok");
+
+    assert_eq!(lines[3]["event"], "request");
+    assert_eq!(lines[3]["prompt"], "second turn");
+    assert_eq!(lines[3]["session_id"], session_id);
+    assert_eq!(lines[3]["turn_index"], 1);
+    assert_eq!(lines[4]["event"], "response_ok");
+
+    assert_eq!(lines[5]["event"], "session_end");
+    assert_eq!(lines[5]["session_id"], session_id);
+    assert_eq!(lines[5]["turns"], 2);
+
+    // Every turn's request carries the one session_id stamped by session_start —
+    // the key that partitions a shared trail back into whole sessions.
+    let turn_ids: Vec<&str> = lines
+        .iter()
+        .filter(|l| l["event"] == "request")
+        .map(|l| l["session_id"].as_str().expect("session turn carries id"))
+        .collect();
+    assert_eq!(turn_ids, vec![session_id.as_str(), session_id.as_str()]);
 }
 
 // ---------------------------------------------------------------------------
