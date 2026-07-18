@@ -992,7 +992,9 @@ fn build_agent_args(
     let mut args = Vec::with_capacity(agent_args.len() + 4);
     if let Some(path) = system_path {
         let prompt = std::fs::read_to_string(path).map_err(|err| {
-            BatonError::Io(format!("could not read --agent-system file {path:?}: {err}"))
+            BatonError::Io(format!(
+                "could not read --agent-system file {path:?}: {err}"
+            ))
         })?;
         args.push("--append-system-prompt".to_string());
         args.push(prompt);
@@ -3304,7 +3306,10 @@ mod tests {
         let args = build_agent_args(
             Some(role.to_str().unwrap()),
             Some("/tmp/mcp.json"),
-            vec!["-p".to_string(), "--dangerously-skip-permissions".to_string()],
+            vec![
+                "-p".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+            ],
         )
         .expect("assembles");
 

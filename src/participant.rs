@@ -430,11 +430,12 @@ impl OutputAdapter {
                             .to_string(),
                     ));
                 };
-                let value: serde_json::Value = serde_json::from_str(line.trim()).map_err(|err| {
-                    BatonError::Decode(format!(
-                        "external agent's final output line is not a JSON object: {err}"
-                    ))
-                })?;
+                let value: serde_json::Value =
+                    serde_json::from_str(line.trim()).map_err(|err| {
+                        BatonError::Decode(format!(
+                            "external agent's final output line is not a JSON object: {err}"
+                        ))
+                    })?;
                 match value.get(result_key) {
                     Some(serde_json::Value::String(s)) => Ok(s.clone()),
                     Some(_) => Err(BatonError::Decode(format!(
