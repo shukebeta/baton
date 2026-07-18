@@ -14,7 +14,7 @@
 //! here); the CLI layers the `BATON_EVENT_LOG` side trail on top.
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -197,87 +197,25 @@ impl SubprocessParticipant {
             BatonError::Io(format!("could not serialize request envelope: {err}"))
         })?;
 
-        let mut child = Command::new(&self.program)
-            .args(&self.args)
-            .envs(self.envs.iter().map(|(k, v)| (k, v)))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|err| {
-                BatonError::Io(format!(
-                    "could not spawn child participant {:?}: {err}",
-                    self.program
-                ))
-            })?;
+        let stdout = capture_child_stdout(
+            &self.program,
+            &self.args,
+            &self.envs,
+            None,
+            payload.as_bytes(),
+            self.read_timeout,
+        )?;
 
-        // Drain stdout on its own thread, started *before* writing stdin, so a
-        // child that emits before consuming all its input cannot deadlock with
-        // us on a full pipe buffer.
-        let mut stdout = child.stdout.take().expect("child stdout is piped");
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let mut buf = String::new();
-            let result = stdout.read_to_string(&mut buf).map(|_| buf);
-            // A dropped receiver (the parent already timed out) is expected.
-            let _ = tx.send(result);
-        });
-
-        // Write the request, then drop stdin so the child sees EOF.
-        {
-            let mut stdin = child.stdin.take().expect("child stdin is piped");
-            stdin
-                .write_all(payload.as_bytes())
-                .map_err(|err| BatonError::Io(format!("could not write to child stdin: {err}")))?;
+        if stdout.trim().is_empty() {
+            return Err(BatonError::Decode(
+                "child participant produced no response envelope".to_string(),
+            ));
         }
-
-        match rx.recv_timeout(self.read_timeout) {
-            Ok(read_result) => {
-                let stdout = read_result
-                    .map_err(|err| BatonError::Io(format!("could not read child stdout: {err}")))?;
-                let status = child.wait().map_err(|err| {
-                    BatonError::Io(format!("could not reap child participant: {err}"))
-                })?;
-                if !status.success() {
-                    let stderr = read_stderr(&mut child);
-                    let detail = if stderr.trim().is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {}", stderr.trim())
-                    };
-                    return Err(BatonError::Transport(format!(
-                        "child participant exited with {status}{detail}"
-                    )));
-                }
-                if stdout.trim().is_empty() {
-                    return Err(BatonError::Decode(
-                        "child participant produced no response envelope".to_string(),
-                    ));
-                }
-                serde_json::from_str(&stdout).map_err(|err| {
-                    BatonError::Decode(format!(
-                        "child participant produced a malformed response envelope: {err}"
-                    ))
-                })
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // The child is still holding stdout open past the deadline; kill
-                // and reap it before surfacing the timeout.
-                let _ = child.kill();
-                let _ = child.wait();
-                Err(BatonError::Transport(format!(
-                    "child participant exceeded the {:?} read timeout",
-                    self.read_timeout
-                )))
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                Err(BatonError::Transport(
-                    "child participant stdout reader terminated unexpectedly".to_string(),
-                ))
-            }
-        }
+        serde_json::from_str(&stdout).map_err(|err| {
+            BatonError::Decode(format!(
+                "child participant produced a malformed response envelope: {err}"
+            ))
+        })
     }
 }
 
@@ -397,6 +335,214 @@ impl Participant for MailboxParticipant {
         match self.try_respond(request) {
             Ok(response) => response,
             Err(err) => synthesize_error_response(request, &err.to_string()),
+        }
+    }
+}
+
+/// An external-agent-backed participant: each reply is one **headless run of a
+/// full-tooled native agent CLI** (one that edits files and runs git/bash/MCP),
+/// driven entirely through the mailbox with no tmux and no live TUI.
+///
+/// Where [`SubprocessParticipant`] reaches an independent *Baton* agent that
+/// emits a complete `baton.message/v1` envelope on stdout, this impl reaches a
+/// generic agent CLI that emits **free text** — its final result — which this
+/// participant then **wraps** into a `kind: "response"` envelope (conversation
+/// preserved, addressing swapped, `in_reply_to` linked). The agent is run with a
+/// **git worktree as cwd** ([`cwd`](Self::cwd)); the request body is written to
+/// its stdin, and its final stdout is captured as the reply body.
+///
+/// Cross-message state is the agent's own responsibility: it reconstructs
+/// context across rounds from **durable artifacts** (the git branch/worktree it
+/// shares run-to-run, the issue thread, prior mailbox history), not from an
+/// in-memory session — headless-per-message is the model. This participant
+/// guarantees only the substrate: the same `cwd` on every call, the request
+/// delivered on stdin, and the final output captured.
+///
+/// The trait stays infallible; the delivered-error boundary is drawn in envelope
+/// terms, mirroring the sibling impls:
+///
+/// - A run that **exits 0 with non-empty stdout** yields a `kind: "response"`
+///   whose body is that stdout, with **no** nested `baton.exchange/v1` record —
+///   an agent run is not a single provider call Baton can vouch for, so it nests
+///   nothing (as [`testing::ScriptedParticipant`] does when it runs no call).
+/// - A **machinery failure** — the agent could not be spawned, exited non-zero,
+///   produced empty stdout, or exceeded [`read_timeout`](Self::read_timeout) —
+///   is reconciled into a *synthesized* delivered `kind: "error"` envelope
+///   ([`synthesize_error_response`]), its body naming the failure.
+pub struct ExternalAgentParticipant {
+    /// The native agent CLI to run headless (e.g. `claude`).
+    program: PathBuf,
+    /// Fixed arguments passed on every run (headless/role flags), before stdin.
+    args: Vec<String>,
+    /// Environment layered over the inherited environment (the agent carries its
+    /// own credentials / MCP config through here).
+    envs: Vec<(String, String)>,
+    /// Working directory for every run — the git worktree the agent acts in and
+    /// reconstructs context from across rounds.
+    cwd: PathBuf,
+    /// Maximum time to await the agent's final output before synthesizing an
+    /// error. Should be *generous*: a headless agent run is many tool calls, not
+    /// one provider turn.
+    read_timeout: Duration,
+}
+
+impl ExternalAgentParticipant {
+    /// Builds a participant that runs `program` with `args` (layering `envs` over
+    /// the inherited environment) in `cwd`, feeding each request body on stdin
+    /// and awaiting the agent's final stdout for at most `read_timeout`.
+    pub fn new(
+        program: impl Into<PathBuf>,
+        args: impl IntoIterator<Item = impl Into<String>>,
+        envs: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+        cwd: impl Into<PathBuf>,
+        read_timeout: Duration,
+    ) -> Self {
+        Self {
+            program: program.into(),
+            args: args.into_iter().map(Into::into).collect(),
+            envs: envs
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
+            cwd: cwd.into(),
+            read_timeout,
+        }
+    }
+
+    /// Runs one headless agent turn, returning the reply body (the agent's final
+    /// stdout) or an `Err` describing the machinery failure (spawn failure,
+    /// non-zero exit, empty output, or read timeout). The infallible
+    /// [`Participant::respond`] reconciles that `Err` into a delivered error
+    /// envelope.
+    fn try_respond(&self, request: &MessageEnvelope) -> Result<String> {
+        let stdout = capture_child_stdout(
+            &self.program,
+            &self.args,
+            &self.envs,
+            Some(&self.cwd),
+            request.body.as_bytes(),
+            self.read_timeout,
+        )?;
+
+        if stdout.trim().is_empty() {
+            return Err(BatonError::Decode(
+                "external agent produced no output".to_string(),
+            ));
+        }
+        Ok(stdout)
+    }
+}
+
+impl Participant for ExternalAgentParticipant {
+    fn respond(&self, request: &MessageEnvelope) -> MessageEnvelope {
+        match self.try_respond(request) {
+            Ok(body) => {
+                let ts_ms = now_ms();
+                let mut response = MessageEnvelope::new(
+                    fresh_message_id(&request.conversation_id, ts_ms),
+                    request.conversation_id.clone(),
+                    request.to.clone(),
+                    request.from.clone(),
+                    MessageKind::Response,
+                    body,
+                    ts_ms,
+                );
+                response.in_reply_to = Some(request.message_id.clone());
+                response
+            }
+            Err(err) => synthesize_error_response(request, &err.to_string()),
+        }
+    }
+}
+
+/// Spawns `program` with `args`/`envs` (optionally in `cwd`), writes `payload`
+/// to its stdin, and returns its stdout captured to EOF — the shared process
+/// machinery behind [`SubprocessParticipant`] and [`ExternalAgentParticipant`].
+///
+/// stdout is drained on its own thread, started *before* the stdin write, so a
+/// child that emits before consuming all its input cannot deadlock against a
+/// full pipe buffer. A child that holds stdout open past `read_timeout` is
+/// killed and reaped. Returns `Ok(stdout)` only when the child exits 0 (the
+/// string may be empty — the caller decides what empty means); a spawn failure,
+/// a non-zero exit (stderr folded into the message), a timeout, or an I/O error
+/// is an `Err`.
+fn capture_child_stdout(
+    program: &Path,
+    args: &[String],
+    envs: &[(String, String)],
+    cwd: Option<&Path>,
+    payload: &[u8],
+    read_timeout: Duration,
+) -> Result<String> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .envs(envs.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let mut child = command.spawn().map_err(|err| {
+        BatonError::Io(format!("could not spawn child process {program:?}: {err}"))
+    })?;
+
+    // Drain stdout on its own thread, started *before* writing stdin, so a child
+    // that emits before consuming all its input cannot deadlock with us on a
+    // full pipe buffer.
+    let mut stdout = child.stdout.take().expect("child stdout is piped");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = String::new();
+        let result = stdout.read_to_string(&mut buf).map(|_| buf);
+        // A dropped receiver (the parent already timed out) is expected.
+        let _ = tx.send(result);
+    });
+
+    // Write the payload, then drop stdin so the child sees EOF.
+    {
+        let mut stdin = child.stdin.take().expect("child stdin is piped");
+        stdin
+            .write_all(payload)
+            .map_err(|err| BatonError::Io(format!("could not write to child stdin: {err}")))?;
+    }
+
+    match rx.recv_timeout(read_timeout) {
+        Ok(read_result) => {
+            let stdout = read_result
+                .map_err(|err| BatonError::Io(format!("could not read child stdout: {err}")))?;
+            let status = child
+                .wait()
+                .map_err(|err| BatonError::Io(format!("could not reap child process: {err}")))?;
+            if !status.success() {
+                let stderr = read_stderr(&mut child);
+                let detail = if stderr.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", stderr.trim())
+                };
+                return Err(BatonError::Transport(format!(
+                    "child process exited with {status}{detail}"
+                )));
+            }
+            Ok(stdout)
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // The child is still holding stdout open past the deadline; kill and
+            // reap it before surfacing the timeout.
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(BatonError::Transport(format!(
+                "child process exceeded the {read_timeout:?} read timeout"
+            )))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(BatonError::Transport(
+                "child process stdout reader terminated unexpectedly".to_string(),
+            ))
         }
     }
 }
@@ -927,6 +1073,164 @@ mod tests {
             Duration::from_secs(5),
         );
         assert_synthesized_error(&participant.respond(&request_envelope()));
+    }
+
+    // -- ExternalAgentParticipant -----------------------------------------
+    //
+    // These drive the impl against `sh -c` stub programs in a tempdir cwd — no
+    // real agent, no network, no API key. Each stub `cat`s its stdin (the
+    // request body) so it never dies on a broken pipe, then acts in cwd and/or
+    // prints its free-text "final result". This proves the machinery: stdin
+    // delivery, the cwd side effect, the free-text→envelope wrap, the two-round
+    // continuity substrate (shared cwd), and every synthesized-error path. The
+    // real cross-context proof (an agent reconstructing from a git branch + the
+    // issue thread) is `scripts/external-agent-proof.sh`, run manually.
+
+    /// Builds an external-agent participant running `script` under `sh -c` in
+    /// `cwd`, with no env overrides.
+    fn external_agent(
+        script: &str,
+        cwd: &std::path::Path,
+        read_timeout: Duration,
+    ) -> ExternalAgentParticipant {
+        ExternalAgentParticipant::new(
+            "sh",
+            ["-c", script],
+            std::iter::empty::<(String, String)>(),
+            cwd,
+            read_timeout,
+        )
+    }
+
+    /// A request envelope with a chosen id/body (agent-a → agent-b), so a
+    /// two-round test can address distinct payloads.
+    fn request_with_body(id: &str, body: &str) -> MessageEnvelope {
+        MessageEnvelope::new(
+            id,
+            "conv-42",
+            "agent-a",
+            "agent-b",
+            MessageKind::Request,
+            body,
+            1_700_000_000_000,
+        )
+    }
+
+    /// A headless run that exits 0 with free-text stdout has that text wrapped
+    /// into a `kind: "response"` correlated to the request (no nested record),
+    /// the request body arrives on the agent's stdin, and the agent's cwd side
+    /// effect lands in the worktree.
+    #[test]
+    fn external_agent_wraps_stdout_and_produces_cwd_side_effect() {
+        let dir = TempDir::new("ext-ok");
+        // The stub records its stdin to a file in cwd (proving stdin delivery +
+        // an observable side effect), then prints its free-text result.
+        let participant = external_agent(
+            "cat > round1.txt; printf 'edited round1.txt and committed'",
+            &dir.path,
+            Duration::from_secs(5),
+        );
+        let request = request_with_body("m-req-1", "please edit round1.txt");
+
+        let response = participant.respond(&request);
+
+        assert_eq!(response.kind, MessageKind::Response);
+        assert_eq!(response.body, "edited round1.txt and committed");
+        assert_eq!(response.conversation_id, "conv-42");
+        assert_eq!(response.in_reply_to.as_deref(), Some("m-req-1"));
+        // Addressing swaps: reply is from the request's recipient, to its sender.
+        assert_eq!(response.from, "agent-b");
+        assert_eq!(response.to, "agent-a");
+        assert!(
+            response.exchange.is_none(),
+            "an agent run is not one provider call, so it nests no record"
+        );
+        // The request body was delivered on the agent's stdin...
+        let stdin_seen = std::fs::read_to_string(dir.path.join("round1.txt")).expect("side effect");
+        assert_eq!(stdin_seen, "please edit round1.txt");
+    }
+
+    /// Two sequential runs over the *same cwd*: the second run observes the
+    /// first's durable artifact — the continuity substrate a headless-per-message
+    /// agent relies on to reconstruct context across rounds.
+    #[test]
+    fn external_agent_two_rounds_share_cwd_for_continuity() {
+        let dir = TempDir::new("ext-continuity");
+
+        // Round 1 appends its payload to a durable ledger in the worktree.
+        let round1 = external_agent(
+            "cat >> ledger.txt; printf 'r1 done'",
+            &dir.path,
+            Duration::from_secs(5),
+        );
+        let resp1 = round1.respond(&request_with_body("m-req-1", "ROUND-ONE-PAYLOAD"));
+        assert_eq!(resp1.body, "r1 done");
+
+        // Round 2 (fresh headless process, same cwd) reads the ledger back —
+        // seeing round 1's artifact proves cross-round continuity via durable
+        // state, not an in-memory session.
+        let round2 = external_agent(
+            "cat >> ledger.txt; cat ledger.txt",
+            &dir.path,
+            Duration::from_secs(5),
+        );
+        let resp2 = round2.respond(&request_with_body("m-req-2", "ROUND-TWO-PAYLOAD"));
+
+        assert_eq!(resp2.kind, MessageKind::Response);
+        assert_eq!(resp2.in_reply_to.as_deref(), Some("m-req-2"));
+        assert!(
+            resp2.body.contains("ROUND-ONE-PAYLOAD"),
+            "round 2 reconstructed round 1's durable artifact: {}",
+            resp2.body
+        );
+        assert!(resp2.body.contains("ROUND-TWO-PAYLOAD"));
+    }
+
+    /// An agent that exits non-zero yields a synthesized delivered error naming
+    /// the failure.
+    #[test]
+    fn external_agent_synthesizes_error_on_nonzero_exit() {
+        let dir = TempDir::new("ext-nonzero");
+        let participant = external_agent(
+            "cat >/dev/null; echo boom >&2; exit 3",
+            &dir.path,
+            Duration::from_secs(5),
+        );
+        let response = participant.respond(&request_with_body("m-req-1", "go"));
+        assert_synthesized_error(&response);
+        assert!(
+            response.body.contains("boom") || response.body.contains("exit"),
+            "body describes the agent failure: {}",
+            response.body
+        );
+    }
+
+    /// An agent that exits 0 with empty stdout yields a synthesized error —
+    /// there is no final result to deliver.
+    #[test]
+    fn external_agent_synthesizes_error_on_empty_output() {
+        let dir = TempDir::new("ext-empty");
+        let participant = external_agent("cat >/dev/null", &dir.path, Duration::from_secs(5));
+        assert_synthesized_error(&participant.respond(&request_with_body("m-req-1", "go")));
+    }
+
+    /// An agent that holds stdout open past the read timeout is killed and
+    /// yields a synthesized error naming the timeout, without hanging the parent.
+    #[test]
+    fn external_agent_synthesizes_error_on_read_timeout() {
+        let dir = TempDir::new("ext-timeout");
+        let participant = external_agent(
+            "cat >/dev/null; sleep 30",
+            &dir.path,
+            Duration::from_millis(150),
+        );
+        let response = participant.respond(&request_with_body("m-req-1", "go"));
+        assert_synthesized_error(&response);
+        assert!(
+            response.body.contains("timeout"),
+            "body names the timeout: {}",
+            response.body
+        );
     }
 
     // -- MailboxParticipant -----------------------------------------------
