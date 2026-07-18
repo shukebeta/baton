@@ -670,6 +670,7 @@ socket.
 
 ```
 baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once]
+            [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>]]
 baton serve --stop --inbox <dir>
 ```
 
@@ -679,12 +680,57 @@ baton serve --stop --inbox <dir>
 - `--poll-ms <n>` — inbox poll interval in milliseconds (default `500`).
 - `--once` — drain everything currently pending, then exit (cron-friendly);
   omitted, `serve` polls the inbox until terminated.
+- `--agent-cmd <program>` — host the role with an **external agent** instead of an
+  in-process provider call (see [External-agent role](#external-agent-role---agent-cmd)).
 - `--stop` — cooperatively stop the `serve` running on `--inbox` (see
   [Shutdown](#shutdown-cooperative-graceful-stop)); takes only `--inbox`.
 
-Each side configures the answering participant exactly as `exchange`/`ask` do
-(`BATON_MODEL`, `BATON_SYSTEM_PROMPT`, the credential env, `BATON_EVENT_LOG`), so
-a served message runs the identical exchange and records the same trail.
+Without `--agent-cmd`, each side configures the answering participant exactly as
+`exchange`/`ask` do (`BATON_MODEL`, `BATON_SYSTEM_PROMPT`, the credential env,
+`BATON_EVENT_LOG`), so a served message runs the identical exchange and records
+the same trail.
+
+### External-agent role (`--agent-cmd`)
+
+By default a served reply is a single Messages-API call. `--agent-cmd` instead
+backs the role with a **full-tooled native agent CLI run headless** — one that
+edits files and runs git/bash/MCP — driven entirely through the mailbox, with
+**no tmux and no live TUI**. This is the tmux-free launch leaf for a non-tmux
+team role: `baton serve --agent-cmd …` has no `TMAT_PANE` / `tmux` / pane-title
+dependency anywhere.
+
+```
+baton serve --inbox <dir> --outbox <dir> \
+  --agent-cmd claude --agent-cwd /path/to/worktree \
+  --agent-arg -p --agent-arg --dangerously-skip-permissions
+```
+
+- `--agent-cmd <program>` — the agent CLI to run once per message.
+- `--agent-arg <arg>` — a fixed argument passed on every run (repeatable), e.g.
+  headless/role flags. The request body is delivered on the agent's **stdin**;
+  the agent's final **stdout** becomes the reply body.
+- `--agent-cwd <dir>` — the working directory (a git worktree) for every run;
+  defaults to the `serve` process's own cwd.
+- `--agent-timeout-ms <n>` — read timeout for one agent run (default `600000`).
+  Generous by design: an agent run is many tool calls, not one provider turn.
+
+In this mode `serve` loads **no `BatonConfig` and needs no API key** — the agent
+carries its own credentials and MCP config (layer them through the inherited
+environment). Cross-message state is the agent's own job: it reconstructs
+context across rounds from **durable artifacts** (the git branch/worktree it
+shares run-to-run, the issue thread, prior mailbox history), not an in-memory
+session — headless-per-message is the model. An agent run that exits 0 with
+non-empty stdout is wrapped into a `kind: "response"` (it nests no
+`baton.exchange/v1` record, since a multi-tool run is not one provider call
+baton can vouch for); a spawn failure, non-zero exit, empty output, or timeout
+becomes a synthesized delivered `kind: "error"`.
+
+`scripts/external-agent-proof.sh` is the runnable end-to-end proof (real agent +
+real credentials, so **not** part of baton's no-API-key CI): it drives two
+addressed rounds against a throwaway git worktree and asserts an observable side
+effect (a commit) plus round-2 continuity on a durable artifact (a further
+commit extending round 1's file). The hermetic machinery is covered by the
+`ExternalAgentParticipant` unit tests.
 
 ### Delivery: atomic, addressable, crash-safe
 

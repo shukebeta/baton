@@ -26,7 +26,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::config::BatonConfig;
@@ -37,7 +37,9 @@ use crate::log::{self, Exchange};
 use crate::mailbox::{self, Mailbox};
 use crate::message::{MessageEnvelope, MessageKind};
 use crate::model::{AssistantReply, Conversation, Prompt};
-use crate::participant::{LocalParticipant, MailboxParticipant, Participant};
+use crate::participant::{
+    ExternalAgentParticipant, LocalParticipant, MailboxParticipant, Participant,
+};
 use crate::registry::Registry;
 use crate::transport::Transport;
 use crate::transport::claude::ClaudeClient;
@@ -47,11 +49,17 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] | baton serve --stop --inbox <dir> | baton send --inbox <dir> (--body <text> | --in <path>) [--to <id>] [--from <id>] [--conversation <id>] [--await --outbox <dir> [--timeout-ms <n>]] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>...";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>]] | baton serve --stop --inbox <dir> | baton send --inbox <dir> (--body <text> | --in <path>) [--to <id>] [--from <id>] [--conversation <id>] [--await --outbox <dir> [--timeout-ms <n>]] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>...";
 
 /// Default `baton serve` inbox poll interval, in milliseconds, when `--poll-ms`
 /// is unset.
 const DEFAULT_SERVE_POLL_MS: u64 = 500;
+
+/// Default `baton serve --agent-cmd` read timeout for one headless agent run, in
+/// milliseconds, when `--agent-timeout-ms` is unset. Very generous: a full-tooled
+/// agent run is many tool calls (git, edits, MCP), not one provider turn, so a
+/// short deadline would kill a live-but-working agent mid-task.
+const DEFAULT_AGENT_TIMEOUT_MS: u64 = 600_000;
 
 /// Default `baton send --await` timeout, in milliseconds, when `--timeout-ms` is
 /// unset.
@@ -125,11 +133,27 @@ enum Command {
     /// Serve a file-mailbox: drain `inbox`'s `pending/` requests through the
     /// participant seam, writing each reply to `outbox`. `once` drains a single
     /// pass and exits; otherwise the inbox is polled every `poll_ms`.
+    ///
+    /// Without `--agent-cmd`, each reply is one in-process Messages-API call
+    /// (`LocalParticipant`, requiring `BatonConfig`/an API key). With
+    /// `--agent-cmd`, each reply is one **headless native-agent run**
+    /// (`ExternalAgentParticipant`) in `agent_cwd`, carrying its own credentials
+    /// — no `BatonConfig` is loaded and no tmux is involved.
     Serve {
         inbox: String,
         outbox: String,
         poll_ms: u64,
         once: bool,
+        /// The native agent CLI to run headless per message; `None` ⇒ the
+        /// in-process `LocalParticipant`.
+        agent_cmd: Option<String>,
+        /// Fixed arguments passed to the agent on every run (headless/role flags).
+        agent_args: Vec<String>,
+        /// Working directory (git worktree) for the agent; `None` ⇒ the serve
+        /// process's own cwd. Only meaningful with `agent_cmd`.
+        agent_cwd: Option<String>,
+        /// Read timeout (ms) for one agent run; `None` ⇒ [`DEFAULT_AGENT_TIMEOUT_MS`].
+        agent_timeout_ms: Option<u64>,
     },
     /// Cooperatively stop a running `baton serve` on `inbox` (Option C graceful
     /// shutdown): drop a stop sentinel the daemon observes between messages, so
@@ -328,12 +352,50 @@ pub fn run() -> Result<()> {
             outbox,
             poll_ms,
             once,
+            agent_cmd,
+            agent_args,
+            agent_cwd,
+            agent_timeout_ms,
         } => {
-            let config = BatonConfig::from_env()?;
-            let meta = exchange_meta(&config);
             let mut sink = open_event_sink()?;
-            let client = ClaudeClient::from_config(config);
-            let participant = LocalParticipant::new(client, meta.clone());
+
+            // Two participant backings behind one drain loop. An external agent
+            // carries its own credentials and MCP config, so agent mode loads no
+            // `BatonConfig` and builds no `ClaudeClient` — the whole point of a
+            // key-free, tmux-free role host. The `meta` stamped on the side-trail
+            // request line is then a placeholder naming the agent, since no
+            // provider model/base_url applies.
+            let (participant, meta): (Box<dyn Participant>, ExchangeMeta) = match agent_cmd {
+                Some(program) => {
+                    let cwd = agent_cwd
+                        .map(PathBuf::from)
+                        .map(Ok)
+                        .unwrap_or_else(std::env::current_dir)
+                        .map_err(|err| {
+                            BatonError::Io(format!("could not resolve the agent cwd: {err}"))
+                        })?;
+                    let read_timeout =
+                        Duration::from_millis(agent_timeout_ms.unwrap_or(DEFAULT_AGENT_TIMEOUT_MS));
+                    let meta = ExchangeMeta {
+                        model: program.clone(),
+                        base_url: "external-agent".to_string(),
+                    };
+                    let participant = ExternalAgentParticipant::new(
+                        program,
+                        agent_args,
+                        std::iter::empty::<(String, String)>(),
+                        cwd,
+                        read_timeout,
+                    );
+                    (Box::new(participant), meta)
+                }
+                None => {
+                    let config = BatonConfig::from_env()?;
+                    let meta = exchange_meta(&config);
+                    let client = ClaudeClient::from_config(config);
+                    (Box::new(LocalParticipant::new(client, meta.clone())), meta)
+                }
+            };
 
             // Lock first, then reclaim: with the single-instance lock held, no
             // other daemon is mid-answer, so returning abandoned `claimed/`
@@ -347,7 +409,7 @@ pub fn run() -> Result<()> {
 
             let poll = Duration::from_millis(poll_ms);
             loop {
-                match drain_mailbox(&mailbox, outbox, &participant, sink.as_mut(), &meta)? {
+                match drain_mailbox(&mailbox, outbox, participant.as_ref(), sink.as_mut(), &meta)? {
                     // Cooperative stop observed between messages ⇒ exit 0.
                     Drain::Stopped => break,
                     Drain::Drained(processed) => {
@@ -608,7 +670,7 @@ fn execute_ask(
 /// Parameterised over [`Participant`]/[`EventSink`] so it is unit-testable with
 /// fakes.
 fn execute_exchange(
-    participant: &impl Participant,
+    participant: &dyn Participant,
     sink: &mut dyn EventSink,
     meta: &ExchangeMeta,
     request: &MessageEnvelope,
@@ -650,7 +712,7 @@ enum Drain {
 fn drain_mailbox(
     mailbox: &Mailbox,
     outbox: &Path,
-    participant: &impl Participant,
+    participant: &dyn Participant,
     sink: &mut dyn EventSink,
     meta: &ExchangeMeta,
 ) -> Result<Drain> {
@@ -1501,6 +1563,10 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
     let mut poll_ms: Option<u64> = None;
     let mut once = false;
     let mut stop = false;
+    let mut agent_cmd: Option<String> = None;
+    let mut agent_args: Vec<String> = Vec::new();
+    let mut agent_cwd: Option<String> = None;
+    let mut agent_timeout_ms: Option<u64> = None;
 
     while let Some(arg) = iter.next() {
         let mut take = |flag: &str| -> Result<String> {
@@ -1523,6 +1589,30 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
             }
             "--once" => once = true,
             "--stop" => stop = true,
+            "--agent-cmd" => agent_cmd = Some(take("--agent-cmd")?),
+            other if other.starts_with("--agent-cmd=") => {
+                agent_cmd = Some(other["--agent-cmd=".len()..].to_string());
+            }
+            "--agent-arg" => agent_args.push(take("--agent-arg")?),
+            other if other.starts_with("--agent-arg=") => {
+                agent_args.push(other["--agent-arg=".len()..].to_string());
+            }
+            "--agent-cwd" => agent_cwd = Some(take("--agent-cwd")?),
+            other if other.starts_with("--agent-cwd=") => {
+                agent_cwd = Some(other["--agent-cwd=".len()..].to_string());
+            }
+            "--agent-timeout-ms" => {
+                agent_timeout_ms = Some(parse_positive_ms(
+                    &take("--agent-timeout-ms")?,
+                    "--agent-timeout-ms",
+                )?)
+            }
+            other if other.starts_with("--agent-timeout-ms=") => {
+                agent_timeout_ms = Some(parse_positive_ms(
+                    &other["--agent-timeout-ms=".len()..],
+                    "--agent-timeout-ms",
+                )?);
+            }
             other => return Err(usage(&format!("unexpected argument {other:?}"))),
         }
     }
@@ -1530,13 +1620,30 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
     // Cooperative-stop client: only `--inbox` is meaningful; the daemon-only
     // flags have no effect here, so reject them rather than silently ignore.
     if stop {
-        if outbox.is_some() || poll_ms.is_some() || once {
+        if outbox.is_some()
+            || poll_ms.is_some()
+            || once
+            || agent_cmd.is_some()
+            || !agent_args.is_empty()
+            || agent_cwd.is_some()
+            || agent_timeout_ms.is_some()
+        {
             return Err(usage(
-                "--stop takes only --inbox (not --outbox/--poll-ms/--once)",
+                "--stop takes only --inbox (not --outbox/--poll-ms/--once/--agent-*)",
             ));
         }
         let inbox = require_dir(inbox, "--inbox")?;
         return Ok(Command::ServeStop { inbox });
+    }
+
+    // The agent-run flags only qualify `--agent-cmd`; without it they would be
+    // silently ignored, so reject them rather than mislead.
+    if agent_cmd.is_none()
+        && (!agent_args.is_empty() || agent_cwd.is_some() || agent_timeout_ms.is_some())
+    {
+        return Err(usage(
+            "--agent-arg/--agent-cwd/--agent-timeout-ms require --agent-cmd",
+        ));
     }
 
     let inbox = require_dir(inbox, "--inbox")?;
@@ -1546,6 +1653,10 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
         outbox,
         poll_ms: poll_ms.unwrap_or(DEFAULT_SERVE_POLL_MS),
         once,
+        agent_cmd,
+        agent_args,
+        agent_cwd,
+        agent_timeout_ms,
     })
 }
 
@@ -1668,15 +1779,18 @@ fn parse_send<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command>
 /// a zero-length await would time out before the first poll could observe a
 /// reply).
 fn parse_timeout_ms(raw: &str) -> Result<u64> {
+    parse_positive_ms(raw, "--timeout-ms")
+}
+
+/// Parses a positive-integer millisecond value for `flag`, rejecting zero and
+/// non-numeric input with a usage error naming the flag. Shared by every
+/// `--*-ms` flag so the "positive integer" rule lives in one place.
+fn parse_positive_ms(raw: &str, flag: &str) -> Result<u64> {
     raw.trim()
         .parse::<u64>()
         .ok()
         .filter(|&n| n > 0)
-        .ok_or_else(|| {
-            usage(&format!(
-                "--timeout-ms must be a positive integer, got {raw:?}"
-            ))
-        })
+        .ok_or_else(|| usage(&format!("{flag} must be a positive integer, got {raw:?}")))
 }
 
 /// Requires a non-blank directory value for `flag`.
@@ -1690,15 +1804,7 @@ fn require_dir(value: Option<String>, flag: &str) -> Result<String> {
 /// Parses `--poll-ms`: a positive integer of milliseconds (zero is rejected — a
 /// zero interval would busy-spin the poll loop).
 fn parse_poll_ms(raw: &str) -> Result<u64> {
-    raw.trim()
-        .parse::<u64>()
-        .ok()
-        .filter(|&n| n > 0)
-        .ok_or_else(|| {
-            usage(&format!(
-                "--poll-ms must be a positive integer, got {raw:?}"
-            ))
-        })
+    parse_positive_ms(raw, "--poll-ms")
 }
 
 /// Builds a usage error carrying `detail` and the one-line usage summary.
@@ -2869,6 +2975,10 @@ mod tests {
                 outbox: "/tmp/out".to_string(),
                 poll_ms: DEFAULT_SERVE_POLL_MS,
                 once: false,
+                agent_cmd: None,
+                agent_args: vec![],
+                agent_cwd: None,
+                agent_timeout_ms: None,
             }
         );
     }
@@ -2910,6 +3020,115 @@ mod tests {
             .unwrap_err(),
             BatonError::Usage(_)
         ));
+        // The agent-run flags are equally meaningless for the stop client.
+        assert!(matches!(
+            parse_args(&argv(&[
+                "serve",
+                "--stop",
+                "--inbox=/tmp/in",
+                "--agent-cmd=claude"
+            ]))
+            .unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_serve_accepts_agent_flags() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "serve",
+                "--inbox",
+                "/tmp/in",
+                "--outbox",
+                "/tmp/out",
+                "--agent-cmd",
+                "claude",
+                "--agent-arg",
+                "-p",
+                "--agent-arg",
+                "--output-format=text",
+                "--agent-cwd",
+                "/tmp/work",
+                "--agent-timeout-ms",
+                "900000",
+            ]))
+            .expect("parses"),
+            Command::Serve {
+                inbox: "/tmp/in".to_string(),
+                outbox: "/tmp/out".to_string(),
+                poll_ms: DEFAULT_SERVE_POLL_MS,
+                once: false,
+                agent_cmd: Some("claude".to_string()),
+                agent_args: vec!["-p".to_string(), "--output-format=text".to_string()],
+                agent_cwd: Some("/tmp/work".to_string()),
+                agent_timeout_ms: Some(900_000),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_serve_accepts_agent_flags_equals_form() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "serve",
+                "--inbox=/tmp/in",
+                "--outbox=/tmp/out",
+                "--agent-cmd=claude",
+                "--agent-arg=-p",
+            ]))
+            .expect("parses"),
+            Command::Serve {
+                inbox: "/tmp/in".to_string(),
+                outbox: "/tmp/out".to_string(),
+                poll_ms: DEFAULT_SERVE_POLL_MS,
+                once: false,
+                agent_cmd: Some("claude".to_string()),
+                agent_args: vec!["-p".to_string()],
+                agent_cwd: None,
+                agent_timeout_ms: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_serve_agent_run_flags_require_agent_cmd() {
+        // --agent-arg/--agent-cwd/--agent-timeout-ms without --agent-cmd would be
+        // silently ignored, so each is a usage error on its own.
+        for flag in [
+            "--agent-arg=-p",
+            "--agent-cwd=/tmp/work",
+            "--agent-timeout-ms=1000",
+        ] {
+            assert!(
+                matches!(
+                    parse_args(&argv(&[
+                        "serve",
+                        "--inbox=/tmp/in",
+                        "--outbox=/tmp/out",
+                        flag
+                    ]))
+                    .unwrap_err(),
+                    BatonError::Usage(_)
+                ),
+                "{flag} without --agent-cmd should be a usage error"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_serve_non_positive_agent_timeout_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&[
+                "serve",
+                "--inbox=/tmp/in",
+                "--outbox=/tmp/out",
+                "--agent-cmd=claude",
+                "--agent-timeout-ms=0",
+            ]))
+            .unwrap_err(),
+            BatonError::Usage(_)
+        ));
     }
 
     #[test]
@@ -2939,6 +3158,10 @@ mod tests {
                 outbox: "/tmp/out".to_string(),
                 poll_ms: 50,
                 once: true,
+                agent_cmd: None,
+                agent_args: vec![],
+                agent_cwd: None,
+                agent_timeout_ms: None,
             }
         );
     }
