@@ -44,6 +44,7 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use crate::error::{BatonError, Result};
 use crate::message::MessageEnvelope;
@@ -85,6 +86,36 @@ pub struct Claimed {
     pub key: String,
     /// The parsed request envelope to answer.
     pub request: MessageEnvelope,
+}
+
+/// Liveness of a mailbox's worker, derived from its `claimed/` entries.
+///
+/// The naive `idle = pending empty AND claimed empty` test cannot tell a
+/// legitimately long run from a crash: both leave a `claimed/` entry. This
+/// three-state signal splits that ambiguity by **claim age** against a per-role
+/// max-runtime threshold — the same crash a [`reclaim_stale`](Mailbox::reclaim_stale)
+/// on the next start would recover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailboxState {
+    /// No message is claimed — the worker is not mid-run.
+    IdleDone,
+    /// A claim younger than the threshold — a worker is actively processing it.
+    Busy,
+    /// A claim older than the threshold — the worker that took it almost
+    /// certainly crashed mid-run, and the message awaits reclaim.
+    CrashedStale,
+}
+
+/// A point-in-time liveness snapshot of a mailbox: its worker [`MailboxState`],
+/// the depth of `pending/`, and the age of the oldest outstanding claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MailboxStatus {
+    /// Worker liveness derived from the oldest claim's age.
+    pub state: MailboxState,
+    /// Number of `baton.message/v1` envelopes waiting in `pending/`.
+    pub queue_depth: usize,
+    /// Age of the oldest `claimed/` entry, or `None` when nothing is claimed.
+    pub claim_age_ms: Option<u64>,
 }
 
 impl Mailbox {
@@ -205,7 +236,16 @@ impl Mailbox {
             let claimed_path = self.claimed.join(file_name(&key));
             match fs::rename(&path, &claimed_path) {
                 Ok(()) => match read_envelope(&claimed_path) {
-                    Ok(request) => return Ok(Some(Claimed { key, request })),
+                    Ok(request) => {
+                        // Stamp the claim time onto the file so `status` can age
+                        // the claim from *when it was claimed*, not when it was
+                        // delivered — `rename(2)` preserves the delivery mtime, so
+                        // a message that waited in `pending/` would otherwise read
+                        // as instantly stale. Best-effort: a failed stamp only
+                        // costs age precision, never the claim.
+                        stamp_claim_time(&claimed_path);
+                        return Ok(Some(Claimed { key, request }));
+                    }
                     Err(err) => {
                         eprintln!("warning: dropping unparseable mailbox message {key:?}: {err}");
                         let _ = fs::rename(&claimed_path, self.done.join(file_name(&key)));
@@ -326,6 +366,107 @@ pub fn request_stop(root: impl AsRef<Path>) -> Result<StopRequest> {
 /// on the same file: the request lands in `pending/` and `serve` claims it out.
 pub fn deliver_to(root: impl AsRef<Path>, envelope: &MessageEnvelope) -> Result<()> {
     deliver_into_pending(&root.as_ref().join("pending"), envelope)
+}
+
+/// Reports the mailbox at `root`'s liveness **without** taking the single-instance
+/// lock, so it can probe a mailbox a live `baton serve` owns.
+///
+/// A pure read of `<root>/pending` and `<root>/claimed`: `queue_depth` counts the
+/// pending envelopes, and the worker [`MailboxState`] is decided by the oldest
+/// claim's age against `max_runtime` — `>= max_runtime` ⇒ [`MailboxState::CrashedStale`],
+/// a younger claim ⇒ [`MailboxState::Busy`], no claim ⇒ [`MailboxState::IdleDone`].
+/// The threshold **must sit above the worst-case legitimate agent run**, or a
+/// slow-but-alive worker is misread as crashed.
+///
+/// Concurrency-safe against a live daemon: a directory that does not exist yet is
+/// read as empty, and a claim file that a concurrent `complete`/`reclaim` moves
+/// between the listing and the stat is skipped (its `ENOENT` is not an error) —
+/// so a mailbox mutating under the probe never makes it flake.
+pub fn status(root: impl AsRef<Path>, max_runtime: Duration) -> Result<MailboxStatus> {
+    let root = root.as_ref();
+    let queue_depth = count_envelopes(&root.join("pending"))?;
+    let oldest = oldest_claim_age(&root.join("claimed"))?;
+    let state = match oldest {
+        None => MailboxState::IdleDone,
+        Some(age) if age >= max_runtime => MailboxState::CrashedStale,
+        Some(_) => MailboxState::Busy,
+    };
+    Ok(MailboxStatus {
+        state,
+        queue_depth,
+        claim_age_ms: oldest.map(|age| age.as_millis() as u64),
+    })
+}
+
+/// Counts the `<key>.json` envelopes in `dir`, treating an absent directory as
+/// empty (a mailbox never opened has no `pending/`).
+fn count_envelopes(dir: &Path) -> Result<usize> {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => {
+            return Err(BatonError::Io(format!(
+                "could not read mailbox directory {dir:?}: {err}"
+            )));
+        }
+    };
+    let mut count = 0;
+    for entry in rd {
+        if json_key(&dir_entry(entry, dir)?.path()).is_some() {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Returns the age of the oldest claimed envelope in `dir`, or `None` when none
+/// is claimed (or the directory is absent).
+///
+/// A file whose stat fails with `ENOENT` was claimed/completed between the
+/// listing and the stat — it is skipped, not surfaced as an error, so the probe
+/// stays stable against a live daemon draining its `claimed/`.
+fn oldest_claim_age(dir: &Path) -> Result<Option<Duration>> {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(BatonError::Io(format!(
+                "could not read mailbox directory {dir:?}: {err}"
+            )));
+        }
+    };
+    let now = SystemTime::now();
+    let mut oldest: Option<Duration> = None;
+    for entry in rd {
+        let path = dir_entry(entry, dir)?.path();
+        if json_key(&path).is_none() {
+            continue;
+        }
+        let modified = match fs::metadata(&path).and_then(|meta| meta.modified()) {
+            Ok(modified) => modified,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(BatonError::Io(format!(
+                    "could not stat claimed message {path:?}: {err}"
+                )));
+            }
+        };
+        // A clock skew that dates the file in the future clamps to zero age.
+        let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+        if oldest.is_none_or(|current| age > current) {
+            oldest = Some(age);
+        }
+    }
+    Ok(oldest)
+}
+
+/// Best-effort update of `path`'s modification time to now, recording when a
+/// message was claimed. A failure is swallowed: it only degrades `status`'s claim
+/// age, never the claim itself.
+fn stamp_claim_time(path: &Path) {
+    if let Ok(file) = OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(SystemTime::now());
+    }
 }
 
 /// Attempts to claim the reply for `request_key` from `outbox`, returning the
@@ -775,5 +916,104 @@ mod tests {
             "a nonexistent root has no daemon to stop"
         );
         assert!(!missing.exists(), "the root is not created by --stop");
+    }
+
+    /// Backdates a file's modification time by `secs` seconds, simulating a claim
+    /// that was taken long ago.
+    fn backdate(path: &Path, secs: u64) {
+        let when = SystemTime::now() - Duration::from_secs(secs);
+        let file = OpenOptions::new().write(true).open(path).expect("open");
+        file.set_modified(when).expect("set mtime");
+    }
+
+    /// A generous threshold under which no real run is stale.
+    const GENEROUS: Duration = Duration::from_secs(3600);
+
+    /// No claim ⇒ `idle-done`, and `queue_depth` counts pending envelopes.
+    #[test]
+    fn status_idle_done_reports_queue_depth() {
+        let dir = TempDir::new("status-idle");
+        let mailbox = Mailbox::open(&dir.path).expect("open");
+        mailbox.deliver(&request("m-1")).expect("deliver");
+        mailbox.deliver(&request("m-2")).expect("deliver");
+
+        let s = status(&dir.path, GENEROUS).expect("status");
+        assert_eq!(s.state, MailboxState::IdleDone);
+        assert_eq!(s.queue_depth, 2);
+        assert_eq!(s.claim_age_ms, None);
+    }
+
+    /// A fresh claim under the threshold ⇒ `busy`, and it is not counted in
+    /// `queue_depth` (it left `pending/`).
+    #[test]
+    fn status_busy_on_fresh_claim() {
+        let dir = TempDir::new("status-busy");
+        let mailbox = Mailbox::open(&dir.path).expect("open");
+        mailbox.deliver(&request("m-1")).expect("deliver");
+        let _claimed = mailbox.claim_next().expect("claim").expect("some");
+
+        let s = status(&dir.path, GENEROUS).expect("status");
+        assert_eq!(s.state, MailboxState::Busy);
+        assert_eq!(s.queue_depth, 0);
+        assert!(s.claim_age_ms.is_some());
+    }
+
+    /// A claim older than the threshold ⇒ `crashed-stale`, distinctly from idle.
+    #[test]
+    fn status_crashed_stale_on_aged_claim() {
+        let dir = TempDir::new("status-stale");
+        let mailbox = Mailbox::open(&dir.path).expect("open");
+        mailbox.deliver(&request("m-1")).expect("deliver");
+        let _claimed = mailbox.claim_next().expect("claim").expect("some");
+        backdate(&dir.path.join("claimed").join("m-1.json"), 3600);
+
+        let s = status(&dir.path, Duration::from_secs(60)).expect("status");
+        assert_eq!(s.state, MailboxState::CrashedStale);
+        assert!(s.claim_age_ms.unwrap() >= 3_600_000);
+    }
+
+    /// A message that sat in `pending/` before being claimed reads `busy`, not
+    /// `crashed-stale`: `claim_next` stamps the claim time, so the age is measured
+    /// from the claim, not the (old) delivery.
+    #[test]
+    fn claim_stamps_time_so_late_claim_is_busy_not_stale() {
+        let dir = TempDir::new("status-stamp");
+        let mailbox = Mailbox::open(&dir.path).expect("open");
+        mailbox.deliver(&request("m-1")).expect("deliver");
+        // Simulate a long wait in pending: backdate the delivered file.
+        backdate(&dir.path.join("pending").join("m-1.json"), 3600);
+
+        let _claimed = mailbox.claim_next().expect("claim").expect("some");
+        let s = status(&dir.path, Duration::from_secs(60)).expect("status");
+        assert_eq!(
+            s.state,
+            MailboxState::Busy,
+            "claim-time stamping keeps a late-claimed message busy"
+        );
+    }
+
+    /// `status` reads a mailbox a live `serve` holds the lock on — it never opens
+    /// (and so never contends) the single-instance lock.
+    #[test]
+    fn status_is_lock_free_against_a_live_mailbox() {
+        let dir = TempDir::new("status-lockfree");
+        let _held = Mailbox::open(&dir.path).expect("live daemon holds the lock");
+        deliver_to(&dir.path, &request("m-1")).expect("lock-free deliver");
+
+        let s = status(&dir.path, GENEROUS).expect("status probes without the lock");
+        assert_eq!(s.state, MailboxState::IdleDone);
+        assert_eq!(s.queue_depth, 1);
+    }
+
+    /// `status` on a root whose `pending/`/`claimed/` do not exist yet is empty,
+    /// not an error.
+    #[test]
+    fn status_on_absent_mailbox_is_idle_empty() {
+        let dir = TempDir::new("status-absent");
+        let root = dir.path.join("never-served");
+        let s = status(&root, GENEROUS).expect("absent mailbox is not an error");
+        assert_eq!(s.state, MailboxState::IdleDone);
+        assert_eq!(s.queue_depth, 0);
+        assert_eq!(s.claim_age_ms, None);
     }
 }

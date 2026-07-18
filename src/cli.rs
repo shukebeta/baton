@@ -34,7 +34,7 @@ use crate::converse::{self, Governance, RingMember, Transcript};
 use crate::error::{BatonError, Result};
 use crate::events::{EventSink, ExchangeEvent, ExchangeMeta, NoopSink, WriterSink, now_ms};
 use crate::log::{self, Exchange};
-use crate::mailbox::{self, Mailbox};
+use crate::mailbox::{self, Mailbox, MailboxState, MailboxStatus};
 use crate::message::{MessageEnvelope, MessageKind};
 use crate::model::{AssistantReply, Conversation, Prompt};
 use crate::participant::{
@@ -49,7 +49,7 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]] [--agent-system <path>] [--agent-mcp-config <path>]] | baton serve --stop --inbox <dir> | baton send --inbox <dir> (--body <text> | --in <path>) [--to <id>] [--from <id>] [--conversation <id>] [--await --outbox <dir> [--timeout-ms <n>]] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>...";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]] [--agent-system <path>] [--agent-mcp-config <path>]] | baton serve --stop --inbox <dir> | baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]] | baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>...";
 
 /// Default `baton serve` inbox poll interval, in milliseconds, when `--poll-ms`
 /// is unset.
@@ -75,6 +75,13 @@ const DEFAULT_CONVERSE_AWAIT_MS: u64 = 60_000;
 /// Fixed (not user-tunable): the await is bounded by `--timeout-ms`, and a tight
 /// interval keeps a local round-trip responsive without a flag for it.
 const SEND_POLL_INTERVAL_MS: u64 = 50;
+
+/// Default `baton status` max-runtime threshold, in milliseconds, when neither
+/// `--max-runtime-ms` nor a per-role registry `max_runtime_ms` is set. A claim
+/// older than this reads as `crashed-stale`. Sized above [`DEFAULT_AGENT_TIMEOUT_MS`]
+/// (the serve-side agent cap) so a slow-but-alive worker is never misjudged
+/// crashed; a team with longer legitimate runs raises it per role.
+const DEFAULT_MAX_RUNTIME_MS: u64 = 900_000;
 
 /// The in-session command that ends the REPL cleanly (alongside EOF).
 const SESSION_EXIT_COMMAND: &str = "/exit";
@@ -177,7 +184,12 @@ enum Command {
     /// reply from `outbox`. The message is built from `--body` (+ optional
     /// addressing) or read whole from `--in`. `await_reply` requires `outbox`.
     Send {
-        inbox: String,
+        /// Explicit mailbox root; `None` when the destination is resolved from
+        /// `registry` + the addressee role instead.
+        inbox: Option<String>,
+        /// Routing registry path; when set, the addressee role (the `--body`
+        /// `--to`, or the `--in` envelope's `to`) resolves the inbox/outbox.
+        registry: Option<String>,
         source: SendSource,
         to: Option<String>,
         from: Option<String>,
@@ -185,6 +197,20 @@ enum Command {
         await_reply: bool,
         outbox: Option<String>,
         timeout_ms: u64,
+    },
+    /// Report a mailbox's liveness — `idle-done` / `busy` / `crashed-stale` plus
+    /// queue depth — over an explicit `--mailbox <root>` or a `--registry
+    /// <path> --role <role>` lookup.
+    Status {
+        /// Explicit mailbox root; mutually exclusive with `registry`/`role`.
+        mailbox: Option<String>,
+        /// Routing registry path, resolving `role` to a mailbox.
+        registry: Option<String>,
+        /// Role name resolved through `registry`.
+        role: Option<String>,
+        /// `--max-runtime-ms` override; takes precedence over the per-role
+        /// registry value and the default.
+        max_runtime_ms: Option<u64>,
     },
     /// Pretty-print the recorded exchange trail.
     LogShow { file: Option<String> },
@@ -465,6 +491,7 @@ pub fn run() -> Result<()> {
         }
         Command::Send {
             inbox,
+            registry,
             source,
             to,
             from,
@@ -477,10 +504,24 @@ pub fn run() -> Result<()> {
             // it does not load `BatonConfig`. Only the event sink is wired.
             let mut sink = open_event_sink()?;
             let envelope = build_send_envelope(&source, to, from, conversation)?;
+            // Resolve the delivery inbox and await outbox: either explicit paths,
+            // or the addressee role (the envelope's `to`) looked up in the
+            // registry. An unknown role fails fast via `Registry::resolve`.
+            let (inbox_path, outbox_path) = match &registry {
+                Some(registry_path) => {
+                    let registry = Registry::from_path(Path::new(registry_path))?;
+                    let mailbox_ref = registry.resolve(&envelope.to)?;
+                    (mailbox_ref.inbox.clone(), Some(mailbox_ref.outbox.clone()))
+                }
+                None => (
+                    PathBuf::from(inbox.expect("parse_send guarantees --inbox without --registry")),
+                    outbox.map(PathBuf::from),
+                ),
+            };
             let stdout = std::io::stdout();
             execute_send(
-                Path::new(&inbox),
-                outbox.as_deref().map(Path::new),
+                &inbox_path,
+                outbox_path.as_deref(),
                 &envelope,
                 await_reply,
                 Duration::from_millis(timeout_ms),
@@ -488,6 +529,38 @@ pub fn run() -> Result<()> {
                 sink.as_mut(),
                 stdout.lock(),
             )
+        }
+        Command::Status {
+            mailbox,
+            registry,
+            role,
+            max_runtime_ms,
+        } => {
+            // Resolve the mailbox root and threshold: an explicit `--mailbox`
+            // uses the flag/default threshold; a `--registry --role` lookup falls
+            // back to the per-role `max_runtime_ms` when no override is given.
+            let (root, threshold_ms) = match (mailbox, registry, role) {
+                (Some(mailbox), None, None) => (
+                    PathBuf::from(mailbox),
+                    max_runtime_ms.unwrap_or(DEFAULT_MAX_RUNTIME_MS),
+                ),
+                (None, Some(registry_path), Some(role)) => {
+                    let registry = Registry::from_path(Path::new(&registry_path))?;
+                    let mailbox_ref = registry.resolve(&role)?;
+                    let threshold = max_runtime_ms
+                        .or(mailbox_ref.max_runtime_ms)
+                        .unwrap_or(DEFAULT_MAX_RUNTIME_MS);
+                    (mailbox_ref.inbox.clone(), threshold)
+                }
+                _ => {
+                    return Err(usage(
+                        "status needs --mailbox <root> or --registry <path> --role <role>",
+                    ));
+                }
+            };
+            let status = mailbox::status(&root, Duration::from_millis(threshold_ms))?;
+            let stdout = std::io::stdout();
+            execute_status(&status, threshold_ms, stdout.lock())
         }
         Command::LogShow { file } => {
             let exchanges = read_log(file.as_deref())?;
@@ -811,6 +884,31 @@ fn execute_send(
 
     emit(sink, &ExchangeEvent::reply_consumed(now_ms(), &reply));
     write_response_envelope(&reply, out)
+}
+
+/// Writes a mailbox `status` snapshot as one JSON line to `out`.
+///
+/// The stable machine-readable contract a gate-check parses: `state` is
+/// `idle-done` / `busy` / `crashed-stale`, `queue_depth` the pending count,
+/// `claim_age_ms` the oldest claim's age in ms (null when idle), and
+/// `max_runtime_ms` the threshold the state was decided against. Parameterised
+/// over [`Write`] so it is unit-testable with an in-memory buffer.
+fn execute_status(status: &MailboxStatus, max_runtime_ms: u64, mut out: impl Write) -> Result<()> {
+    let state = match status.state {
+        MailboxState::IdleDone => "idle-done",
+        MailboxState::Busy => "busy",
+        MailboxState::CrashedStale => "crashed-stale",
+    };
+    let claim_age = match status.claim_age_ms {
+        Some(ms) => ms.to_string(),
+        None => "null".to_string(),
+    };
+    writeln!(
+        out,
+        "{{\"state\":\"{state}\",\"queue_depth\":{},\"claim_age_ms\":{claim_age},\"max_runtime_ms\":{max_runtime_ms}}}",
+        status.queue_depth
+    )
+    .map_err(io_err)
 }
 
 /// Polls `outbox` for the reply keyed by `key`, claiming it atomically, until it
@@ -1193,6 +1291,7 @@ fn parse_args(args: &[String]) -> Result<Command> {
         "converse-ring" => parse_converse_ring(iter),
         "serve" => parse_serve(iter),
         "send" => parse_send(iter),
+        "status" => parse_status(iter),
         "log" => parse_log(iter),
         other => Err(usage(&format!("unknown command {other:?}"))),
     }
@@ -1786,6 +1885,7 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
 /// any other token is a usage error.
 fn parse_send<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
     let mut inbox: Option<String> = None;
+    let mut registry: Option<String> = None;
     let mut body: Option<String> = None;
     let mut in_path: Option<String> = None;
     let mut to: Option<String> = None;
@@ -1805,6 +1905,10 @@ fn parse_send<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command>
             "--inbox" => inbox = Some(take("--inbox")?),
             other if other.starts_with("--inbox=") => {
                 inbox = Some(other["--inbox=".len()..].to_string());
+            }
+            "--registry" => registry = Some(take("--registry")?),
+            other if other.starts_with("--registry=") => {
+                registry = Some(other["--registry=".len()..].to_string());
             }
             "--body" => body = Some(take("--body")?),
             other if other.starts_with("--body=") => {
@@ -1839,8 +1943,6 @@ fn parse_send<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command>
         }
     }
 
-    let inbox = require_dir(inbox, "--inbox")?;
-
     let source = match (body, in_path) {
         (Some(_), Some(_)) => return Err(usage("--body and --in are mutually exclusive")),
         (Some(body), None) => {
@@ -1862,8 +1964,34 @@ fn parse_send<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command>
         }
     };
 
-    if await_reply && outbox.is_none() {
-        return Err(usage("--await requires --outbox <dir>"));
+    // Destination: exactly one of --inbox (a path) / --registry (role lookup).
+    let inbox = match (inbox, &registry) {
+        (Some(_), Some(_)) => return Err(usage("--inbox and --registry are mutually exclusive")),
+        (Some(inbox), None) => Some(require_dir(Some(inbox), "--inbox")?),
+        (None, Some(_)) => None,
+        (None, None) => return Err(usage("--inbox <dir> or --registry <path> is required")),
+    };
+    let registry = match registry {
+        Some(path) if path.trim().is_empty() => {
+            return Err(usage("--registry <path> must not be empty"));
+        }
+        other => other,
+    };
+    // A --body send routes by --to (the addressee role); an --in send routes by
+    // the envelope's own `to`, so --to is not required (and is rejected above).
+    if registry.is_some() && matches!(source, SendSource::Body(_)) && to.is_none() {
+        return Err(usage("--registry with --body requires --to <role>"));
+    }
+
+    // With --registry the outbox is resolved from the role, so --outbox is
+    // rejected; --await then needs no explicit outbox.
+    if registry.is_some() && outbox.is_some() {
+        return Err(usage("--outbox is supplied by --registry; do not pass it"));
+    }
+    if await_reply && outbox.is_none() && registry.is_none() {
+        return Err(usage(
+            "--await requires --outbox <dir> (or --registry to resolve it)",
+        ));
     }
     if !await_reply && outbox.is_some() {
         return Err(usage("--outbox is only valid with --await"));
@@ -1880,6 +2008,7 @@ fn parse_send<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command>
 
     Ok(Command::Send {
         inbox,
+        registry,
         source,
         to,
         from,
@@ -1888,6 +2017,79 @@ fn parse_send<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command>
         outbox,
         timeout_ms: timeout_ms.unwrap_or(DEFAULT_SEND_TIMEOUT_MS),
     })
+}
+
+/// Parses the arguments following the `status` command.
+///
+/// Accepts either `--mailbox <root>` or a `--registry <path> --role <role>`
+/// lookup — the two forms are mutually exclusive, and neither being present is a
+/// usage error. `--max-runtime-ms` is an optional positive-integer override of
+/// the crashed-stale threshold. Every valued flag also accepts the `--flag=value`
+/// form; any other token is a usage error. The `--mailbox`/`--registry`/`--role`
+/// combination is validated in [`run`] where the registry is loaded.
+fn parse_status<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut mailbox: Option<String> = None;
+    let mut registry: Option<String> = None;
+    let mut role: Option<String> = None;
+    let mut max_runtime_ms: Option<u64> = None;
+
+    while let Some(arg) = iter.next() {
+        let mut take = |flag: &str| -> Result<String> {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| usage(&format!("{flag} requires a value")))
+        };
+        match arg.as_str() {
+            "--mailbox" => mailbox = Some(take("--mailbox")?),
+            other if other.starts_with("--mailbox=") => {
+                mailbox = Some(other["--mailbox=".len()..].to_string());
+            }
+            "--registry" => registry = Some(take("--registry")?),
+            other if other.starts_with("--registry=") => {
+                registry = Some(other["--registry=".len()..].to_string());
+            }
+            "--role" => role = Some(take("--role")?),
+            other if other.starts_with("--role=") => {
+                role = Some(other["--role=".len()..].to_string());
+            }
+            "--max-runtime-ms" => {
+                max_runtime_ms = Some(parse_max_runtime_ms(&take("--max-runtime-ms")?)?);
+            }
+            other if other.starts_with("--max-runtime-ms=") => {
+                max_runtime_ms = Some(parse_max_runtime_ms(&other["--max-runtime-ms=".len()..])?);
+            }
+            other => return Err(usage(&format!("unexpected argument {other:?}"))),
+        }
+    }
+
+    // Shape check here; the full --mailbox vs --registry/--role resolution (and
+    // registry load) happens in `run`.
+    if mailbox.is_none() && registry.is_none() && role.is_none() {
+        return Err(usage(
+            "status needs --mailbox <root> or --registry <path> --role <role>",
+        ));
+    }
+    if mailbox.is_some() && (registry.is_some() || role.is_some()) {
+        return Err(usage(
+            "--mailbox and --registry/--role are mutually exclusive",
+        ));
+    }
+    if registry.is_some() != role.is_some() {
+        return Err(usage("--registry and --role must be given together"));
+    }
+
+    Ok(Command::Status {
+        mailbox,
+        registry,
+        role,
+        max_runtime_ms,
+    })
+}
+
+/// Parses `--max-runtime-ms`: a positive integer of milliseconds (zero is
+/// rejected — a zero threshold would flag every live claim as crashed).
+fn parse_max_runtime_ms(raw: &str) -> Result<u64> {
+    parse_positive_ms(raw, "--max-runtime-ms")
 }
 
 /// Parses `--timeout-ms`: a positive integer of milliseconds (zero is rejected —
@@ -3639,7 +3841,8 @@ mod tests {
         assert_eq!(
             parse_args(&argv(&["send", "--inbox", "/tmp/mb", "--body", "hi"])).expect("parses"),
             Command::Send {
-                inbox: "/tmp/mb".to_string(),
+                inbox: Some("/tmp/mb".to_string()),
+                registry: None,
                 source: SendSource::Body("hi".to_string()),
                 to: None,
                 from: None,
@@ -3664,7 +3867,8 @@ mod tests {
             ]))
             .expect("parses"),
             Command::Send {
-                inbox: "/tmp/mb".to_string(),
+                inbox: Some("/tmp/mb".to_string()),
+                registry: None,
                 source: SendSource::Envelope("/tmp/env.json".to_string()),
                 to: None,
                 from: None,
@@ -3716,6 +3920,184 @@ mod tests {
                 "expected usage error for {case:?}"
             );
         }
+    }
+
+    #[test]
+    fn parses_send_registry_role_addressed() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "send",
+                "--registry",
+                "/tmp/reg.json",
+                "--to",
+                "reviewer",
+                "--body",
+                "hi",
+            ]))
+            .expect("parses"),
+            Command::Send {
+                inbox: None,
+                registry: Some("/tmp/reg.json".to_string()),
+                source: SendSource::Body("hi".to_string()),
+                to: Some("reviewer".to_string()),
+                from: None,
+                conversation: None,
+                await_reply: false,
+                outbox: None,
+                timeout_ms: DEFAULT_SEND_TIMEOUT_MS,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_send_registry_await_without_outbox() {
+        // --registry supplies the outbox, so --await needs no --outbox.
+        assert_eq!(
+            parse_args(&argv(&[
+                "send",
+                "--registry=/tmp/reg.json",
+                "--to=reviewer",
+                "--body=hi",
+                "--await",
+            ]))
+            .expect("parses"),
+            Command::Send {
+                inbox: None,
+                registry: Some("/tmp/reg.json".to_string()),
+                source: SendSource::Body("hi".to_string()),
+                to: Some("reviewer".to_string()),
+                from: None,
+                conversation: None,
+                await_reply: true,
+                outbox: None,
+                timeout_ms: DEFAULT_SEND_TIMEOUT_MS,
+            }
+        );
+    }
+
+    #[test]
+    fn send_registry_rules_are_usage_errors() {
+        let cases: &[&[&str]] = &[
+            // --inbox and --registry are mutually exclusive.
+            &[
+                "send",
+                "--inbox",
+                "/mb",
+                "--registry",
+                "/reg",
+                "--to",
+                "r",
+                "--body",
+                "hi",
+            ],
+            // --registry with --body needs --to.
+            &["send", "--registry", "/reg", "--body", "hi"],
+            // --outbox is supplied by --registry.
+            &[
+                "send",
+                "--registry",
+                "/reg",
+                "--to",
+                "r",
+                "--body",
+                "hi",
+                "--await",
+                "--outbox",
+                "/ob",
+            ],
+            // blank --registry.
+            &["send", "--registry", "  ", "--to", "r", "--body", "hi"],
+        ];
+        for case in cases {
+            assert!(
+                matches!(parse_args(&argv(case)).unwrap_err(), BatonError::Usage(_)),
+                "expected usage error for {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_status_mailbox_and_registry_forms() {
+        assert_eq!(
+            parse_args(&argv(&["status", "--mailbox", "/tmp/mb"])).expect("parses"),
+            Command::Status {
+                mailbox: Some("/tmp/mb".to_string()),
+                registry: None,
+                role: None,
+                max_runtime_ms: None,
+            }
+        );
+        assert_eq!(
+            parse_args(&argv(&[
+                "status",
+                "--registry=/tmp/reg.json",
+                "--role=reviewer",
+                "--max-runtime-ms=1200000",
+            ]))
+            .expect("parses"),
+            Command::Status {
+                mailbox: None,
+                registry: Some("/tmp/reg.json".to_string()),
+                role: Some("reviewer".to_string()),
+                max_runtime_ms: Some(1_200_000),
+            }
+        );
+    }
+
+    #[test]
+    fn status_argument_rules_are_usage_errors() {
+        let cases: &[&[&str]] = &[
+            &["status"],                                              // neither form
+            &["status", "--mailbox", "/mb", "--role", "r"],           // mixed forms
+            &["status", "--registry", "/reg"],                        // registry sans role
+            &["status", "--role", "r"],                               // role sans registry
+            &["status", "--mailbox", "/mb", "--max-runtime-ms", "0"], // zero threshold
+        ];
+        for case in cases {
+            assert!(
+                matches!(parse_args(&argv(case)).unwrap_err(), BatonError::Usage(_)),
+                "expected usage error for {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn execute_status_renders_json_per_state() {
+        let busy = MailboxStatus {
+            state: MailboxState::Busy,
+            queue_depth: 3,
+            claim_age_ms: Some(4200),
+        };
+        let mut out = Vec::new();
+        execute_status(&busy, 900_000, &mut out).expect("render");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "{\"state\":\"busy\",\"queue_depth\":3,\"claim_age_ms\":4200,\"max_runtime_ms\":900000}\n"
+        );
+
+        let idle = MailboxStatus {
+            state: MailboxState::IdleDone,
+            queue_depth: 0,
+            claim_age_ms: None,
+        };
+        let mut out = Vec::new();
+        execute_status(&idle, 900_000, &mut out).expect("render");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "{\"state\":\"idle-done\",\"queue_depth\":0,\"claim_age_ms\":null,\"max_runtime_ms\":900000}\n"
+        );
+
+        let stale = MailboxStatus {
+            state: MailboxState::CrashedStale,
+            queue_depth: 1,
+            claim_age_ms: Some(999_999),
+        };
+        let mut out = Vec::new();
+        execute_status(&stale, 60_000, &mut out).expect("render");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "{\"state\":\"crashed-stale\",\"queue_depth\":1,\"claim_age_ms\":999999,\"max_runtime_ms\":60000}\n"
+        );
     }
 
     #[test]

@@ -17,8 +17,10 @@ interactive multi-turn REPL that accumulates conversation history across turns,
 `baton converse` for a governed two-participant conversation driven to a terminal
 condition, `baton converse-ring` for the N-party round-robin generalisation over a
 static routing registry, `baton serve` for answering `baton.message/v1` requests
-from a file mailbox, `baton send` for posting a request into a mailbox and consuming the
-correlated reply, and `baton log` for inspecting and replaying the recorded
+from a file mailbox, `baton send` for posting a request into a mailbox (by path or
+by **role name** via the registry) and consuming the correlated reply, `baton
+status` for reporting a mailbox's liveness (`idle-done` / `busy` / `crashed-stale`
+plus queue depth), and `baton log` for inspecting and replaying the recorded
 exchange trail.
 
 ## Quickstart
@@ -844,19 +846,26 @@ single-instance lock, so it posts to an inbox a live `serve` already owns; and i
 runs no provider call, so it needs no credential.
 
 ```
-baton send --inbox <dir> (--body <text> | --in <path>) [--to <id>] [--from <id>] [--conversation <id>] [--await --outbox <dir> [--timeout-ms <n>]]
+baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]]
 ```
 
 - `--inbox <dir>` — the mailbox root; the request is written to its `pending/`.
+  Mutually exclusive with `--registry`.
+- `--registry <path>` — resolve the destination by **role name** instead of a
+  path (same registry format as `converse-ring`). The addressee role — the
+  `--body` `--to <role>`, or the `--in` envelope's own `to` — is looked up to its
+  `{inbox, outbox}` pair; an unknown role fails fast. The registry supplies the
+  `--await` outbox, so `--outbox` is not passed with `--registry`.
 - `--body <text>` — build a request envelope around this body. `--to`/`--from`/
   `--conversation` override its addressing (defaults `agent-b`/`agent-a` and a
   time-derived conversation id); the `message_id` is derived so no external id
-  source is needed.
+  source is needed. With `--registry`, `--to <role>` is required (it is both the
+  routing key and the envelope `to`).
 - `--in <path>` — read a complete envelope from a file instead (mutually
   exclusive with `--body`; the addressing flags do not apply — the envelope
-  carries its own).
-- `--await` — after delivering, wait for the reply and print it to stdout.
-  Requires `--outbox <dir>`.
+  carries its own; with `--registry` its `to` is the routing role).
+- `--await` — after delivering, wait for the reply and print it to stdout. Needs
+  `--outbox <dir>` unless `--registry` resolves it.
 - `--outbox <dir>` — where `serve` writes replies (`<outbox>/<message_id>.json`).
 - `--timeout-ms <n>` — how long `--await` waits before giving up (default
   `30000`).
@@ -885,6 +894,68 @@ on `in_reply_to` / `conversation_id`, exactly as they must for `serve`.
 
 Both the send and the consumed reply are recorded to `BATON_EVENT_LOG` (as
 `message_sent` / `reply_consumed` lines on the same trail), when it is set.
+
+## Mailbox liveness (`baton status`)
+
+`baton status` reports whether a mailbox's worker is idle, actively running, or
+crashed — the signal a team's gate-check reads before starting a cycle. The naive
+test `idle = pending empty AND claimed empty` cannot tell a legitimately long run
+from a crash: both leave a `claimed/` entry (this is why
+[reclaim](#at-least-once-semantics) exists). `status` splits that ambiguity by
+**claim age** against a max-runtime threshold — there is **no heartbeat protocol**.
+
+```
+baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>]
+```
+
+- `--mailbox <root>` — probe this mailbox root directly.
+- `--registry <path> --role <role>` — resolve the mailbox by role name (same
+  registry as `send`/`converse-ring`); an unknown role fails fast.
+- `--max-runtime-ms <n>` — the crashed-stale threshold, in milliseconds. Precedence:
+  this flag > the role's `max_runtime_ms` in the registry (see below) > a built-in
+  default. It **must sit above the worst-case legitimate agent run**, or a
+  slow-but-alive worker is misread as crashed.
+
+It prints one JSON line and exits 0:
+
+```json
+{"state":"busy","queue_depth":2,"claim_age_ms":4200,"max_runtime_ms":900000}
+```
+
+- `state` — `idle-done` (no claim), `busy` (a claim younger than the threshold),
+  or `crashed-stale` (a claim older than the threshold).
+- `queue_depth` — the number of requests waiting in `pending/`.
+- `claim_age_ms` — the oldest claim's age in milliseconds, or `null` when idle.
+
+The probe is **lock-free**: it reads `pending/` and `claimed/` without taking the
+single-instance lock, so it safely inspects a mailbox a live `serve` owns. A
+claim's age is measured from **when it was claimed** — `claim_next` stamps the
+claim time onto the file — so a request that waited in `pending/` is not misread as
+instantly stale.
+
+**Reclaim hazard (documented boundary).** A `crashed-stale` claim is recovered by
+`serve`'s [at-least-once reclaim](#at-least-once-semantics) on the next start,
+which re-runs the abandoned message — possibly re-running a side-effecting agent (a
+double commit / PR). Two mitigations are required: (a) the threshold above sits
+above the worst-case legitimate run, so a live worker is never falsely reclaimed;
+and (b) correctness on re-run relies on the agent's **idempotency via durable
+artifacts** — on re-run it observes its own prior branch/commit and adapts.
+
+### Per-role threshold in the registry
+
+A registry entry may carry an optional `max_runtime_ms`, used by `status
+--registry --role` when no `--max-runtime-ms` override is given:
+
+```json
+{
+  "participants": {
+    "reviewer": { "inbox": "/tmp/reviewer/inbox", "outbox": "/tmp/reviewer/outbox", "max_runtime_ms": 1200000 }
+  }
+}
+```
+
+The field is optional and back-compatible: existing registries without it parse
+unchanged and fall back to the `status` default.
 
 ## Development
 
