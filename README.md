@@ -200,8 +200,38 @@ Brazil, 3–0.
   Setting `BATON_EVENT_LOG` records a real-time, self-delimiting JSONL **session
   trail** — a `session_id`, per-turn `turn_index`, and session start/end markers —
   that a single file (or a shared append log) is unambiguously partitionable back
-  into whole sessions (see [Session trail](#session-trail)). Resuming a session
-  from its trail is not yet supported.
+  into whole sessions (see [Session trail](#session-trail)).
+
+### Resuming a session
+
+`baton session --resume <file>` rehydrates a prior session from its trail: it
+reads the session-scoped JSONL, replays the recorded turns in `turn_index` order
+into a fresh conversation, and enters the REPL with that history preloaded — so
+the first new request already carries every prior turn.
+
+```bash
+# continue where a previous `baton session` left off
+cargo run -- session --resume ./session.jsonl
+```
+
+- New turns continue the **same** session: they append to `<file>` with the
+  original `session_id` and a `turn_index` continuing monotonically from the last
+  recorded turn, so the resumed run extends one coherent session rather than
+  forking a new one. (New turns are written to the resume file itself, not to
+  `BATON_EVENT_LOG`.)
+- Only completed turns (a recorded assistant reply) are replayed into the
+  history; a turn that errored or was cut off by an unclean shutdown contributes
+  no reply and is skipped, so the resumed history never holds a dangling user
+  turn.
+- **Selection.** When `<file>` is a shared append log holding several sessions,
+  pass `--session <id>` to choose one. With a single-session file the selector is
+  optional; a missing `--session` against a multi-session file names the
+  available ids and exits with a usage error. Selecting a non-existent
+  `session_id`, or an empty / malformed trail, is a usage error that exits
+  non-zero having written nothing.
+- A trail whose final line is torn (an unclean prior shutdown) resumes from the
+  last complete turn — the incomplete trailing record is dropped with a warning,
+  matching the trail's [torn-tail handling](#session-trail).
 
 ## Provider transport
 

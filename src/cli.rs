@@ -49,7 +49,7 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]] [--agent-system <path>] [--agent-mcp-config <path>]] | baton serve --stop --inbox <dir> | baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]] | baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>...";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session [--resume <file> [--session <id>]] | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]] [--agent-system <path>] [--agent-mcp-config <path>]] | baton serve --stop --inbox <dir> | baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]] | baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>...";
 
 /// Default `baton serve` inbox poll interval, in milliseconds, when `--poll-ms`
 /// is unset.
@@ -91,8 +91,10 @@ const SESSION_EXIT_COMMAND: &str = "/exit";
 enum Command {
     /// Send a single prompt and print the assistant reply.
     Ask { prompt: String },
-    /// Start an interactive multi-turn REPL.
-    Session,
+    /// Start an interactive multi-turn REPL. `resume` is `None` for a fresh
+    /// session; `Some` rehydrates a prior session from its JSONL trail and
+    /// continues appending to it (see [`ResumeArgs`]).
+    Session { resume: Option<ResumeArgs> },
     /// Run one A2A envelope exchange: read a `baton.message/v1` request
     /// envelope, run the provider call, and write one response envelope.
     /// `in_path`/`out_path` default to stdin/stdout when `None`.
@@ -228,6 +230,21 @@ enum Command {
     },
 }
 
+/// Selects the session trail to rehydrate for `baton session --resume`.
+///
+/// `file` is the JSONL trail path (`--resume <file>`); `session_id` optionally
+/// disambiguates when the file is a shared append log holding several sessions
+/// (`--session <id>`). Resolved to a [`ResumedSession`] only in [`run`], keeping
+/// [`parse_args`] free of I/O.
+#[derive(Debug, PartialEq, Eq)]
+struct ResumeArgs {
+    /// The JSONL session trail to read the prior turns from.
+    file: String,
+    /// The `session_id` to select; `None` selects the sole session in the file
+    /// (an error when the file holds zero or more than one).
+    session_id: Option<String>,
+}
+
 /// Where the `converse` seed message comes from: inline text or a file path.
 /// Resolved to the opening body only in [`run`], keeping [`parse_args`] free of
 /// I/O.
@@ -267,14 +284,35 @@ pub fn run() -> Result<()> {
             println!("{reply}");
             Ok(())
         }
-        Command::Session => {
+        Command::Session { resume } => {
             let config = BatonConfig::from_env()?;
             let meta = exchange_meta(&config);
-            let mut sink = open_event_sink()?;
             let client = ClaudeClient::from_config(config);
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
-            execute_session(&client, sink.as_mut(), &meta, stdin.lock(), stdout.lock())
+            match resume {
+                None => {
+                    let mut sink = open_event_sink()?;
+                    execute_session(&client, sink.as_mut(), &meta, stdin.lock(), stdout.lock())
+                }
+                // Resume: load + select the prior session *before* opening any
+                // sink, so a bad selection (missing id, empty/ambiguous trail)
+                // exits non-zero having written nothing. The sink then appends to
+                // the resumed trail itself — not `BATON_EVENT_LOG` — so new turns
+                // extend the same file.
+                Some(args) => {
+                    let resumed = load_resume(&args.file, args.session_id.as_deref())?;
+                    let mut sink = open_append_sink(&args.file)?;
+                    execute_session_resumed(
+                        &client,
+                        sink.as_mut(),
+                        &meta,
+                        stdin.lock(),
+                        stdout.lock(),
+                        resumed,
+                    )
+                }
+            }
         }
         Command::Exchange { in_path, out_path } => {
             let config = BatonConfig::from_env()?;
@@ -1171,21 +1209,96 @@ fn execute_session(
     sink: &mut dyn EventSink,
     meta: &ExchangeMeta,
     input: impl BufRead,
-    mut output: impl Write,
+    output: impl Write,
 ) -> Result<()> {
-    eprintln!(
-        "baton session — type a message and press enter; Ctrl-D or {SESSION_EXIT_COMMAND} to quit"
-    );
-
     // Mint one id for the whole run and open the session boundary on the trail.
     // Every turn's `request` carries this id; the matching `session_end` closes
-    // it on a clean exit. `turn_index` counts only turns whose `request` is
-    // emitted, so it is bumped after a turn is dispatched, not per input line.
+    // it on a clean exit.
     let session_id = new_session_id();
     emit(sink, &ExchangeEvent::session_start(now_ms(), &session_id));
+    run_session_repl(
+        transport,
+        sink,
+        meta,
+        input,
+        output,
+        session_id,
+        Conversation::new(),
+        0,
+    )
+}
 
-    let mut conversation = Conversation::new();
-    let mut turn_index: u64 = 0;
+/// Resumes a prior session from its rehydrated state and re-enters the REPL.
+///
+/// Unlike [`execute_session`], no fresh `session_start` is emitted: the original
+/// run already opened this session's frame on the trail, and partitioning keys on
+/// `session_id` (see [`crate::log::parse_sessions`]), so the resumed run reuses
+/// that id and continues its `turn_index`. The preloaded [`Conversation`] means
+/// the first new request already carries every prior user + assistant turn.
+fn execute_session_resumed(
+    transport: &impl Transport,
+    sink: &mut dyn EventSink,
+    meta: &ExchangeMeta,
+    input: impl BufRead,
+    output: impl Write,
+    resumed: ResumedSession,
+) -> Result<()> {
+    eprintln!(
+        "baton session — resumed {} ({} prior turn(s)); type a message and press enter, Ctrl-D or {SESSION_EXIT_COMMAND} to quit",
+        resumed.session_id,
+        resumed.conversation.len() / 2,
+    );
+    run_session_repl(
+        transport,
+        sink,
+        meta,
+        input,
+        output,
+        resumed.session_id,
+        resumed.conversation,
+        resumed.next_turn_index,
+    )
+}
+
+/// The shared REPL loop behind [`execute_session`] and [`execute_session_resumed`].
+///
+/// Each line read from `input` becomes a user turn appended to `conversation`;
+/// the full accumulated history is sent on every request, so turn N carries all
+/// prior user and assistant turns. The assistant reply is printed to `output`
+/// (and appended as the next turn). Blank lines are ignored; EOF or a lone
+/// [`SESSION_EXIT_COMMAND`] line ends the loop cleanly (the caller returns exit
+/// code 0).
+///
+/// `output` carries only assistant replies — one per turn — so it stays useful
+/// to a programmatic consumer; the greeting banner and any error go to stderr.
+///
+/// A turn that fails at the transport layer is **not** fatal: the error is
+/// reported on stderr and the loop continues. The failed user turn is rolled
+/// back out of the history so it never produces two consecutive same-role turns,
+/// which the Messages API rejects. Each turn still emits a `request` plus one
+/// `response_ok`/`response_error` event, exactly like `ask`.
+///
+/// `session_id` frames every turn's `request`; `turn_index` is the next turn's
+/// index (0 for a fresh session, the continuation for a resumed one) and counts
+/// only turns whose `request` is emitted, so it is bumped after a turn is
+/// dispatched, not per input line. The caller owns the opening `session_start`
+/// (a fresh session emits one; a resumed session reuses the trail's existing
+/// frame); this loop always closes with a `session_end` on a clean exit.
+///
+/// Parameterised over [`BufRead`]/[`Write`] so the whole loop — history
+/// accumulation, exit conditions, and error rollback — is unit-testable with
+/// in-memory buffers and a fake transport, without a terminal or a network.
+#[allow(clippy::too_many_arguments)]
+fn run_session_repl(
+    transport: &impl Transport,
+    sink: &mut dyn EventSink,
+    meta: &ExchangeMeta,
+    input: impl BufRead,
+    mut output: impl Write,
+    session_id: String,
+    mut conversation: Conversation,
+    mut turn_index: u64,
+) -> Result<()> {
     for line in input.lines() {
         let line = line.map_err(io_err)?;
         let trimmed = line.trim();
@@ -1220,13 +1333,117 @@ fn execute_session(
     // Clean exit (EOF / `/exit`): close the session boundary. A session killed
     // mid-run never reaches here, so its trail carries a `session_start` and
     // turns but no `session_end` — partitioning keys on `session_id`, not on a
-    // matched pair (see `crate::log::parse_sessions`).
+    // matched pair (see `crate::log::parse_sessions`). On a *resumed* run this
+    // appends a second `session_end` for a session that already had one (if the
+    // prior run exited cleanly); that duplicate is intentional and harmless —
+    // `parse_sessions` keys on `session_id` and takes the last `declared_turns`,
+    // so read-back reflects the full resumed turn count.
     emit(
         sink,
         &ExchangeEvent::session_end(now_ms(), &session_id, turn_index),
     );
 
     Ok(())
+}
+
+/// A prior session rehydrated from its trail, ready to re-enter the REPL.
+///
+/// Built by [`select_and_rehydrate`]: the trail's `session_id` (reused so the
+/// resumed run extends one coherent session), the [`Conversation`] reconstructed
+/// from the recorded turns, and the next `turn_index` (continuing monotonically
+/// past the last recorded turn).
+#[derive(Debug)]
+struct ResumedSession {
+    /// The original session's id, reused for every resumed turn.
+    session_id: String,
+    /// History reconstructed from the trail's completed turns.
+    conversation: Conversation,
+    /// The `turn_index` the first resumed turn will carry.
+    next_turn_index: u64,
+}
+
+/// Reads a session trail and rehydrates the target session for `--resume`.
+///
+/// Opens `file`, partitions it with [`crate::log::parse_sessions`] (torn-tail
+/// tolerant), surfaces any parse warnings on stderr, then hands off to
+/// [`select_and_rehydrate`]. All of this runs *before* the caller opens the
+/// append sink, so a parse or selection failure exits non-zero having written
+/// nothing — the same contract as the `--in`/parse-error path.
+fn load_resume(file: &str, session_id: Option<&str>) -> Result<ResumedSession> {
+    let handle = File::open(file)
+        .map_err(|err| BatonError::Io(format!("failed to open --resume file {file:?}: {err}")))?;
+    let report = log::parse_sessions(handle)?;
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
+    }
+    select_and_rehydrate(report.sessions, session_id)
+}
+
+/// Selects the target session and rehydrates it — the pure core of `--resume`.
+///
+/// With `session_id`, selects that id (a miss is a usage error). Without it, the
+/// file must hold exactly one session: zero is a usage error ("no sessions"),
+/// more than one is a usage error naming the available ids and requiring
+/// `--session`. The selected session's turns are replayed in order into a fresh
+/// [`Conversation`]: each turn whose outcome is `Ok` contributes a user + an
+/// assistant turn. Turns with an `Error` or a torn (`None`) outcome contributed
+/// no assistant reply to the original in-memory history (the live loop rolls a
+/// failed user turn back out), so they are skipped — never leaving a dangling
+/// user turn that would send two consecutive user turns on resume. The next
+/// `turn_index` continues past the last recorded turn (torn or not), keeping the
+/// resumed run's indices monotonic and non-colliding.
+///
+/// Pure over its inputs (no I/O), so selection and rehydration are unit-testable
+/// without a trail file.
+fn select_and_rehydrate(
+    sessions: Vec<log::SessionRecord>,
+    session_id: Option<&str>,
+) -> Result<ResumedSession> {
+    let record = match session_id {
+        Some(wanted) => sessions
+            .into_iter()
+            .find(|s| s.session_id == wanted)
+            .ok_or_else(|| usage(&format!("no session {wanted:?} in the --resume trail")))?,
+        None => {
+            let mut iter = sessions.into_iter();
+            let first = iter
+                .next()
+                .ok_or_else(|| usage("the --resume trail holds no sessions"))?;
+            if let Some(second) = iter.next() {
+                let mut ids = vec![first.session_id, second.session_id];
+                ids.extend(iter.map(|s| s.session_id));
+                return Err(usage(&format!(
+                    "the --resume trail holds {} sessions; select one with --session <id>: {}",
+                    ids.len(),
+                    ids.join(", "),
+                )));
+            }
+            first
+        }
+    };
+
+    let mut conversation = Conversation::new();
+    for turn in &record.turns {
+        if let Some(log::Outcome::Ok { reply, .. }) = &turn.outcome {
+            conversation.push_user(turn.request.prompt.as_str());
+            conversation.push_assistant(reply.as_str());
+        }
+    }
+
+    // Continue past the last recorded turn — including a torn final turn whose
+    // outcome never landed (it still counts as a recorded turn). Fall back to the
+    // turn count if a `turn_index` is somehow absent.
+    let next_turn_index = record
+        .turns
+        .last()
+        .and_then(|t| t.request.turn_index)
+        .map_or(record.turns.len() as u64, |i| i + 1);
+
+    Ok(ResumedSession {
+        session_id: record.session_id,
+        conversation,
+        next_turn_index,
+    })
 }
 
 /// Mints a session id unique to this `baton session` process.
@@ -1316,6 +1533,21 @@ fn open_event_sink() -> Result<Box<dyn EventSink>> {
         }
         _ => Ok(Box::new(NoopSink)),
     }
+}
+
+/// Opens an append-mode event sink on an explicit trail file, for `--resume`.
+///
+/// Resuming writes new turns back to the trail it read from (not
+/// [`EVENT_LOG_ENV`]), so the resumed run extends the same session file. The file
+/// already exists — [`load_resume`] read it first — so a failure here is a real
+/// I/O error worth surfacing rather than silently dropping.
+fn open_append_sink(path: &str) -> Result<Box<dyn EventSink>> {
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|err| BatonError::Io(format!("failed to open --resume file {path:?}: {err}")))?;
+    Ok(Box::new(WriterSink::new(file)))
 }
 
 /// Parses CLI arguments (already stripped of the binary name) into a [`Command`].
@@ -1493,12 +1725,45 @@ fn parse_ask<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> 
 
 /// Parses the arguments following the `session` subcommand.
 ///
-/// `session` takes no arguments; any trailing token is a usage error.
+/// A bare `session` starts a fresh REPL. `--resume <file>` rehydrates a prior
+/// session from that JSONL trail; the optional `--session <id>` selects one when
+/// the file holds several. Both accept the `--flag=value` form. `--session`
+/// without `--resume` — or any other token — is a usage error.
 fn parse_session<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
-    if let Some(arg) = iter.next() {
-        return Err(usage(&format!("unexpected argument {arg:?}")));
+    let mut file: Option<String> = None;
+    let mut session_id: Option<String> = None;
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--resume" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| usage("--resume requires a value"))?;
+                file = Some(value.clone());
+            }
+            other if other.starts_with("--resume=") => {
+                file = Some(other["--resume=".len()..].to_string());
+            }
+            "--session" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| usage("--session requires a value"))?;
+                session_id = Some(value.clone());
+            }
+            other if other.starts_with("--session=") => {
+                session_id = Some(other["--session=".len()..].to_string());
+            }
+            other => return Err(usage(&format!("unexpected argument {other:?}"))),
+        }
     }
-    Ok(Command::Session)
+
+    match file {
+        Some(file) => Ok(Command::Session {
+            resume: Some(ResumeArgs { file, session_id }),
+        }),
+        None if session_id.is_some() => Err(usage("--session requires --resume <file>")),
+        None => Ok(Command::Session { resume: None }),
+    }
 }
 
 /// Parses the arguments following the `exchange` subcommand.
@@ -2706,7 +2971,7 @@ mod tests {
     fn parses_session_command() {
         assert_eq!(
             parse_args(&argv(&["session"])).expect("should parse"),
-            Command::Session
+            Command::Session { resume: None }
         );
     }
 
@@ -2714,6 +2979,62 @@ mod tests {
     fn session_with_extra_argument_is_usage_error() {
         assert!(matches!(
             parse_args(&argv(&["session", "extra"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parses_session_resume_file() {
+        assert_eq!(
+            parse_args(&argv(&["session", "--resume", "/tmp/trail.jsonl"])).expect("should parse"),
+            Command::Session {
+                resume: Some(ResumeArgs {
+                    file: "/tmp/trail.jsonl".to_string(),
+                    session_id: None,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_session_resume_with_session_selector() {
+        // Both the spaced and `--flag=value` forms resolve to the same command.
+        let spaced = parse_args(&argv(&[
+            "session",
+            "--resume",
+            "/tmp/trail.jsonl",
+            "--session",
+            "sess-A",
+        ]))
+        .expect("should parse");
+        let joined = parse_args(&argv(&[
+            "session",
+            "--resume=/tmp/trail.jsonl",
+            "--session=sess-A",
+        ]))
+        .expect("should parse");
+        let expected = Command::Session {
+            resume: Some(ResumeArgs {
+                file: "/tmp/trail.jsonl".to_string(),
+                session_id: Some("sess-A".to_string()),
+            }),
+        };
+        assert_eq!(spaced, expected);
+        assert_eq!(joined, expected);
+    }
+
+    #[test]
+    fn session_selector_without_resume_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&["session", "--session", "sess-A"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn session_resume_without_value_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&["session", "--resume"])).unwrap_err(),
             BatonError::Usage(_)
         ));
     }
@@ -2863,6 +3184,235 @@ mod tests {
             sink.events[5],
             ExchangeEvent::SessionEnd { turns: 2, .. }
         ));
+    }
+
+    // -- baton session --resume --------------------------------------------
+
+    /// Builds a `RequestRecord` for a session turn at `turn_index`.
+    fn resume_request(session_id: &str, turn_index: u64, prompt: &str) -> log::RequestRecord {
+        log::RequestRecord {
+            ts_ms: 1,
+            model: "m".to_string(),
+            base_url: "u".to_string(),
+            prompt: prompt.to_string(),
+            session_id: Some(session_id.to_string()),
+            turn_index: Some(turn_index),
+        }
+    }
+
+    /// A completed session turn (`Ok` outcome carrying `reply`).
+    fn ok_turn(session_id: &str, turn_index: u64, prompt: &str, reply: &str) -> log::SessionTurn {
+        log::SessionTurn {
+            request: resume_request(session_id, turn_index, prompt),
+            outcome: Some(log::Outcome::Ok {
+                ts_ms: 2,
+                duration_ms: 1,
+                reply: reply.to_string(),
+                input_tokens: None,
+                output_tokens: None,
+            }),
+        }
+    }
+
+    /// A session record wrapping the given turns (start marker seen, no end).
+    fn session_record(session_id: &str, turns: Vec<log::SessionTurn>) -> log::SessionRecord {
+        log::SessionRecord {
+            session_id: session_id.to_string(),
+            started: true,
+            ended: false,
+            declared_turns: None,
+            turns,
+        }
+    }
+
+    #[test]
+    fn rehydrate_builds_user_assistant_pairs_and_continues_turn_index() {
+        let record = session_record(
+            "sess-A",
+            vec![
+                ok_turn("sess-A", 0, "hi", "hello"),
+                ok_turn("sess-A", 1, "again", "yo"),
+            ],
+        );
+        let resumed = select_and_rehydrate(vec![record], None).expect("rehydrates");
+        assert_eq!(resumed.session_id, "sess-A");
+        assert_eq!(
+            resumed.conversation.messages(),
+            &[
+                Message::user("hi"),
+                Message::assistant("hello"),
+                Message::user("again"),
+                Message::assistant("yo"),
+            ]
+        );
+        // Two recorded turns (0, 1) → the next resumed turn is index 2.
+        assert_eq!(resumed.next_turn_index, 2);
+    }
+
+    #[test]
+    fn rehydrate_skips_torn_final_turn_but_advances_past_it() {
+        // A torn final turn — its `request` landed (turn_index 1) but the outcome
+        // never did — contributes no assistant reply, so it is not replayed into
+        // the history; the next turn_index still advances past it (to 2).
+        let torn = log::SessionTurn {
+            request: resume_request("sess-A", 1, "unanswered"),
+            outcome: None,
+        };
+        let record = session_record("sess-A", vec![ok_turn("sess-A", 0, "hi", "hello"), torn]);
+        let resumed = select_and_rehydrate(vec![record], None).expect("rehydrates");
+        assert_eq!(
+            resumed.conversation.messages(),
+            &[Message::user("hi"), Message::assistant("hello")],
+            "the torn turn leaves no dangling user turn"
+        );
+        assert_eq!(
+            resumed.next_turn_index, 2,
+            "index advances past the torn turn"
+        );
+    }
+
+    #[test]
+    fn rehydrate_skips_errored_turn() {
+        let errored = log::SessionTurn {
+            request: resume_request("sess-A", 1, "boom"),
+            outcome: Some(log::Outcome::Error {
+                ts_ms: 2,
+                duration_ms: 1,
+                kind: "transport".to_string(),
+                message: "network down".to_string(),
+            }),
+        };
+        let record = session_record("sess-A", vec![ok_turn("sess-A", 0, "hi", "hello"), errored]);
+        let resumed = select_and_rehydrate(vec![record], None).expect("rehydrates");
+        assert_eq!(
+            resumed.conversation.messages(),
+            &[Message::user("hi"), Message::assistant("hello")],
+            "an errored turn contributes no assistant reply"
+        );
+        assert_eq!(resumed.next_turn_index, 2);
+    }
+
+    #[test]
+    fn rehydrate_selects_named_session_from_many() {
+        let sessions = vec![
+            session_record("sess-A", vec![ok_turn("sess-A", 0, "a", "ra")]),
+            session_record("sess-B", vec![ok_turn("sess-B", 0, "b", "rb")]),
+        ];
+        let resumed = select_and_rehydrate(sessions, Some("sess-B")).expect("selects B");
+        assert_eq!(resumed.session_id, "sess-B");
+        assert_eq!(resumed.conversation.messages()[0], Message::user("b"));
+    }
+
+    #[test]
+    fn rehydrate_unknown_session_id_is_usage_error() {
+        let sessions = vec![session_record(
+            "sess-A",
+            vec![ok_turn("sess-A", 0, "a", "ra")],
+        )];
+        assert!(matches!(
+            select_and_rehydrate(sessions, Some("sess-Z")).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn rehydrate_ambiguous_selection_is_usage_error() {
+        let sessions = vec![
+            session_record("sess-A", vec![ok_turn("sess-A", 0, "a", "ra")]),
+            session_record("sess-B", vec![ok_turn("sess-B", 0, "b", "rb")]),
+        ];
+        match select_and_rehydrate(sessions, None).unwrap_err() {
+            // The error names both ids so the caller knows what to pass.
+            BatonError::Usage(msg) => {
+                assert!(
+                    msg.contains("sess-A") && msg.contains("sess-B"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rehydrate_empty_trail_is_usage_error() {
+        assert!(matches!(
+            select_and_rehydrate(vec![], None).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn resumed_session_first_request_carries_prior_history_and_continues_frame() {
+        // A prior session with two completed turns, rehydrated and resumed.
+        let record = session_record(
+            "sess-A",
+            vec![
+                ok_turn("sess-A", 0, "who won 1998?", "France"),
+                ok_turn("sess-A", 1, "the final score?", "3–0"),
+            ],
+        );
+        let resumed = select_and_rehydrate(vec![record], None).expect("rehydrates");
+
+        let transport = RecordingTransport::new();
+        let mut sink = RecordingSink::new();
+        let input = Cursor::new("and who did they beat?\n");
+        let mut output: Vec<u8> = Vec::new();
+
+        execute_session_resumed(
+            &transport,
+            &mut sink,
+            &test_meta(),
+            input,
+            &mut output,
+            resumed,
+        )
+        .expect("resume exits cleanly on EOF");
+
+        // The first resumed request already carries every prior user+assistant
+        // turn, then the new user line — the model sees the earlier context.
+        let calls = transport.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            vec![
+                Message::user("who won 1998?"),
+                Message::assistant("France"),
+                Message::user("the final score?"),
+                Message::assistant("3–0"),
+                Message::user("and who did they beat?"),
+            ]
+        );
+
+        // No fresh session_start — the resumed run reuses the trail's frame. The
+        // first event is the continuing turn's request at index 2 under sess-A;
+        // the closing session_end reports the full resumed turn count (3).
+        assert!(
+            !sink
+                .events
+                .iter()
+                .any(|e| matches!(e, ExchangeEvent::SessionStart { .. })),
+            "resume must not open a second session frame"
+        );
+        match &sink.events[0] {
+            ExchangeEvent::Request {
+                session_id,
+                turn_index,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("sess-A"));
+                assert_eq!(*turn_index, Some(2), "turn_index continues from the trail");
+            }
+            other => panic!("first resumed event must be a request, got: {other:?}"),
+        }
+        match sink.events.last().expect("has events") {
+            ExchangeEvent::SessionEnd {
+                session_id, turns, ..
+            } => {
+                assert_eq!(session_id, "sess-A");
+                assert_eq!(*turns, 3, "one new turn on top of the two resumed");
+            }
+            other => panic!("last resumed event must be session_end, got: {other:?}"),
+        }
     }
 
     // -- baton exchange ----------------------------------------------------
