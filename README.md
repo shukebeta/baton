@@ -156,6 +156,8 @@ $BATON_HOME/                    # BATON_HOME, else $HOME/.baton
     alice/
       config.json               # alice's identity overrides
       system.md                 # optional; the default system prompt
+      sessions/                 # recorded sessions alice took part in (#82)
+        <session_id>.jsonl      # one file per session, both sides' turns
 ```
 
 > **Behaviour change.** This is a deliberate departure from Baton's prior
@@ -219,8 +221,51 @@ secret.
 A role's home is consumed by [`baton serve --role <name>`](#serving-a-mailbox-baton-serve):
 each party in an N-party ring is its own `serve --role` daemon, so identity lands
 there while the [routing registry](#routing-registry-name--mailbox) stays pure
-routing and references roles by name only. Per-role **session recording** into
-`roles/<name>/sessions/` is specified separately (#82).
+routing and references roles by name only.
+
+### Per-role session recording
+
+A role's home also holds its **history**. The unit is the *session* — the whole
+back-and-forth the role took part in, both sides' turns, not the role's own
+utterances in isolation. Each session the role participates in is one file:
+
+```text
+roles/<name>/sessions/<session_id>.jsonl
+```
+
+Written by two paths, both reusing the flush-per-line JSONL writer (a killed
+process leaves a valid partial session — the same torn-tail tolerance
+`baton log` already has):
+
+- **`baton session --role <name>`** (human↔agent) speaks as the role's identity
+  and records the #76-shaped trail — every user *and* assistant turn — under the
+  role's home. The `<session_id>` is the minted `sess-…` id. (`--role` cannot be
+  combined with `--resume`, which already fixes its own trail file.)
+- **`baton serve --role <name>`** (A2A) records each answered exchange as one
+  **seat turn** — the request it received *and* the reply it sent — keyed on the
+  message's `conversation_id`, so turns of one conversation land in one file.
+
+**Schema** — baton's own (`baton.exchange/v1`, extending the #76 session events;
+*not* Claude Code's format). One JSON object per line:
+
+- `session_start` — opens the file, carrying `session_id`, the recording `role`,
+  and its effective `identity` (each config value + the layer it came from, for
+  reproducibility; the credential is the reference form, never the secret).
+- Per turn, a `request` line (the received/sent prompt; on a seat turn it also
+  carries `from` / `to` / `conversation_id` / `message_id` / `in_reply_to`, and
+  its `session_id` equals `conversation_id`) followed by a `response_ok` /
+  `response_error` outcome line — the two together are **both sides** of the turn.
+- `session_end` — closes a cleanly-exited `baton session` (a long-lived `serve`
+  daemon does not emit one; the reader tolerates its absence).
+
+Read one back with `baton log show --file roles/<name>/sessions/<id>.jsonl`.
+
+**N-party role views are seat-scoped.** A single `serve` sees only its own
+request/reply pairs, so for the common 2-party shapes (human↔agent, agent↔agent)
+the seat view *is* the complete session; in an N-party ring each role's file is
+its own seat's view. The full-ring transcript is the conversation driver's
+`--out` trail, or assemble it across trails with
+[`baton log merge`](#cross-trail-merge-baton-log-merge).
 
 ## First reply
 
@@ -284,6 +329,10 @@ Brazil, 3–0.
   trail** — a `session_id`, per-turn `turn_index`, and session start/end markers —
   that a single file (or a shared append log) is unambiguously partitionable back
   into whole sessions (see [Session trail](#session-trail)).
+- `baton session --role <name>` speaks as that role's identity and records the
+  same trail under the role's home
+  ([per-role session recording](#per-role-session-recording)), stamping the
+  role's effective identity on the opening marker, instead of `BATON_EVENT_LOG`.
 
 ### Resuming a session
 
@@ -877,7 +926,10 @@ baton serve --stop --inbox <dir>
   provider call; agent mode fills `--agent-cwd` / `--agent-system` /
   `--agent-mcp-config` from the role's `cwd` / `system_prompt` / `mcp_config` when
   the flag is not passed. **Explicit flags and env always override the role**
-  (`flag > env > role config > defaults > default`).
+  (`flag > env > role config > defaults > default`). With `--role`, each answered
+  exchange is also recorded as a per-role
+  [session](#per-role-session-recording) under
+  `roles/<name>/sessions/<conversation_id>.jsonl`.
 - `--stop` — cooperatively stop the `serve` running on `--inbox` (see
   [Shutdown](#shutdown-cooperative-graceful-stop)); takes only `--inbox`.
 

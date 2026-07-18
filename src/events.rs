@@ -19,7 +19,7 @@
 use std::io::{self, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::BatonError;
 use crate::model::TokenUsage;
@@ -37,6 +37,22 @@ pub struct ExchangeMeta {
     pub model: String,
     /// Base URL the request is sent to.
     pub base_url: String,
+}
+
+/// One resolved identity field recorded on a session's opening marker: the
+/// effective per-role config value and the layer that supplied it (the #80
+/// reproducibility note). `value` is always a plain string — for the credential
+/// entry it is the **reference** form (`oauth (env ALICE_TOKEN)`), never the
+/// secret; [`crate::roles::Identity::to_fields`] passes it through as-is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityField {
+    /// The friendly config key (`model`, `base_url`, `credential`, …).
+    pub key: String,
+    /// The resolved value, or `None` when unset with no built-in default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// The layer that supplied it (`env` / `role` / `defaults` / `default`).
+    pub source: String,
 }
 
 /// A single lifecycle event for one `ask` exchange.
@@ -67,10 +83,33 @@ pub enum ExchangeEvent {
         /// whole sessions.
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
-        /// Monotonic turn number within the session, starting at 0. Omitted on
-        /// the `ask` path; present on every session turn alongside `session_id`.
+        /// Monotonic turn number within the session, starting at 0. Present on
+        /// every human↔agent session turn alongside `session_id`; omitted on the
+        /// `ask` path and on A2A seat turns (which order by file position, since
+        /// [`crate::log::parse_sessions`] ignores `turn_index` for placement).
         #[serde(skip_serializing_if = "Option::is_none")]
         turn_index: Option<u64>,
+        /// A2A speaker (the peer who sent this turn's request). Present only on a
+        /// `serve --role` seat turn; omitted on the `ask` / human↔agent paths.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+        /// A2A recipient (the recording role's own address). Present only on a
+        /// seat turn.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        to: Option<String>,
+        /// Conversation this seat turn belongs to. On the A2A path this equals
+        /// `session_id` (the seat file is keyed on it), so the seat trail
+        /// partitions into one session; omitted off the A2A path.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+        /// Id of the request message this seat turn answered. Present only on a
+        /// seat turn.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        /// The message this request replies to, correlating turns across the
+        /// conversation. Present only on a seat turn that carried one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        in_reply_to: Option<String>,
     },
     /// Emitted when the provider call succeeds.
     ResponseOk {
@@ -157,6 +196,14 @@ pub enum ExchangeEvent {
         ts_ms: u64,
         /// Stable id for this session run, carried by every turn's `request`.
         session_id: String,
+        /// The role whose home this session was recorded under, when framed from
+        /// a `--role` context; omitted for a plain `BATON_EVENT_LOG` session.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        /// The role's effective identity at session open (values + source), for
+        /// reproducibility (#80). Omitted when no role framed the session.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        identity: Option<Vec<IdentityField>>,
     },
     /// Emitted once by `baton session` on a clean exit (EOF / `/exit`), after the
     /// last turn. Marks the closing boundary of a session.
@@ -191,6 +238,11 @@ impl ExchangeEvent {
             prompt: prompt.to_string(),
             session_id: None,
             turn_index: None,
+            from: None,
+            to: None,
+            conversation_id: None,
+            message_id: None,
+            in_reply_to: None,
         }
     }
 
@@ -211,15 +263,75 @@ impl ExchangeEvent {
             prompt: prompt.to_string(),
             session_id: Some(session_id.to_string()),
             turn_index: Some(turn_index),
+            from: None,
+            to: None,
+            conversation_id: None,
+            message_id: None,
+            in_reply_to: None,
         }
     }
 
-    /// Builds the session-start marker stamping the run's `session_id`.
+    /// Builds an A2A **seat turn** request for a `serve --role` session file: the
+    /// peer's request (`prompt` = the utterance received) stamped with the seat's
+    /// addressing and correlation. `session_id` is set to `conversation_id` so the
+    /// seat trail partitions into exactly one session under
+    /// [`crate::log::parse_sessions`] (a `None` here would be read as a sessionless
+    /// `ask` line and skipped). `turn_index` is left `None` — the seat trail orders
+    /// by file position, which the reader honours.
+    #[allow(clippy::too_many_arguments)]
+    pub fn a2a_turn_request(
+        ts_ms: u64,
+        meta: &ExchangeMeta,
+        prompt: &str,
+        conversation_id: &str,
+        from: &str,
+        to: &str,
+        message_id: &str,
+        in_reply_to: Option<&str>,
+    ) -> Self {
+        ExchangeEvent::Request {
+            schema: SCHEMA,
+            ts_ms,
+            model: meta.model.clone(),
+            base_url: meta.base_url.clone(),
+            prompt: prompt.to_string(),
+            session_id: Some(conversation_id.to_string()),
+            turn_index: None,
+            from: Some(from.to_string()),
+            to: Some(to.to_string()),
+            conversation_id: Some(conversation_id.to_string()),
+            message_id: Some(message_id.to_string()),
+            in_reply_to: in_reply_to.map(str::to_string),
+        }
+    }
+
+    /// Builds the session-start marker stamping the run's `session_id`, with no
+    /// role framing (the plain `BATON_EVENT_LOG` session path).
     pub fn session_start(ts_ms: u64, session_id: &str) -> Self {
         ExchangeEvent::SessionStart {
             schema: SCHEMA,
             ts_ms,
             session_id: session_id.to_string(),
+            role: None,
+            identity: None,
+        }
+    }
+
+    /// Builds the session-start marker for a `--role`-framed session, recording
+    /// the role name and its effective identity (values + source) for
+    /// reproducibility (#80).
+    pub fn session_start_with_identity(
+        ts_ms: u64,
+        session_id: &str,
+        role: &str,
+        identity: Vec<IdentityField>,
+    ) -> Self {
+        ExchangeEvent::SessionStart {
+            schema: SCHEMA,
+            ts_ms,
+            session_id: session_id.to_string(),
+            role: Some(role.to_string()),
+            identity: Some(identity),
         }
     }
 
@@ -574,5 +686,102 @@ mod tests {
     fn now_ms_is_after_a_known_recent_epoch() {
         // 2023-01-01T00:00:00Z in ms; the clock must be well past it.
         assert!(now_ms() > 1_672_531_200_000);
+    }
+
+    #[test]
+    fn a2a_turn_request_sets_session_id_to_conversation_and_omits_turn_index() {
+        // The linchpin (#82): the seat turn's `session_id` must equal
+        // `conversation_id` so `parse_sessions` partitions the seat trail into one
+        // session; a `None` session_id would be read as a sessionless `ask` line.
+        let event = ExchangeEvent::a2a_turn_request(
+            5,
+            &meta(),
+            "hi",
+            "conv-1",
+            "alice",
+            "bob",
+            "m-1",
+            Some("m-0"),
+        );
+        let value: Value = serde_json::to_value(&event).expect("serializes");
+        assert_eq!(value["event"], "request");
+        assert_eq!(value["session_id"], "conv-1");
+        assert_eq!(value["conversation_id"], "conv-1");
+        assert_eq!(value["from"], "alice");
+        assert_eq!(value["to"], "bob");
+        assert_eq!(value["message_id"], "m-1");
+        assert_eq!(value["in_reply_to"], "m-0");
+        assert!(
+            value.get("turn_index").is_none(),
+            "A2A seat turns order by file position, not turn_index: {value}"
+        );
+    }
+
+    #[test]
+    fn a2a_turn_request_omits_in_reply_to_when_absent() {
+        let event = ExchangeEvent::a2a_turn_request(
+            5,
+            &meta(),
+            "hi",
+            "conv-1",
+            "alice",
+            "bob",
+            "m-1",
+            None,
+        );
+        let value: Value = serde_json::to_value(&event).expect("serializes");
+        assert!(
+            value.get("in_reply_to").is_none(),
+            "absent in_reply_to must be omitted, got: {value}"
+        );
+    }
+
+    #[test]
+    fn session_start_with_identity_serializes_role_and_fields() {
+        let event = ExchangeEvent::session_start_with_identity(
+            7,
+            "conv-1",
+            "bob",
+            vec![IdentityField {
+                key: "model".to_string(),
+                value: Some("claude-x".to_string()),
+                source: "role".to_string(),
+            }],
+        );
+        let value: Value = serde_json::to_value(&event).expect("serializes");
+        assert_eq!(value["event"], "session_start");
+        assert_eq!(value["session_id"], "conv-1");
+        assert_eq!(value["role"], "bob");
+        assert_eq!(value["identity"][0]["key"], "model");
+        assert_eq!(value["identity"][0]["value"], "claude-x");
+        assert_eq!(value["identity"][0]["source"], "role");
+    }
+
+    #[test]
+    fn bare_session_start_omits_role_and_identity() {
+        let event = ExchangeEvent::session_start(7, "sess-1");
+        let value: Value = serde_json::to_value(&event).expect("serializes");
+        assert!(
+            value.get("role").is_none() && value.get("identity").is_none(),
+            "a plain session marker carries no role framing, got: {value}"
+        );
+    }
+
+    #[test]
+    fn bare_and_session_request_omit_a2a_correlation_fields() {
+        // The `ask` / human↔agent lines stay byte-identical: the new A2A fields
+        // are omitted entirely.
+        for event in [
+            ExchangeEvent::request(1, &meta(), "q"),
+            ExchangeEvent::session_request(1, &meta(), "q", "sess-1", 0),
+        ] {
+            let value: Value = serde_json::to_value(&event).expect("serializes");
+            for field in ["from", "to", "conversation_id", "message_id", "in_reply_to"] {
+                assert!(
+                    value.get(field).is_none(),
+                    "{field} must be omitted off the A2A path, got: {value}"
+                );
+            }
+        }
     }
 }

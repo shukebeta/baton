@@ -32,11 +32,13 @@ use std::time::{Duration, Instant};
 use crate::config::BatonConfig;
 use crate::converse::{self, Governance, RingMember, Transcript};
 use crate::error::{BatonError, Result};
-use crate::events::{EventSink, ExchangeEvent, ExchangeMeta, NoopSink, WriterSink, now_ms};
+use crate::events::{
+    EventSink, ExchangeEvent, ExchangeMeta, IdentityField, NoopSink, WriterSink, now_ms,
+};
 use crate::log::{self, Exchange};
 use crate::mailbox::{self, Mailbox, MailboxState, MailboxStatus};
 use crate::message::{MessageEnvelope, MessageKind};
-use crate::model::{AssistantReply, Conversation, Prompt};
+use crate::model::{AssistantReply, Conversation, Prompt, TokenUsage};
 use crate::participant::{
     ExternalAgentParticipant, LocalParticipant, MailboxParticipant, OutputAdapter, Participant,
 };
@@ -50,7 +52,7 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session [--resume <file> [--session <id>]] | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]] [--agent-system <path>] [--agent-mcp-config <path>]] [--role <name>] | baton serve --stop --inbox <dir> | baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]] | baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>... | baton roles | baton role show <name>";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session [--role <name>] [--resume <file> [--session <id>]] | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]] [--agent-system <path>] [--agent-mcp-config <path>]] [--role <name>] | baton serve --stop --inbox <dir> | baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]] | baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>... | baton roles | baton role show <name>";
 
 /// Default `baton serve` inbox poll interval, in milliseconds, when `--poll-ms`
 /// is unset.
@@ -94,8 +96,14 @@ enum Command {
     Ask { prompt: String },
     /// Start an interactive multi-turn REPL. `resume` is `None` for a fresh
     /// session; `Some` rehydrates a prior session from its JSONL trail and
-    /// continues appending to it (see [`ResumeArgs`]).
-    Session { resume: Option<ResumeArgs> },
+    /// continues appending to it (see [`ResumeArgs`]). `role`, when set (fresh
+    /// session only), speaks as that role's identity and records the session under
+    /// its home `roles/<name>/sessions/<id>.jsonl` (#82) instead of
+    /// `BATON_EVENT_LOG`.
+    Session {
+        resume: Option<ResumeArgs>,
+        role: Option<String>,
+    },
     /// Run one A2A envelope exchange: read a `baton.message/v1` request
     /// envelope, run the provider call, and write one response envelope.
     /// `in_path`/`out_path` default to stdin/stdout when `None`.
@@ -294,23 +302,63 @@ pub fn run() -> Result<()> {
             println!("{reply}");
             Ok(())
         }
-        Command::Session { resume } => {
-            let config = BatonConfig::from_env()?;
-            let meta = exchange_meta(&config);
-            let client = ClaudeClient::from_config(config);
+        Command::Session { resume, role } => {
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
             match resume {
+                // Fresh session. With `--role`, speak as the role (its layered
+                // identity feeds the config loader, exactly as `serve --role`) and
+                // record the trail under the role's home, stamping the resolved
+                // identity on the opening marker. Without `--role`, plain env
+                // config recorded to `BATON_EVENT_LOG` — unchanged.
                 None => {
-                    let mut sink = open_event_sink()?;
-                    execute_session(&client, sink.as_mut(), &meta, stdin.lock(), stdout.lock())
+                    let session_id = new_session_id();
+                    match &role {
+                        Some(name) => {
+                            let home = RolesHome::from_env()?;
+                            let identity =
+                                home.resolve_identity(name, |key| std::env::var(key).ok())?;
+                            let config = BatonConfig::from_lookup(identity.as_lookup())?;
+                            let meta = exchange_meta(&config);
+                            let client = ClaudeClient::from_config(config);
+                            let mut sink = open_session_home_sink(&home, name, &session_id)?;
+                            execute_session(
+                                &client,
+                                sink.as_mut(),
+                                &meta,
+                                stdin.lock(),
+                                stdout.lock(),
+                                session_id,
+                                Some((name.as_str(), identity.to_fields())),
+                            )
+                        }
+                        None => {
+                            let config = BatonConfig::from_env()?;
+                            let meta = exchange_meta(&config);
+                            let client = ClaudeClient::from_config(config);
+                            let mut sink = open_event_sink()?;
+                            execute_session(
+                                &client,
+                                sink.as_mut(),
+                                &meta,
+                                stdin.lock(),
+                                stdout.lock(),
+                                session_id,
+                                None,
+                            )
+                        }
+                    }
                 }
                 // Resume: load + select the prior session *before* opening any
                 // sink, so a bad selection (missing id, empty/ambiguous trail)
                 // exits non-zero having written nothing. The sink then appends to
                 // the resumed trail itself — not `BATON_EVENT_LOG` — so new turns
-                // extend the same file.
+                // extend the same file. `--role` is rejected upstream on resume
+                // (the trail already fixes the recording location).
                 Some(args) => {
+                    let config = BatonConfig::from_env()?;
+                    let meta = exchange_meta(&config);
+                    let client = ClaudeClient::from_config(config);
                     let resumed = load_resume(&args.file, args.session_id.as_deref())?;
                     let mut sink = open_append_sink(&args.file)?;
                     execute_session_resumed(
@@ -451,12 +499,14 @@ pub fn run() -> Result<()> {
             let mut sink = open_event_sink()?;
 
             // A `--role` resolves the role's home once; its values fill any
-            // identity the operator did not pass explicitly (flag over role).
-            // Without `--role` the identity is absent and the path is unchanged.
+            // identity the operator did not pass explicitly (flag over role), and
+            // the same home records the per-role seat session (#82). Without
+            // `--role` the identity is absent and the path is unchanged.
+            let roles_home = RolesHome::from_env()?;
             let identity = match &role {
-                Some(name) => Some(
-                    RolesHome::from_env()?.resolve_identity(name, |key| std::env::var(key).ok())?,
-                ),
+                Some(name) => {
+                    Some(roles_home.resolve_identity(name, |key| std::env::var(key).ok())?)
+                }
                 None => None,
             };
             let role_value = |key: &str| {
@@ -523,6 +573,19 @@ pub fn run() -> Result<()> {
                 }
             };
 
+            // With a `--role`, record each answered exchange as a per-role seat
+            // session (#82). No role ⇒ no recorder, and the drain path is
+            // byte-identical to before.
+            let recorder = match (&role, &identity) {
+                (Some(name), Some(id)) => Some(RoleSessionRecorder {
+                    role: name.clone(),
+                    identity: id.to_fields(),
+                    meta: meta.clone(),
+                    home: roles_home,
+                }),
+                _ => None,
+            };
+
             // Lock first, then reclaim: with the single-instance lock held, no
             // other daemon is mid-answer, so returning abandoned `claimed/`
             // messages to `pending/` cannot race a concurrent processor.
@@ -535,7 +598,14 @@ pub fn run() -> Result<()> {
 
             let poll = Duration::from_millis(poll_ms);
             loop {
-                match drain_mailbox(&mailbox, outbox, participant.as_ref(), sink.as_mut(), &meta)? {
+                match drain_mailbox(
+                    &mailbox,
+                    outbox,
+                    participant.as_ref(),
+                    sink.as_mut(),
+                    &meta,
+                    recorder.as_ref(),
+                )? {
                     // Cooperative stop observed between messages ⇒ exit 0.
                     Drain::Stopped => break,
                     Drain::Drained(processed) => {
@@ -900,6 +970,79 @@ fn execute_exchange(
     response
 }
 
+/// Records a `serve --role` daemon's A2A exchanges as per-role **seat** sessions
+/// under `roles/<role>/sessions/<conversation_id>.jsonl` (#82).
+///
+/// Each drained message is one seat turn: the peer's request (its body = the
+/// utterance received) paired with this role's reply — both sides in one
+/// request/outcome pair, from this role's seat. Turns of one conversation land in
+/// one file, keyed on `conversation_id` (which the turn's `session_id` mirrors so
+/// [`crate::log::parse_sessions`] partitions the seat trail into one session). The
+/// file is opened append per turn and flushed per line ([`WriterSink`]), so a
+/// killed daemon leaves a valid partial session — the torn-tail tolerance carries
+/// over from #76. A single `serve` sees only its own request/reply pairs, so this
+/// seat view is complete for the 2-party case and seat-scoped for the N-party ring
+/// (the full-ring view is the driver's `--out` trail / `baton log merge`).
+struct RoleSessionRecorder {
+    /// The recording role — the `sessions/` owner and the seat's own address.
+    role: String,
+    /// The role's effective identity, stamped on each new session's opening
+    /// marker for reproducibility (#80).
+    identity: Vec<IdentityField>,
+    /// The provider metadata stamped on each turn's `request` line.
+    meta: ExchangeMeta,
+    /// The role's home, resolving the `sessions/<id>.jsonl` path.
+    home: RolesHome,
+}
+
+impl RoleSessionRecorder {
+    /// Appends one seat turn (the peer's `request` + this role's `response`) to the
+    /// conversation's session file, opening the session with a `session_start`
+    /// marker (carrying the role identity) the first time the file is written.
+    fn record_turn(&self, request: &MessageEnvelope, response: &MessageEnvelope) -> io::Result<()> {
+        let conversation_id = request.conversation_id.as_str();
+        let path = self
+            .home
+            .session_path(&self.role, conversation_id)
+            .map_err(io::Error::other)?;
+        let is_new = !path.exists();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut sink = WriterSink::new(file);
+
+        if is_new {
+            sink.record(&ExchangeEvent::session_start_with_identity(
+                now_ms(),
+                conversation_id,
+                &self.role,
+                self.identity.clone(),
+            ))?;
+        }
+        sink.record(&ExchangeEvent::a2a_turn_request(
+            now_ms(),
+            &self.meta,
+            &request.body,
+            conversation_id,
+            &request.from,
+            &request.to,
+            &request.message_id,
+            request.in_reply_to.as_deref(),
+        ))?;
+        // The reply's nested exchange is the authoritative outcome (timing +
+        // tokens shared with the response envelope). A reply with no nested record
+        // (a participant that answers without one) still gets both sides: its body
+        // is recorded as a `response_ok` so the seat turn is never one-sided.
+        let outcome = match &response.exchange {
+            Some(wrapped) => ExchangeEvent::from_outcome(&wrapped.exchange.outcome),
+            None => ExchangeEvent::response_ok(now_ms(), 0, &response.body, &TokenUsage::default()),
+        };
+        sink.record(&outcome)?;
+        Ok(())
+    }
+}
+
 /// The result of one [`drain_mailbox`] pass.
 enum Drain {
     /// Drained every currently-claimable request; carries how many were processed.
@@ -929,6 +1072,7 @@ fn drain_mailbox(
     participant: &dyn Participant,
     sink: &mut dyn EventSink,
     meta: &ExchangeMeta,
+    recorder: Option<&RoleSessionRecorder>,
 ) -> Result<Drain> {
     let mut processed = 0;
     loop {
@@ -939,6 +1083,14 @@ fn drain_mailbox(
             return Ok(Drain::Drained(processed));
         };
         let response = execute_exchange(participant, sink, meta, &claimed.request);
+        // Record the per-role seat session (#82) when serving with a `--role`. A
+        // recording failure is observability, not the reply — downgrade it to a
+        // warning rather than abort the drain, matching [`emit`].
+        if let Some(recorder) = recorder
+            && let Err(err) = recorder.record_turn(&claimed.request, &response)
+        {
+            eprintln!("warning: failed to record role session: {err}");
+        }
         mailbox.deliver_response(outbox, &claimed.key, &response)?;
         mailbox.complete(claimed)?;
         processed += 1;
@@ -1284,12 +1436,20 @@ fn execute_session(
     meta: &ExchangeMeta,
     input: impl BufRead,
     output: impl Write,
+    session_id: String,
+    opening: Option<(&str, Vec<IdentityField>)>,
 ) -> Result<()> {
-    // Mint one id for the whole run and open the session boundary on the trail.
-    // Every turn's `request` carries this id; the matching `session_end` closes
-    // it on a clean exit.
-    let session_id = new_session_id();
-    emit(sink, &ExchangeEvent::session_start(now_ms(), &session_id));
+    // Open the session boundary on the trail. Every turn's `request` carries this
+    // id; the matching `session_end` closes it on a clean exit. A `--role` session
+    // stamps the role name + effective identity on the marker (#80/#82); a plain
+    // session opens with the bare marker.
+    let start = match opening {
+        Some((role, identity)) => {
+            ExchangeEvent::session_start_with_identity(now_ms(), &session_id, role, identity)
+        }
+        None => ExchangeEvent::session_start(now_ms(), &session_id),
+    };
+    emit(sink, &start);
     run_session_repl(
         transport,
         sink,
@@ -1609,6 +1769,37 @@ fn open_event_sink() -> Result<Box<dyn EventSink>> {
     }
 }
 
+/// Opens the append-mode session sink under a role's home for `session --role`:
+/// `roles/<role>/sessions/<session_id>.jsonl` (#82), creating the `sessions/`
+/// directory lazily. A `--role` session was explicitly requested, so an open
+/// failure is surfaced rather than silently dropped.
+fn open_session_home_sink(
+    home: &RolesHome,
+    role: &str,
+    session_id: &str,
+) -> Result<Box<dyn EventSink>> {
+    let path = home.session_path(role, session_id)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            BatonError::Io(format!(
+                "could not create session directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|err| {
+            BatonError::Io(format!(
+                "failed to open session file {}: {err}",
+                path.display()
+            ))
+        })?;
+    Ok(Box::new(WriterSink::new(file)))
+}
+
 /// Opens an append-mode event sink on an explicit trail file, for `--resume`.
 ///
 /// Resuming writes new turns back to the trail it read from (not
@@ -1842,6 +2033,7 @@ fn parse_ask<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> 
 fn parse_session<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
     let mut file: Option<String> = None;
     let mut session_id: Option<String> = None;
+    let mut role: Option<String> = None;
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1863,16 +2055,30 @@ fn parse_session<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comma
             other if other.starts_with("--session=") => {
                 session_id = Some(other["--session=".len()..].to_string());
             }
+            "--role" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| usage("--role requires a value"))?;
+                role = Some(value.clone());
+            }
+            other if other.starts_with("--role=") => {
+                role = Some(other["--role=".len()..].to_string());
+            }
             other => return Err(usage(&format!("unexpected argument {other:?}"))),
         }
     }
 
     match file {
+        // `--role` fixes the recording location via the role's home; `--resume`
+        // fixes it via the trail file it reads from. The two are mutually
+        // exclusive rather than silently letting one win.
+        Some(_) if role.is_some() => Err(usage("--role cannot be combined with --resume")),
         Some(file) => Ok(Command::Session {
             resume: Some(ResumeArgs { file, session_id }),
+            role: None,
         }),
         None if session_id.is_some() => Err(usage("--session requires --resume <file>")),
-        None => Ok(Command::Session { resume: None }),
+        None => Ok(Command::Session { resume: None, role }),
     }
 }
 
@@ -3088,7 +3294,10 @@ mod tests {
     fn parses_session_command() {
         assert_eq!(
             parse_args(&argv(&["session"])).expect("should parse"),
-            Command::Session { resume: None }
+            Command::Session {
+                resume: None,
+                role: None
+            }
         );
     }
 
@@ -3109,6 +3318,7 @@ mod tests {
                     file: "/tmp/trail.jsonl".to_string(),
                     session_id: None,
                 }),
+                role: None,
             }
         );
     }
@@ -3135,9 +3345,46 @@ mod tests {
                 file: "/tmp/trail.jsonl".to_string(),
                 session_id: Some("sess-A".to_string()),
             }),
+            role: None,
         };
         assert_eq!(spaced, expected);
         assert_eq!(joined, expected);
+    }
+
+    #[test]
+    fn parses_session_role() {
+        assert_eq!(
+            parse_args(&argv(&["session", "--role", "bob"])).expect("should parse"),
+            Command::Session {
+                resume: None,
+                role: Some("bob".to_string()),
+            }
+        );
+        // The `--flag=value` form resolves identically.
+        assert_eq!(
+            parse_args(&argv(&["session", "--role=bob"])).expect("should parse"),
+            Command::Session {
+                resume: None,
+                role: Some("bob".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn session_role_with_resume_is_usage_error() {
+        // `--role` fixes recording via the home; `--resume` via the trail file —
+        // mutually exclusive.
+        assert!(matches!(
+            parse_args(&argv(&[
+                "session",
+                "--resume",
+                "/tmp/t.jsonl",
+                "--role",
+                "bob"
+            ]))
+            .unwrap_err(),
+            BatonError::Usage(_)
+        ));
     }
 
     #[test]
@@ -3163,8 +3410,16 @@ mod tests {
         let input = Cursor::new("hello\nhow are you\n");
         let mut output: Vec<u8> = Vec::new();
 
-        execute_session(&transport, &mut sink, &test_meta(), input, &mut output)
-            .expect("EOF must exit cleanly");
+        execute_session(
+            &transport,
+            &mut sink,
+            &test_meta(),
+            input,
+            &mut output,
+            "sess-test".to_string(),
+            None,
+        )
+        .expect("EOF must exit cleanly");
 
         let calls = transport.calls.borrow();
         assert_eq!(calls.len(), 2, "one request per non-blank line");
@@ -3233,8 +3488,16 @@ mod tests {
         let input = Cursor::new("hi\n/exit\nnever sent\n");
         let mut output: Vec<u8> = Vec::new();
 
-        execute_session(&transport, &mut sink, &test_meta(), input, &mut output)
-            .expect("/exit must exit cleanly");
+        execute_session(
+            &transport,
+            &mut sink,
+            &test_meta(),
+            input,
+            &mut output,
+            "sess-test".to_string(),
+            None,
+        )
+        .expect("/exit must exit cleanly");
 
         let calls = transport.calls.borrow();
         assert_eq!(calls.len(), 1, "only the line before /exit is sent");
@@ -3248,8 +3511,16 @@ mod tests {
         let input = Cursor::new("\n   \nhi\n");
         let mut output: Vec<u8> = Vec::new();
 
-        execute_session(&transport, &mut sink, &test_meta(), input, &mut output)
-            .expect("blank-only input still exits cleanly");
+        execute_session(
+            &transport,
+            &mut sink,
+            &test_meta(),
+            input,
+            &mut output,
+            "sess-test".to_string(),
+            None,
+        )
+        .expect("blank-only input still exits cleanly");
 
         let calls = transport.calls.borrow();
         assert_eq!(calls.len(), 1, "blank lines never produce a request");
@@ -3263,8 +3534,16 @@ mod tests {
         let input = Cursor::new("first\nsecond\n");
         let mut output: Vec<u8> = Vec::new();
 
-        execute_session(&transport, &mut sink, &test_meta(), input, &mut output)
-            .expect("a turn error must not be fatal");
+        execute_session(
+            &transport,
+            &mut sink,
+            &test_meta(),
+            input,
+            &mut output,
+            "sess-test".to_string(),
+            None,
+        )
+        .expect("a turn error must not be fatal");
 
         let calls = transport.calls.borrow();
         assert_eq!(calls.len(), 2, "both turns are attempted");
@@ -4607,8 +4886,15 @@ mod tests {
         let participant = participant_over(OkTransport::new("four"));
         let mut sink = NoopSink;
 
-        let drained =
-            drain_mailbox(&mailbox, &outbox, &participant, &mut sink, &test_meta()).expect("drain");
+        let drained = drain_mailbox(
+            &mailbox,
+            &outbox,
+            &participant,
+            &mut sink,
+            &test_meta(),
+            None,
+        )
+        .expect("drain");
         assert!(matches!(drained, Drain::Drained(1)), "one request drained");
 
         // The reply is keyed by the request id (m-req-1), not the fresh response id.
@@ -4621,8 +4907,15 @@ mod tests {
         assert!(json_files(&inbox.join("pending")).is_empty());
 
         // Re-running is a no-op: the id is in `done/`.
-        let drained2 = drain_mailbox(&mailbox, &outbox, &participant, &mut sink, &test_meta())
-            .expect("second drain");
+        let drained2 = drain_mailbox(
+            &mailbox,
+            &outbox,
+            &participant,
+            &mut sink,
+            &test_meta(),
+            None,
+        )
+        .expect("second drain");
         assert!(
             matches!(drained2, Drain::Drained(0)),
             "already-done id is not reprocessed"
@@ -4646,8 +4939,15 @@ mod tests {
         let participant = participant_over(OkTransport::new("four"));
         let mut sink = NoopSink;
 
-        let drained =
-            drain_mailbox(&mailbox, &outbox, &participant, &mut sink, &test_meta()).expect("drain");
+        let drained = drain_mailbox(
+            &mailbox,
+            &outbox,
+            &participant,
+            &mut sink,
+            &test_meta(),
+            None,
+        )
+        .expect("drain");
         assert!(matches!(drained, Drain::Stopped), "sentinel ⇒ Stopped");
         assert_eq!(
             json_files(&inbox.join("pending")).len(),
@@ -4671,7 +4971,15 @@ mod tests {
 
         // First delivery + drain writes one reply.
         mailbox.deliver(&request_envelope()).expect("deliver");
-        drain_mailbox(&mailbox, &outbox, &participant, &mut sink, &test_meta()).expect("drain");
+        drain_mailbox(
+            &mailbox,
+            &outbox,
+            &participant,
+            &mut sink,
+            &test_meta(),
+            None,
+        )
+        .expect("drain");
         assert_eq!(json_files(&outbox).len(), 1);
 
         // Simulate a reprocess: re-deliver the same request id and drain again.
@@ -4679,7 +4987,15 @@ mod tests {
         // effect on the outbox key.) It must overwrite, not append.
         std::fs::remove_file(inbox.join("done").join("m-req-1.json")).expect("clear done");
         mailbox.deliver(&request_envelope()).expect("re-deliver");
-        drain_mailbox(&mailbox, &outbox, &participant, &mut sink, &test_meta()).expect("re-drain");
+        drain_mailbox(
+            &mailbox,
+            &outbox,
+            &participant,
+            &mut sink,
+            &test_meta(),
+            None,
+        )
+        .expect("re-drain");
         assert_eq!(
             json_files(&outbox).len(),
             1,
@@ -5153,5 +5469,192 @@ mod tests {
             vec!["m-send-4.json".to_string()],
             "the request remains in the mailbox after a timeout"
         );
+    }
+
+    // -- per-role session recording (#82) ----------------------------------
+
+    /// A unique temp baton home for one test, resolved via `BATON_HOME`.
+    fn temp_role_home(tag: &str) -> (PathBuf, RolesHome) {
+        let root = std::env::temp_dir().join(format!("baton-cli-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let root_str = root.to_string_lossy().into_owned();
+        let home = RolesHome::resolve(move |key| (key == "BATON_HOME").then(|| root_str.clone()))
+            .expect("resolves home");
+        (root, home)
+    }
+
+    fn id_field(key: &str, value: &str, source: &str) -> IdentityField {
+        IdentityField {
+            key: key.to_string(),
+            value: Some(value.to_string()),
+            source: source.to_string(),
+        }
+    }
+
+    /// AC1: a `serve --role` seat records both sides of an A2A exchange into
+    /// `roles/<role>/sessions/<conversation_id>.jsonl`, and the file reads back via
+    /// `parse_sessions` as **one** session (keyed on `conversation_id`) whose turns
+    /// carry the received request *and* the sent reply, in order — with a single
+    /// opening marker across turns of the same conversation.
+    #[test]
+    fn role_recorder_writes_seat_session_readable_by_parse_sessions() {
+        let (root, home) = temp_role_home("sess-recorder");
+        let recorder = RoleSessionRecorder {
+            role: "bob".to_string(),
+            identity: vec![id_field("model", "claude-x", "role")],
+            meta: test_meta(),
+            home: home.clone(),
+        };
+
+        // Turn 1: alice asks bob; bob's reply carries a nested exchange (the serve
+        // production path), whose outcome is the recorded reply.
+        let req1 = MessageEnvelope::new(
+            "m-1",
+            "conv-1",
+            "alice",
+            "bob",
+            MessageKind::Request,
+            "hello",
+            1_000,
+        );
+        let mut resp1 = MessageEnvelope::new(
+            "m-2",
+            "conv-1",
+            "bob",
+            "alice",
+            MessageKind::Response,
+            "hi there",
+            1_001,
+        );
+        resp1.in_reply_to = Some("m-1".to_string());
+        resp1.exchange = Some(crate::message::WrappedExchange::new(log::Exchange {
+            request: log::RequestRecord {
+                ts_ms: 1_001,
+                model: "m".to_string(),
+                base_url: "u".to_string(),
+                prompt: "hello".to_string(),
+                session_id: None,
+                turn_index: None,
+            },
+            outcome: log::Outcome::Ok {
+                ts_ms: 1_002,
+                duration_ms: 5,
+                reply: "hi there".to_string(),
+                input_tokens: None,
+                output_tokens: None,
+            },
+        }));
+        recorder.record_turn(&req1, &resp1).expect("records turn 1");
+
+        // Turn 2: same conversation, second exchange (no nested record → the reply
+        // body is recorded, so the seat turn is still two-sided).
+        let req2 = MessageEnvelope::new(
+            "m-3",
+            "conv-1",
+            "alice",
+            "bob",
+            MessageKind::Request,
+            "again",
+            1_003,
+        );
+        let mut resp2 = MessageEnvelope::new(
+            "m-4",
+            "conv-1",
+            "bob",
+            "alice",
+            MessageKind::Response,
+            "sure",
+            1_004,
+        );
+        resp2.in_reply_to = Some("m-3".to_string());
+        recorder.record_turn(&req2, &resp2).expect("records turn 2");
+
+        let path = home.session_path("bob", "conv-1").expect("path");
+        let raw = std::fs::read_to_string(&path).expect("reads seat file");
+        assert_eq!(
+            raw.matches(r#""event":"session_start""#).count(),
+            1,
+            "exactly one opening marker across turns of the conversation"
+        );
+        assert!(
+            raw.contains(r#""role":"bob""#),
+            "identity marker names the role"
+        );
+
+        let report = log::parse_sessions(std::fs::File::open(&path).unwrap()).expect("parses");
+        assert_eq!(
+            report.sessions.len(),
+            1,
+            "one seat session, keyed on conversation"
+        );
+        let s = &report.sessions[0];
+        assert_eq!(s.session_id, "conv-1", "session_id mirrors conversation_id");
+        assert!(s.started, "the opening marker was written");
+        assert_eq!(s.turns.len(), 2, "both exchanges are recorded");
+        // Turn 0: the received request + the sent reply (both sides).
+        assert_eq!(s.turns[0].request.session_id.as_deref(), Some("conv-1"));
+        assert_eq!(s.turns[0].request.prompt, "hello");
+        assert_eq!(
+            s.turns[0].outcome,
+            Some(log::Outcome::Ok {
+                ts_ms: 1_002,
+                duration_ms: 5,
+                reply: "hi there".to_string(),
+                input_tokens: None,
+                output_tokens: None,
+            })
+        );
+        // Turn 1: the fallback path still records the reply body.
+        assert_eq!(s.turns[1].request.prompt, "again");
+        match &s.turns[1].outcome {
+            Some(log::Outcome::Ok { reply, .. }) => assert_eq!(reply, "sure"),
+            other => panic!("expected an Ok outcome carrying the reply, got: {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// AC2: `session --role` records the #76-shaped human↔agent trail (a
+    /// user+assistant turn) under the role's home, with the role identity stamped
+    /// on the opening marker, and it reads back via `parse_sessions`.
+    #[test]
+    fn session_role_records_identity_framed_trail_under_home() {
+        let (root, home) = temp_role_home("sess-role");
+        let mut sink = open_session_home_sink(&home, "bob", "sess-x").expect("home sink");
+        let transport = RecordingTransport::new();
+        let input = Cursor::new("hi\n");
+        let mut output: Vec<u8> = Vec::new();
+
+        execute_session(
+            &transport,
+            sink.as_mut(),
+            &test_meta(),
+            input,
+            &mut output,
+            "sess-x".to_string(),
+            Some(("bob", vec![id_field("model", "claude-x", "role")])),
+        )
+        .expect("session exits cleanly on EOF");
+        drop(sink);
+
+        let path = home.session_path("bob", "sess-x").expect("path");
+        let raw = std::fs::read_to_string(&path).expect("reads session file");
+        assert!(raw.contains(r#""event":"session_start""#));
+        assert!(raw.contains(r#""role":"bob""#));
+        assert!(raw.contains(r#""source":"role""#));
+
+        let report = log::parse_sessions(std::fs::File::open(&path).unwrap()).expect("parses");
+        assert_eq!(report.sessions.len(), 1);
+        let s = &report.sessions[0];
+        assert_eq!(s.session_id, "sess-x");
+        assert!(s.started && s.ended, "a clean session frames start + end");
+        assert_eq!(s.turns.len(), 1, "one user+assistant turn");
+        assert_eq!(s.turns[0].request.prompt, "hi");
+        match &s.turns[0].outcome {
+            Some(log::Outcome::Ok { reply, .. }) => assert_eq!(reply, "reply1"),
+            other => panic!("expected the assistant reply, got: {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
