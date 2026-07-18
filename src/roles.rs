@@ -50,6 +50,7 @@ use serde::Deserialize;
 
 use crate::config::{DEFAULT_BASE_URL, DEFAULT_MAX_TOKENS, DEFAULT_MODEL, DEFAULT_TIMEOUT_SECS};
 use crate::error::{BatonError, Result};
+use crate::events::IdentityField;
 use crate::mailbox::is_safe_key;
 
 /// Environment variable naming the baton home root. Unset ⇒ `$HOME/.baton`.
@@ -243,6 +244,22 @@ impl RolesHome {
         Ok(self.roles_dir().join(name))
     }
 
+    /// The `roles/<role>/sessions/<session_id>.jsonl` path for a recorded session
+    /// (#82), rejecting an unsafe `role` (via [`RolesHome::role_dir`]) or
+    /// `session_id` so neither can escape the role's home via path components. The
+    /// `sessions/` directory is created lazily by the writer, not here.
+    pub fn session_path(&self, role: &str, session_id: &str) -> Result<PathBuf> {
+        if !is_safe_key(session_id) {
+            return Err(BatonError::Config(format!(
+                "session id is not a safe file key: {session_id:?}"
+            )));
+        }
+        Ok(self
+            .role_dir(role)?
+            .join("sessions")
+            .join(format!("{session_id}.jsonl")))
+    }
+
     /// Lists the role names — the sorted subdirectory names under `roles/`. An
     /// absent `roles/` directory lists nothing (not an error).
     pub fn list_roles(&self) -> Result<Vec<String>> {
@@ -320,6 +337,22 @@ impl Identity {
     /// The ordered per-field resolution, for `baton role show`.
     pub fn entries(&self) -> &[IdentityValue] {
         &self.entries
+    }
+
+    /// The effective identity as recordable [`IdentityField`]s for a session's
+    /// opening marker (#80 reproducibility). Passes each [`IdentityValue::value`]
+    /// through **as-is**: the credential entry's value is already its reference
+    /// form (`oauth (env ALICE_TOKEN)` / `env ANTHROPIC_API_KEY`), never the
+    /// secret, so this never surfaces a secret.
+    pub fn to_fields(&self) -> Vec<IdentityField> {
+        self.entries
+            .iter()
+            .map(|e| IdentityField {
+                key: e.key.to_string(),
+                value: e.value.clone(),
+                source: e.source.label().to_string(),
+            })
+            .collect()
     }
 
     /// The resolved value for a friendly key (e.g. `cwd`, `mcp_config`,
@@ -844,6 +877,52 @@ mod tests {
             BatonError::Config(msg) => assert!(msg.contains("alice"), "got: {msg}"),
             other => panic!("expected Config, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn session_path_builds_under_role_home_and_rejects_unsafe_keys() {
+        let home = RolesHome::resolve(lookup_from(&[("BATON_HOME", "/tmp/h")])).expect("resolves");
+        assert_eq!(
+            home.session_path("alice", "sess-1").expect("safe"),
+            Path::new("/tmp/h/roles/alice/sessions/sess-1.jsonl")
+        );
+        // An unsafe role (guarded by role_dir) or session id cannot escape the home.
+        assert!(home.session_path("../evil", "sess-1").is_err());
+        assert!(home.session_path("alice", "../evil").is_err());
+        assert!(home.session_path("alice", "a/b").is_err());
+        assert!(home.session_path("alice", "").is_err());
+    }
+
+    #[test]
+    fn to_fields_carries_credential_reference_never_secret() {
+        let root = temp_home("tofields-cred");
+        let home = RolesHome::resolve(lookup_from(&[("BATON_HOME", root.to_str().unwrap())]))
+            .expect("resolves");
+        write(
+            &home.role_dir("alice").unwrap().join("config.json"),
+            r#"{ "model": "role-model", "credential": { "kind": "oauth", "env": "ALICE_TOKEN" } }"#,
+        );
+        let id = home
+            .resolve_identity("alice", lookup_from(&[("ALICE_TOKEN", "secret-tok")]))
+            .expect("resolves");
+
+        let fields = id.to_fields();
+        let cred = fields.iter().find(|f| f.key == "credential").unwrap();
+        // The recorded value is the reference form, not the secret.
+        assert_eq!(cred.value.as_deref(), Some("oauth (env ALICE_TOKEN)"));
+        assert_eq!(cred.source, "role");
+        assert!(
+            !fields
+                .iter()
+                .any(|f| f.value.as_deref() == Some("secret-tok")),
+            "no field may carry the resolved secret"
+        );
+        // A plain field passes its value + source label through as-is.
+        let model = fields.iter().find(|f| f.key == "model").unwrap();
+        assert_eq!(model.value.as_deref(), Some("role-model"));
+        assert_eq!(model.source, "role");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

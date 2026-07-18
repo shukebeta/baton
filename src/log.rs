@@ -54,10 +54,13 @@ pub struct RequestRecord {
     pub base_url: String,
     /// The user prompt text.
     pub prompt: String,
-    /// Session this turn belonged to; absent on the single-turn `ask` path.
+    /// Session this turn belonged to; absent on the single-turn `ask` path. On
+    /// an A2A seat turn this equals `conversation_id`, so the seat trail
+    /// partitions into one session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    /// Monotonic turn number within the session; absent on the `ask` path.
+    /// Monotonic turn number within the session; absent on the `ask` path and on
+    /// A2A seat turns (which order by file position).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_index: Option<u64>,
 }
