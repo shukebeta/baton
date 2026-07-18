@@ -41,6 +41,7 @@ use crate::participant::{
     ExternalAgentParticipant, LocalParticipant, MailboxParticipant, OutputAdapter, Participant,
 };
 use crate::registry::Registry;
+use crate::roles::{Identity, RolesHome};
 use crate::transport::Transport;
 use crate::transport::claude::ClaudeClient;
 
@@ -49,7 +50,7 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session [--resume <file> [--session <id>]] | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]] [--agent-system <path>] [--agent-mcp-config <path>]] | baton serve --stop --inbox <dir> | baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]] | baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>...";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session [--resume <file> [--session <id>]] | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]] [--agent-system <path>] [--agent-mcp-config <path>]] [--role <name>] | baton serve --stop --inbox <dir> | baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]] | baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>... | baton roles | baton role show <name>";
 
 /// Default `baton serve` inbox poll interval, in milliseconds, when `--poll-ms`
 /// is unset.
@@ -175,6 +176,10 @@ enum Command {
         /// Path to an MCP config file, injected as the reference agent's
         /// `--mcp-config <path>`. Only meaningful with `agent_cmd`.
         agent_mcp_config: Option<String>,
+        /// Role name whose `roles/<name>/` home supplies the identity (model,
+        /// system prompt, credential, cwd, MCP config). Explicit flags override
+        /// the role's values; `None` ⇒ pure env, the prior behaviour.
+        role: Option<String>,
     },
     /// Cooperatively stop a running `baton serve` on `inbox` (Option C graceful
     /// shutdown): drop a stop sentinel the daemon observes between messages, so
@@ -228,6 +233,11 @@ enum Command {
         paths: Vec<String>,
         conversation: String,
     },
+    /// List the role names under the baton home's `roles/` directory.
+    Roles,
+    /// Print a role's effective resolved identity — each value and the layer it
+    /// came from (`flag`/`env`/`role`/`defaults`/`default`).
+    RoleShow { name: String },
 }
 
 /// Selects the session trail to rehydrate for `baton session --resume`.
@@ -436,8 +446,27 @@ pub fn run() -> Result<()> {
             agent_result_key,
             agent_system,
             agent_mcp_config,
+            role,
         } => {
             let mut sink = open_event_sink()?;
+
+            // A `--role` resolves the role's home once; its values fill any
+            // identity the operator did not pass explicitly (flag over role).
+            // Without `--role` the identity is absent and the path is unchanged.
+            let identity = match &role {
+                Some(name) => Some(
+                    RolesHome::from_env()?.resolve_identity(name, |key| std::env::var(key).ok())?,
+                ),
+                None => None,
+            };
+            let role_value = |key: &str| {
+                identity
+                    .as_ref()
+                    .and_then(|id| id.value_of(key).map(str::to_string))
+            };
+            let agent_cwd = agent_cwd.or_else(|| role_value("cwd"));
+            let agent_system = agent_system.or_else(|| role_value("system_prompt"));
+            let agent_mcp_config = agent_mcp_config.or_else(|| role_value("mcp_config"));
 
             // Two participant backings behind one drain loop. An external agent
             // carries its own credentials and MCP config, so agent mode loads no
@@ -481,7 +510,13 @@ pub fn run() -> Result<()> {
                     (Box::new(participant), meta)
                 }
                 None => {
-                    let config = BatonConfig::from_env()?;
+                    // Local in-process provider: a `--role` feeds its layered
+                    // lookup (env > role > defaults > built-in) to the config
+                    // loader; without one, plain env, exactly as before.
+                    let config = match &identity {
+                        Some(id) => BatonConfig::from_lookup(id.as_lookup())?,
+                        None => BatonConfig::from_env()?,
+                    };
                     let meta = exchange_meta(&config);
                     let client = ClaudeClient::from_config(config);
                     (Box::new(LocalParticipant::new(client, meta.clone())), meta)
@@ -634,7 +669,46 @@ pub fn run() -> Result<()> {
             let stdout = std::io::stdout();
             execute_log_merge(&merged, stdout.lock())
         }
+        Command::Roles => {
+            let home = RolesHome::from_env()?;
+            let names = home.list_roles()?;
+            let stdout = std::io::stdout();
+            execute_roles(&names, stdout.lock())
+        }
+        Command::RoleShow { name } => {
+            let home = RolesHome::from_env()?;
+            let identity = home.resolve_identity(&name, |key| std::env::var(key).ok())?;
+            let stdout = std::io::stdout();
+            execute_role_show(&name, &identity, stdout.lock())
+        }
     }
+}
+
+/// Prints the role names, one per line. An empty roster writes nothing.
+fn execute_roles(names: &[String], mut out: impl Write) -> Result<()> {
+    for name in names {
+        writeln!(out, "{name}").map_err(io_err)?;
+    }
+    Ok(())
+}
+
+/// Prints a role's effective resolved identity: each field, its value (or
+/// `(unset)`), and the layer it came from. Parameterised over [`Write`] so it is
+/// unit-testable with an in-memory buffer. The credential line shows only the
+/// reference (`kind (env NAME)` or `env NAME`), never the secret.
+fn execute_role_show(name: &str, identity: &Identity, mut out: impl Write) -> Result<()> {
+    writeln!(out, "role {name}").map_err(io_err)?;
+    for entry in identity.entries() {
+        let value = entry.value.as_deref().unwrap_or("(unset)");
+        writeln!(
+            out,
+            "  {:<14} {value}  [{}]",
+            entry.key,
+            entry.source.label()
+        )
+        .map_err(io_err)?;
+    }
+    Ok(())
 }
 
 /// Reads every `baton.message/v1` envelope across `paths`, concatenated in the
@@ -1566,7 +1640,43 @@ fn parse_args(args: &[String]) -> Result<Command> {
         "send" => parse_send(iter),
         "status" => parse_status(iter),
         "log" => parse_log(iter),
+        "roles" => parse_roles(iter),
+        "role" => parse_role(iter),
         other => Err(usage(&format!("unknown command {other:?}"))),
+    }
+}
+
+/// Parses `baton roles` — a bare command taking no arguments.
+fn parse_roles<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    if let Some(arg) = iter.next() {
+        return Err(usage(&format!("roles takes no arguments, got {arg:?}")));
+    }
+    Ok(Command::Roles)
+}
+
+/// Parses `baton role show <name>`.
+///
+/// Requires the `show` subcommand and a non-blank `<name>`; anything else — a
+/// missing/unknown subcommand, a missing/blank name, or a trailing argument — is
+/// a usage error.
+fn parse_role<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let sub = iter
+        .next()
+        .ok_or_else(|| usage("role requires a subcommand: show <name>"))?;
+    match sub.as_str() {
+        "show" => {
+            let name = iter
+                .next()
+                .ok_or_else(|| usage("role show requires a <name>"))?;
+            if name.trim().is_empty() {
+                return Err(usage("role show <name> must not be empty"));
+            }
+            if let Some(extra) = iter.next() {
+                return Err(usage(&format!("unexpected argument {extra:?}")));
+            }
+            Ok(Command::RoleShow { name: name.clone() })
+        }
+        other => Err(usage(&format!("unknown role subcommand {other:?}"))),
     }
 }
 
@@ -2051,6 +2161,7 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
     let mut agent_result_key: Option<String> = None;
     let mut agent_system: Option<String> = None;
     let mut agent_mcp_config: Option<String> = None;
+    let mut role: Option<String> = None;
 
     while let Some(arg) = iter.next() {
         let mut take = |flag: &str| -> Result<String> {
@@ -2113,6 +2224,10 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
             other if other.starts_with("--agent-mcp-config=") => {
                 agent_mcp_config = Some(other["--agent-mcp-config=".len()..].to_string());
             }
+            "--role" => role = Some(take("--role")?),
+            other if other.starts_with("--role=") => {
+                role = Some(other["--role=".len()..].to_string());
+            }
             other => return Err(usage(&format!("unexpected argument {other:?}"))),
         }
     }
@@ -2131,9 +2246,10 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
             || agent_result_key.is_some()
             || agent_system.is_some()
             || agent_mcp_config.is_some()
+            || role.is_some()
         {
             return Err(usage(
-                "--stop takes only --inbox (not --outbox/--poll-ms/--once/--agent-*)",
+                "--stop takes only --inbox (not --outbox/--poll-ms/--once/--agent-*/--role)",
             ));
         }
         let inbox = require_dir(inbox, "--inbox")?;
@@ -2177,6 +2293,7 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
         agent_result_key,
         agent_system,
         agent_mcp_config,
+        role,
     })
 }
 
@@ -3928,6 +4045,124 @@ mod tests {
         assert_eq!(back, response);
     }
 
+    // -- roles / role show --------------------------------------------------
+
+    #[test]
+    fn parse_roles_takes_no_arguments() {
+        assert_eq!(
+            parse_args(&argv(&["roles"])).expect("parses"),
+            Command::Roles
+        );
+        assert!(matches!(
+            parse_args(&argv(&["roles", "extra"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_role_show_requires_a_name() {
+        assert_eq!(
+            parse_args(&argv(&["role", "show", "alice"])).expect("parses"),
+            Command::RoleShow {
+                name: "alice".to_string(),
+            }
+        );
+        // Missing subcommand, unknown subcommand, missing/blank name, or a
+        // trailing argument are all usage errors.
+        for args in [
+            vec!["role"],
+            vec!["role", "list"],
+            vec!["role", "show"],
+            vec!["role", "show", "   "],
+            vec!["role", "show", "alice", "extra"],
+        ] {
+            assert!(
+                matches!(parse_args(&argv(&args)).unwrap_err(), BatonError::Usage(_)),
+                "expected usage error for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_serve_accepts_role_flag() {
+        let cmd = parse_args(&argv(&[
+            "serve",
+            "--inbox=/tmp/in",
+            "--outbox=/tmp/out",
+            "--role=alice",
+        ]))
+        .expect("parses");
+        match cmd {
+            Command::Serve { role, .. } => assert_eq!(role.as_deref(), Some("alice")),
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_serve_stop_rejects_role() {
+        assert!(matches!(
+            parse_args(&argv(&[
+                "serve",
+                "--stop",
+                "--inbox=/tmp/in",
+                "--role=alice"
+            ]))
+            .unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn execute_roles_prints_one_name_per_line() {
+        let mut out = Vec::new();
+        execute_roles(&["alice".to_string(), "bob".to_string()], &mut out).expect("writes");
+        assert_eq!(String::from_utf8(out).unwrap(), "alice\nbob\n");
+        // Empty roster writes nothing.
+        let mut empty = Vec::new();
+        execute_roles(&[], &mut empty).expect("writes");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn execute_role_show_renders_values_and_sources() {
+        let root = std::env::temp_dir().join(format!("baton-cli-roleshow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = RolesHome::resolve(|k| {
+            if k == "BATON_HOME" {
+                Some(root.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        })
+        .expect("resolves");
+        std::fs::create_dir_all(home.role_dir("alice").unwrap()).unwrap();
+        std::fs::write(
+            home.role_dir("alice").unwrap().join("config.json"),
+            r#"{ "model": "role-model" }"#,
+        )
+        .unwrap();
+        let identity = home
+            .resolve_identity("alice", |k| {
+                if k == "BATON_MODEL" {
+                    None
+                } else {
+                    None::<String>
+                }
+            })
+            .expect("resolves");
+        let mut out = Vec::new();
+        execute_role_show("alice", &identity, &mut out).expect("writes");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("role alice\n"), "got: {text}");
+        assert!(text.contains("model"), "got: {text}");
+        assert!(text.contains("role-model"), "got: {text}");
+        assert!(text.contains("[role]"), "got: {text}");
+        // The unset credential renders as (unset), never a secret.
+        assert!(text.contains("credential"), "got: {text}");
+        assert!(text.contains("(unset)"), "got: {text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // -- serve / parse_serve ------------------------------------------------
 
     #[test]
@@ -3947,6 +4182,7 @@ mod tests {
                 agent_result_key: None,
                 agent_system: None,
                 agent_mcp_config: None,
+                role: None,
             }
         );
     }
@@ -4035,6 +4271,7 @@ mod tests {
                 agent_result_key: None,
                 agent_system: None,
                 agent_mcp_config: None,
+                role: None,
             }
         );
     }
@@ -4063,6 +4300,7 @@ mod tests {
                 agent_result_key: None,
                 agent_system: None,
                 agent_mcp_config: None,
+                role: None,
             }
         );
     }
@@ -4094,6 +4332,7 @@ mod tests {
                 agent_result_key: Some("message".to_string()),
                 agent_system: Some("/tmp/role.txt".to_string()),
                 agent_mcp_config: Some("/tmp/mcp.json".to_string()),
+                role: None,
             }
         );
     }
@@ -4267,6 +4506,7 @@ mod tests {
                 agent_result_key: None,
                 agent_system: None,
                 agent_mcp_config: None,
+                role: None,
             }
         );
     }

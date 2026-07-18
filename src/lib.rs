@@ -13,6 +13,7 @@
 //! - [`mailbox`] — the crash-safe file-mailbox backing `baton serve`.
 //! - [`message`] — the `baton.message/v1` A2A peer-message envelope.
 //! - [`participant`] — the envelope-in / envelope-out participant seam.
+//! - [`roles`] — per-role home directories and layered identity resolution.
 //! - [`error`] — shared error and result types.
 //! - [`cli`] — the command-line entry surface.
 
@@ -27,4 +28,5 @@ pub mod message;
 pub mod model;
 pub mod participant;
 pub mod registry;
+pub mod roles;
 pub mod transport;
