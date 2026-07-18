@@ -670,7 +670,8 @@ socket.
 
 ```
 baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once]
-            [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>]]
+            [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>]
+             [--agent-output raw|json [--agent-result-key <key>]] [--agent-system <path>] [--agent-mcp-config <path>]]
 baton serve --stop --inbox <dir>
 ```
 
@@ -702,28 +703,66 @@ dependency anywhere.
 ```
 baton serve --inbox <dir> --outbox <dir> \
   --agent-cmd claude --agent-cwd /path/to/worktree \
+  --agent-system /path/to/role-identity.txt \
   --agent-arg -p --agent-arg --dangerously-skip-permissions
 ```
 
 - `--agent-cmd <program>` — the agent CLI to run once per message.
 - `--agent-arg <arg>` — a fixed argument passed on every run (repeatable), e.g.
   headless/role flags. The request body is delivered on the agent's **stdin**;
-  the agent's final **stdout** becomes the reply body.
+  the agent's final **stdout** becomes the reply body (see the output adapter
+  below).
 - `--agent-cwd <dir>` — the working directory (a git worktree) for every run;
   defaults to the `serve` process's own cwd.
 - `--agent-timeout-ms <n>` — read timeout for one agent run (default `600000`).
   Generous by design: an agent run is many tool calls, not one provider turn.
 
+#### Reply shape: the output adapter
+
+By default the **whole** stdout is the reply body — correct for a backend that
+prints only its final answer (e.g. `claude -p`). A *streaming* backend
+(codex/copilot) interleaves tool/step chatter into stdout, which would leak into
+the reply. `--agent-output` isolates the final result:
+
+- `--agent-output raw` (default) — the whole stdout is the reply body.
+- `--agent-output json` — the reply body is the string value at a result field
+  in the agent's **final non-empty stdout line, parsed as a JSON object** — the
+  `--output-format json`/`stream-json` convention. Chatter lines above that final
+  line are dropped. Pair it with the backend's own structured-output flag via
+  `--agent-arg` (e.g. `--agent-arg --output-format --agent-arg json`).
+  - `--agent-result-key <key>` — the field to read (default `result`, matching
+    `claude -p --output-format json`; set it to your backend's field, e.g.
+    `message`). Valid only with `--agent-output json`.
+  - If the final line is absent, is not a JSON object, lacks the key, or the
+    key's value is not a string, the run becomes a synthesized delivered
+    `kind: "error"` (never a stringified-JSON body).
+
+#### Per-role identity and MCP config
+
+Role identity and MCP configuration are first-class, so a served role is
+configured *by role* rather than by a hand-assembled `--agent-arg` list:
+
+- `--agent-system <path>` — a role system-prompt/identity **file**, injected as
+  the agent's `--append-system-prompt <contents>`.
+- `--agent-mcp-config <path>` — an MCP config file, injected as the agent's
+  `--mcp-config <path>`.
+
+Both are **mapped to Claude Code's flag spelling** (baton's reference backend)
+and prepended to your `--agent-arg` values, so a raw override still composes. For
+a non-claude backend whose flags differ, pass identity/MCP through raw
+`--agent-arg` instead.
+
 In this mode `serve` loads **no `BatonConfig` and needs no API key** — the agent
 carries its own credentials and MCP config (layer them through the inherited
-environment). Cross-message state is the agent's own job: it reconstructs
-context across rounds from **durable artifacts** (the git branch/worktree it
-shares run-to-run, the issue thread, prior mailbox history), not an in-memory
-session — headless-per-message is the model. An agent run that exits 0 with
-non-empty stdout is wrapped into a `kind: "response"` (it nests no
-`baton.exchange/v1` record, since a multi-tool run is not one provider call
-baton can vouch for); a spawn failure, non-zero exit, empty output, or timeout
-becomes a synthesized delivered `kind: "error"`.
+environment, or via `--agent-mcp-config`). Cross-message state is the agent's own
+job: it reconstructs context across rounds from **durable artifacts** (the git
+branch/worktree it shares run-to-run, the issue thread, prior mailbox history),
+not an in-memory session — headless-per-message is the model. An agent run that
+exits 0 with a non-empty extracted result is wrapped into a `kind: "response"`
+(it nests no `baton.exchange/v1` record, since a multi-tool run is not one
+provider call baton can vouch for); a spawn failure, non-zero exit, empty output,
+an unextractable JSON result, or a timeout becomes a synthesized delivered
+`kind: "error"`.
 
 `scripts/external-agent-proof.sh` is the runnable end-to-end proof (real agent +
 real credentials, so **not** part of baton's no-API-key CI): it drives two
