@@ -361,14 +361,20 @@ impl Participant for MailboxParticipant {
 /// The trait stays infallible; the delivered-error boundary is drawn in envelope
 /// terms, mirroring the sibling impls:
 ///
-/// - A run that **exits 0 with non-empty stdout** yields a `kind: "response"`
-///   whose body is that stdout, with **no** nested `baton.exchange/v1` record —
-///   an agent run is not a single provider call Baton can vouch for, so it nests
-///   nothing (as [`testing::ScriptedParticipant`] does when it runs no call).
+/// - A run that **exits 0 with a non-empty extracted result** yields a
+///   `kind: "response"` whose body is that result, with **no** nested
+///   `baton.exchange/v1` record — an agent run is not a single provider call
+///   Baton can vouch for, so it nests nothing (as [`testing::ScriptedParticipant`]
+///   does when it runs no call). The result is isolated from the raw stdout by an
+///   [`OutputAdapter`]: `Raw` takes the whole stdout, `Json` takes the final JSON
+///   line's result field, so a streaming backend's tool/step chatter never leaks
+///   into the reply body.
 /// - A **machinery failure** — the agent could not be spawned, exited non-zero,
-///   produced empty stdout, or exceeded [`read_timeout`](Self::read_timeout) —
-///   is reconciled into a *synthesized* delivered `kind: "error"` envelope
-///   ([`synthesize_error_response`]), its body naming the failure.
+///   produced empty output, exceeded [`read_timeout`](Self::read_timeout), or (in
+///   [`OutputAdapter::Json`] mode) emitted a final line the adapter could not
+///   extract a string result from — is reconciled into a *synthesized* delivered
+///   `kind: "error"` envelope ([`synthesize_error_response`]), its body naming the
+///   failure.
 pub struct ExternalAgentParticipant {
     /// The native agent CLI to run headless (e.g. `claude`).
     program: PathBuf,
@@ -380,21 +386,80 @@ pub struct ExternalAgentParticipant {
     /// Working directory for every run — the git worktree the agent acts in and
     /// reconstructs context from across rounds.
     cwd: PathBuf,
+    /// How the reply body is isolated from the agent's raw stdout (whole stdout
+    /// vs. the final JSON line's result field).
+    output: OutputAdapter,
     /// Maximum time to await the agent's final output before synthesizing an
     /// error. Should be *generous*: a headless agent run is many tool calls, not
     /// one provider turn.
     read_timeout: Duration,
 }
 
+/// Isolates the agent's final *result* from its raw stdout.
+///
+/// A non-streaming backend (e.g. `claude -p`) prints only its final answer, so
+/// the whole stdout *is* the result ([`Raw`](Self::Raw)). A streaming backend
+/// (codex/copilot) interleaves tool/step chatter into stdout; run under its
+/// `--output-format json`/`stream-json` convention its terminal line is a JSON
+/// object carrying the result, which [`Json`](Self::Json) extracts by key so the
+/// chatter above it is dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputAdapter {
+    /// The whole stdout is the reply body (the #68 default; correct when the
+    /// backend prints only its final answer).
+    Raw,
+    /// The reply body is the string value at `result_key` in the final non-empty
+    /// stdout line parsed as a JSON object. Anything else — no non-empty line, a
+    /// line that is not a JSON object, an absent key, or a present-but-non-string
+    /// value — is a machinery failure the caller reconciles into a delivered
+    /// error, never a stringified-JSON surprise.
+    Json { result_key: String },
+}
+
+impl OutputAdapter {
+    /// Extracts the reply body from `stdout`, or an `Err` describing why no result
+    /// could be isolated (only reachable in [`Json`](Self::Json) mode).
+    fn extract(&self, stdout: &str) -> Result<String> {
+        match self {
+            OutputAdapter::Raw => Ok(stdout.to_string()),
+            OutputAdapter::Json { result_key } => {
+                let last = stdout.lines().rev().find(|line| !line.trim().is_empty());
+                let Some(line) = last else {
+                    return Err(BatonError::Decode(
+                        "external agent produced no output line to extract a JSON result from"
+                            .to_string(),
+                    ));
+                };
+                let value: serde_json::Value = serde_json::from_str(line.trim()).map_err(|err| {
+                    BatonError::Decode(format!(
+                        "external agent's final output line is not a JSON object: {err}"
+                    ))
+                })?;
+                match value.get(result_key) {
+                    Some(serde_json::Value::String(s)) => Ok(s.clone()),
+                    Some(_) => Err(BatonError::Decode(format!(
+                        "external agent's JSON result field {result_key:?} is not a string"
+                    ))),
+                    None => Err(BatonError::Decode(format!(
+                        "external agent's JSON output has no {result_key:?} result field"
+                    ))),
+                }
+            }
+        }
+    }
+}
+
 impl ExternalAgentParticipant {
     /// Builds a participant that runs `program` with `args` (layering `envs` over
-    /// the inherited environment) in `cwd`, feeding each request body on stdin
-    /// and awaiting the agent's final stdout for at most `read_timeout`.
+    /// the inherited environment) in `cwd`, feeding each request body on stdin,
+    /// awaiting the agent's final stdout for at most `read_timeout`, and isolating
+    /// the reply body from that stdout with `output`.
     pub fn new(
         program: impl Into<PathBuf>,
         args: impl IntoIterator<Item = impl Into<String>>,
         envs: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
         cwd: impl Into<PathBuf>,
+        output: OutputAdapter,
         read_timeout: Duration,
     ) -> Self {
         Self {
@@ -405,13 +470,15 @@ impl ExternalAgentParticipant {
                 .map(|(k, v)| (k.into(), v.into()))
                 .collect(),
             cwd: cwd.into(),
+            output,
             read_timeout,
         }
     }
 
     /// Runs one headless agent turn, returning the reply body (the agent's final
-    /// stdout) or an `Err` describing the machinery failure (spawn failure,
-    /// non-zero exit, empty output, or read timeout). The infallible
+    /// result, isolated from raw stdout by the [`OutputAdapter`]) or an `Err`
+    /// describing the machinery failure (spawn failure, non-zero exit, empty
+    /// output, unextractable result, or read timeout). The infallible
     /// [`Participant::respond`] reconciles that `Err` into a delivered error
     /// envelope.
     fn try_respond(&self, request: &MessageEnvelope) -> Result<String> {
@@ -429,7 +496,13 @@ impl ExternalAgentParticipant {
                 "external agent produced no output".to_string(),
             ));
         }
-        Ok(stdout)
+        let body = self.output.extract(&stdout)?;
+        if body.trim().is_empty() {
+            return Err(BatonError::Decode(
+                "external agent produced an empty result".to_string(),
+            ));
+        }
+        Ok(body)
     }
 }
 
@@ -1087,10 +1160,22 @@ mod tests {
     // issue thread) is `scripts/external-agent-proof.sh`, run manually.
 
     /// Builds an external-agent participant running `script` under `sh -c` in
-    /// `cwd`, with no env overrides.
+    /// `cwd`, with no env overrides and the `Raw` output adapter (whole stdout).
     fn external_agent(
         script: &str,
         cwd: &std::path::Path,
+        read_timeout: Duration,
+    ) -> ExternalAgentParticipant {
+        external_agent_with_output(script, cwd, OutputAdapter::Raw, read_timeout)
+    }
+
+    /// Builds an external-agent participant running `script` under `sh -c` in
+    /// `cwd`, with the chosen `output` adapter — for exercising streaming-result
+    /// extraction against a stub that emits chatter + a final result.
+    fn external_agent_with_output(
+        script: &str,
+        cwd: &std::path::Path,
+        output: OutputAdapter,
         read_timeout: Duration,
     ) -> ExternalAgentParticipant {
         ExternalAgentParticipant::new(
@@ -1098,6 +1183,7 @@ mod tests {
             ["-c", script],
             std::iter::empty::<(String, String)>(),
             cwd,
+            output,
             read_timeout,
         )
     }
@@ -1229,6 +1315,68 @@ mod tests {
         assert!(
             response.body.contains("timeout"),
             "body names the timeout: {}",
+            response.body
+        );
+    }
+
+    /// A **streaming** backend that interleaves tool/step chatter on stdout and
+    /// prints its final answer as a terminal JSON line yields a reply whose body
+    /// is **only** that answer — the chatter is excluded by the `Json` adapter.
+    #[test]
+    fn external_agent_json_adapter_excludes_streaming_chatter() {
+        let dir = TempDir::new("ext-json");
+        // The stub mimics a streaming agent: tool/step chatter lines, then the
+        // final result as a JSON object on the last line (the `--output-format
+        // json` convention). Only the `result` field must reach the reply body.
+        let participant = external_agent_with_output(
+            "cat >/dev/null; \
+             printf '[tool] reading files\\n'; \
+             printf '[step] editing notes.md\\n'; \
+             printf '{\"type\":\"result\",\"result\":\"edited notes.md and committed\"}\\n'",
+            &dir.path,
+            OutputAdapter::Json {
+                result_key: "result".to_string(),
+            },
+            Duration::from_secs(5),
+        );
+
+        let response = participant.respond(&request_with_body("m-req-1", "please edit notes.md"));
+
+        assert_eq!(response.kind, MessageKind::Response);
+        assert_eq!(response.body, "edited notes.md and committed");
+        assert!(
+            !response.body.contains("[tool]") && !response.body.contains("[step]"),
+            "streaming chatter must be excluded from the reply body: {}",
+            response.body
+        );
+        assert_eq!(response.in_reply_to.as_deref(), Some("m-req-1"));
+        assert!(
+            response.exchange.is_none(),
+            "an agent run is not one provider call, so it nests no record"
+        );
+    }
+
+    /// In `Json` mode a final line whose result field is missing or non-string is
+    /// a machinery failure — a synthesized delivered error, never a stringified
+    /// JSON body.
+    #[test]
+    fn external_agent_json_adapter_synthesizes_error_on_unextractable_result() {
+        let dir = TempDir::new("ext-json-bad");
+        // The result field is a nested object, not a string — must not be
+        // stringified into the body.
+        let participant = external_agent_with_output(
+            "cat >/dev/null; printf '{\"result\":{\"nested\":true}}\\n'",
+            &dir.path,
+            OutputAdapter::Json {
+                result_key: "result".to_string(),
+            },
+            Duration::from_secs(5),
+        );
+        let response = participant.respond(&request_with_body("m-req-1", "go"));
+        assert_synthesized_error(&response);
+        assert!(
+            response.body.contains("not a string"),
+            "body names the extraction failure: {}",
             response.body
         );
     }

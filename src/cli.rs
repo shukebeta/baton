@@ -38,7 +38,7 @@ use crate::mailbox::{self, Mailbox};
 use crate::message::{MessageEnvelope, MessageKind};
 use crate::model::{AssistantReply, Conversation, Prompt};
 use crate::participant::{
-    ExternalAgentParticipant, LocalParticipant, MailboxParticipant, Participant,
+    ExternalAgentParticipant, LocalParticipant, MailboxParticipant, OutputAdapter, Participant,
 };
 use crate::registry::Registry;
 use crate::transport::Transport;
@@ -49,7 +49,7 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>]] | baton serve --stop --inbox <dir> | baton send --inbox <dir> (--body <text> | --in <path>) [--to <id>] [--from <id>] [--conversation <id>] [--await --outbox <dir> [--timeout-ms <n>]] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>...";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]] [--agent-system <path>] [--agent-mcp-config <path>]] | baton serve --stop --inbox <dir> | baton send --inbox <dir> (--body <text> | --in <path>) [--to <id>] [--from <id>] [--conversation <id>] [--await --outbox <dir> [--timeout-ms <n>]] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>...";
 
 /// Default `baton serve` inbox poll interval, in milliseconds, when `--poll-ms`
 /// is unset.
@@ -154,6 +154,18 @@ enum Command {
         agent_cwd: Option<String>,
         /// Read timeout (ms) for one agent run; `None` ⇒ [`DEFAULT_AGENT_TIMEOUT_MS`].
         agent_timeout_ms: Option<u64>,
+        /// Output adapter selector: `raw` (whole stdout) or `json` (final JSON
+        /// line's result field). `None` ⇒ `raw`. Only meaningful with `agent_cmd`.
+        agent_output: Option<String>,
+        /// JSON result-field key for `--agent-output json`; `None` ⇒ `result`.
+        agent_result_key: Option<String>,
+        /// Path to a role system-prompt/identity file, injected as the reference
+        /// agent's `--append-system-prompt <contents>`. Only meaningful with
+        /// `agent_cmd`.
+        agent_system: Option<String>,
+        /// Path to an MCP config file, injected as the reference agent's
+        /// `--mcp-config <path>`. Only meaningful with `agent_cmd`.
+        agent_mcp_config: Option<String>,
     },
     /// Cooperatively stop a running `baton serve` on `inbox` (Option C graceful
     /// shutdown): drop a stop sentinel the daemon observes between messages, so
@@ -356,6 +368,10 @@ pub fn run() -> Result<()> {
             agent_args,
             agent_cwd,
             agent_timeout_ms,
+            agent_output,
+            agent_result_key,
+            agent_system,
+            agent_mcp_config,
         } => {
             let mut sink = open_event_sink()?;
 
@@ -376,15 +392,26 @@ pub fn run() -> Result<()> {
                         })?;
                     let read_timeout =
                         Duration::from_millis(agent_timeout_ms.unwrap_or(DEFAULT_AGENT_TIMEOUT_MS));
+                    let output = build_output_adapter(agent_output.as_deref(), agent_result_key)?;
+                    // Assemble the first-class role config into the agent arg list
+                    // *before* the operator's `--agent-arg` values, mapped to the
+                    // reference agent's (Claude Code) flags. The participant stays
+                    // backend-neutral — it never learns a flag spelling.
+                    let args = build_agent_args(
+                        agent_system.as_deref(),
+                        agent_mcp_config.as_deref(),
+                        agent_args,
+                    )?;
                     let meta = ExchangeMeta {
                         model: program.clone(),
                         base_url: "external-agent".to_string(),
                     };
                     let participant = ExternalAgentParticipant::new(
                         program,
-                        agent_args,
+                        args,
                         std::iter::empty::<(String, String)>(),
                         cwd,
+                        output,
                         read_timeout,
                     );
                     (Box::new(participant), meta)
@@ -930,6 +957,52 @@ fn participant_config(
         config.model = model;
     }
     Ok(config)
+}
+
+/// Resolves the `--agent-output` selector (+ `--agent-result-key`) into an
+/// [`OutputAdapter`]. `None`/`"raw"` ⇒ whole stdout; `"json"` ⇒ the final JSON
+/// line's `result_key` field (default `result`). Any other selector is a usage
+/// error.
+fn build_output_adapter(
+    selector: Option<&str>,
+    result_key: Option<String>,
+) -> Result<OutputAdapter> {
+    match selector.unwrap_or("raw") {
+        "raw" => Ok(OutputAdapter::Raw),
+        "json" => Ok(OutputAdapter::Json {
+            result_key: result_key.unwrap_or_else(|| "result".to_string()),
+        }),
+        other => Err(usage(&format!(
+            "--agent-output must be 'raw' or 'json', got {other:?}"
+        ))),
+    }
+}
+
+/// Assembles the external agent's argument list: the first-class role-config
+/// flags mapped to the reference agent's (Claude Code) spelling — `--agent-system
+/// <path>` → `--append-system-prompt <contents>`, `--agent-mcp-config <path>` →
+/// `--mcp-config <path>` — **prepended** to the operator's raw `--agent-arg`
+/// values so a hand-supplied override still composes. Reads the system-prompt
+/// file (an Io error on failure, matching [`participant_config`]).
+fn build_agent_args(
+    system_path: Option<&str>,
+    mcp_config_path: Option<&str>,
+    agent_args: Vec<String>,
+) -> Result<Vec<String>> {
+    let mut args = Vec::with_capacity(agent_args.len() + 4);
+    if let Some(path) = system_path {
+        let prompt = std::fs::read_to_string(path).map_err(|err| {
+            BatonError::Io(format!("could not read --agent-system file {path:?}: {err}"))
+        })?;
+        args.push("--append-system-prompt".to_string());
+        args.push(prompt);
+    }
+    if let Some(path) = mcp_config_path {
+        args.push("--mcp-config".to_string());
+        args.push(path.to_string());
+    }
+    args.extend(agent_args);
+    Ok(args)
 }
 
 /// Builds the seed request envelope: participant A's opening message addressed
@@ -1567,6 +1640,10 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
     let mut agent_args: Vec<String> = Vec::new();
     let mut agent_cwd: Option<String> = None;
     let mut agent_timeout_ms: Option<u64> = None;
+    let mut agent_output: Option<String> = None;
+    let mut agent_result_key: Option<String> = None;
+    let mut agent_system: Option<String> = None;
+    let mut agent_mcp_config: Option<String> = None;
 
     while let Some(arg) = iter.next() {
         let mut take = |flag: &str| -> Result<String> {
@@ -1613,6 +1690,22 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
                     "--agent-timeout-ms",
                 )?);
             }
+            "--agent-output" => agent_output = Some(take("--agent-output")?),
+            other if other.starts_with("--agent-output=") => {
+                agent_output = Some(other["--agent-output=".len()..].to_string());
+            }
+            "--agent-result-key" => agent_result_key = Some(take("--agent-result-key")?),
+            other if other.starts_with("--agent-result-key=") => {
+                agent_result_key = Some(other["--agent-result-key=".len()..].to_string());
+            }
+            "--agent-system" => agent_system = Some(take("--agent-system")?),
+            other if other.starts_with("--agent-system=") => {
+                agent_system = Some(other["--agent-system=".len()..].to_string());
+            }
+            "--agent-mcp-config" => agent_mcp_config = Some(take("--agent-mcp-config")?),
+            other if other.starts_with("--agent-mcp-config=") => {
+                agent_mcp_config = Some(other["--agent-mcp-config=".len()..].to_string());
+            }
             other => return Err(usage(&format!("unexpected argument {other:?}"))),
         }
     }
@@ -1627,6 +1720,10 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
             || !agent_args.is_empty()
             || agent_cwd.is_some()
             || agent_timeout_ms.is_some()
+            || agent_output.is_some()
+            || agent_result_key.is_some()
+            || agent_system.is_some()
+            || agent_mcp_config.is_some()
         {
             return Err(usage(
                 "--stop takes only --inbox (not --outbox/--poll-ms/--once/--agent-*)",
@@ -1639,11 +1736,23 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
     // The agent-run flags only qualify `--agent-cmd`; without it they would be
     // silently ignored, so reject them rather than mislead.
     if agent_cmd.is_none()
-        && (!agent_args.is_empty() || agent_cwd.is_some() || agent_timeout_ms.is_some())
+        && (!agent_args.is_empty()
+            || agent_cwd.is_some()
+            || agent_timeout_ms.is_some()
+            || agent_output.is_some()
+            || agent_result_key.is_some()
+            || agent_system.is_some()
+            || agent_mcp_config.is_some())
     {
         return Err(usage(
-            "--agent-arg/--agent-cwd/--agent-timeout-ms require --agent-cmd",
+            "--agent-arg/--agent-cwd/--agent-timeout-ms/--agent-output/--agent-result-key/--agent-system/--agent-mcp-config require --agent-cmd",
         ));
+    }
+
+    // `--agent-result-key` names a field the `json` adapter reads; under `raw`
+    // (the default) it has no effect, so reject it rather than silently ignore.
+    if agent_result_key.is_some() && agent_output.as_deref() != Some("json") {
+        return Err(usage("--agent-result-key requires --agent-output json"));
     }
 
     let inbox = require_dir(inbox, "--inbox")?;
@@ -1657,6 +1766,10 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
         agent_args,
         agent_cwd,
         agent_timeout_ms,
+        agent_output,
+        agent_result_key,
+        agent_system,
+        agent_mcp_config,
     })
 }
 
@@ -2979,6 +3092,10 @@ mod tests {
                 agent_args: vec![],
                 agent_cwd: None,
                 agent_timeout_ms: None,
+                agent_output: None,
+                agent_result_key: None,
+                agent_system: None,
+                agent_mcp_config: None,
             }
         );
     }
@@ -3063,6 +3180,10 @@ mod tests {
                 agent_args: vec!["-p".to_string(), "--output-format=text".to_string()],
                 agent_cwd: Some("/tmp/work".to_string()),
                 agent_timeout_ms: Some(900_000),
+                agent_output: None,
+                agent_result_key: None,
+                agent_system: None,
+                agent_mcp_config: None,
             }
         );
     }
@@ -3087,18 +3208,144 @@ mod tests {
                 agent_args: vec!["-p".to_string()],
                 agent_cwd: None,
                 agent_timeout_ms: None,
+                agent_output: None,
+                agent_result_key: None,
+                agent_system: None,
+                agent_mcp_config: None,
             }
         );
     }
 
     #[test]
+    fn parse_serve_accepts_role_config_flags() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "serve",
+                "--inbox=/tmp/in",
+                "--outbox=/tmp/out",
+                "--agent-cmd=codex",
+                "--agent-output=json",
+                "--agent-result-key=message",
+                "--agent-system=/tmp/role.txt",
+                "--agent-mcp-config=/tmp/mcp.json",
+            ]))
+            .expect("parses"),
+            Command::Serve {
+                inbox: "/tmp/in".to_string(),
+                outbox: "/tmp/out".to_string(),
+                poll_ms: DEFAULT_SERVE_POLL_MS,
+                once: false,
+                agent_cmd: Some("codex".to_string()),
+                agent_args: vec![],
+                agent_cwd: None,
+                agent_timeout_ms: None,
+                agent_output: Some("json".to_string()),
+                agent_result_key: Some("message".to_string()),
+                agent_system: Some("/tmp/role.txt".to_string()),
+                agent_mcp_config: Some("/tmp/mcp.json".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_serve_result_key_requires_json_output() {
+        // Under the default `raw` adapter, --agent-result-key has no effect.
+        assert!(matches!(
+            parse_args(&argv(&[
+                "serve",
+                "--inbox=/tmp/in",
+                "--outbox=/tmp/out",
+                "--agent-cmd=claude",
+                "--agent-result-key=result",
+            ]))
+            .unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_serve_rejects_unknown_agent_output() {
+        assert!(matches!(
+            build_output_adapter(Some("yaml"), None).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn build_output_adapter_maps_selectors() {
+        assert_eq!(
+            build_output_adapter(None, None).expect("raw default"),
+            OutputAdapter::Raw
+        );
+        assert_eq!(
+            build_output_adapter(Some("raw"), None).expect("raw"),
+            OutputAdapter::Raw
+        );
+        assert_eq!(
+            build_output_adapter(Some("json"), None).expect("json default key"),
+            OutputAdapter::Json {
+                result_key: "result".to_string()
+            }
+        );
+        assert_eq!(
+            build_output_adapter(Some("json"), Some("message".to_string())).expect("json key"),
+            OutputAdapter::Json {
+                result_key: "message".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn build_agent_args_prepends_role_config_before_operator_args() {
+        let root = TempRoot::new("agent-args");
+        let role = root.path.join("role.txt");
+        std::fs::write(&role, "You are the reviewer.").expect("write role file");
+
+        let args = build_agent_args(
+            Some(role.to_str().unwrap()),
+            Some("/tmp/mcp.json"),
+            vec!["-p".to_string(), "--dangerously-skip-permissions".to_string()],
+        )
+        .expect("assembles");
+
+        assert_eq!(
+            args,
+            vec![
+                "--append-system-prompt".to_string(),
+                "You are the reviewer.".to_string(),
+                "--mcp-config".to_string(),
+                "/tmp/mcp.json".to_string(),
+                "-p".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_agent_args_without_role_config_is_operator_args_verbatim() {
+        let args = build_agent_args(None, None, vec!["-p".to_string()]).expect("assembles");
+        assert_eq!(args, vec!["-p".to_string()]);
+    }
+
+    #[test]
+    fn build_agent_args_missing_system_file_is_io_error() {
+        assert!(matches!(
+            build_agent_args(Some("/no/such/role/file.txt"), None, vec![]).unwrap_err(),
+            BatonError::Io(_)
+        ));
+    }
+
+    #[test]
     fn parse_serve_agent_run_flags_require_agent_cmd() {
-        // --agent-arg/--agent-cwd/--agent-timeout-ms without --agent-cmd would be
-        // silently ignored, so each is a usage error on its own.
+        // The agent-run + role-config flags without --agent-cmd would be silently
+        // ignored, so each is a usage error on its own.
         for flag in [
             "--agent-arg=-p",
             "--agent-cwd=/tmp/work",
             "--agent-timeout-ms=1000",
+            "--agent-output=json",
+            "--agent-system=/tmp/role.txt",
+            "--agent-mcp-config=/tmp/mcp.json",
         ] {
             assert!(
                 matches!(
@@ -3162,6 +3409,10 @@ mod tests {
                 agent_args: vec![],
                 agent_cwd: None,
                 agent_timeout_ms: None,
+                agent_output: None,
+                agent_result_key: None,
+                agent_system: None,
+                agent_mcp_config: None,
             }
         );
     }

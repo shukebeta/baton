@@ -88,11 +88,16 @@ printf 'seed\n' >"$REPO/README.md"
 git -C "$REPO" add README.md
 git -C "$REPO" commit -q -m "seed"
 
-ROLE_PROMPT="You are a headless worker agent hosted by baton over a file-mailbox. \
-Your current working directory is a git repository. Each message you receive is a \
-task. Do the task by editing files in this repository and committing with git, then \
-print a single concise line summarising what you did. Reconstruct any earlier \
-context from the git history and the files already in the repository."
+# Role identity supplied through the first-class --agent-system flag (a file),
+# not a hand-assembled --agent-arg --append-system-prompt pair.
+ROLE_FILE="$WORK/role-identity.txt"
+cat >"$ROLE_FILE" <<'EOF'
+You are a headless worker agent hosted by baton over a file-mailbox. Your current
+working directory is a git repository. Each message you receive is a task. Do the
+task by editing files in this repository and committing with git, then print a
+single concise line summarising what you did. Reconstruct any earlier context from
+the git history and the files already in the repository.
+EOF
 
 # --- Launch the tmux-free role host -----------------------------------------
 # No TMAT_PANE, no tmux, no live TUI — just `baton serve --agent-cmd`.
@@ -103,10 +108,9 @@ echo "external-agent-proof: launching '$AGENT_BIN' as a served role in $REPO"
   --agent-cmd "$AGENT_BIN" \
   --agent-cwd "$REPO" \
   --agent-timeout-ms "$AGENT_TIMEOUT_MS" \
+  --agent-system "$ROLE_FILE" \
   --agent-arg -p \
-  --agent-arg --dangerously-skip-permissions \
-  --agent-arg --append-system-prompt \
-  --agent-arg "$ROLE_PROMPT" &
+  --agent-arg --dangerously-skip-permissions &
 SERVE_PID=$!
 
 send_round() {
