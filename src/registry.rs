@@ -46,6 +46,12 @@ pub struct MailboxRef {
     pub inbox: PathBuf,
     /// Directory the correlated reply is awaited from (the peer's outbox).
     pub outbox: PathBuf,
+    /// Per-role max-runtime threshold, in milliseconds, above which a claim is
+    /// read as `crashed-stale` by `baton status`. Optional and back-compatible:
+    /// an omitted value leaves the threshold to the `status` caller (its
+    /// `--max-runtime-ms` override or the documented default).
+    #[serde(default)]
+    pub max_runtime_ms: Option<u64>,
 }
 
 /// A static name → mailbox registry, loaded once at startup.
@@ -139,6 +145,7 @@ mod tests {
             &MailboxRef {
                 inbox: PathBuf::from("/tmp/bob/inbox"),
                 outbox: PathBuf::from("/tmp/bob/outbox"),
+                max_runtime_ms: None,
             }
         );
         assert_eq!(
