@@ -23,6 +23,33 @@ status` for reporting a mailbox's liveness (`idle-done` / `busy` / `crashed-stal
 plus queue depth), and `baton log` for inspecting and replaying the recorded
 exchange trail.
 
+## Install
+
+Install the `baton` binary from a pinned git tag with a Rust toolchain (≥ 1.89):
+
+```bash
+cargo install --git https://github.com/shukebeta/baton --tag v0.1.0 --locked
+```
+
+This puts `baton` on your PATH — the form a consumer that invokes baton as a
+binary uses. The `--locked` flag is **required**: without it `cargo install
+--git` ignores the tracked `Cargo.lock` and resolves fresh dependency versions,
+losing the reproducibility the lockfile exists to guarantee. `--tag <tag>` pins
+the build to a blessed commit; `cargo install --git … --rev <sha> --locked` pins
+just as immutably if you prefer a raw SHA — the tag is the human-memorable name
+and GitHub releases anchor over it.
+
+Consumers stay frozen by pinning a tag, and upgrade by re-pinning a newer tag
+deliberately. Pinning is the churn-control mechanism.
+
+**Stability is an explicit non-goal at 0.1.0.** Neither the Rust library API nor
+the CLI flag surface is promised stable; the CLI is only the *intended*
+integration surface, and pinning a tag is how a consumer insulates itself from
+change. This release ships no crates.io publish, no prebuilt or cross-platform
+binaries (no homebrew / apt), and no supported library-dependency recipe — baton
+compiles as lib+bin, but crate consumption is unsupported at 0.1.0 because the
+module layout is intentionally thin and will be reworked.
+
 ## Quickstart
 
 To see the whole A2A loop end-to-end — reproducibly, with no API key and no
