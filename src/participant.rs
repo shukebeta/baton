@@ -74,6 +74,8 @@ impl<T: Transport> Participant for LocalParticipant<T> {
             model: self.meta.model.clone(),
             base_url: self.meta.base_url.clone(),
             prompt: request.body.clone(),
+            session_id: None,
+            turn_index: None,
         };
 
         let (kind, body, outcome) = match result {
@@ -766,6 +768,8 @@ pub mod testing {
                         model: "fake-model".to_string(),
                         base_url: "fake-base-url".to_string(),
                         prompt: request.body.clone(),
+                        session_id: None,
+                        turn_index: None,
                     },
                     outcome: Outcome::Ok {
                         ts_ms: request.ts_ms + 1,
@@ -1048,6 +1052,8 @@ mod tests {
                 model: "claude-test-model".to_string(),
                 base_url: "https://api.anthropic.com".to_string(),
                 prompt: "what is 2+2?".to_string(),
+                session_id: None,
+                turn_index: None,
             },
             outcome: Outcome::Error {
                 ts_ms: 1_700_000_000_002,
@@ -1446,6 +1452,8 @@ mod tests {
                     model: "peer-model".to_string(),
                     base_url: "https://peer".to_string(),
                     prompt: request.body.clone(),
+                    session_id: None,
+                    turn_index: None,
                 },
                 outcome: Outcome::Ok {
                     ts_ms: request.ts_ms + 1,

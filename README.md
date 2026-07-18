@@ -119,7 +119,7 @@ Baton reads its runtime configuration from environment variables:
 | `BATON_SYSTEM_PROMPT`        | no       | — (no system prompt)        | Path to a markdown file whose content is sent as the request's `system` field. Missing/unreadable file is a startup error. |
 | `BATON_MAX_TURNS`            | no       | `8`                         | `baton converse` hard turn-cap: the maximum number of reply turns before the run ends (positive integer; zero is rejected). |
 | `BATON_TOKEN_BUDGET`         | no       | — (disabled)                | `baton converse` cumulative token budget across all replies' reported usage; the run ends once it is exceeded (positive integer; zero is rejected). Unset disables the arm. |
-| `BATON_EVENT_LOG`            | no       | — (disabled)                | File path for the JSONL exchange-event trail (see below). |
+| `BATON_EVENT_LOG`            | no       | — (disabled)                | File path for the JSONL exchange-event trail, opened in append mode. Also carries the `baton session` [session trail](#session-trail) (session start/end markers + per-turn `session_id` / `turn_index`). See below. |
 
 Exactly one credential variable is required. The first one that is set (in
 precedence `ANTHROPIC_API_KEY` > `ANTHROPIC_AUTH_TOKEN` > `CLAUDE_CODE_OAUTH_TOKEN`)
@@ -196,8 +196,12 @@ Brazil, 3–0.
 - A turn that fails (rate limit, transport error, …) is **not** fatal: the
   error is printed to stderr, the failed turn is dropped from the history, and
   the REPL continues so you can retry.
-- History lives only in memory: it is not persisted across process restarts,
-  and there are no named sessions or session IDs yet.
+- History lives only in memory: it is not persisted across process restarts.
+  Setting `BATON_EVENT_LOG` records a real-time, self-delimiting JSONL **session
+  trail** — a `session_id`, per-turn `turn_index`, and session start/end markers —
+  that a single file (or a shared append log) is unambiguously partitionable back
+  into whole sessions (see [Session trail](#session-trail)). Resuming a session
+  from its trail is not yet supported.
 
 ## Provider transport
 
@@ -257,11 +261,13 @@ a `ts_ms` wall-clock timestamp (Unix epoch milliseconds). One exchange emits a
 {"event":"response_ok","schema":"baton.exchange/v1","ts_ms":1700000000420,"duration_ms":418,"reply":"Hi there!","input_tokens":9,"output_tokens":3}
 ```
 
-| `event`          | Fields beyond `schema` / `ts_ms`                          | Meaning                                              |
-| ---------------- | --------------------------------------------------------- | ---------------------------------------------------- |
-| `request`        | `model`, `base_url`, `prompt`                             | Emitted before the call; carries enough to replay it. |
-| `response_ok`    | `duration_ms`, `reply`, `input_tokens`, `output_tokens`   | The call succeeded.                                  |
-| `response_error` | `duration_ms`, `kind`, `message`                          | The call failed; `kind` is the stable machine class. |
+| `event`          | Fields beyond `schema` / `ts_ms`                            | Meaning                                              |
+| ---------------- | ----------------------------------------------------------- | ---------------------------------------------------- |
+| `request`        | `model`, `base_url`, `prompt`, `session_id?`, `turn_index?` | Emitted before the call; carries enough to replay it. `session_id` / `turn_index` are present only on a `session` turn (see below). |
+| `response_ok`    | `duration_ms`, `reply`, `input_tokens`, `output_tokens`     | The call succeeded.                                  |
+| `response_error` | `duration_ms`, `kind`, `message`                            | The call failed; `kind` is the stable machine class. |
+| `session_start`  | `session_id`                                                | Emitted once at the start of a `baton session` run.  |
+| `session_end`    | `session_id`, `turns`                                       | Emitted once on a clean session exit (EOF / `/exit`); `turns` is the turn count. |
 
 `input_tokens` / `output_tokens` are the provider-reported token counts for the
 call. They are **optional**: a `2xx` response that omits the `usage` block (or a
@@ -288,6 +294,35 @@ rather than failing the command. The schema is per-exchange: each line is one
 request or one outcome, and a session turn's `request` carries that turn's user
 input as `prompt` (the full accumulated history is not aggregated into a single
 schema object).
+
+### Session trail
+
+A `baton session` run frames its turns so a single file — or a shared append log
+holding several runs — is unambiguously partitionable back into whole sessions,
+without guessing from line ordering:
+
+- One `session_start` line opens the run and stamps a `session_id` unique to that
+  process.
+- Each turn's `request` carries that same `session_id` plus a monotonic
+  `turn_index` (starting at 0), so every turn is placed within its session. A
+  failed turn still emits its `request` and advances the index.
+- One `session_end` line closes the run on a clean exit (EOF / `/exit`), carrying
+  the `session_id` and the total `turns` count.
+
+```jsonl
+{"event":"session_start","schema":"baton.exchange/v1","ts_ms":1700000000000,"session_id":"sess-4171-1700000000000"}
+{"event":"request","schema":"baton.exchange/v1","ts_ms":1700000000001,"model":"claude-sonnet-4-6","base_url":"https://api.anthropic.com","prompt":"hello","session_id":"sess-4171-1700000000000","turn_index":0}
+{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":1700000000420,"duration_ms":418,"reply":"Hi there!","input_tokens":9,"output_tokens":3}
+{"event":"session_end","schema":"baton.exchange/v1","ts_ms":1700000000500,"session_id":"sess-4171-1700000000000","turns":1}
+```
+
+Partitioning keys on `session_id`, **not** on a matched start/end pair: a session
+killed mid-run leaves a `session_start` and its turns but no `session_end`, and is
+still recovered as one whole session (its final line may be torn — the same
+partial-trail tolerance above covers it). The `ask` path is unframed: its
+`request` line omits `session_id` / `turn_index` and belongs to no session. The
+`session_start` / `session_end` markers ride the same `baton.exchange/v1` trail;
+`baton log show` / `replay` skip them, so they are unaffected.
 
 ## Inspecting and replaying the trail
 
