@@ -31,3 +31,24 @@ jobs:
 
       - name: Test
         run: cargo test --verbose
+
+  # Verifies the declared MSRV floor so `cargo install --tag <tag> --locked`
+  # can't silently break for a consumer on the exact rustc the README promises.
+  # Build/test only — no fmt/clippy (their output is toolchain-version-specific).
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rust toolchain
+        # Exact pin tracks Cargo.toml `rust-version`; update both together (#96 AC 4).
+        uses: dtolnay/rust-toolchain@1.89.0
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (locked)
+        run: cargo build --locked --verbose
+
+      - name: Test (locked)
+        run: cargo test --locked --verbose
