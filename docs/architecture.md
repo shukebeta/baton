@@ -12,8 +12,8 @@ Baton is an **A2A-first harness**: its subject is one agent sending another a
 structured message and getting a correlated, recorded reply — not a human
 chatting with a model. The chat-style single-turn verbs (`ask`, `session`)
 exist, but they are the shallow end; the centre of gravity is the
-`baton.message/v1` envelope (see [README §A2A message
-envelope](../README.md#a2a-message-envelope-batonmessagev1)) flowing between
+`baton.message/v1` envelope (see [protocol.md §A2A message
+envelope](protocol.md#a2a-message-envelope-batonmessagev1)) flowing between
 independent participants, with every provider call recorded in-band as a nested
 `baton.exchange/v1` record so a conversation is observable and replayable after
 the fact.
