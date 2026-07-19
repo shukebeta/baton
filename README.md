@@ -40,7 +40,8 @@ just as immutably if you prefer a raw SHA — the tag is the human-memorable nam
 and GitHub releases anchor over it.
 
 Consumers stay frozen by pinning a tag, and upgrade by re-pinning a newer tag
-deliberately. Pinning is the churn-control mechanism.
+deliberately. Pinning is the churn-control mechanism. [`CHANGELOG.md`](CHANGELOG.md)
+is the curated record of what each tag bump includes — read it before re-pinning.
 
 **Stability is an explicit non-goal at 0.1.0.** Neither the Rust library API nor
 the CLI flag surface is promised stable; the CLI is only the *intended*
