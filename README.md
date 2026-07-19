@@ -23,6 +23,17 @@ status` for reporting a mailbox's liveness (`idle-done` / `busy` / `crashed-stal
 plus queue depth), and `baton log` for inspecting and replaying the recorded
 exchange trail.
 
+## Documentation
+
+New here? Start with the conceptual map, then use the reference below.
+
+- [docs/architecture.md](docs/architecture.md) — what Baton is, the **two
+  participant paths** (external-agent wrapper vs. Baton-owned Messages client),
+  the module layout, and the CLI-verb → A2A-model map. Read this first.
+
+The rest of this README is the CLI/reference surface; protocol-reference
+sections are being extracted into `docs/` incrementally.
+
 ## Install
 
 Install the `baton` binary from a pinned git tag with a Rust toolchain (≥ 1.89):
