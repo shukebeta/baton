@@ -223,6 +223,68 @@ each party in an N-party ring is its own `serve --role` daemon, so identity land
 there while the [routing registry](#routing-registry-name--mailbox) stays pure
 routing and references roles by name only.
 
+### Provider configuration — recorded decision
+
+This records *why* provider access is configured the way it is above, and the
+explicit conditions under which that changes. It is a decision record, not a
+new mechanism — nothing here adds a config file type, field, or precedence tier.
+
+**1. Identity is inlined by reference.** A role reaches a provider through a
+`base_url` plus a **credential reference** — the name of the env var holding the
+secret, never the secret itself (`{ "kind": "api_key"|"oauth", "env": "<VAR>" }`).
+These resolve through the layered chain `env > role config.json > defaults.json >
+built-in`. `defaults.json` is the single shared bucket every role inherits, so one
+shared account is written there once and referenced by every role that uses it.
+
+**2. No backend entity now.** Baton does not add a named `backends/<name>.json`
+record, a role `backend:` reference, or the resulting per-field 6-tier precedence
+chain. The only thing that would drive such an entity is **≥2 distinct** shared
+provider groups — which the single `defaults.json` bucket cannot express — and
+that need is not present in Baton's own `roles/` usage. Deferring costs nothing
+compounding: adding `backend: Option<String>` to `RoleConfig` later is
+non-breaking (config fields are `#[serde(default)] Option<_>`, and
+`deny_unknown_fields` rejects only *unknown* keys, not newly-added ones), and
+retrofitting existing roles onto a shared record is linear whenever it is done.
+The full shape to build when that day comes is preserved in issue #84.
+
+**3. No dialect-dispatch seam now.** There is one `Transport` implementation
+(`ClaudeClient`) and one wire dialect. A protocol-keyed dispatch with a single
+registered arm is dead scaffolding, so no `protocol`/`kind`/`dialect` field or
+dispatch registry is added until a second dialect is real work. When it is, a
+plain field named `protocol` reads distinctly from the harness-level `kind` and
+from `CredentialRef.kind`.
+
+**4. Per-worker tuning stays on the worker.** A role carries not only *which
+account it reaches* but *how it runs against it* — today `model`, and plausibly a
+future `effort`/reasoning-level knob. (On this transport path `effort` would map
+to the Messages API `thinking: { budget_tokens }` param, which the transport does
+not yet send — so it is a transport feature, not a free field, and is likewise
+not built now.) Two roles on the *same* provider and token legitimately differ in
+model and effort. This tuning is a separate axis from the shared
+`base_url`+`credential` a backend entity would hold: when that entity lands,
+tuning stays on the worker, never on the backend.
+
+**When to revisit.** Reopen this decision when an operator configures **a second
+distinct non-default provider group** — a shared `base_url`/`credential.env` pair
+across ≥2 roles that the single `defaults.json` bucket cannot hold — **or** when a
+second wire dialect is needed. A single shared non-default pair is *not* the
+trigger: it hoists into `defaults.json`. The near-term archetype is roles split
+across **Anthropic + z.ai (GLM) + MiniMax** — all the same `claude` wire dialect
+(so not a dialect trigger), but each a distinct `base_url` + `credential.env`.
+`defaults.json` can hold one as the default; the second and third distinct groups
+are exactly what one bucket cannot express, and are the trigger.
+
+**Designated first step when the trigger fires (recorded, not built).** The first
+thing to build then is a cross-role **coupling view** extending `baton roles`
+(today a name-only lister): resolve every role's effective identity and report,
+grouped by shared value, the roles sharing the same non-default `base_url` and/or
+`credential.env` — credentials shown in reference form only (`kind (env NAME)`),
+never a resolved secret — distinguishing `defaults.json`-inherited pairs (already
+one-edit atomic) from per-role inliners. It gives operators an auditable
+pre-migration checklist and sizes the eventual backend entity. Its value is empty
+until the trigger fires, so its shape is recorded here only so nothing is
+re-derived.
+
 ### Per-role session recording
 
 A role's home also holds its **history**. The unit is the *session* — the whole
