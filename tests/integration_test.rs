@@ -1555,6 +1555,10 @@ fn converse_b_mailbox_times_out_when_no_peer_answers() {
 /// `CARGO_BIN_EXE_*`; the test builds it explicitly and derives its path from
 /// the `baton` bin's directory, so the run never depends on cargo's example
 /// build-ordering.
+///
+/// Unix-only: `quickstart.sh` is a bash artifact and the mock binary carries no
+/// `.exe` suffix, so the harness assumptions hold on Unix (Linux + macOS) only.
+#[cfg(unix)]
 #[test]
 fn quickstart_script_runs_full_loop_against_mock() {
     // Build the mock example explicitly (idempotent / cached) so its compiled
