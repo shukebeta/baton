@@ -11,7 +11,7 @@
 //! confidence that the same logic survives a real `ureq` round-trip.
 
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -32,6 +32,50 @@ const SUCCESS_BODY: &str = r#"{
     "stop_reason": "end_turn",
     "usage": {"input_tokens": 9, "output_tokens": 3}
 }"#;
+
+/// Reads a complete HTTP request before the mock writes a response. Closing a
+/// socket with unread request body bytes can cause Windows to reset the
+/// connection instead of delivering that response.
+fn drain_request(stream: &mut TcpStream) -> Vec<u8> {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut request = Vec::new();
+    let mut chunk = [0u8; 4096];
+
+    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return request,
+            Ok(read) => request.extend_from_slice(&chunk[..read]),
+        }
+    }
+
+    let header_end = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("request headers were read")
+        + 4;
+    let content_length = std::str::from_utf8(&request[..header_end])
+        .ok()
+        .and_then(|headers| {
+            headers.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+        });
+
+    let Some(content_length) = content_length else {
+        return request;
+    };
+    let body_end = header_end + content_length;
+    while request.len() < body_end {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => request.extend_from_slice(&chunk[..read]),
+        }
+    }
+    request
+}
 
 #[test]
 fn global_help_and_version_flags_succeed_without_configuration() {
@@ -93,11 +137,9 @@ impl MockServer {
         let handle = thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(mut stream) = conn else { break };
-                // Drain the request so the client's `send` returns, then write
-                // the canned response. One request/response per connection.
-                let mut buf = [0u8; 4096];
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                let _ = stream.read(&mut buf);
+                // Drain the request before replying. One request/response per
+                // connection.
+                let _ = drain_request(&mut stream);
 
                 let response = format!(
                     "HTTP/1.1 {status} {}\r\n\
@@ -132,9 +174,7 @@ impl MockServer {
                     // writing, then sleep past any reasonable timeout to
                     // keep the connection open. The client must time out on
                     // its own — we never write a response.
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                    let mut buf = [0u8; 4096];
-                    let _ = stream.read(&mut buf);
+                    let _ = drain_request(&mut stream);
                     thread::sleep(Duration::from_secs(30));
                     return;
                 }
@@ -143,9 +183,7 @@ impl MockServer {
                 // status-mapping tests, but we must read it so the client's
                 // `send` returns; otherwise the OS buffer fills and the
                 // server-side write blocks.
-                let mut buf = [0u8; 4096];
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                let _ = stream.read(&mut buf);
+                let _ = drain_request(&mut stream);
 
                 let response = format!(
                     "HTTP/1.1 {status} {}\r\n\
@@ -308,19 +346,7 @@ fn request_carries_expected_headers() {
 
     let _server = thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-            // Read until we've seen the end-of-headers marker. The body
-            // bytes may still be in flight; we don't need them for header
-            // assertions.
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                match stream.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                    Err(_) => break,
-                }
-            }
+            let buf = drain_request(&mut stream);
             *captured_for_thread.lock().unwrap() = Some(String::from_utf8_lossy(&buf).into_owned());
 
             let response = format!(
@@ -381,16 +407,7 @@ fn request_carries_bearer_auth_header_for_oauth_credential() {
 
     let _server = thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                match stream.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                    Err(_) => break,
-                }
-            }
+            let buf = drain_request(&mut stream);
             *captured_for_thread.lock().unwrap() = Some(String::from_utf8_lossy(&buf).into_owned());
 
             let response = format!(
