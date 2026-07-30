@@ -1286,7 +1286,9 @@ mod tests {
         assert_eq!(response.kind, MessageKind::Response);
         assert_eq!(response.body.trim(), "shim response");
         assert_eq!(
-            std::fs::read_to_string(dir.path.join("request.txt")).expect("stdin side effect"),
+            std::fs::read_to_string(dir.path.join("request.txt"))
+                .expect("stdin side effect")
+                .trim_end(),
             "shim request"
         );
         assert_eq!(
