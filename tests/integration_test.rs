@@ -1726,20 +1726,28 @@ fn converse_ring_drives_three_live_serve_peers() {
 
     // A registry mapping each roster name to its own mailbox pair (a pair, not a
     // single path). Absolute paths so the driver resolves them regardless of cwd.
-    let registry_json = format!(
-        r#"{{
-            "participants": {{
-                "alice": {{ "inbox": "{a}/inbox", "outbox": "{a}/outbox" }},
-                "bob":   {{ "inbox": "{b}/inbox", "outbox": "{b}/outbox" }},
-                "carol": {{ "inbox": "{c}/inbox", "outbox": "{c}/outbox" }}
-            }}
-        }}"#,
-        a = alice.to_str().unwrap(),
-        b = bob.to_str().unwrap(),
-        c = carol.to_str().unwrap(),
-    );
+    let registry_json = serde_json::json!({
+        "participants": {
+            "alice": {
+                "inbox": alice.join("inbox").to_string_lossy(),
+                "outbox": alice.join("outbox").to_string_lossy(),
+            },
+            "bob": {
+                "inbox": bob.join("inbox").to_string_lossy(),
+                "outbox": bob.join("outbox").to_string_lossy(),
+            },
+            "carol": {
+                "inbox": carol.join("inbox").to_string_lossy(),
+                "outbox": carol.join("outbox").to_string_lossy(),
+            },
+        },
+    });
     let registry_path = root.path.join("registry.json");
-    std::fs::write(&registry_path, registry_json).expect("write registry");
+    std::fs::write(
+        &registry_path,
+        serde_json::to_string(&registry_json).expect("serialize registry"),
+    )
+    .expect("write registry");
 
     // Three independent peers; each is a full `baton serve` daemon.
     let mut alice_child = spawn_ring_serve(&alice, server.base_url(), "model-alice");
@@ -1824,17 +1832,24 @@ fn converse_ring_unknown_roster_name_is_startup_error() {
     // A roster name absent from the registry must fail fast at startup — before
     // any turn runs and without needing a live peer.
     let root = TempMailbox::new("ring-unknown");
-    let registry_json = format!(
-        r#"{{
-            "participants": {{
-                "alice": {{ "inbox": "{r}/alice/inbox", "outbox": "{r}/alice/outbox" }},
-                "bob":   {{ "inbox": "{r}/bob/inbox",   "outbox": "{r}/bob/outbox" }}
-            }}
-        }}"#,
-        r = root.path.to_str().unwrap(),
-    );
+    let registry_json = serde_json::json!({
+        "participants": {
+            "alice": {
+                "inbox": root.path.join("alice/inbox").to_string_lossy(),
+                "outbox": root.path.join("alice/outbox").to_string_lossy(),
+            },
+            "bob": {
+                "inbox": root.path.join("bob/inbox").to_string_lossy(),
+                "outbox": root.path.join("bob/outbox").to_string_lossy(),
+            },
+        },
+    });
     let registry_path = root.path.join("registry.json");
-    std::fs::write(&registry_path, registry_json).expect("write registry");
+    std::fs::write(
+        &registry_path,
+        serde_json::to_string(&registry_json).expect("serialize registry"),
+    )
+    .expect("write registry");
 
     let mut ring = Command::new(env!("CARGO_BIN_EXE_baton"));
     ring.args([
