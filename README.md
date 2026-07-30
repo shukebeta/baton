@@ -820,7 +820,9 @@ baton serve --inbox <dir> --outbox <dir> \
   --agent-arg -p --agent-arg --dangerously-skip-permissions
 ```
 
-- `--agent-cmd <program>` — the agent CLI to run once per message.
+- `--agent-cmd <program>` — the agent CLI to run once per message. On Windows,
+  use the installed CLI command name (for example, `claude` or `codex`); Baton
+  resolves its `.cmd` shim.
 - `--agent-arg <arg>` — a fixed argument passed on every run (repeatable), e.g.
   headless/role flags. The request body is delivered on the agent's **stdin**;
   the agent's final **stdout** becomes the reply body (see the output adapter
