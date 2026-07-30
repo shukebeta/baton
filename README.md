@@ -37,6 +37,10 @@ New here? Start with the conceptual map, then use the reference below.
 
 The rest of this README is the CLI/reference surface.
 
+Run `baton --help` (or `baton -h`) for the current command synopsis. Run
+`baton --version` (or `baton -V`) to print the installed crate version. These
+global flags need no Baton configuration or provider credentials.
+
 ## Install
 
 Install the `baton` binary from a pinned git tag with a Rust toolchain (≥ 1.89):

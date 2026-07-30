@@ -33,6 +33,32 @@ const SUCCESS_BODY: &str = r#"{
     "usage": {"input_tokens": 9, "output_tokens": 3}
 }"#;
 
+#[test]
+fn global_help_and_version_flags_succeed_without_configuration() {
+    for (flag, expected) in [
+        ("--help", "Global options:"),
+        ("-h", "Global options:"),
+        ("--version", env!("CARGO_PKG_VERSION")),
+        ("-V", env!("CARGO_PKG_VERSION")),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .arg(flag)
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+            .output()
+            .expect("run baton global flag");
+        assert!(
+            out.status.success(),
+            "{flag} should succeed; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stderr.is_empty(), "{flag} stderr must be empty");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains(expected), "{flag} stdout: {stdout}");
+    }
+}
+
 /// A single-shot mock HTTP server bound to a kernel-assigned port on
 /// `127.0.0.1`. The first request receives `status` + `body` and the
 /// connection is closed. `hold_open` controls whether the connection is

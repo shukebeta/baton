@@ -92,6 +92,11 @@ const SESSION_EXIT_COMMAND: &str = "/exit";
 /// A parsed CLI invocation.
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
+    /// Print the command synopsis and global options without loading runtime
+    /// configuration.
+    Help,
+    /// Print the crate release version without loading runtime configuration.
+    Version,
     /// Send a single prompt and print the assistant reply.
     Ask { prompt: String },
     /// Start an interactive multi-turn REPL. `resume` is `None` for a fresh
@@ -293,6 +298,14 @@ enum SendSource {
 pub fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse_args(&args)? {
+        Command::Help => {
+            let stdout = std::io::stdout();
+            execute_help(stdout.lock())
+        }
+        Command::Version => {
+            let stdout = std::io::stdout();
+            execute_version(stdout.lock())
+        }
         Command::Ask { prompt } => {
             let config = BatonConfig::from_env()?;
             let meta = exchange_meta(&config);
@@ -752,6 +765,23 @@ pub fn run() -> Result<()> {
             execute_role_show(&name, &identity, stdout.lock())
         }
     }
+}
+
+/// Prints the command synopsis and the top-level flags. Parameterised over
+/// [`Write`] so the exact operator-facing text is unit-testable.
+fn execute_help(mut out: impl Write) -> Result<()> {
+    writeln!(out, "{USAGE}").map_err(io_err)?;
+    writeln!(out).map_err(io_err)?;
+    writeln!(out, "Global options:").map_err(io_err)?;
+    writeln!(out, "  -h, --help     Print help and exit.").map_err(io_err)?;
+    writeln!(out, "  -V, --version  Print version and exit.").map_err(io_err)?;
+    Ok(())
+}
+
+/// Prints the release version. Parameterised over [`Write`] so the stable
+/// output contract is unit-testable.
+fn execute_version(mut out: impl Write) -> Result<()> {
+    writeln!(out, "baton {}", env!("CARGO_PKG_VERSION")).map_err(io_err)
 }
 
 /// Prints the role names, one per line. An empty roster writes nothing.
@@ -1822,6 +1852,8 @@ fn parse_args(args: &[String]) -> Result<Command> {
     let mut iter = args.iter();
     let command = iter.next().ok_or_else(|| usage("no command given"))?;
     match command.as_str() {
+        "--help" | "-h" => Ok(Command::Help),
+        "--version" | "-V" => Ok(Command::Version),
         "ask" => parse_ask(iter),
         "session" => parse_session(iter),
         "exchange" => parse_exchange(iter),
@@ -2800,6 +2832,41 @@ mod tests {
             Command::Ask {
                 prompt: "hi there".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn parses_global_help_and_version_flags_only_as_first_token() {
+        for flag in ["--help", "-h"] {
+            assert_eq!(parse_args(&argv(&[flag])).expect("parses"), Command::Help);
+        }
+        for flag in ["--version", "-V"] {
+            assert_eq!(
+                parse_args(&argv(&[flag])).expect("parses"),
+                Command::Version
+            );
+        }
+        assert!(matches!(
+            parse_args(&argv(&["ask", "--help"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn help_and_version_renderers_document_all_aliases() {
+        let mut help = Vec::new();
+        execute_help(&mut help).expect("render help");
+        let help = String::from_utf8(help).expect("UTF-8 help");
+        assert!(help.starts_with(USAGE));
+        for alias in ["-h", "--help", "-V", "--version"] {
+            assert!(help.contains(alias), "help documents {alias}: {help}");
+        }
+
+        let mut version = Vec::new();
+        execute_version(&mut version).expect("render version");
+        assert_eq!(
+            String::from_utf8(version).expect("UTF-8 version"),
+            format!("baton {}\n", env!("CARGO_PKG_VERSION"))
         );
     }
 
