@@ -550,9 +550,20 @@ fn capture_child_stdout(
     payload: &[u8],
     read_timeout: Duration,
 ) -> Result<String> {
+    // `CreateProcessW` does not consult `PATHEXT`, so `Command::new` cannot
+    // resolve an installed Windows CLI's `.cmd` shim by its command name.
+    // `cmd /C` performs that resolution for both participant implementations.
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        command.args(["/D", "/S", "/C"]).arg(program).args(args);
+        command
+    };
+    #[cfg(not(windows))]
     let mut command = Command::new(program);
+    #[cfg(not(windows))]
+    command.args(args);
     command
-        .args(args)
         .envs(envs.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1241,6 +1252,47 @@ mod tests {
         // The request body was delivered on the agent's stdin...
         let stdin_seen = std::fs::read_to_string(dir.path.join("round1.txt")).expect("side effect");
         assert_eq!(stdin_seen, "please edit round1.txt");
+    }
+
+    /// On Windows, an installed agent CLI commonly has a `.cmd` shim. `cmd`
+    /// resolves that shim by command name from PATH; the shim still receives
+    /// the request on stdin and runs in the participant's configured cwd.
+    #[cfg(windows)]
+    #[test]
+    fn external_agent_resolves_cmd_shim_by_command_name() {
+        let dir = TempDir::new("ext-cmd-shim");
+        let shim = dir.path.join("baton-test-agent.cmd");
+        std::fs::write(
+            &shim,
+            "@echo off\r\nmore > request.txt\r\n> argument.txt <nul set /p =%~1\r\necho shim response\r\n",
+        )
+        .expect("write cmd shim");
+        let path = format!(
+            "{};{}",
+            dir.path.display(),
+            std::env::var("PATH").expect("PATH is set")
+        );
+        let participant = ExternalAgentParticipant::new(
+            "baton-test-agent",
+            ["agent argument"],
+            [("PATH", path)],
+            &dir.path,
+            OutputAdapter::Raw,
+            Duration::from_secs(5),
+        );
+
+        let response = participant.respond(&request_with_body("m-req-1", "shim request"));
+
+        assert_eq!(response.kind, MessageKind::Response);
+        assert_eq!(response.body.trim(), "shim response");
+        assert_eq!(
+            std::fs::read_to_string(dir.path.join("request.txt")).expect("stdin side effect"),
+            "shim request"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path.join("argument.txt")).expect("argument side effect"),
+            "agent argument"
+        );
     }
 
     /// Two sequential runs over the *same cwd*: the second run observes the
