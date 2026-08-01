@@ -514,7 +514,7 @@ fn deliver_into_pending(pending: &Path, envelope: &MessageEnvelope) -> Result<()
 }
 
 /// The on-disk filename for a message key.
-fn file_name(key: &str) -> String {
+pub(crate) fn file_name(key: &str) -> String {
     format!("{key}.json")
 }
 
@@ -533,21 +533,25 @@ fn read_envelope(path: &Path) -> Result<MessageEnvelope> {
 }
 
 /// Reads a directory, mapping the open failure to a [`BatonError::Io`].
-fn read_dir(dir: &Path) -> Result<fs::ReadDir> {
+///
+/// `pub(crate)`: also the directory-scan primitive for [`crate::service`]'s
+/// control-plane request/session directories, which follow this same
+/// atomic-rename-on-local-fs style.
+pub(crate) fn read_dir(dir: &Path) -> Result<fs::ReadDir> {
     fs::read_dir(dir)
         .map_err(|err| BatonError::Io(format!("could not read mailbox directory {dir:?}: {err}")))
 }
 
 /// Unwraps one directory entry, mapping the per-entry read failure to a
 /// [`BatonError::Io`] that names the directory being scanned.
-fn dir_entry(entry: std::io::Result<fs::DirEntry>, dir: &Path) -> Result<fs::DirEntry> {
+pub(crate) fn dir_entry(entry: std::io::Result<fs::DirEntry>, dir: &Path) -> Result<fs::DirEntry> {
     entry.map_err(|err| BatonError::Io(format!("could not read an entry in {dir:?}: {err}")))
 }
 
 /// The path-safe message key for a `<key>.json` file, or `None` for anything
 /// else (a non-`.json` file, a temp file, or an unsafe stem — guarding against
 /// path traversal via a hostile filename).
-fn json_key(path: &Path) -> Option<String> {
+pub(crate) fn json_key(path: &Path) -> Option<String> {
     if path.extension().and_then(|e| e.to_str()) != Some("json") {
         return None;
     }
@@ -575,7 +579,12 @@ pub(crate) fn is_safe_key(key: &str) -> bool {
 /// the same directory (so the `rename` stays on one filesystem and is atomic),
 /// then `rename` over the destination. The temp name is `.`-prefixed and
 /// `.tmp`-suffixed so [`json_key`] never mistakes it for a message.
-fn atomic_write(dir: &Path, final_name: &str, contents: &str) -> Result<()> {
+///
+/// `pub(crate)`: this atomic-write idiom is not envelope-specific (it takes
+/// plain string contents), so [`crate::service`]'s control-plane files
+/// (session-spec requests, responses, session records) reuse it directly
+/// rather than duplicating the temp-file-then-rename dance.
+pub(crate) fn atomic_write(dir: &Path, final_name: &str, contents: &str) -> Result<()> {
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!(".{final_name}.{}.{seq}.tmp", std::process::id()));
     {

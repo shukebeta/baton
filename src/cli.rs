@@ -44,6 +44,7 @@ use crate::participant::{
 };
 use crate::registry::Registry;
 use crate::roles::{Identity, RolesHome};
+use crate::service::{self, SessionSpec};
 use crate::transport::Transport;
 use crate::transport::claude::ClaudeClient;
 
@@ -52,7 +53,7 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session [--role <name>] [--resume <file> [--session <id>]] | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton serve --stop --inbox <dir> | baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]] | baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>... | baton roles | baton role show <name>";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session [--role <name>] [--resume <file> [--session <id>]] | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton serve --stop --inbox <dir> | baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]] | baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>... | baton roles | baton role show <name> | baton service run --control <dir> | baton service start --control <dir> --inbox <dir> --outbox <dir> [--poll-ms <n>] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton service status --control <dir> [--session <id>] | baton service stop --control <dir> --session <id> | baton service teardown --control <dir>";
 
 /// Default `baton serve` inbox poll interval, in milliseconds, when `--poll-ms`
 /// is unset.
@@ -244,6 +245,9 @@ enum Command {
     /// Print a role's effective resolved identity — each value and the layer it
     /// came from (`flag`/`env`/`role`/`defaults`/`default`).
     RoleShow { name: String },
+    /// A host-owned `baton service` supervisor invocation — see
+    /// [`crate::service`].
+    Service(service::ServiceCommand),
 }
 
 /// Selects the session trail to rehydrate for `baton session --resume`.
@@ -748,6 +752,10 @@ pub fn run() -> Result<()> {
             let identity = home.resolve_identity(&name, |key| std::env::var(key).ok())?;
             let stdout = std::io::stdout();
             execute_role_show(&name, &identity, stdout.lock())
+        }
+        Command::Service(cmd) => {
+            let stdout = std::io::stdout();
+            service::execute_service(cmd, stdout.lock())
         }
     }
 }
@@ -1821,6 +1829,7 @@ fn parse_args(args: &[String]) -> Result<Command> {
         "log" => parse_log(iter),
         "roles" => parse_roles(iter),
         "role" => parse_role(iter),
+        "service" => parse_service(iter),
         other => Err(usage(&format!("unknown command {other:?}"))),
     }
 }
@@ -2475,6 +2484,254 @@ fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command
     })
 }
 
+/// Parses the arguments following the `service` subcommand.
+///
+/// Requires a subcommand token (`run`/`start`/`status`/`stop`/`teardown`);
+/// each requires `--control <dir>` plus its own flags. An unknown subcommand
+/// is a usage error.
+fn parse_service<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let sub = iter
+        .next()
+        .ok_or_else(|| usage("service requires a subcommand: run|start|status|stop|teardown"))?;
+    match sub.as_str() {
+        "run" => parse_service_run(iter),
+        "start" => parse_service_start(iter),
+        "status" => parse_service_status(iter),
+        "stop" => parse_service_stop(iter),
+        "teardown" => parse_service_teardown(iter),
+        other => Err(usage(&format!("unknown service subcommand {other:?}"))),
+    }
+}
+
+/// Parses `baton service run --control <dir>`.
+fn parse_service_run<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut control: Option<String> = None;
+    while let Some(arg) = iter.next() {
+        let mut take = |flag: &str| -> Result<String> {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| usage(&format!("{flag} requires a value")))
+        };
+        match arg.as_str() {
+            "--control" => control = Some(take("--control")?),
+            other if other.starts_with("--control=") => {
+                control = Some(other["--control=".len()..].to_string());
+            }
+            other => return Err(usage(&format!("unexpected argument {other:?}"))),
+        }
+    }
+    let control = require_dir(control, "--control")?;
+    Ok(Command::Service(service::ServiceCommand::Run { control }))
+}
+
+/// Parses `baton service start --control <dir> --inbox <dir> --outbox <dir>
+/// [--poll-ms <n>] [--agent-cmd <program> [--agent-arg <arg>]...
+/// [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json
+/// [--agent-result-key <key>]]] [--role <name>]`.
+///
+/// The session-spec flags mirror `baton serve`'s exactly (see
+/// [`parse_serve`]) — same names, same "agent-run flags require --agent-cmd"
+/// and "--agent-result-key requires --agent-output json" rules — since `Run`
+/// reconstructs an equivalent `baton serve` argv from the submitted spec
+/// rather than translating through a second flag surface.
+fn parse_service_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut control: Option<String> = None;
+    let mut inbox: Option<String> = None;
+    let mut outbox: Option<String> = None;
+    let mut poll_ms: Option<u64> = None;
+    let mut agent_cmd: Option<String> = None;
+    let mut agent_args: Vec<String> = Vec::new();
+    let mut agent_cwd: Option<String> = None;
+    let mut agent_timeout_ms: Option<u64> = None;
+    let mut agent_output: Option<String> = None;
+    let mut agent_result_key: Option<String> = None;
+    let mut role: Option<String> = None;
+
+    while let Some(arg) = iter.next() {
+        let mut take = |flag: &str| -> Result<String> {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| usage(&format!("{flag} requires a value")))
+        };
+        match arg.as_str() {
+            "--control" => control = Some(take("--control")?),
+            other if other.starts_with("--control=") => {
+                control = Some(other["--control=".len()..].to_string());
+            }
+            "--inbox" => inbox = Some(take("--inbox")?),
+            other if other.starts_with("--inbox=") => {
+                inbox = Some(other["--inbox=".len()..].to_string());
+            }
+            "--outbox" => outbox = Some(take("--outbox")?),
+            other if other.starts_with("--outbox=") => {
+                outbox = Some(other["--outbox=".len()..].to_string());
+            }
+            "--poll-ms" => poll_ms = Some(parse_poll_ms(&take("--poll-ms")?)?),
+            other if other.starts_with("--poll-ms=") => {
+                poll_ms = Some(parse_poll_ms(&other["--poll-ms=".len()..])?);
+            }
+            "--agent-cmd" => agent_cmd = Some(take("--agent-cmd")?),
+            other if other.starts_with("--agent-cmd=") => {
+                agent_cmd = Some(other["--agent-cmd=".len()..].to_string());
+            }
+            "--agent-arg" => agent_args.push(take("--agent-arg")?),
+            other if other.starts_with("--agent-arg=") => {
+                agent_args.push(other["--agent-arg=".len()..].to_string());
+            }
+            "--agent-cwd" => agent_cwd = Some(take("--agent-cwd")?),
+            other if other.starts_with("--agent-cwd=") => {
+                agent_cwd = Some(other["--agent-cwd=".len()..].to_string());
+            }
+            "--agent-timeout-ms" => {
+                agent_timeout_ms = Some(parse_positive_ms(
+                    &take("--agent-timeout-ms")?,
+                    "--agent-timeout-ms",
+                )?)
+            }
+            other if other.starts_with("--agent-timeout-ms=") => {
+                agent_timeout_ms = Some(parse_positive_ms(
+                    &other["--agent-timeout-ms=".len()..],
+                    "--agent-timeout-ms",
+                )?);
+            }
+            "--agent-output" => agent_output = Some(take("--agent-output")?),
+            other if other.starts_with("--agent-output=") => {
+                agent_output = Some(other["--agent-output=".len()..].to_string());
+            }
+            "--agent-result-key" => agent_result_key = Some(take("--agent-result-key")?),
+            other if other.starts_with("--agent-result-key=") => {
+                agent_result_key = Some(other["--agent-result-key=".len()..].to_string());
+            }
+            "--role" => role = Some(take("--role")?),
+            other if other.starts_with("--role=") => {
+                role = Some(other["--role=".len()..].to_string());
+            }
+            other => return Err(usage(&format!("unexpected argument {other:?}"))),
+        }
+    }
+
+    // Same two guards as `parse_serve`: the agent-run flags only qualify
+    // `--agent-cmd`, and `--agent-result-key` only qualifies `--agent-output
+    // json`.
+    if agent_cmd.is_none()
+        && (!agent_args.is_empty()
+            || agent_cwd.is_some()
+            || agent_timeout_ms.is_some()
+            || agent_output.is_some()
+            || agent_result_key.is_some())
+    {
+        return Err(usage(
+            "--agent-arg/--agent-cwd/--agent-timeout-ms/--agent-output/--agent-result-key require --agent-cmd",
+        ));
+    }
+    if agent_result_key.is_some() && agent_output.as_deref() != Some("json") {
+        return Err(usage("--agent-result-key requires --agent-output json"));
+    }
+
+    let control = require_dir(control, "--control")?;
+    let inbox = require_dir(inbox, "--inbox")?;
+    let outbox = require_dir(outbox, "--outbox")?;
+    let spec = SessionSpec {
+        schema: service::SESSION_SPEC_SCHEMA.to_string(),
+        inbox,
+        outbox,
+        poll_ms,
+        agent_cmd,
+        agent_args,
+        agent_cwd,
+        agent_timeout_ms,
+        agent_output,
+        agent_result_key,
+        role,
+    };
+    Ok(Command::Service(service::ServiceCommand::Start {
+        control,
+        spec: Box::new(spec),
+    }))
+}
+
+/// Parses `baton service status --control <dir> [--session <id>]`.
+fn parse_service_status<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut control: Option<String> = None;
+    let mut session: Option<String> = None;
+    while let Some(arg) = iter.next() {
+        let mut take = |flag: &str| -> Result<String> {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| usage(&format!("{flag} requires a value")))
+        };
+        match arg.as_str() {
+            "--control" => control = Some(take("--control")?),
+            other if other.starts_with("--control=") => {
+                control = Some(other["--control=".len()..].to_string());
+            }
+            "--session" => session = Some(take("--session")?),
+            other if other.starts_with("--session=") => {
+                session = Some(other["--session=".len()..].to_string());
+            }
+            other => return Err(usage(&format!("unexpected argument {other:?}"))),
+        }
+    }
+    let control = require_dir(control, "--control")?;
+    Ok(Command::Service(service::ServiceCommand::Status {
+        control,
+        session,
+    }))
+}
+
+/// Parses `baton service stop --control <dir> --session <id>`.
+fn parse_service_stop<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut control: Option<String> = None;
+    let mut session: Option<String> = None;
+    while let Some(arg) = iter.next() {
+        let mut take = |flag: &str| -> Result<String> {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| usage(&format!("{flag} requires a value")))
+        };
+        match arg.as_str() {
+            "--control" => control = Some(take("--control")?),
+            other if other.starts_with("--control=") => {
+                control = Some(other["--control=".len()..].to_string());
+            }
+            "--session" => session = Some(take("--session")?),
+            other if other.starts_with("--session=") => {
+                session = Some(other["--session=".len()..].to_string());
+            }
+            other => return Err(usage(&format!("unexpected argument {other:?}"))),
+        }
+    }
+    let control = require_dir(control, "--control")?;
+    let session = require_value(session, "--session")?;
+    Ok(Command::Service(service::ServiceCommand::Stop {
+        control,
+        session,
+    }))
+}
+
+/// Parses `baton service teardown --control <dir>`.
+fn parse_service_teardown<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut control: Option<String> = None;
+    while let Some(arg) = iter.next() {
+        let mut take = |flag: &str| -> Result<String> {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| usage(&format!("{flag} requires a value")))
+        };
+        match arg.as_str() {
+            "--control" => control = Some(take("--control")?),
+            other if other.starts_with("--control=") => {
+                control = Some(other["--control=".len()..].to_string());
+            }
+            other => return Err(usage(&format!("unexpected argument {other:?}"))),
+        }
+    }
+    let control = require_dir(control, "--control")?;
+    Ok(Command::Service(service::ServiceCommand::Teardown {
+        control,
+    }))
+}
+
 /// Parses the arguments following the `send` subcommand.
 ///
 /// Requires `--inbox <dir>` and exactly one message source (`--body <text>` xor
@@ -2716,6 +2973,16 @@ fn require_dir(value: Option<String>, flag: &str) -> Result<String> {
     match value {
         Some(v) if !v.trim().is_empty() => Ok(v),
         _ => Err(usage(&format!("{flag} <dir> is required"))),
+    }
+}
+
+/// Requires a non-blank value for `flag` — like [`require_dir`], for a
+/// required string flag that is not itself a directory (e.g. `--session
+/// <id>`).
+fn require_value(value: Option<String>, flag: &str) -> Result<String> {
+    match value {
+        Some(v) if !v.trim().is_empty() => Ok(v),
+        _ => Err(usage(&format!("{flag} <value> is required"))),
     }
 }
 
@@ -4783,6 +5050,229 @@ mod tests {
             parse_args(&argv(&["serve", "--inbox"])).unwrap_err(),
             BatonError::Usage(_)
         ));
+    }
+
+    // -- service / parse_service ---------------------------------------------
+
+    #[test]
+    fn parse_service_missing_subcommand_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&["service"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_service_unknown_subcommand_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&["service", "nope"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_service_run_requires_control() {
+        assert!(matches!(
+            parse_args(&argv(&["service", "run"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_service_run_parses() {
+        assert_eq!(
+            parse_args(&argv(&["service", "run", "--control", "/tmp/ctl"])).expect("parses"),
+            Command::Service(service::ServiceCommand::Run {
+                control: "/tmp/ctl".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_service_start_requires_control_inbox_outbox() {
+        assert!(matches!(
+            parse_args(&argv(&[
+                "service", "start", "--inbox", "/tmp/in", "--outbox", "/tmp/out"
+            ]))
+            .unwrap_err(),
+            BatonError::Usage(_)
+        ));
+        assert!(matches!(
+            parse_args(&argv(&["service", "start", "--control", "/tmp/ctl"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_service_start_parses_minimal_spec() {
+        let cmd = parse_args(&argv(&[
+            "service",
+            "start",
+            "--control",
+            "/tmp/ctl",
+            "--inbox",
+            "/tmp/in",
+            "--outbox",
+            "/tmp/out",
+        ]))
+        .expect("parses");
+        match cmd {
+            Command::Service(service::ServiceCommand::Start { control, spec }) => {
+                assert_eq!(control, "/tmp/ctl");
+                assert_eq!(spec.inbox, "/tmp/in");
+                assert_eq!(spec.outbox, "/tmp/out");
+                assert_eq!(spec.schema, service::SESSION_SPEC_SCHEMA);
+                assert!(spec.agent_cmd.is_none());
+            }
+            other => panic!("expected Service(Start), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_service_start_parses_agent_flags() {
+        let cmd = parse_args(&argv(&[
+            "service",
+            "start",
+            "--control",
+            "/tmp/ctl",
+            "--inbox",
+            "/tmp/in",
+            "--outbox",
+            "/tmp/out",
+            "--agent-cmd",
+            "claude",
+            "--agent-arg",
+            "--print",
+            "--agent-cwd",
+            "/work",
+            "--agent-output",
+            "json",
+            "--agent-result-key",
+            "result",
+            "--role",
+            "alice",
+        ]))
+        .expect("parses");
+        match cmd {
+            Command::Service(service::ServiceCommand::Start { spec, .. }) => {
+                assert_eq!(spec.agent_cmd.as_deref(), Some("claude"));
+                assert_eq!(spec.agent_args, vec!["--print".to_string()]);
+                assert_eq!(spec.agent_cwd.as_deref(), Some("/work"));
+                assert_eq!(spec.agent_output.as_deref(), Some("json"));
+                assert_eq!(spec.agent_result_key.as_deref(), Some("result"));
+                assert_eq!(spec.role.as_deref(), Some("alice"));
+            }
+            other => panic!("expected Service(Start), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_service_start_agent_run_flags_require_agent_cmd() {
+        assert!(matches!(
+            parse_args(&argv(&[
+                "service",
+                "start",
+                "--control",
+                "/tmp/ctl",
+                "--inbox",
+                "/tmp/in",
+                "--outbox",
+                "/tmp/out",
+                "--agent-cwd",
+                "/work",
+            ]))
+            .unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_service_start_result_key_requires_json_output() {
+        assert!(matches!(
+            parse_args(&argv(&[
+                "service",
+                "start",
+                "--control",
+                "/tmp/ctl",
+                "--inbox",
+                "/tmp/in",
+                "--outbox",
+                "/tmp/out",
+                "--agent-cmd",
+                "claude",
+                "--agent-result-key",
+                "result",
+            ]))
+            .unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_service_status_parses_with_and_without_session() {
+        assert_eq!(
+            parse_args(&argv(&["service", "status", "--control", "/tmp/ctl"])).expect("parses"),
+            Command::Service(service::ServiceCommand::Status {
+                control: "/tmp/ctl".to_string(),
+                session: None,
+            })
+        );
+        assert_eq!(
+            parse_args(&argv(&[
+                "service",
+                "status",
+                "--control",
+                "/tmp/ctl",
+                "--session",
+                "svc-1"
+            ]))
+            .expect("parses"),
+            Command::Service(service::ServiceCommand::Status {
+                control: "/tmp/ctl".to_string(),
+                session: Some("svc-1".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_service_stop_requires_control_and_session() {
+        assert!(matches!(
+            parse_args(&argv(&["service", "stop", "--control", "/tmp/ctl"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+        assert!(matches!(
+            parse_args(&argv(&["service", "stop", "--session", "svc-1"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_service_stop_parses() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "service",
+                "stop",
+                "--control",
+                "/tmp/ctl",
+                "--session",
+                "svc-1"
+            ]))
+            .expect("parses"),
+            Command::Service(service::ServiceCommand::Stop {
+                control: "/tmp/ctl".to_string(),
+                session: "svc-1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_service_teardown_parses() {
+        assert_eq!(
+            parse_args(&argv(&["service", "teardown", "--control", "/tmp/ctl"])).expect("parses"),
+            Command::Service(service::ServiceCommand::Teardown {
+                control: "/tmp/ctl".to_string(),
+            })
+        );
     }
 
     /// A unique self-cleaning temp dir, mirroring the mailbox unit tests.

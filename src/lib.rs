@@ -29,4 +29,5 @@ pub mod model;
 pub mod participant;
 pub mod registry;
 pub mod roles;
+pub mod service;
 pub mod transport;

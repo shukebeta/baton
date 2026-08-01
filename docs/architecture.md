@@ -90,6 +90,7 @@ concern:
 | **Provider transport** | `transport` (boundary + `claude` Messages client + `http` execution seam), `model` (typed prompt/reply/session), `config` (env-backed runtime config: credential, base URL, model, timeout) |
 | **A2A envelope & driver** | `message` (the `baton.message/v1` envelope), `converse` (the governed N≥2 participant conversation driver), `registry` (static name → mailbox routing) |
 | **Mailbox** | `mailbox` — the addressable, crash-safe on-disk queue backing `baton serve` |
+| **Session ownership** | `service` — the host-owned supervisor spawning `baton serve` sessions as its own children (see [`docs/service.md`](service.md)) |
 | **Trail** | `events` (structured JSONL recording of each exchange), `log` (reading/rendering/replaying the trail) |
 | **Identity** | `roles` — per-role home directories and layered env>config identity resolution |
 | **Surface & plumbing** | `cli` (command entry surface), `error` (shared error/result types) |
