@@ -197,7 +197,6 @@ then the built-in default:
   "system_prompt": "system.md",
   "credential": { "kind": "oauth", "env": "ALICE_TOKEN" },
   "cwd": "/work/alice",
-  "mcp_config": "mcp.json",
   "timeout_secs": 60,
   "max_tokens": 1024
 }
@@ -210,7 +209,6 @@ then the built-in default:
 | `system_prompt` | `BATON_SYSTEM_PROMPT`       | File path; relative resolves against the role dir. Defaults to `system.md` in the role dir when present (the "inline" ergonomics). |
 | `credential`    | credential env var          | A **reference**, never the secret: `{ "kind": "api_key"\|"oauth", "env": "<VAR>" }` names the env var holding the secret. |
 | `cwd`           | `serve --agent-cwd`         | External-agent working directory; relative resolves against the role dir. |
-| `mcp_config`    | `serve --agent-mcp-config`  | MCP config path; relative resolves against the role dir.              |
 | `timeout_secs`  | `BATON_TIMEOUT_SECS`        |                                                                      |
 | `max_tokens`    | `BATON_MAX_TOKENS`          |                                                                      |
 
@@ -771,7 +769,7 @@ socket.
 ```
 baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once]
             [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>]
-             [--agent-output raw|json [--agent-result-key <key>]] [--agent-system <path>] [--agent-mcp-config <path>]]
+             [--agent-output raw|json [--agent-result-key <key>]]]
             [--role <name>]
 baton serve --stop --inbox <dir>
 ```
@@ -788,9 +786,9 @@ baton serve --stop --inbox <dir>
   [home directory](#role-homes-roles-name) (`roles/<name>/`), so a party is stood
   up by name instead of hand-assembled env vars. In-process mode feeds the role's
   layered config (model, base URL, credential, system prompt, timeouts) to the
-  provider call; agent mode fills `--agent-cwd` / `--agent-system` /
-  `--agent-mcp-config` from the role's `cwd` / `system_prompt` / `mcp_config` when
-  the flag is not passed. **Explicit flags and env always override the role**
+  provider call; agent mode fills `--agent-cwd` from the role's `cwd` when the
+  flag is not passed — baton stops there, since it carries no other
+  agent-specific knowledge. **Explicit flags and env always override the role**
   (`flag > env > role config > defaults > default`). With `--role`, each answered
   exchange is also recorded as a per-role
   [session](#per-role-session-recording) under
@@ -813,10 +811,16 @@ edits files and runs git/bash/MCP — driven entirely through the mailbox, with
 team role: `baton serve --agent-cmd …` has no `TMAT_PANE` / `tmux` / pane-title
 dependency anywhere.
 
+Baton is a **pure backend-agnostic transport** here: it spawns `--agent-cmd`,
+feeds the request body on stdin, reads the reply on stdout, and does nothing
+else agent-specific. All agent knowledge — flag spelling, system prompt, MCP
+config, permissions — lives in the caller's `--agent-cmd` program (a wrapper
+script, as `mat` does) or is passed straight through via `--agent-arg`.
+
 ```
 baton serve --inbox <dir> --outbox <dir> \
   --agent-cmd claude --agent-cwd /path/to/worktree \
-  --agent-system /path/to/role-identity.txt \
+  --agent-arg --append-system-prompt --agent-arg "$(cat /path/to/role-identity.txt)" \
   --agent-arg -p --agent-arg --dangerously-skip-permissions
 ```
 
@@ -852,24 +856,25 @@ the reply. `--agent-output` isolates the final result:
     key's value is not a string, the run becomes a synthesized delivered
     `kind: "error"` (never a stringified-JSON body).
 
-#### Per-role identity and MCP config
+#### System prompt and MCP: the caller's job
 
-Role identity and MCP configuration are first-class, so a served role is
-configured *by role* rather than by a hand-assembled `--agent-arg` list:
+Baton has no first-class flag for system prompt or MCP config in agent mode —
+that would bake in one backend's flag spelling. Instead, pass them straight
+through as `--agent-arg` values, exactly as the example above does for
+`--append-system-prompt`:
 
-- `--agent-system <path>` — a role system-prompt/identity **file**, injected as
-  the agent's `--append-system-prompt <contents>`.
-- `--agent-mcp-config <path>` — an MCP config file, injected as the agent's
-  `--mcp-config <path>`.
+```
+--agent-arg --append-system-prompt --agent-arg "$(cat /path/to/role-identity.txt)"
+--agent-arg --mcp-config --agent-arg /path/to/mcp.json
+```
 
-Both are **mapped to Claude Code's flag spelling** (baton's reference backend)
-and prepended to your `--agent-arg` values, so a raw override still composes. For
-a non-claude backend whose flags differ, pass identity/MCP through raw
-`--agent-arg` instead.
+This composes with any backend: swap the flag spelling for whatever your
+`--agent-cmd` program expects. `mat`'s own per-kind adapter builds its agent CLI
+invocation this same way, driving baton purely as a transport.
 
 In this mode `serve` loads **no `BatonConfig` and needs no API key** — the agent
-carries its own credentials and MCP config (layer them through the inherited
-environment, or via `--agent-mcp-config`). Cross-message state is the agent's own
+carries its own credentials and MCP config, layered through the inherited
+environment or the `--agent-arg` passthrough above. Cross-message state is the agent's own
 job: it reconstructs context across rounds from **durable artifacts** (the git
 branch/worktree it shares run-to-run, the issue thread, prior mailbox history),
 not an in-memory session — headless-per-message is the model. An agent run that

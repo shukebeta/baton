@@ -38,8 +38,7 @@
 //!   "model": "claude-opus-4-8",
 //!   "system_prompt": "system.md",
 //!   "credential": { "kind": "oauth", "env": "ALICE_TOKEN" },
-//!   "cwd": "/work/alice",
-//!   "mcp_config": "mcp.json"
+//!   "cwd": "/work/alice"
 //! }
 //! ```
 
@@ -151,10 +150,6 @@ pub struct RoleConfig {
     /// Working directory for an external agent (`serve --agent-cwd`).
     #[serde(default)]
     pub cwd: Option<String>,
-    /// MCP config file path (`serve --agent-mcp-config`). Relative paths resolve
-    /// as for `system_prompt`.
-    #[serde(default)]
-    pub mcp_config: Option<String>,
     /// Per-request timeout in seconds (`BATON_TIMEOUT_SECS`).
     #[serde(default)]
     pub timeout_secs: Option<u64>,
@@ -355,8 +350,8 @@ impl Identity {
             .collect()
     }
 
-    /// The resolved value for a friendly key (e.g. `cwd`, `mcp_config`,
-    /// `system_prompt`), for `serve --role` agent-mode wiring. `None` when unset.
+    /// The resolved value for a friendly key (e.g. `cwd`, `system_prompt`), for
+    /// `serve --role` agent-mode wiring. `None` when unset.
     pub fn value_of(&self, key: &str) -> Option<&str> {
         self.entries
             .iter()
@@ -438,7 +433,7 @@ fn build_identity(
     ];
 
     // Order the simple entries for display: model, base_url, system_prompt,
-    // then (credential inserted below), cwd, mcp_config, timeout, max_tokens.
+    // then (credential inserted below), cwd, timeout, max_tokens.
     let defaults_simple: HashMap<&str, Option<String>> = HashMap::from([
         ("model", defaults.model.clone()),
         ("base_url", defaults.base_url.clone()),
@@ -477,20 +472,12 @@ fn build_identity(
     // exactly as a directly-set variable; the entry surfaces only the reference.
     entries.push(resolve_credential(role, defaults, lookup, &mut map));
 
-    // cwd / mcp_config: agent-mode paths, not part of the loader's env
-    // namespace, so they populate the display/serve view but not `map`.
+    // cwd: an agent-mode path, not part of the loader's env namespace, so it
+    // populates the display/serve view but not `map`.
     entries.push(path_entry(
         "cwd",
         role.cwd.as_deref().map(|p| absolutize(role_dir, p)),
         defaults.cwd.as_deref().map(|p| absolutize(home_root, p)),
-    ));
-    entries.push(path_entry(
-        "mcp_config",
-        role.mcp_config.as_deref().map(|p| absolutize(role_dir, p)),
-        defaults
-            .mcp_config
-            .as_deref()
-            .map(|p| absolutize(home_root, p)),
     ));
 
     // Re-order to the documented display order.
@@ -574,8 +561,8 @@ fn resolve_credential(
     }
 }
 
-/// Builds a non-env path entry (`cwd` / `mcp_config`) from its role/defaults
-/// layers (no env var, no built-in default).
+/// Builds a non-env path entry (`cwd`) from its role/defaults layers (no env
+/// var, no built-in default).
 fn path_entry(
     key: &'static str,
     role_val: Option<String>,
@@ -630,9 +617,8 @@ fn display_rank(key: &str) -> u8 {
         "system_prompt" => 2,
         "credential" => 3,
         "cwd" => 4,
-        "mcp_config" => 5,
-        "timeout_secs" => 6,
-        "max_tokens" => 7,
+        "timeout_secs" => 5,
+        "max_tokens" => 6,
         _ => u8::MAX,
     }
 }
@@ -843,20 +829,13 @@ mod tests {
         let home = RolesHome::resolve(lookup_from(&[("BATON_HOME", root.to_str().unwrap())]))
             .expect("resolves");
         let role_dir = home.role_dir("alice").unwrap();
-        write(
-            &role_dir.join("config.json"),
-            r#"{ "cwd": "work", "mcp_config": "mcp.json" }"#,
-        );
+        write(&role_dir.join("config.json"), r#"{ "cwd": "work" }"#);
         let id = home
             .resolve_identity("alice", lookup_from(&[]))
             .expect("resolves");
         assert_eq!(
             id.value_of("cwd"),
             Some(&*role_dir.join("work").to_string_lossy())
-        );
-        assert_eq!(
-            id.value_of("mcp_config"),
-            Some(&*role_dir.join("mcp.json").to_string_lossy())
         );
         let _ = std::fs::remove_dir_all(&root);
     }
