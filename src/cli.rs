@@ -4589,7 +4589,10 @@ mod tests {
     fn parse_serve_rejects_removed_agent_translation_flags() {
         // --agent-system / --agent-mcp-config no longer exist: baton is a pure
         // transport, so these fall through to the unknown-argument usage error.
-        for flag in ["--agent-system=/tmp/role.txt", "--agent-mcp-config=/tmp/mcp.json"] {
+        for flag in [
+            "--agent-system=/tmp/role.txt",
+            "--agent-mcp-config=/tmp/mcp.json",
+        ] {
             assert!(
                 matches!(
                     parse_args(&argv(&[
