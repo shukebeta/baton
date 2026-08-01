@@ -88,8 +88,9 @@ printf 'seed\n' >"$REPO/README.md"
 git -C "$REPO" add README.md
 git -C "$REPO" commit -q -m "seed"
 
-# Role identity supplied through the first-class --agent-system flag (a file),
-# not a hand-assembled --agent-arg --append-system-prompt pair.
+# Baton is a pure transport: it carries no Claude-specific flag translation, so
+# the role identity is injected via plain --agent-arg passthrough — the same
+# --append-system-prompt flag a caller would hand-assemble for any agent CLI.
 ROLE_FILE="$WORK/role-identity.txt"
 cat >"$ROLE_FILE" <<'EOF'
 You are a headless worker agent hosted by baton over a file-mailbox. Your current
@@ -108,7 +109,8 @@ echo "external-agent-proof: launching '$AGENT_BIN' as a served role in $REPO"
   --agent-cmd "$AGENT_BIN" \
   --agent-cwd "$REPO" \
   --agent-timeout-ms "$AGENT_TIMEOUT_MS" \
-  --agent-system "$ROLE_FILE" \
+  --agent-arg --append-system-prompt \
+  --agent-arg "$(cat "$ROLE_FILE")" \
   --agent-arg -p \
   --agent-arg --dangerously-skip-permissions &
 SERVE_PID=$!
