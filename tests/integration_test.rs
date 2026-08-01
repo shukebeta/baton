@@ -1898,3 +1898,158 @@ fn converse_ring_unknown_roster_name_is_startup_error() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+/// Reads `/proc/<pid>/status`'s `PPid` field. Linux-only — this crate has no
+/// portable process-parentage lookup, and this regression exists specifically
+/// to prove parentage.
+#[cfg(target_os = "linux")]
+fn read_ppid(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:")?.trim().parse::<u32>().ok())
+}
+
+/// Issue #109 AC #5 (orphan-survival regression): a session started through
+/// `baton service start` is spawned as a **direct child of the long-lived
+/// `baton service run`**, not of the short-lived `service start` client that
+/// submitted it — so it survives that client's exit (and could never have
+/// been taken down by a kill of the client's process tree, since it was never
+/// part of it). Linux-only: the parentage proof reads `/proc/<pid>/status`,
+/// which has no portable equivalent in this crate.
+#[cfg(target_os = "linux")]
+#[test]
+fn service_session_survives_submitting_client_and_is_owned_by_run() {
+    use baton::mailbox;
+    use baton::message::{MessageEnvelope, MessageKind};
+
+    let server = MockServer::spawn_repeating(200, SUCCESS_BODY);
+    let root = TempMailbox::new("service");
+    let control = root.path.join("control");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+
+    // The long-lived supervisor. The mock provider credentials/model live
+    // here, not on the short-lived `service start` client below — the spawned
+    // `serve` session inherits *this* process's environment, since `Run` is
+    // its real parent.
+    let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    run.args(["service", "run", "--control", control.to_str().unwrap()]);
+    run.env("ANTHROPIC_API_KEY", "test-key");
+    run.env("ANTHROPIC_BASE_URL", server.base_url());
+    run.env("BATON_MODEL", "model-service");
+    run.env("BATON_TIMEOUT_SECS", "5");
+    run.env_remove("ANTHROPIC_AUTH_TOKEN");
+    run.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+    run.env_remove("BATON_EVENT_LOG");
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::null());
+    let mut run_child = run.spawn().expect("spawn baton service run");
+    let run_pid = run_child.id();
+
+    let control_str = control.to_str().unwrap();
+
+    // Wait for `Run` to acquire its control lock: `Start` fails fast rather
+    // than waiting when no live service is found yet.
+    let mut live = false;
+    for _ in 0..100 {
+        if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(["service", "status", "--control", control_str])
+            .output()
+            && out.status.success()
+            && String::from_utf8_lossy(&out.stdout).contains("\"service_running\":true")
+        {
+            live = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(live, "baton service run did not report live in time");
+
+    // The short-lived submitting client: it starts the session and has fully
+    // exited (`.output()` waits for it) by the time this call returns — there
+    // is no lingering process tree behind it to kill.
+    let start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str,
+            "--inbox",
+            inbox.to_str().unwrap(),
+            "--outbox",
+            outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+        ])
+        .output()
+        .expect("run baton service start");
+    assert!(
+        start.status.success(),
+        "service start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let session_id = String::from_utf8_lossy(&start.stdout).trim().to_string();
+    assert!(!session_id.is_empty(), "service start prints a session id");
+
+    // Structural proof: the session's real PID's parent is `service run`,
+    // never the already-exited `service start` client.
+    let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "status",
+            "--control",
+            control_str,
+            "--session",
+            &session_id,
+        ])
+        .output()
+        .expect("run baton service status");
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status is JSON");
+    let sessions = status_json["sessions"].as_array().expect("sessions array");
+    assert_eq!(sessions.len(), 1, "status reports the started session");
+    assert_eq!(sessions[0]["live"], true, "the session reads as live");
+    let serve_pid = sessions[0]["pid"].as_u64().expect("pid") as u32;
+    let ppid = read_ppid(serve_pid).expect("the serve session has a PPid");
+    assert_eq!(
+        ppid, run_pid,
+        "the serve session's parent is the live `service run`, not the exited submitter"
+    );
+
+    // Functional proof: a message delivered after the submitter is long gone
+    // is still consumed by the still-running, service-owned session.
+    let request = MessageEnvelope::new(
+        "svc-m1",
+        "conv-svc",
+        "agent-a",
+        "agent-b",
+        MessageKind::Request,
+        "hello",
+        1_700_000_000_000,
+    );
+    mailbox::deliver_to(&inbox, &request).expect("deliver to the live session's inbox");
+    let mut reply = None;
+    for _ in 0..100 {
+        if let Ok(Some(envelope)) = mailbox::try_claim_response(&outbox, "svc-m1") {
+            reply = Some(envelope);
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let reply = reply.expect("the still-running session answers a message from a later sender");
+    assert_eq!(reply.body, "hello from the mock server");
+
+    // Teardown reaps the session and stops `Run` cooperatively; wait it out.
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str])
+        .output()
+        .expect("run baton service teardown");
+    assert!(
+        teardown.status.success(),
+        "teardown should exit 0; stderr: {}",
+        String::from_utf8_lossy(&teardown.stderr)
+    );
+    let run_status = run_child.wait().expect("baton service run exits");
+    assert!(run_status.success(), "service run exits 0 on teardown");
+}
