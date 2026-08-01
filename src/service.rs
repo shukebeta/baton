@@ -59,6 +59,7 @@
 //! host-service integration are tracked separately.
 
 use std::io::Write;
+#[cfg(unix)]
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -267,14 +268,26 @@ mod imp {
         // A request left mid-`processing/` by a crash between claim and
         // response is returned to `requests/`, mirroring
         // `Mailbox::reclaim_stale` — reprocessed harmlessly under a fresh
-        // session id on this restart.
+        // session id on this restart: the reprocessed spec spawns a *second*
+        // `baton serve` on the same inbox/outbox, but `serve`'s own
+        // single-instance mailbox lock refuses the duplicate immediately, so
+        // it exits at once, leaving only a transient stale session record
+        // behind (reaped the next time it's inspected).
         reclaim_stale_requests(control)?;
         writeln!(out, "baton service running on {}", control.display()).map_err(io_err)?;
 
         let mut children: HashMap<String, Child> = HashMap::new();
         loop {
-            if consume_stop_sentinel(control)? {
-                break;
+            // A failure to check the stop sentinel (as opposed to a clean
+            // present/absent read) must not crash the loop either — the same
+            // "one bad thing can't wedge the daemon" posture as the request
+            // arm below.
+            match consume_stop_sentinel(control) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(err) => {
+                    eprintln!("warning: baton service failed to check its stop sentinel: {err}");
+                }
             }
             reap_exited(&mut children);
             // One request's failure (a malformed spec, a transient spawn
@@ -547,25 +560,51 @@ mod imp {
         let spec: SessionSpec = serde_json::from_str(&data).map_err(|err| {
             BatonError::Decode(format!("malformed session spec {spec_path:?}: {err}"))
         })?;
-        let child = spawn_serve_child(&spec)?;
+        let mut child = spawn_serve_child(&spec)?;
         let pid = child.id();
         let started_at = recorded_start_key(pid);
+        // Everything below this point must kill+reap `child` before
+        // returning `Err`: once this function returns an error, nothing else
+        // ever tracks this `Child` (it isn't inserted into `Run`'s
+        // `children` map, and `Drop` for `std::process::Child` does not
+        // kill), so leaving it running here would leak a live, unrecorded,
+        // unreapable `serve` process.
+        if !spawn_start_key_ok(&started_at) {
+            let _ = signal_group(pid, "-KILL");
+            let _ = child.wait();
+            return Err(BatonError::Io(format!(
+                "baton serve (pid {pid}) could not be corroborated right after spawn; treating as a spawn failure"
+            )));
+        }
         let record = SessionRecord {
             id: fresh_session_id(),
             spec,
             pid,
             started_at,
         };
-        write_session_record(control, &record)?;
+        if let Err(err) = write_session_record(control, &record) {
+            let _ = signal_group(pid, "-KILL");
+            let _ = child.wait();
+            return Err(err);
+        }
         let response = StartResponse {
             session_id: record.id.clone(),
         };
-        let json = serde_json::to_string(&response)
-            .map_err(|err| BatonError::Io(format!("could not serialize start response: {err}")))?;
-        let responses = responses_dir(control);
-        fs::create_dir_all(&responses)
-            .map_err(|err| BatonError::Io(format!("could not create {responses:?}: {err}")))?;
-        mailbox::atomic_write(&responses, &mailbox::file_name(request_id), &json)?;
+        let respond = serde_json::to_string(&response)
+            .map_err(|err| BatonError::Io(format!("could not serialize start response: {err}")))
+            .and_then(|json| {
+                let responses = responses_dir(control);
+                fs::create_dir_all(&responses).map_err(|err| {
+                    BatonError::Io(format!("could not create {responses:?}: {err}"))
+                })?;
+                mailbox::atomic_write(&responses, &mailbox::file_name(request_id), &json)
+            });
+        if let Err(err) = respond {
+            let _ = signal_group(pid, "-KILL");
+            let _ = child.wait();
+            let _ = remove_session_record(control, &record.id);
+            return Err(err);
+        }
         Ok((record, child))
     }
 
@@ -671,12 +710,24 @@ mod imp {
         process_start_key(pid)
     }
 
+    /// Whether a freshly-spawned child's start key is trustworthy enough to
+    /// persist. On Linux, a `None` here means the child was already gone or a
+    /// zombie microseconds after `spawn()` — fail closed and treat that as a
+    /// spawn failure rather than persisting an uncorroborated record.
+    #[cfg(target_os = "linux")]
+    fn spawn_start_key_ok(started_at: &Option<String>) -> bool {
+        started_at.is_some()
+    }
+
     #[cfg(target_os = "linux")]
     fn is_session_alive(record: &SessionRecord) -> bool {
         match (&record.started_at, process_start_key(record.pid)) {
             (Some(recorded), Some(current)) => *recorded == current,
-            (None, Some(_)) => true,
-            (_, None) => false,
+            // No corroborating start key on record (should not happen for a
+            // record this module wrote — see `spawn_start_key_ok` — but a
+            // hand-edited or pre-upgrade record could lack one): fail closed
+            // rather than risk reporting a reused PID as this session, alive.
+            _ => false,
         }
     }
 
@@ -692,8 +743,19 @@ mod imp {
         None
     }
 
+    /// No spawn-time corroboration is possible on this host (see
+    /// [`recorded_start_key`]'s doc), so a `None` start key is expected, not a
+    /// spawn failure.
+    #[cfg(not(target_os = "linux"))]
+    fn spawn_start_key_ok(_started_at: &Option<String>) -> bool {
+        true
+    }
+
     #[cfg(not(target_os = "linux"))]
     fn is_session_alive(record: &SessionRecord) -> bool {
+        if record.pid <= 1 {
+            return false;
+        }
         Command::new("kill")
             .args(["-0", &record.pid.to_string()])
             .stdout(Stdio::null())
@@ -705,8 +767,14 @@ mod imp {
 
     /// Sends `sig` (e.g. `"-TERM"`) to the process **group** led by `pid`
     /// (`kill <sig> -<pid>`). A failure (the group is already gone) is not
-    /// surfaced — only a failure to run `kill` itself is.
+    /// surfaced — only a failure to run `kill` itself is. Refuses `pid <= 1`:
+    /// a corrupt/hand-edited session record must never be able to turn this
+    /// into `kill -TERM -1`, which would signal every process the invoking
+    /// user owns rather than one session's group.
     fn signal_group(pid: u32, sig: &str) -> Result<()> {
+        if pid <= 1 {
+            return Ok(());
+        }
         Command::new("kill")
             .arg(sig)
             .arg(format!("-{pid}"))
