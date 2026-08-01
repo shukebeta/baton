@@ -34,6 +34,10 @@ New here? Start with the conceptual map, then use the reference below.
   reference**: the `baton.message/v1` envelope, the `baton.exchange/v1` event
   schema + nesting, and the trail JSONL / replay / merge semantics. Serialize
   against this.
+- [docs/service.md](docs/service.md) — `baton service`, the host-owned
+  supervisor that keeps a `baton serve` session running after the process
+  that launched it exits: ownership contract, control surface, lifecycle, and
+  systemd setup.
 
 The rest of this README is the CLI/reference surface.
 

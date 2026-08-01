@@ -1,0 +1,31 @@
+# Example systemd *user* service for `baton service run`.
+#
+# This unit is a thin, external liveness wrapper: it starts/stops the
+# supervisor and restarts it if it dies. It carries no knowledge of `baton`'s
+# control-plane protocol or session bookkeeping — that all lives in
+# `baton service` itself and works identically if this unit is never
+# installed. See ../../docs/service.md for the full ownership contract.
+#
+# Install (per-user, no root required):
+#   mkdir -p ~/.config/systemd/user
+#   cp packaging/systemd/baton.service ~/.config/systemd/user/
+#   # edit ExecStart's --control path and BATON_HOME below for your host
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now baton.service
+#
+# `loginctl enable-linger <user>` if the service should also survive the
+# user's last session logout.
+
+[Unit]
+Description=Baton host-owned serve-session supervisor
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/baton service run --control %h/.baton/service
+ExecStop=%h/.cargo/bin/baton service teardown --control %h/.baton/service
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
