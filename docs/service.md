@@ -102,6 +102,110 @@ Standalone `baton serve` (run directly, without `baton service`) is
 unaffected by any of this — `service` only ever spawns the same `serve`
 binary as a subprocess with the same flags a caller would pass by hand.
 
+## Task lifecycle (`baton task`)
+
+`baton task` extends the same control plane with a generic, service-owned
+asynchronous job: a command that keeps running (and reports back) after the
+submitting turn/process has already exited. It exists because a headless
+`baton serve --agent-cmd` turn runs one cold agent invocation per mailbox
+message and has no resident place to wait on a slow command; a task is that
+missing place, owned by the same `service run` process that owns sessions.
+
+```
+baton task start --control <dir> --session <id> --command <program>
+                 [--arg <arg>]... [--cwd <dir>] [--env KEY=VALUE]...
+                 [--milestone-ms <n>]... --max-duration-ms <n>
+                 --callback-inbox <dir> [--callback-role <name>]
+baton task status --control <dir> [--task <id>]
+baton task cancel --control <dir> --task <id>
+```
+
+- **`task start`** submits a `TaskSpec` (schema `baton.task-spec/v1`) and
+  returns a stable task id as soon as `run` has spawned the command and
+  persisted its record — like `service start`, it never waits on the command
+  to finish, and fails fast if no `service run` is live on `--control`.
+- **`--session <id>` is the ownership tag, not a routing target.** A task is
+  owned and reaped by whichever `baton service` session names it here,
+  independent of where its events are delivered — see "Ownership vs. callback"
+  below.
+- **`--milestone-ms <n>` is opaque to baton.** The core carries no default
+  duration set and no cadence semantics; a caller supplies whichever
+  durations (elapsed ms since spawn) it wants an event at, or none. The same
+  timer that enforces `--max-duration-ms` also fires milestones, so there is
+  no separate scheduler subsystem and no consumer-side polling requirement.
+- **`--callback-inbox <dir>` / `--callback-role <name>`** address a mailbox
+  root exactly like every other `baton` surface (`SessionSpec.inbox`,
+  `send --to`, …): `inbox` is where events land, `role` is an optional
+  identity tag carried on the delivered envelope for the recipient's own
+  framing. Neither is used to resolve delivery beyond that.
+- **`task status`** reports one task (`--task <id>`) or every known task:
+  `running`/`completed`/`failed`/`timeout`/`cancelled` state, exit code,
+  elapsed milliseconds, command identity, and the captured stdout/stderr log
+  paths. Reads the durable `TaskRecord` directly by PID, so it works whether
+  or not `run` is currently alive.
+- **`task cancel`** is idempotent: kills the task's whole process group if
+  still running (cooperative cancel sentinel consumed by the next tick, so
+  the resulting terminal event reads `cancelled` rather than `failed`), and a
+  no-op success if the task is already gone.
+
+### Event delivery and dedup contract
+
+Each configured milestone and the eventual terminal outcome produces exactly
+one event, delivered via the same atomic mailbox write every other `baton`
+surface uses (`mailbox::deliver_to`, see
+[`src/mailbox.rs`](../src/mailbox.rs)) into the callback inbox's `pending/` as
+a `baton.message/v1` envelope with `kind: "notify"` (see
+[`src/message.rs`](../src/message.rs)) and a JSON `TaskEventBody` (`task_id`,
+`kind: "milestone"|"terminal"`, and — depending on kind — `milestone_index`,
+or `state`/`exit_code`/`elapsed_ms`) as its `body`.
+
+Every event's id is **deterministic and content-addressable**: composed only
+from the task id, the event kind, and — for a milestone — that milestone's
+configured index (e.g. `<task-id>-milestone-0`, `<task-id>-terminal`; see
+`task_event_id` in [`src/task.rs`](../src/task.rs)). No wall-clock or
+fire-time input feeds the id, so a crash-restart replay or any other
+redelivery regenerates the exact same id every time. Delivery is
+at-least-once, matching every other `baton` mailbox path; a consumer dedups a
+redelivered event for free via the mailbox's own `done/`-membership check
+(`Mailbox::claim_next` drops an id it has already claimed-and-completed) — no
+resident store or polling loop needed between turns.
+
+### Ownership vs. callback
+
+A task's ownership and reaping are scoped strictly to the `--session <id>` it
+names, never to its callback target. `service stop --session <id>` and
+`service teardown` reap every task owned by that session — killing its
+process group and removing its record — even if that task's
+`--callback-inbox` points somewhere entirely outside the owning session's own
+mailbox. The callback is a delivery target only.
+
+### Injectable clock
+
+The task loop's milestone/max-duration timing decisions are driven by an
+injectable `Clock` trait (`SystemClock` in the real `run_service` loop, a
+manually-advanced `FakeClock` in tests; see [`src/task.rs`](../src/task.rs)),
+so a contract test can submit
+a task and drive it through milestone and terminal delivery without any real
+`sleep` — see `service::imp::tests::tick_one_task_delivers_milestone_via_fake_clock_no_real_sleep`
+in [`src/service.rs`](../src/service.rs). A separate live-subprocess
+regression, `service_task_survives_submitting_client_and_is_owned_by_run` in
+[`tests/integration_test.rs`](../tests/integration_test.rs), proves the
+ownership/survival contract against a real `baton service run`, with trivial
+real thresholds and no `sleep()` of its own beyond bounded polling for
+delivery.
+
+### `bg-run` integration boundary
+
+`baton task` is generic and provider-neutral: it owns process and mailbox
+lifecycle only, never an agent's context or model conversation, and carries
+no `bg-run`-specific naming or default cadence. The my-ai-team `bg-run`
+command is the product-facing adapter: it translates its own options into a
+`baton task start` call, supplies its own milestone-duration defaults (baton
+core has none), maps delivered task events onto its existing `[relay]`
+wake/result-file contract, and returns the task id immediately. `bg-run` is
+not, and will not become, a `baton` command name — Baton core exposes only
+the generic `task` namespace.
+
 ## systemd setup
 
 `packaging/systemd/baton.service` is an example per-user unit:

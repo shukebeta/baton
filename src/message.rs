@@ -36,9 +36,10 @@ pub const SCHEMA: &str = "baton.message/v1";
 /// What kind of peer message this envelope carries.
 ///
 /// Serializes to the snake_case wire values `request` / `response` / `done` /
-/// `error`. `notify` is intentionally omitted this slice (no producer or
-/// consumer yet); the unknown-field/variant skip keeps adding it later a
-/// non-breaking change.
+/// `error` / `notify`. The unknown-field/variant skip (see the module doc)
+/// is what let `notify` join this enum as a non-breaking addition once
+/// [`crate::task`] needed a fire-and-forget lifecycle event kind distinct
+/// from a conversation turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageKind {
@@ -50,6 +51,9 @@ pub enum MessageKind {
     Done,
     /// A terminal marker: the turn failed.
     Error,
+    /// A fire-and-forget lifecycle event with no expected reply — e.g. a
+    /// `baton task` milestone or terminal event.
+    Notify,
 }
 
 /// The provider-call record a message wraps, self-describing via its schema.
@@ -208,6 +212,7 @@ mod tests {
             (MessageKind::Response, "response"),
             (MessageKind::Done, "done"),
             (MessageKind::Error, "error"),
+            (MessageKind::Notify, "notify"),
         ] {
             let mut msg = base();
             msg.kind = kind;

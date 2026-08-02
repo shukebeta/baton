@@ -65,6 +65,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{BatonError, Result};
+use crate::task::TaskCommand;
 
 /// Schema tag for a [`SessionSpec`] request, stamped for forward-compatible
 /// parsing (unchecked today — there is only one version).
@@ -164,6 +165,29 @@ pub fn execute_service(cmd: ServiceCommand, _out: impl Write) -> Result<()> {
     ))
 }
 
+/// Runs `cmd` to completion, writing any human-readable output to `out`.
+///
+/// A `baton task` is owned and reaped by the same control-plane `Run` loop as
+/// a `baton service` session (see the module doc) — `Start` reaches it
+/// through the identical atomic-rename request protocol, while `Status` and
+/// `Cancel` act directly on the durable [`crate::task::TaskRecord`], just as
+/// `Status`/`Stop` do for a [`SessionRecord`](imp), so both keep working even
+/// when `Run` itself is not currently alive.
+#[cfg(unix)]
+pub fn execute_task(cmd: TaskCommand, out: impl Write) -> Result<()> {
+    imp::dispatch_task(cmd, out)
+}
+
+/// `baton task` has no supported implementation on this host; see
+/// [`execute_service`]'s non-Unix stub for why.
+#[cfg(not(unix))]
+pub fn execute_task(cmd: TaskCommand, _out: impl Write) -> Result<()> {
+    let _ = cmd;
+    Err(BatonError::Io(
+        "baton task requires a Unix host (Linux or macOS); Windows support is tracked in a follow-up issue".to_string(),
+    ))
+}
+
 #[cfg(unix)]
 mod imp {
     use super::*;
@@ -175,6 +199,13 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use crate::mailbox;
+    use crate::message::{MessageEnvelope, MessageKind};
+    use crate::task::{
+        Clock, SystemClock, TaskEventBody, TaskEventKind, TaskRecord, TaskSpec, TaskState,
+        max_duration_exceeded, milestones_due, task_event_id,
+    };
+    #[cfg(test)]
+    use crate::task::{FakeClock, TaskCallback};
 
     /// Name of the control-plane lockfile at the control root, mirroring
     /// [`mailbox`]'s `serve.lock`.
@@ -244,6 +275,22 @@ mod imp {
         }
     }
 
+    /// Dispatches one parsed [`TaskCommand`].
+    pub(super) fn dispatch_task(cmd: TaskCommand, mut out: impl Write) -> Result<()> {
+        match cmd {
+            TaskCommand::Start { control, spec } => {
+                let task_id = submit_task_start_request(Path::new(&control), &spec)?;
+                writeln!(out, "{task_id}").map_err(io_err)
+            }
+            TaskCommand::Status { control, task } => {
+                execute_task_status(Path::new(&control), task.as_deref(), out)
+            }
+            TaskCommand::Cancel { control, task } => {
+                execute_task_cancel(Path::new(&control), &task, out)
+            }
+        }
+    }
+
     /// Maps an [`std::io::Error`] encountered writing to `out` to a
     /// [`BatonError::Io`].
     fn io_err(err: std::io::Error) -> BatonError {
@@ -274,14 +321,17 @@ mod imp {
         // it exits at once, leaving only a transient stale session record
         // behind (reaped the next time it's inspected).
         reclaim_stale_requests(control)?;
+        reclaim_stale_task_requests(control)?;
         writeln!(out, "baton service running on {}", control.display()).map_err(io_err)?;
 
+        let clock = SystemClock;
         let mut children: HashMap<String, Child> = HashMap::new();
+        let mut tasks: HashMap<String, RunningTask> = HashMap::new();
         loop {
             // A failure to check the stop sentinel (as opposed to a clean
             // present/absent read) must not crash the loop either — the same
             // "one bad thing can't wedge the daemon" posture as the request
-            // arm below.
+            // arms below.
             match consume_stop_sentinel(control) {
                 Ok(true) => break,
                 Ok(false) => {}
@@ -290,31 +340,52 @@ mod imp {
                 }
             }
             reap_exited(&mut children);
+            tick_tasks(control, &mut tasks, &clock);
+
             // One request's failure (a malformed spec, a transient spawn
             // error) must not crash the loop out from under every other
-            // session this instance already owns — warn and keep polling,
-            // the same "one bad message can't wedge the daemon" posture
-            // `Mailbox::claim_next` takes for a malformed mailbox entry.
+            // session/task this instance already owns — warn and keep
+            // polling, the same "one bad message can't wedge the daemon"
+            // posture `Mailbox::claim_next` takes for a malformed mailbox
+            // entry.
+            let mut did_work = false;
             match process_one_request(control) {
                 Ok(Some((session_id, child))) => {
                     children.insert(session_id, child);
+                    did_work = true;
                 }
-                Ok(None) => std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS)),
+                Ok(None) => {}
                 Err(err) => {
                     eprintln!(
                         "warning: baton service failed to process a session-start request: {err}"
                     );
-                    std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
                 }
+            }
+            match process_one_task_request(control, &clock) {
+                Ok(Some((task_id, running))) => {
+                    tasks.insert(task_id, running);
+                    did_work = true;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    eprintln!(
+                        "warning: baton service failed to process a task-start request: {err}"
+                    );
+                }
+            }
+            if !did_work {
+                std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
             }
         }
 
         // Best-effort final reap: `Teardown` already killed every known
-        // session before dropping the sentinel, so this is normally instant.
+        // session (and, per session, every task it owns) before dropping the
+        // sentinel, so this is normally instant.
         let deadline = Instant::now() + Duration::from_millis(FINAL_REAP_GRACE_MS);
-        while !children.is_empty() && Instant::now() < deadline {
+        while (!children.is_empty() || !tasks.is_empty()) && Instant::now() < deadline {
             reap_exited(&mut children);
-            if !children.is_empty() {
+            tick_tasks(control, &mut tasks, &clock);
+            if !children.is_empty() || !tasks.is_empty() {
                 std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
             }
         }
@@ -683,6 +754,535 @@ mod imp {
             .map_err(|err| BatonError::Io(format!("could not spawn baton serve: {err}")))
     }
 
+    // -- Task control-plane request protocol -------------------------------
+    //
+    // A `baton task` reaches the live `Run` loop through the identical
+    // atomic-rename request protocol as a session `Start` (its own
+    // `task-requests/`/`task-processing/`/`task-responses/` directories, so
+    // the two schemas — `SessionSpec` and `TaskSpec` — are never comingled in
+    // the same request file). `Run`'s own tick is the sole writer of a
+    // task's terminal state and the sole deliverer of its events; `Cancel`
+    // (below, alongside `Status`) instead acts directly on the durable
+    // `TaskRecord`'s PID, exactly like `Stop` does for a session, so both
+    // keep working even when `Run` itself is not currently alive.
+
+    fn task_requests_dir(control: &Path) -> std::path::PathBuf {
+        control.join("task-requests")
+    }
+
+    fn task_processing_dir(control: &Path) -> std::path::PathBuf {
+        control.join("task-processing")
+    }
+
+    fn task_responses_dir(control: &Path) -> std::path::PathBuf {
+        control.join("task-responses")
+    }
+
+    fn tasks_dir(control: &Path) -> std::path::PathBuf {
+        control.join("tasks")
+    }
+
+    fn task_logs_dir(control: &Path, task_id: &str) -> std::path::PathBuf {
+        control.join("task-logs").join(task_id)
+    }
+
+    fn task_cancel_dir(control: &Path) -> std::path::PathBuf {
+        control.join("task-cancel")
+    }
+
+    fn fresh_task_id() -> String {
+        format!(
+            "task-{}-{}-{}",
+            std::process::id(),
+            crate::events::now_ms(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// The `Start` response body, keyed by request id in `task-responses/`.
+    #[derive(Debug, Serialize, Deserialize)]
+    struct TaskStartResponse {
+        task_id: String,
+    }
+
+    /// Submits `spec` to a live `Run` and awaits its task id. Mirrors
+    /// [`submit_start_request`] exactly, against the task request
+    /// directories instead.
+    fn submit_task_start_request(control: &Path, spec: &TaskSpec) -> Result<String> {
+        if probe_control(control)? == ControlLiveness::NotRunning {
+            return Err(BatonError::Io(format!(
+                "no live baton service on {control:?}; start one with `baton service run --control <dir>` first"
+            )));
+        }
+        let request_id = fresh_request_id();
+        let json = serde_json::to_string(spec)
+            .map_err(|err| BatonError::Io(format!("could not serialize task spec: {err}")))?;
+        mailbox::atomic_write(
+            &task_requests_dir(control),
+            &mailbox::file_name(&request_id),
+            &json,
+        )?;
+        await_task_start_response(control, &request_id)
+    }
+
+    fn await_task_start_response(control: &Path, request_id: &str) -> Result<String> {
+        let path = task_responses_dir(control).join(mailbox::file_name(request_id));
+        let deadline = Instant::now() + Duration::from_millis(START_AWAIT_MS);
+        loop {
+            if let Ok(data) = fs::read_to_string(&path) {
+                let _ = fs::remove_file(&path);
+                let resp: TaskStartResponse = serde_json::from_str(&data).map_err(|err| {
+                    BatonError::Decode(format!("malformed task response {path:?}: {err}"))
+                })?;
+                return Ok(resp.task_id);
+            }
+            if Instant::now() >= deadline {
+                return Err(BatonError::Io(format!(
+                    "timed out waiting for baton service to start the task ({request_id})"
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        }
+    }
+
+    /// Returns any `task-processing/` entry a crash left mid-request to
+    /// `task-requests/`. Mirrors [`reclaim_stale_requests`].
+    fn reclaim_stale_task_requests(control: &Path) -> Result<()> {
+        let processing = task_processing_dir(control);
+        let entries = match fs::read_dir(&processing) {
+            Ok(rd) => rd,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(BatonError::Io(format!(
+                    "could not read {processing:?}: {err}"
+                )));
+            }
+        };
+        let requests = task_requests_dir(control);
+        fs::create_dir_all(&requests)
+            .map_err(|err| BatonError::Io(format!("could not create {requests:?}: {err}")))?;
+        for entry in entries {
+            let path = mailbox::dir_entry(entry, &processing)?.path();
+            let Some(key) = mailbox::json_key(&path) else {
+                continue;
+            };
+            let dest = requests.join(mailbox::file_name(&key));
+            fs::rename(&path, &dest)
+                .map_err(|err| BatonError::Io(format!("could not reclaim {path:?}: {err}")))?;
+        }
+        Ok(())
+    }
+
+    /// One task the `Run` loop is currently tracking: the live [`Child`]
+    /// handle (so a non-blocking `try_wait` can reap it), its durable
+    /// [`TaskRecord`] (kept in sync as milestones fire and it goes
+    /// terminal), and the injected-clock timestamps driving milestone/
+    /// max-duration decisions.
+    struct RunningTask {
+        record: TaskRecord,
+        child: Child,
+        started_ms: u64,
+        /// Set once this task's max duration has been exceeded and `SIGTERM`
+        /// sent, so a later tick knows to escalate to `SIGKILL` after
+        /// `KILL_GRACE_MS`, and a successful reap after this is set is
+        /// attributed to `timeout`, not `completed`/`failed`.
+        term_sent_at_ms: Option<u64>,
+        /// Set once `SIGKILL` has been sent, so it is only ever sent once.
+        kill_sent: bool,
+    }
+
+    /// Outcome of one [`tick_one_task`] call.
+    enum TaskTick {
+        StillRunning,
+        Finished,
+    }
+
+    /// Claims and handles the next pending task-start request, if any.
+    /// Mirrors [`process_one_request`].
+    fn process_one_task_request(
+        control: &Path,
+        clock: &dyn Clock,
+    ) -> Result<Option<(String, RunningTask)>> {
+        let dir = task_requests_dir(control);
+        fs::create_dir_all(&dir)
+            .map_err(|err| BatonError::Io(format!("could not create {dir:?}: {err}")))?;
+        let entries = match fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(BatonError::Io(format!("could not read {dir:?}: {err}"))),
+        };
+        for entry in entries {
+            let path = mailbox::dir_entry(entry, &dir)?.path();
+            let Some(key) = mailbox::json_key(&path) else {
+                continue;
+            };
+            let processing = task_processing_dir(control);
+            fs::create_dir_all(&processing)
+                .map_err(|err| BatonError::Io(format!("could not create {processing:?}: {err}")))?;
+            let claimed_path = processing.join(mailbox::file_name(&key));
+            match fs::rename(&path, &claimed_path) {
+                Ok(()) => {
+                    let outcome = handle_task_start_request(control, &key, &claimed_path, clock);
+                    let _ = fs::remove_file(&claimed_path);
+                    let (record, child, started_ms) = outcome?;
+                    let id = record.id.clone();
+                    let running = RunningTask {
+                        record,
+                        child,
+                        started_ms,
+                        term_sent_at_ms: None,
+                        kill_sent: false,
+                    };
+                    return Ok(Some((id, running)));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(BatonError::Io(format!("could not claim {path:?}: {err}"))),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Spawns the requested task, persists its [`TaskRecord`], and answers
+    /// the request with its task id. Mirrors [`handle_start_request`]'s
+    /// kill-and-unwind-on-any-later-failure discipline: once spawned, every
+    /// early return below this point kills and reaps `child` first, so a
+    /// failure here never leaves an unrecorded, unreapable process behind.
+    fn handle_task_start_request(
+        control: &Path,
+        request_id: &str,
+        spec_path: &Path,
+        clock: &dyn Clock,
+    ) -> Result<(TaskRecord, Child, u64)> {
+        let data = fs::read_to_string(spec_path)
+            .map_err(|err| BatonError::Io(format!("could not read {spec_path:?}: {err}")))?;
+        let spec: TaskSpec = serde_json::from_str(&data)
+            .map_err(|err| BatonError::Decode(format!("malformed task spec {spec_path:?}: {err}")))?;
+        let task_id = fresh_task_id();
+        let log_dir = task_logs_dir(control, &task_id);
+        fs::create_dir_all(&log_dir)
+            .map_err(|err| BatonError::Io(format!("could not create {log_dir:?}: {err}")))?;
+        let stdout_path = log_dir.join("stdout.log");
+        let stderr_path = log_dir.join("stderr.log");
+        let mut child = spawn_task_child(&spec, &stdout_path, &stderr_path)?;
+        let pid = child.id();
+        let started_at = recorded_start_key(pid);
+        if !spawn_start_key_ok(&started_at) {
+            let _ = signal_group(pid, "-KILL");
+            let _ = child.wait();
+            return Err(BatonError::Io(format!(
+                "task command (pid {pid}) could not be corroborated right after spawn; treating as a spawn failure"
+            )));
+        }
+        let record = TaskRecord {
+            id: task_id,
+            spec,
+            pid,
+            started_at,
+            state: TaskState::Running,
+            exit_code: None,
+            elapsed_ms: None,
+            stdout_path: stdout_path.display().to_string(),
+            stderr_path: stderr_path.display().to_string(),
+            delivered_milestones: 0,
+        };
+        if let Err(err) = write_task_record(control, &record) {
+            let _ = signal_group(pid, "-KILL");
+            let _ = child.wait();
+            return Err(err);
+        }
+        let response = TaskStartResponse {
+            task_id: record.id.clone(),
+        };
+        let respond = serde_json::to_string(&response)
+            .map_err(|err| BatonError::Io(format!("could not serialize task start response: {err}")))
+            .and_then(|json| {
+                let responses = task_responses_dir(control);
+                fs::create_dir_all(&responses).map_err(|err| {
+                    BatonError::Io(format!("could not create {responses:?}: {err}"))
+                })?;
+                mailbox::atomic_write(&responses, &mailbox::file_name(request_id), &json)
+            });
+        if let Err(err) = respond {
+            let _ = signal_group(pid, "-KILL");
+            let _ = child.wait();
+            let _ = remove_task_record(control, &record.id);
+            return Err(err);
+        }
+        Ok((record, child, clock.now_ms()))
+    }
+
+    /// Spawns `spec`'s command as its own process-group leader, stdout/stderr
+    /// redirected to durable log files (unlike [`spawn_serve_child`], which
+    /// discards its child's stdio entirely — a task's output is part of its
+    /// durable record), and returns the live [`Child`] without waiting on
+    /// it — `Run`'s loop reaps it later via [`tick_one_task`].
+    fn spawn_task_child(spec: &TaskSpec, stdout_path: &Path, stderr_path: &Path) -> Result<Child> {
+        let mut command = Command::new(&spec.command);
+        command.args(&spec.args);
+        if let Some(cwd) = &spec.cwd {
+            command.current_dir(cwd);
+        }
+        command.envs(spec.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        command.stdin(Stdio::null());
+        let stdout_file = File::create(stdout_path)
+            .map_err(|err| BatonError::Io(format!("could not create {stdout_path:?}: {err}")))?;
+        let stderr_file = File::create(stderr_path)
+            .map_err(|err| BatonError::Io(format!("could not create {stderr_path:?}: {err}")))?;
+        command.stdout(Stdio::from(stdout_file));
+        command.stderr(Stdio::from(stderr_file));
+        // Own process-group leader, like `spawn_serve_child`, so a later
+        // `kill -<pid>` (max-duration enforcement or `baton task cancel`)
+        // reaches the task's whole subtree, not just this direct child.
+        command.process_group(0);
+        command.spawn().map_err(|err| {
+            BatonError::Io(format!(
+                "could not spawn task command {:?}: {err}",
+                spec.command
+            ))
+        })
+    }
+
+    /// Advances one tracked task by one loop tick: delivers any
+    /// newly-due milestone events, escalates `SIGTERM`→`SIGKILL` past
+    /// `max_duration_ms`, and — once the process has actually exited —
+    /// persists its terminal state and delivers its terminal event.
+    ///
+    /// Pure with respect to wall-clock time: every timing decision reads
+    /// `clock.now_ms()`, so a test can drive milestone/max-duration/terminal
+    /// behavior deterministically with a `FakeClock` and no real sleep.
+    fn tick_one_task(
+        control: &Path,
+        id: &str,
+        running: &mut RunningTask,
+        clock: &dyn Clock,
+    ) -> Result<TaskTick> {
+        let elapsed_ms = clock.now_ms().saturating_sub(running.started_ms);
+
+        for index in milestones_due(
+            elapsed_ms,
+            &running.record.spec.milestones_ms,
+            running.record.delivered_milestones,
+        ) {
+            deliver_task_event(&running.record, TaskEventKind::Milestone { index })?;
+            running.record.delivered_milestones = index + 1;
+            write_task_record(control, &running.record)?;
+        }
+
+        if running.term_sent_at_ms.is_none()
+            && max_duration_exceeded(elapsed_ms, running.record.spec.max_duration_ms)
+        {
+            let _ = signal_group(running.record.pid, "-TERM");
+            running.term_sent_at_ms = Some(clock.now_ms());
+        } else if let Some(term_at) = running.term_sent_at_ms
+            && !running.kill_sent
+            && clock.now_ms().saturating_sub(term_at) >= KILL_GRACE_MS
+        {
+            let _ = signal_group(running.record.pid, "-KILL");
+            running.kill_sent = true;
+        }
+
+        match running.child.try_wait() {
+            Ok(Some(status)) => {
+                // An external `Stop`/`Teardown`/`Cancel` may already have
+                // finalized and removed this task's record (they act
+                // directly on the durable PID, independent of this `Run`
+                // loop being alive) — if so, this reap is a no-op besides
+                // dropping our own in-memory tracking below, so a race with
+                // an external reaper never resurrects a torn-down record.
+                if read_task_record(control, id)?.is_none() {
+                    return Ok(TaskTick::Finished);
+                }
+                let cancelled = consume_task_cancel_sentinel(control, id)?;
+                let state = if cancelled {
+                    TaskState::Cancelled
+                } else if running.term_sent_at_ms.is_some() {
+                    TaskState::Timeout
+                } else if status.success() {
+                    TaskState::Completed
+                } else {
+                    TaskState::Failed
+                };
+                running.record.state = state;
+                running.record.exit_code = status.code();
+                running.record.elapsed_ms = Some(elapsed_ms);
+                write_task_record(control, &running.record)?;
+                deliver_task_event(&running.record, TaskEventKind::Terminal)?;
+                Ok(TaskTick::Finished)
+            }
+            Ok(None) => Ok(TaskTick::StillRunning),
+            Err(err) => Err(BatonError::Io(format!("could not poll task {id}: {err}"))),
+        }
+    }
+
+    /// Ticks every tracked task once, dropping any that finished. One task's
+    /// tick failure is warned and leaves it tracked for the next tick — the
+    /// same "one bad thing can't wedge the daemon" posture the rest of
+    /// `Run`'s loop takes.
+    fn tick_tasks(control: &Path, tasks: &mut HashMap<String, RunningTask>, clock: &dyn Clock) {
+        let mut finished = Vec::new();
+        for (id, running) in tasks.iter_mut() {
+            match tick_one_task(control, id, running, clock) {
+                Ok(TaskTick::Finished) => finished.push(id.clone()),
+                Ok(TaskTick::StillRunning) => {}
+                Err(err) => {
+                    eprintln!("warning: baton service failed to tick task {id}: {err}");
+                }
+            }
+        }
+        for id in finished {
+            tasks.remove(&id);
+        }
+    }
+
+    /// Delivers one task lifecycle event to `record.spec.callback.inbox`,
+    /// keyed by its deterministic [`task_event_id`] so the mailbox's own
+    /// `done/`-membership dedup recognizes an exact redelivery.
+    fn deliver_task_event(record: &TaskRecord, kind: TaskEventKind) -> Result<()> {
+        let event_id = task_event_id(&record.id, kind);
+        let body = match kind {
+            TaskEventKind::Milestone { index } => TaskEventBody::milestone(&record.id, index),
+            TaskEventKind::Terminal => TaskEventBody::terminal(
+                &record.id,
+                record.state,
+                record.exit_code,
+                record.elapsed_ms.unwrap_or(0),
+            ),
+        };
+        let body_json = serde_json::to_string(&body)
+            .map_err(|err| BatonError::Io(format!("could not serialize task event body: {err}")))?;
+        // `to` is a delivery-target-agnostic identity tag only — the actual
+        // routing is `record.spec.callback.inbox`, a mailbox root, exactly
+        // like `SessionSpec::role` never resolves anything by itself.
+        let to = record
+            .spec
+            .callback
+            .role
+            .clone()
+            .unwrap_or_else(|| record.id.clone());
+        let envelope = MessageEnvelope::new(
+            event_id,
+            record.id.clone(),
+            "baton-task",
+            to,
+            MessageKind::Notify,
+            body_json,
+            crate::events::now_ms(),
+        );
+        mailbox::deliver_to(&record.spec.callback.inbox, &envelope)
+    }
+
+    // -- Task records -------------------------------------------------------
+
+    fn task_record_path(control: &Path, id: &str) -> Result<std::path::PathBuf> {
+        if !mailbox::is_safe_key(id) {
+            return Err(BatonError::Io(format!(
+                "task id is not usable as a filename: {id:?}"
+            )));
+        }
+        Ok(tasks_dir(control).join(mailbox::file_name(id)))
+    }
+
+    fn write_task_record(control: &Path, record: &TaskRecord) -> Result<()> {
+        let dir = tasks_dir(control);
+        fs::create_dir_all(&dir)
+            .map_err(|err| BatonError::Io(format!("could not create {dir:?}: {err}")))?;
+        let json = serde_json::to_string(record)
+            .map_err(|err| BatonError::Io(format!("could not serialize task record: {err}")))?;
+        mailbox::atomic_write(&dir, &mailbox::file_name(&record.id), &json)
+    }
+
+    fn read_task_record(control: &Path, id: &str) -> Result<Option<TaskRecord>> {
+        let path = task_record_path(control, id)?;
+        match fs::read_to_string(&path) {
+            Ok(data) => serde_json::from_str(&data).map(Some).map_err(|err| {
+                BatonError::Decode(format!("malformed task record {path:?}: {err}"))
+            }),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(BatonError::Io(format!("could not read {path:?}: {err}"))),
+        }
+    }
+
+    fn remove_task_record(control: &Path, id: &str) -> Result<()> {
+        let path = task_record_path(control, id)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(BatonError::Io(format!("could not remove {path:?}: {err}"))),
+        }
+    }
+
+    fn list_task_records(control: &Path) -> Result<Vec<TaskRecord>> {
+        let dir = tasks_dir(control);
+        let entries = match fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(BatonError::Io(format!("could not read {dir:?}: {err}"))),
+        };
+        let mut records = Vec::new();
+        for entry in entries {
+            let path = mailbox::dir_entry(entry, &dir)?.path();
+            let Some(key) = mailbox::json_key(&path) else {
+                continue;
+            };
+            if let Some(record) = read_task_record(control, &key)? {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    /// Cancels and reaps every task owned by `session_id`, regardless of
+    /// each task's own callback target — the callback mailbox/role is a
+    /// delivery target only, never the ownership or reaping boundary. Called
+    /// from [`stop_session_record`], so this runs on both `Stop <session>`
+    /// and `Teardown` (which stops every session).
+    fn reap_session_tasks(control: &Path, session_id: &str) -> Result<()> {
+        for record in list_task_records(control)? {
+            if record.spec.session != session_id {
+                continue;
+            }
+            if is_task_alive(&record) {
+                let _ = signal_group(record.pid, "-TERM");
+                wait_while_task_alive(&record, KILL_GRACE_MS);
+                if is_task_alive(&record) {
+                    let _ = signal_group(record.pid, "-KILL");
+                    wait_while_task_alive(&record, KILL_GRACE_MS);
+                }
+            }
+            remove_task_record(control, &record.id)?;
+            let _ = fs::remove_file(task_cancel_sentinel_path(control, &record.id));
+        }
+        Ok(())
+    }
+
+    // -- Task cancel sentinel -----------------------------------------------
+    //
+    // Mirrors `service.stop`/`serve.stop`: a per-task cooperative sentinel
+    // `Cancel` drops before signalling, so `Run`'s own tick — the sole
+    // writer of terminal state — can attribute the reap it later observes to
+    // `cancelled` rather than misreading a `SIGTERM` exit as `failed`.
+
+    fn task_cancel_sentinel_path(control: &Path, task_id: &str) -> std::path::PathBuf {
+        task_cancel_dir(control).join(mailbox::file_name(task_id))
+    }
+
+    fn request_task_cancel_sentinel(control: &Path, task_id: &str) -> Result<()> {
+        let dir = task_cancel_dir(control);
+        fs::create_dir_all(&dir)
+            .map_err(|err| BatonError::Io(format!("could not create {dir:?}: {err}")))?;
+        mailbox::atomic_write(&dir, &mailbox::file_name(task_id), "")
+    }
+
+    fn consume_task_cancel_sentinel(control: &Path, task_id: &str) -> Result<bool> {
+        match fs::remove_file(task_cancel_sentinel_path(control, task_id)) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(BatonError::Io(format!(
+                "could not consume task cancel sentinel: {err}"
+            ))),
+        }
+    }
+
     // -- Liveness ---------------------------------------------------------
 
     /// Reads `/proc/<pid>/stat`'s state and starttime fields: `None` for a
@@ -719,16 +1319,28 @@ mod imp {
         started_at.is_some()
     }
 
+    /// Shared corroboration check behind [`is_session_alive`] and
+    /// [`is_task_alive`]: a recorded start key must match the pid's current
+    /// one. No corroborating start key on record (should not happen for a
+    /// record this module wrote — see `spawn_start_key_ok` — but a
+    /// hand-edited or pre-upgrade record could lack one) fails closed rather
+    /// than risk reporting a reused pid as this session/task, alive.
     #[cfg(target_os = "linux")]
-    fn is_session_alive(record: &SessionRecord) -> bool {
-        match (&record.started_at, process_start_key(record.pid)) {
+    fn corroborated_alive(pid: u32, started_at: &Option<String>) -> bool {
+        match (started_at, process_start_key(pid)) {
             (Some(recorded), Some(current)) => *recorded == current,
-            // No corroborating start key on record (should not happen for a
-            // record this module wrote — see `spawn_start_key_ok` — but a
-            // hand-edited or pre-upgrade record could lack one): fail closed
-            // rather than risk reporting a reused PID as this session, alive.
             _ => false,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_session_alive(record: &SessionRecord) -> bool {
+        corroborated_alive(record.pid, &record.started_at)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_task_alive(record: &TaskRecord) -> bool {
+        corroborated_alive(record.pid, &record.started_at)
     }
 
     /// macOS has no `/proc`; existence-only fallback (`kill -0`). This cannot
@@ -752,17 +1364,27 @@ mod imp {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn is_session_alive(record: &SessionRecord) -> bool {
-        if record.pid <= 1 {
+    fn corroborated_alive(pid: u32) -> bool {
+        if pid <= 1 {
             return false;
         }
         Command::new("kill")
-            .args(["-0", &record.pid.to_string()])
+            .args(["-0", &pid.to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn is_session_alive(record: &SessionRecord) -> bool {
+        corroborated_alive(record.pid)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn is_task_alive(record: &TaskRecord) -> bool {
+        corroborated_alive(record.pid)
     }
 
     /// Sends `sig` (e.g. `"-TERM"`) to the process **group** led by `pid`
@@ -792,11 +1414,19 @@ mod imp {
         }
     }
 
+    fn wait_while_task_alive(record: &TaskRecord, grace_ms: u64) {
+        let deadline = Instant::now() + Duration::from_millis(grace_ms);
+        while is_task_alive(record) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        }
+    }
+
     /// Stops one session: cooperative `serve --stop` on its inbox first,
     /// bounded wait, then `SIGTERM`/`SIGKILL` process-group escalation if
-    /// still alive, then removes its durable record. Idempotent — a session
-    /// already gone just gets its (possibly already-absent) record cleaned
-    /// up.
+    /// still alive, then reaps every task this session owns
+    /// ([`reap_session_tasks`]) and removes the session's own durable
+    /// record. Idempotent — a session already gone just gets its (possibly
+    /// already-absent) record, and its tasks', cleaned up.
     fn stop_session_record(control: &Path, record: &SessionRecord) -> Result<()> {
         let _ = mailbox::request_stop(&record.spec.inbox);
         wait_while_alive(record, STOP_GRACE_MS);
@@ -808,6 +1438,7 @@ mod imp {
                 wait_while_alive(record, KILL_GRACE_MS);
             }
         }
+        reap_session_tasks(control, &record.id)?;
         remove_session_record(control, &record.id)
     }
 
@@ -932,6 +1563,86 @@ mod imp {
         }
     }
 
+    #[derive(Serialize)]
+    struct TaskStatusView<'a> {
+        id: &'a str,
+        session: &'a str,
+        pid: u32,
+        state: TaskState,
+        live: bool,
+        exit_code: Option<i32>,
+        elapsed_ms: Option<u64>,
+    }
+
+    #[derive(Serialize)]
+    struct TaskStatusReport<'a> {
+        control: String,
+        tasks: Vec<TaskStatusView<'a>>,
+    }
+
+    fn execute_task_status(control: &Path, task: Option<&str>, mut out: impl Write) -> Result<()> {
+        let records: Vec<TaskRecord> = match task {
+            Some(id) => read_task_record(control, id)?.into_iter().collect(),
+            None => list_task_records(control)?,
+        };
+        let tasks = records
+            .iter()
+            .map(|record| TaskStatusView {
+                id: &record.id,
+                session: &record.spec.session,
+                pid: record.pid,
+                state: record.state,
+                live: record.state == TaskState::Running && is_task_alive(record),
+                exit_code: record.exit_code,
+                elapsed_ms: record.elapsed_ms,
+            })
+            .collect();
+        let report = TaskStatusReport {
+            control: control.display().to_string(),
+            tasks,
+        };
+        let json = serde_json::to_string(&report)
+            .map_err(|err| BatonError::Io(format!("could not serialize task status: {err}")))?;
+        writeln!(out, "{json}").map_err(io_err)
+    }
+
+    /// Cancels one task: idempotent — a task already terminal (or unknown)
+    /// is a no-op success. Acts directly on the durable [`TaskRecord`]'s
+    /// PID, exactly like [`stop_session_record`] does for a session, so this
+    /// works even when `Run` is not currently alive; `Run`'s own tick (if
+    /// alive) still performs the actual terminal-state write and event
+    /// delivery once it observes the exit.
+    fn cancel_task_record(control: &Path, record: &TaskRecord) -> Result<()> {
+        if record.state != TaskState::Running {
+            return Ok(());
+        }
+        request_task_cancel_sentinel(control, &record.id)?;
+        if is_task_alive(record) {
+            let _ = signal_group(record.pid, "-TERM");
+            wait_while_task_alive(record, KILL_GRACE_MS);
+            if is_task_alive(record) {
+                let _ = signal_group(record.pid, "-KILL");
+                wait_while_task_alive(record, KILL_GRACE_MS);
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_task_cancel(control: &Path, task: &str, mut out: impl Write) -> Result<()> {
+        match read_task_record(control, task)? {
+            Some(record) => {
+                cancel_task_record(control, &record)?;
+                writeln!(out, "cancelled task {task}").map_err(io_err)
+            }
+            None => writeln!(
+                out,
+                "no task {task:?} on {}; nothing to cancel",
+                control.display()
+            )
+            .map_err(io_err),
+        }
+    }
+
     fn execute_teardown(control: &Path, mut out: impl Write) -> Result<()> {
         for record in list_session_records(control)? {
             stop_session_record(control, &record)?;
@@ -992,6 +1703,64 @@ mod imp {
                 agent_output: None,
                 agent_result_key: None,
                 role: None,
+            }
+        }
+
+        fn task_spec(
+            session: &str,
+            command: &str,
+            args: Vec<String>,
+            milestones_ms: Vec<u64>,
+            max_duration_ms: u64,
+            callback_inbox: &str,
+        ) -> TaskSpec {
+            TaskSpec {
+                schema: crate::task::TASK_SPEC_SCHEMA.to_string(),
+                session: session.to_string(),
+                command: command.to_string(),
+                args,
+                cwd: None,
+                env: Vec::new(),
+                milestones_ms,
+                max_duration_ms,
+                callback: TaskCallback {
+                    inbox: callback_inbox.to_string(),
+                    role: None,
+                },
+            }
+        }
+
+        /// Spawns `spec` under `dir` and wraps it as a durably-recorded
+        /// [`RunningTask`], mirroring what `handle_task_start_request` does
+        /// inside the real request protocol — but callable directly, so a
+        /// test can drive [`tick_one_task`] without going through the
+        /// request-file dance or the infinite `run_service` loop.
+        fn spawn_running_task(dir: &Path, id: &str, spec: TaskSpec, clock: &dyn Clock) -> RunningTask {
+            let log_dir = task_logs_dir(dir, id);
+            fs::create_dir_all(&log_dir).expect("create log dir");
+            let stdout_path = log_dir.join("stdout.log");
+            let stderr_path = log_dir.join("stderr.log");
+            let child = spawn_task_child(&spec, &stdout_path, &stderr_path).expect("spawn task");
+            let pid = child.id();
+            let record = TaskRecord {
+                id: id.to_string(),
+                spec,
+                pid,
+                started_at: recorded_start_key(pid),
+                state: TaskState::Running,
+                exit_code: None,
+                elapsed_ms: None,
+                stdout_path: stdout_path.display().to_string(),
+                stderr_path: stderr_path.display().to_string(),
+                delivered_milestones: 0,
+            };
+            write_task_record(dir, &record).expect("write task record");
+            RunningTask {
+                record,
+                child,
+                started_ms: clock.now_ms(),
+                term_sent_at_ms: None,
+                kill_sent: false,
             }
         }
 
@@ -1256,6 +2025,437 @@ mod imp {
                     .unwrap()
                     .contains("no running baton service")
             );
+        }
+
+        // -- Task records -----------------------------------------------
+
+        /// A task record round-trips through the atomic-write file protocol
+        /// byte-for-byte.
+        #[test]
+        fn task_record_round_trips() {
+            let dir = TempDir::new("task-record");
+            let record = TaskRecord {
+                id: "task-1".to_string(),
+                spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/cb"),
+                pid: 4242,
+                started_at: Some("123456".to_string()),
+                state: TaskState::Running,
+                exit_code: None,
+                elapsed_ms: None,
+                stdout_path: "/tmp/out.log".to_string(),
+                stderr_path: "/tmp/err.log".to_string(),
+                delivered_milestones: 0,
+            };
+            write_task_record(&dir.path, &record).expect("write");
+            let read = read_task_record(&dir.path, "task-1")
+                .expect("read")
+                .expect("present");
+            assert_eq!(read, record);
+        }
+
+        /// A task id absent from `tasks/` reads as `None`, not an error.
+        #[test]
+        fn read_task_record_absent_is_none() {
+            let dir = TempDir::new("task-absent");
+            assert!(read_task_record(&dir.path, "nope").expect("read").is_none());
+        }
+
+        /// An unsafe task id is rejected rather than escaping the control
+        /// root.
+        #[test]
+        fn unsafe_task_id_is_rejected() {
+            let dir = TempDir::new("task-unsafe");
+            assert!(read_task_record(&dir.path, "../escape").is_err());
+            assert!(remove_task_record(&dir.path, "../escape").is_err());
+        }
+
+        /// `list_task_records` returns every written record.
+        #[test]
+        fn list_task_records_returns_all() {
+            let dir = TempDir::new("task-list");
+            for i in 0..3 {
+                let record = TaskRecord {
+                    id: format!("task-{i}"),
+                    spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/cb"),
+                    pid: 1000 + i,
+                    started_at: None,
+                    state: TaskState::Running,
+                    exit_code: None,
+                    elapsed_ms: None,
+                    stdout_path: String::new(),
+                    stderr_path: String::new(),
+                    delivered_milestones: 0,
+                };
+                write_task_record(&dir.path, &record).expect("write");
+            }
+            let mut ids: Vec<String> = list_task_records(&dir.path)
+                .expect("list")
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            ids.sort();
+            assert_eq!(ids, vec!["task-0", "task-1", "task-2"]);
+        }
+
+        /// Removing an already-absent task record is a no-op success
+        /// (idempotent).
+        #[test]
+        fn remove_task_record_is_idempotent() {
+            let dir = TempDir::new("task-remove");
+            assert!(remove_task_record(&dir.path, "nope").is_ok());
+        }
+
+        // -- Deterministic event ids + mailbox delivery ------------------
+
+        /// A redelivered event id — already consumed (`claimed → done`) by a
+        /// prior delivery — is dropped by the mailbox's own dedup, not
+        /// reprocessed, so a crash-restart replay never creates a second
+        /// visible event.
+        #[test]
+        fn task_event_redelivery_is_deduped_by_mailbox_done_ledger() {
+            let dir = TempDir::new("event-dedup");
+            let callback_inbox = dir.path.join("callback");
+            let record = TaskRecord {
+                id: "task-x".to_string(),
+                spec: task_spec(
+                    "svc-1",
+                    "true",
+                    vec![],
+                    vec![],
+                    1_000,
+                    &callback_inbox.display().to_string(),
+                ),
+                pid: 0,
+                started_at: None,
+                state: TaskState::Completed,
+                exit_code: Some(0),
+                elapsed_ms: Some(10),
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                delivered_milestones: 0,
+            };
+
+            deliver_task_event(&record, TaskEventKind::Terminal).expect("deliver");
+            {
+                let mailbox = mailbox::Mailbox::open(&callback_inbox).expect("open");
+                let claimed = mailbox
+                    .claim_next()
+                    .expect("claim")
+                    .expect("event present");
+                assert_eq!(claimed.key, "task-x-terminal");
+                mailbox.complete(claimed).expect("complete");
+            }
+
+            // Redeliver the identical event (same deterministic id).
+            deliver_task_event(&record, TaskEventKind::Terminal).expect("redeliver");
+            {
+                let mailbox = mailbox::Mailbox::open(&callback_inbox).expect("open");
+                assert!(
+                    mailbox.claim_next().expect("claim").is_none(),
+                    "an id already in done/ must be dropped, not reprocessed"
+                );
+            }
+        }
+
+        // -- Task loop: FakeClock-driven milestone/max-duration/terminal -
+
+        /// A milestone fires exactly once it is due, per the injected clock
+        /// — not real wall-clock time — and is delivered to the callback
+        /// mailbox under its deterministic id.
+        #[test]
+        fn tick_one_task_delivers_milestone_via_fake_clock_no_real_sleep() {
+            let dir = TempDir::new("tick-milestone");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let spec = task_spec(
+                "svc-1",
+                "sleep",
+                vec!["0.3".to_string()],
+                vec![50],
+                10_000,
+                &callback_inbox.display().to_string(),
+            );
+            let mut running = spawn_running_task(&dir.path, "task-m", spec, &clock);
+
+            clock.advance(60);
+            let tick = tick_one_task(&dir.path, "task-m", &mut running, &clock).expect("tick");
+            assert!(matches!(tick, TaskTick::StillRunning));
+            assert_eq!(running.record.delivered_milestones, 1);
+
+            let mailbox = mailbox::Mailbox::open(&callback_inbox).expect("open");
+            let claimed = mailbox
+                .claim_next()
+                .expect("claim")
+                .expect("milestone event present");
+            assert_eq!(claimed.key, "task-m-milestone-0");
+
+            // Ticking again at the same elapsed time must not re-fire it.
+            let tick = tick_one_task(&dir.path, "task-m", &mut running, &clock).expect("tick");
+            assert!(matches!(tick, TaskTick::StillRunning));
+            assert_eq!(running.record.delivered_milestones, 1);
+
+            let _ = signal_group(running.record.pid, "-KILL");
+            let _ = running.child.wait();
+        }
+
+        /// Exceeding `max_duration_ms` (per the injected clock) escalates
+        /// `SIGTERM`→`SIGKILL` and the eventual reap is attributed to
+        /// `timeout`, not `completed`/`failed`.
+        #[test]
+        fn tick_one_task_enforces_max_duration_and_marks_timeout() {
+            let dir = TempDir::new("tick-timeout");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let spec = task_spec(
+                "svc-1",
+                "sleep",
+                vec!["5".to_string()],
+                vec![],
+                100,
+                &callback_inbox.display().to_string(),
+            );
+            let mut running = spawn_running_task(&dir.path, "task-t", spec, &clock);
+
+            clock.advance(150);
+            let tick = tick_one_task(&dir.path, "task-t", &mut running, &clock).expect("tick");
+            assert!(matches!(tick, TaskTick::StillRunning));
+            assert!(
+                running.term_sent_at_ms.is_some(),
+                "max-duration breach must send SIGTERM"
+            );
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match tick_one_task(&dir.path, "task-t", &mut running, &clock).expect("tick") {
+                    TaskTick::Finished => break,
+                    TaskTick::StillRunning => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "task did not exit after SIGTERM within the test bound"
+                        );
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            }
+            assert_eq!(running.record.state, TaskState::Timeout);
+
+            let mailbox = mailbox::Mailbox::open(&callback_inbox).expect("open");
+            let claimed = mailbox
+                .claim_next()
+                .expect("claim")
+                .expect("terminal event present");
+            assert_eq!(claimed.key, "task-t-terminal");
+        }
+
+        /// A task that exits zero on its own, before any max-duration
+        /// breach, is reaped as `completed`.
+        #[test]
+        fn tick_one_task_reaps_a_clean_exit_as_completed() {
+            let dir = TempDir::new("tick-completed");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let spec = task_spec(
+                "svc-1",
+                "true",
+                vec![],
+                vec![],
+                10_000,
+                &callback_inbox.display().to_string(),
+            );
+            let mut running = spawn_running_task(&dir.path, "task-c", spec, &clock);
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match tick_one_task(&dir.path, "task-c", &mut running, &clock).expect("tick") {
+                    TaskTick::Finished => break,
+                    TaskTick::StillRunning => {
+                        assert!(Instant::now() < deadline, "task did not exit in time");
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            }
+            assert_eq!(running.record.state, TaskState::Completed);
+            assert_eq!(running.record.exit_code, Some(0));
+        }
+
+        // -- Session-scoped task reaping ----------------------------------
+
+        /// `reap_session_tasks` reaps only the records owned by the given
+        /// session, leaving another session's task record untouched.
+        #[test]
+        fn reap_session_tasks_is_scoped_to_the_owning_session() {
+            let dir = TempDir::new("reap-scoped");
+            let owned = TaskRecord {
+                id: "task-owned".to_string(),
+                spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/cb-a"),
+                pid: u32::MAX - 1,
+                started_at: None,
+                state: TaskState::Running,
+                exit_code: None,
+                elapsed_ms: None,
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                delivered_milestones: 0,
+            };
+            let other = TaskRecord {
+                id: "task-other".to_string(),
+                spec: task_spec("svc-2", "true", vec![], vec![], 1_000, "/tmp/cb-b"),
+                pid: u32::MAX - 1,
+                started_at: None,
+                state: TaskState::Running,
+                exit_code: None,
+                elapsed_ms: None,
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                delivered_milestones: 0,
+            };
+            write_task_record(&dir.path, &owned).expect("write owned");
+            write_task_record(&dir.path, &other).expect("write other");
+
+            reap_session_tasks(&dir.path, "svc-1").expect("reap");
+
+            assert!(
+                read_task_record(&dir.path, "task-owned")
+                    .expect("read")
+                    .is_none(),
+                "the owning session's task record is reaped"
+            );
+            assert!(
+                read_task_record(&dir.path, "task-other")
+                    .expect("read")
+                    .is_some(),
+                "a different session's task record is untouched"
+            );
+        }
+
+        /// `execute_teardown` reaps every session's owned task records too,
+        /// regardless of each task's own callback target — the callback is
+        /// a delivery target only, never the ownership/reaping boundary.
+        #[test]
+        fn execute_teardown_reaps_stale_task_records_owned_by_the_session() {
+            let dir = TempDir::new("teardown-tasks");
+            let session_record = SessionRecord {
+                id: "svc-1".to_string(),
+                spec: spec("/tmp/in", "/tmp/out"),
+                pid: u32::MAX - 1,
+                started_at: None,
+            };
+            write_session_record(&dir.path, &session_record).expect("write session");
+            let task_record = TaskRecord {
+                id: "task-1".to_string(),
+                spec: task_spec(
+                    "svc-1",
+                    "true",
+                    vec![],
+                    vec![],
+                    1_000,
+                    // A callback role/inbox outside the owning session's own
+                    // mailbox — still reaped, since ownership is by session,
+                    // not by callback target.
+                    "/tmp/some-other-roles-inbox",
+                ),
+                pid: u32::MAX - 1,
+                started_at: None,
+                state: TaskState::Running,
+                exit_code: None,
+                elapsed_ms: None,
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                delivered_milestones: 0,
+            };
+            write_task_record(&dir.path, &task_record).expect("write task");
+
+            let mut out = Vec::new();
+            execute_teardown(&dir.path, &mut out).expect("teardown");
+
+            assert!(
+                read_session_record(&dir.path, "svc-1")
+                    .expect("read")
+                    .is_none()
+            );
+            assert!(
+                read_task_record(&dir.path, "task-1").expect("read").is_none(),
+                "the session's task record is reaped too"
+            );
+        }
+
+        // -- Task CLI-facing operations -----------------------------------
+
+        /// `execute_task_status` reports a written task record's liveness
+        /// and fields.
+        #[test]
+        fn execute_task_status_reports_task_fields() {
+            let dir = TempDir::new("task-status");
+            let record = TaskRecord {
+                id: "task-1".to_string(),
+                spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/cb"),
+                pid: u32::MAX - 1,
+                started_at: None,
+                state: TaskState::Completed,
+                exit_code: Some(0),
+                elapsed_ms: Some(42),
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                delivered_milestones: 0,
+            };
+            write_task_record(&dir.path, &record).expect("write");
+
+            let mut out = Vec::new();
+            execute_task_status(&dir.path, None, &mut out).expect("status");
+            let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
+            let tasks = json["tasks"].as_array().unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0]["id"], "task-1");
+            assert_eq!(tasks[0]["session"], "svc-1");
+            assert_eq!(tasks[0]["state"], "completed");
+            assert_eq!(tasks[0]["exit_code"], 0);
+            assert_eq!(tasks[0]["elapsed_ms"], 42);
+        }
+
+        /// `execute_task_cancel` on an unknown task id is a no-op success
+        /// (idempotent).
+        #[test]
+        fn execute_task_cancel_unknown_task_is_idempotent_success() {
+            let dir = TempDir::new("cancel-unknown");
+            let mut out = Vec::new();
+            execute_task_cancel(&dir.path, "nope", &mut out).expect("cancel");
+            assert!(String::from_utf8(out).unwrap().contains("nothing to cancel"));
+        }
+
+        /// Cancelling a running task writes the cooperative cancel sentinel
+        /// and kills its process group; a subsequent reap (driven directly
+        /// via `tick_one_task`, standing in for `Run`'s own tick) attributes
+        /// the exit to `cancelled`, not `failed`.
+        #[test]
+        fn cancel_then_tick_marks_task_cancelled() {
+            let dir = TempDir::new("cancel-then-tick");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let spec = task_spec(
+                "svc-1",
+                "sleep",
+                vec!["5".to_string()],
+                vec![],
+                10_000,
+                &callback_inbox.display().to_string(),
+            );
+            let mut running = spawn_running_task(&dir.path, "task-cancel", spec, &clock);
+
+            let mut out = Vec::new();
+            execute_task_cancel(&dir.path, "task-cancel", &mut out).expect("cancel");
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match tick_one_task(&dir.path, "task-cancel", &mut running, &clock).expect("tick")
+                {
+                    TaskTick::Finished => break,
+                    TaskTick::StillRunning => {
+                        assert!(Instant::now() < deadline, "task did not exit in time");
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            }
+            assert_eq!(running.record.state, TaskState::Cancelled);
         }
     }
 }

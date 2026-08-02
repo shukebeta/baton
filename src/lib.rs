@@ -14,6 +14,8 @@
 //! - [`message`] — the `baton.message/v1` A2A peer-message envelope.
 //! - [`participant`] — the envelope-in / envelope-out participant seam.
 //! - [`roles`] — per-role home directories and layered identity resolution.
+//! - [`service`] — the host-owned supervisor for `baton serve` sessions.
+//! - [`task`] — the service-owned asynchronous job contract.
 //! - [`error`] — shared error and result types.
 //! - [`cli`] — the command-line entry surface.
 
@@ -30,4 +32,5 @@ pub mod participant;
 pub mod registry;
 pub mod roles;
 pub mod service;
+pub mod task;
 pub mod transport;
