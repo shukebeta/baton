@@ -2091,6 +2091,21 @@ fn read_ppid(pid: u32) -> Option<u32> {
         .find_map(|line| line.strip_prefix("PPid:")?.trim().parse::<u32>().ok())
 }
 
+/// Reports whether a Linux process is still running rather than a zombie.
+#[cfg(target_os = "linux")]
+fn process_is_live(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+        return false;
+    };
+    after_comm
+        .split_whitespace()
+        .next()
+        .is_some_and(|state| state != "Z")
+}
+
 /// Issue #109 AC #5 (orphan-survival regression): a session started through
 /// `baton service start` is spawned as a **direct child of the long-lived
 /// `baton service run`**, not of the short-lived `service start` client that
@@ -2233,6 +2248,349 @@ fn service_session_survives_submitting_client_and_is_owned_by_run() {
     );
     let run_status = run_child.wait().expect("baton service run exits");
     assert!(run_status.success(), "service run exits 0 on teardown");
+}
+
+/// Issue #123 regression: task admission and session cleanup are serialized
+/// by a separate lock. The stop path reaps an already-admitted task, rejects
+/// a racing task request after owner removal, and teardown reaps another
+/// running task whose callback inbox is outside the owning session.
+#[cfg(target_os = "linux")]
+#[test]
+fn service_stop_serializes_task_admission_and_reaps_owned_tasks() {
+    use baton::mailbox;
+    use baton::message::{MessageEnvelope, MessageKind};
+
+    let root = TempMailbox::new("task-cleanup-race");
+    let control = root.path.join("control");
+    let session_inbox = root.path.join("session-inbox");
+    let session_outbox = root.path.join("session-outbox");
+    let agent_started = root.path.join("agent-started");
+    let callback_inbox = root.path.join("callback");
+    let racing_marker = root.path.join("racing-marker");
+
+    let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    run.args(["service", "run", "--control", control.to_str().unwrap()]);
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::null());
+    let mut run_child = run.spawn().expect("spawn baton service run");
+    let control_str = control.to_str().unwrap();
+
+    let mut live = false;
+    for _ in 0..100 {
+        if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(["service", "status", "--control", control_str])
+            .output()
+            && out.status.success()
+            && String::from_utf8_lossy(&out.stdout).contains("\"service_running\":true")
+        {
+            live = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(live, "baton service run did not report live in time");
+
+    let session_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str,
+            "--inbox",
+            session_inbox.to_str().unwrap(),
+            "--outbox",
+            session_outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+            "--agent-cmd",
+            "sh",
+            "--agent-arg",
+            "-c",
+            "--agent-arg",
+            "cat >/dev/null; touch \"$1\"; sleep 30",
+            "--agent-arg",
+            "task-stop-agent",
+            "--agent-arg",
+            agent_started.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run service start for cleanup race");
+    assert!(
+        session_start.status.success(),
+        "service start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&session_start.stderr)
+    );
+    let session_id = String::from_utf8_lossy(&session_start.stdout)
+        .trim()
+        .to_string();
+    assert!(!session_id.is_empty(), "service start prints a session id");
+
+    let admitted_task = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "task",
+            "start",
+            "--control",
+            control_str,
+            "--session",
+            &session_id,
+            "--command",
+            "sleep",
+            "--arg",
+            "30",
+            "--max-duration-ms",
+            "60000",
+            "--callback-inbox",
+            callback_inbox.to_str().unwrap(),
+        ])
+        .output()
+        .expect("start task under live owner");
+    assert!(
+        admitted_task.status.success(),
+        "task start should succeed for a live owner; stderr: {}",
+        String::from_utf8_lossy(&admitted_task.stderr)
+    );
+    let admitted_task_id = String::from_utf8_lossy(&admitted_task.stdout)
+        .trim()
+        .to_string();
+    assert!(!admitted_task_id.is_empty(), "task start prints a task id");
+    let admitted_status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "task",
+            "status",
+            "--control",
+            control_str,
+            "--task",
+            &admitted_task_id,
+        ])
+        .output()
+        .expect("read admitted task status");
+    let admitted_json: serde_json::Value =
+        serde_json::from_slice(&admitted_status.stdout).expect("admitted task status is JSON");
+    let admitted_pid = admitted_json["tasks"][0]["pid"]
+        .as_u64()
+        .expect("admitted task pid") as u32;
+    assert!(
+        process_is_live(admitted_pid),
+        "admitted task should be running"
+    );
+
+    let request = MessageEnvelope::new(
+        "task-stop-race-m1",
+        "conv-task-stop-race",
+        "agent-a",
+        "agent-b",
+        MessageKind::Request,
+        "hold this turn",
+        1_700_000_000_000,
+    );
+    mailbox::deliver_to(&session_inbox, &request).expect("deliver in-flight session request");
+    let mut in_flight = false;
+    for _ in 0..100 {
+        if agent_started.is_file() {
+            in_flight = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(in_flight, "session did not enter its in-flight agent turn");
+
+    let stop = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "stop",
+            "--control",
+            control_str,
+            "--session",
+            &session_id,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn service stop");
+    let session_stop = session_inbox.join("serve.stop");
+    let mut draining = false;
+    for _ in 0..250 {
+        if session_stop.is_file() {
+            draining = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(draining, "service stop did not begin draining the session");
+
+    let racing_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "task",
+            "start",
+            "--control",
+            control_str,
+            "--session",
+            &session_id,
+            "--command",
+            "sh",
+            "--arg",
+            "-c",
+            "--arg",
+            "touch \"$1\"; sleep 30",
+            "--arg",
+            "racing-task",
+            "--arg",
+            racing_marker.to_str().unwrap(),
+            "--max-duration-ms",
+            "60000",
+            "--callback-inbox",
+            callback_inbox.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run racing task start");
+    let stop_output = stop.wait_with_output().expect("wait for service stop");
+    assert!(
+        stop_output.status.success(),
+        "service stop should exit 0; stderr: {}",
+        String::from_utf8_lossy(&stop_output.stderr)
+    );
+    assert!(
+        !racing_start.status.success(),
+        "task admission racing cleanup must be rejected; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&racing_start.stdout),
+        String::from_utf8_lossy(&racing_start.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&racing_start.stderr)
+            .contains("does not name a live managed session"),
+        "racing rejection should explain the owner failure: {}",
+        String::from_utf8_lossy(&racing_start.stderr)
+    );
+    assert!(
+        !racing_marker.exists(),
+        "rejected racing task must not spawn"
+    );
+
+    let mut admitted_reaped = false;
+    for _ in 0..100 {
+        let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(["task", "status", "--control", control_str])
+            .output()
+            .expect("read task status after service stop");
+        let json: serde_json::Value =
+            serde_json::from_slice(&status.stdout).expect("task status is JSON");
+        if json["tasks"].as_array().unwrap().is_empty() && !process_is_live(admitted_pid) {
+            admitted_reaped = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        admitted_reaped,
+        "service stop must remove the admitted task and stop its process"
+    );
+
+    let second_inbox = root.path.join("second-session-inbox");
+    let second_outbox = root.path.join("second-session-outbox");
+    let second_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str,
+            "--inbox",
+            second_inbox.to_str().unwrap(),
+            "--outbox",
+            second_outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+            "--agent-cmd",
+            "sh",
+            "--agent-arg",
+            "-c",
+            "--agent-arg",
+            "cat >/dev/null; printf ready",
+        ])
+        .output()
+        .expect("run second service start");
+    assert!(
+        second_start.status.success(),
+        "second service start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&second_start.stderr)
+    );
+    let second_session = String::from_utf8_lossy(&second_start.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        !second_session.is_empty(),
+        "second service start prints a session id"
+    );
+
+    let teardown_task = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "task",
+            "start",
+            "--control",
+            control_str,
+            "--session",
+            &second_session,
+            "--command",
+            "sleep",
+            "--arg",
+            "30",
+            "--max-duration-ms",
+            "60000",
+            "--callback-inbox",
+            callback_inbox.to_str().unwrap(),
+        ])
+        .output()
+        .expect("start task for teardown cleanup");
+    assert!(
+        teardown_task.status.success(),
+        "task start under second live owner should succeed; stderr: {}",
+        String::from_utf8_lossy(&teardown_task.stderr)
+    );
+    let teardown_task_id = String::from_utf8_lossy(&teardown_task.stdout)
+        .trim()
+        .to_string();
+    let teardown_task_status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "task",
+            "status",
+            "--control",
+            control_str,
+            "--task",
+            &teardown_task_id,
+        ])
+        .output()
+        .expect("read teardown task status");
+    let teardown_task_json: serde_json::Value =
+        serde_json::from_slice(&teardown_task_status.stdout).expect("teardown task status JSON");
+    let teardown_task_pid = teardown_task_json["tasks"][0]["pid"]
+        .as_u64()
+        .expect("teardown task pid") as u32;
+
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str])
+        .output()
+        .expect("run service teardown");
+    assert!(
+        teardown.status.success(),
+        "teardown should exit 0; stderr: {}",
+        String::from_utf8_lossy(&teardown.stderr)
+    );
+    let run_status = run_child.wait().expect("baton service run exits");
+    assert!(run_status.success(), "service run exits 0 on teardown");
+
+    let final_status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["task", "status", "--control", control_str])
+        .output()
+        .expect("read task status after teardown");
+    let final_json: serde_json::Value =
+        serde_json::from_slice(&final_status.stdout).expect("final task status is JSON");
+    assert!(
+        final_json["tasks"].as_array().unwrap().is_empty(),
+        "teardown removes the running task record"
+    );
+    assert!(
+        !process_is_live(teardown_task_pid),
+        "teardown stops the running task process"
+    );
 }
 
 /// Issue #119 regression: `service start` resolves relative session paths in
@@ -2616,12 +2974,14 @@ fn service_task_survives_submitting_client_and_is_owned_by_run() {
 
     let root = TempMailbox::new("task");
     let control = root.path.join("control");
+    let session_inbox = root.path.join("session-inbox");
+    let session_outbox = root.path.join("session-outbox");
     let callback_inbox = root.path.join("callback");
 
     let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
     run.args(["service", "run", "--control", control.to_str().unwrap()]);
     run.stdout(Stdio::null());
-    run.stderr(Stdio::null());
+    run.stderr(Stdio::piped());
     let mut run_child = run.spawn().expect("spawn baton service run");
     let run_pid = run_child.id();
 
@@ -2630,7 +2990,7 @@ fn service_task_survives_submitting_client_and_is_owned_by_run() {
     // Wait for `Run` to acquire its control lock: `task start` fails fast
     // rather than waiting when no live service is found yet.
     let mut live = false;
-    for _ in 0..100 {
+    for _ in 0..200 {
         if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
             .args(["service", "status", "--control", control_str])
             .output()
@@ -2642,7 +3002,50 @@ fn service_task_survives_submitting_client_and_is_owned_by_run() {
         }
         thread::sleep(Duration::from_millis(50));
     }
-    assert!(live, "baton service run did not report live in time");
+    if !live {
+        let _ = run_child.kill();
+        let output = run_child
+            .wait_with_output()
+            .expect("collect failed service run output");
+        panic!(
+            "baton service run did not report live in time; status={:?}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Task ownership is tied to an actual managed session, not an arbitrary
+    // caller-supplied label. Keep the session alive while the task runs.
+    let session_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str,
+            "--inbox",
+            session_inbox.to_str().unwrap(),
+            "--outbox",
+            session_outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+            "--agent-cmd",
+            "sh",
+            "--agent-arg",
+            "-c",
+            "--agent-arg",
+            "cat >/dev/null; printf ready",
+        ])
+        .output()
+        .expect("run baton service start for task owner");
+    assert!(
+        session_start.status.success(),
+        "service start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&session_start.stderr)
+    );
+    let session_id = String::from_utf8_lossy(&session_start.stdout)
+        .trim()
+        .to_string();
+    assert!(!session_id.is_empty(), "service start prints a session id");
 
     // The short-lived submitting client: `task start` waits for `Run` to
     // spawn and record the task, then exits — there is no lingering process
@@ -2654,7 +3057,7 @@ fn service_task_survives_submitting_client_and_is_owned_by_run() {
             "--control",
             control_str,
             "--session",
-            "svc-task-1",
+            &session_id,
             "--command",
             "sh",
             "--arg",
@@ -2760,6 +3163,208 @@ fn service_task_survives_submitting_client_and_is_owned_by_run() {
     assert_eq!(final_json["tasks"][0]["state"], "completed");
 
     // Teardown reaps the task and stops `Run` cooperatively; wait it out.
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str])
+        .output()
+        .expect("run baton service teardown");
+    assert!(
+        teardown.status.success(),
+        "teardown should exit 0; stderr: {}",
+        String::from_utf8_lossy(&teardown.stderr)
+    );
+    let run_status = run_child.wait().expect("baton service run exits");
+    assert!(run_status.success(), "service run exits 0 on teardown");
+}
+
+/// Issue #123 regression: task admission rejects both an absent owner record
+/// and a record whose session process is already dead, before it creates a
+/// child or durable task record.
+#[cfg(target_os = "linux")]
+#[test]
+fn service_task_rejects_missing_and_stale_owners_before_spawn() {
+    let root = TempMailbox::new("task-owner-rejection");
+    let control = root.path.join("control");
+    let stale_inbox = root.path.join("stale-inbox");
+    let stale_outbox = root.path.join("stale-outbox");
+    let callback_inbox = root.path.join("callback");
+
+    let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    run.args(["service", "run", "--control", control.to_str().unwrap()]);
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::null());
+    let mut run_child = run.spawn().expect("spawn baton service run");
+    let control_str = control.to_str().unwrap();
+
+    let mut live = false;
+    for _ in 0..100 {
+        if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(["service", "status", "--control", control_str])
+            .output()
+            && out.status.success()
+            && String::from_utf8_lossy(&out.stdout).contains("\"service_running\":true")
+        {
+            live = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(live, "baton service run did not report live in time");
+
+    let stale_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str,
+            "--inbox",
+            stale_inbox.to_str().unwrap(),
+            "--outbox",
+            stale_outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+            "--agent-cmd",
+            "sh",
+            "--agent-arg",
+            "-c",
+            "--agent-arg",
+            "cat >/dev/null; printf ready",
+        ])
+        .output()
+        .expect("run baton service start for stale owner");
+    assert!(
+        stale_start.status.success(),
+        "service start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&stale_start.stderr)
+    );
+    let stale_session = String::from_utf8_lossy(&stale_start.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        !stale_session.is_empty(),
+        "service start prints a session id"
+    );
+
+    let stale_status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "status",
+            "--control",
+            control_str,
+            "--session",
+            &stale_session,
+        ])
+        .output()
+        .expect("read stale owner status");
+    let stale_json: serde_json::Value =
+        serde_json::from_slice(&stale_status.stdout).expect("stale owner status is JSON");
+    let stale_pid = stale_json["sessions"][0]["pid"]
+        .as_u64()
+        .expect("stale owner pid") as u32;
+    let stale_group = format!("-{stale_pid}");
+    let kill = Command::new("kill")
+        .args(["-KILL", "--", stale_group.as_str()])
+        .status()
+        .expect("kill stale owner process group");
+    assert!(
+        kill.success(),
+        "stale owner process group should be killable"
+    );
+
+    let mut stale = false;
+    for _ in 0..100 {
+        if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args([
+                "service",
+                "status",
+                "--control",
+                control_str,
+                "--session",
+                &stale_session,
+            ])
+            .output()
+            && out.status.success()
+        {
+            let json: serde_json::Value =
+                serde_json::from_slice(&out.stdout).expect("stale status is JSON");
+            stale = json["sessions"]
+                .as_array()
+                .map(|sessions| sessions.is_empty() || sessions[0]["live"] == false)
+                .unwrap_or(true);
+            if stale {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        stale,
+        "the killed session should be stale before task admission"
+    );
+
+    let cases = [
+        (
+            "missing-owner".to_string(),
+            root.path.join("missing-marker"),
+        ),
+        (stale_session.clone(), root.path.join("stale-marker")),
+    ];
+    for (owner, marker) in cases {
+        let task_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args([
+                "task",
+                "start",
+                "--control",
+                control_str,
+                "--session",
+                owner.as_str(),
+                "--command",
+                "sh",
+                "--arg",
+                "-c",
+                "--arg",
+                "touch \"$1\"; sleep 30",
+                "--arg",
+                "task-owner",
+                "--arg",
+                marker.to_str().unwrap(),
+                "--max-duration-ms",
+                "60000",
+                "--callback-inbox",
+                callback_inbox.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run baton task start with stale owner");
+        assert!(
+            !task_start.status.success(),
+            "stale owner must be rejected; stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&task_start.stdout),
+            String::from_utf8_lossy(&task_start.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&task_start.stderr)
+                .contains("does not name a live managed session"),
+            "owner rejection should explain the live-session requirement: {}",
+            String::from_utf8_lossy(&task_start.stderr)
+        );
+        assert!(
+            task_start.stdout.is_empty(),
+            "rejected task start prints no task id"
+        );
+        assert!(!marker.exists(), "rejected task must not spawn its command");
+
+        let task_status = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(["task", "status", "--control", control_str])
+            .output()
+            .expect("read task status after owner rejection");
+        let task_json: serde_json::Value =
+            serde_json::from_slice(&task_status.stdout).expect("task status is JSON");
+        assert_eq!(
+            task_json["tasks"].as_array().unwrap().len(),
+            0,
+            "owner rejection leaves no durable task record"
+        );
+    }
+
     let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
         .args(["service", "teardown", "--control", control_str])
         .output()
