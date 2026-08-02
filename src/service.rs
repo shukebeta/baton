@@ -57,9 +57,9 @@
 //! Unix only (Linux and macOS): process groups and the `kill` escalation this
 //! module relies on have no equivalent in this crate's dependency-free design
 //! on Windows. [`execute_service`] fails clearly there rather than silently
-//! degrading. The systemd user-service integration (`packaging/systemd/`) is
-//! Linux-specific and external to this binary; launchd (macOS) and a Windows
-//! host-service integration are tracked separately.
+//! degrading. The systemd user-service integration (`packaging/systemd/`) and
+//! macOS LaunchAgent integration (`packaging/launchd/`) are external to this
+//! binary; a Windows host-service integration is tracked separately.
 
 use std::io::Write;
 #[cfg(unix)]
@@ -1605,48 +1605,100 @@ mod imp {
         corroborated_alive(record.pid, &record.started_at)
     }
 
-    /// macOS has no `/proc`; existence-only fallback (`kill -0`). This cannot
-    /// corroborate a PID against reuse across a `Run` restart the way the
-    /// Linux path does — acceptable here because macOS host-service
-    /// ownership (launchd) is explicitly out of scope for this module (see
-    /// the module doc); this fallback exists so `baton service` still
-    /// compiles, spawns, and tears down correctly on macOS in the foreground/
-    /// test/diagnostic mode this module always supports on Unix.
+    /// A non-Linux Unix `ps` sample. macOS has no `/proc`, so `state` and
+    /// `lstart` are the available process-state and start-time corroborators.
+    /// `lstart` is second-granular, weaker than Linux `/proc` ticks, and the
+    /// `state=,lstart=` format is a BSD/procps extension rather than POSIX.
+    /// That tradeoff is accepted because Linux and macOS are the supported
+    /// Unix hosts in CI.
     #[cfg(not(target_os = "linux"))]
-    fn recorded_start_key(_pid: u32) -> Option<String> {
-        None
-    }
-
-    /// No spawn-time corroboration is possible on this host (see
-    /// [`recorded_start_key`]'s doc), so a `None` start key is expected, not a
-    /// spawn failure.
-    #[cfg(not(target_os = "linux"))]
-    fn spawn_start_key_ok(_started_at: &Option<String>) -> bool {
-        true
+    #[derive(Debug, PartialEq, Eq)]
+    struct ProcessProbe {
+        state: String,
+        start_key: String,
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn corroborated_alive(pid: u32) -> bool {
-        if pid <= 1 {
-            return false;
+    impl ProcessProbe {
+        fn is_zombie(&self) -> bool {
+            self.state.starts_with('Z')
         }
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+    }
+
+    /// Parses one `ps -p <pid> -o state=,lstart=` row. Splitting on
+    /// whitespace deliberately normalizes repeated spaces in `lstart`, so
+    /// repeated probes compare the same stable key.
+    #[cfg(not(target_os = "linux"))]
+    fn parse_process_probe(output: &str) -> Option<ProcessProbe> {
+        let mut fields = output.split_whitespace();
+        let state = fields.next()?.to_string();
+        let start_key = fields.collect::<Vec<_>>().join(" ");
+        (!start_key.is_empty()).then_some(ProcessProbe { state, start_key })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn process_probe(pid: u32) -> Option<ProcessProbe> {
+        if pid <= 1 {
+            return None;
+        }
+        let output = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "state=,lstart="])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_process_probe(std::str::from_utf8(&output.stdout).ok()?)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn process_start_key_from_probe(probe: &ProcessProbe) -> Option<String> {
+        (!probe.is_zombie()).then(|| probe.start_key.clone())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn process_start_key(pid: u32) -> Option<String> {
+        process_probe(pid).and_then(|probe| process_start_key_from_probe(&probe))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn recorded_start_key(pid: u32) -> Option<String> {
+        process_start_key(pid)
+    }
+
+    /// A missing start key after spawn means the process was already gone or
+    /// a zombie, so fail closed rather than persisting an uncorroborated PID.
+    #[cfg(not(target_os = "linux"))]
+    fn spawn_start_key_ok(started_at: &Option<String>) -> bool {
+        started_at.is_some()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn corroborated_alive_from_probe(
+        probe: Option<&ProcessProbe>,
+        started_at: &Option<String>,
+    ) -> bool {
+        match (started_at, probe) {
+            (Some(recorded), Some(current)) if !current.is_zombie() => {
+                *recorded == current.start_key
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn corroborated_alive(pid: u32, started_at: &Option<String>) -> bool {
+        corroborated_alive_from_probe(process_probe(pid).as_ref(), started_at)
     }
 
     #[cfg(not(target_os = "linux"))]
     fn is_session_alive(record: &SessionRecord) -> bool {
-        corroborated_alive(record.pid)
+        corroborated_alive(record.pid, &record.started_at)
     }
 
     #[cfg(not(target_os = "linux"))]
     fn is_task_alive(record: &TaskRecord) -> bool {
-        corroborated_alive(record.pid)
+        corroborated_alive(record.pid, &record.started_at)
     }
 
     /// Builds the argv for sending `sig` (e.g. `"-TERM"`) to the process
@@ -2520,7 +2572,6 @@ mod imp {
 
         /// A PID whose current start key does not match the durable record is
         /// finalized as gone and is never signalled as the task.
-        #[cfg(target_os = "linux")]
         #[test]
         fn rehydrate_rejects_pid_reuse_without_signalling() {
             let _guard = serialize_forks_and_locks();
@@ -2578,6 +2629,19 @@ mod imp {
 
             let _ = signal_group(child.id(), "-KILL");
             let _ = child.wait();
+        }
+
+        /// A zombie sample is never accepted as a live, corroborated task
+        /// even when its reported start time matches the durable record.
+        #[cfg(not(target_os = "linux"))]
+        #[test]
+        fn process_probe_rejects_zombie_state() {
+            let probe = parse_process_probe("Z Mon Aug 3 12:34:56 2026\n")
+                .expect("parse zombie process sample");
+            let started_at = Some(probe.start_key.clone());
+            assert!(probe.is_zombie());
+            assert!(process_start_key_from_probe(&probe).is_none());
+            assert!(!corroborated_alive_from_probe(Some(&probe), &started_at));
         }
 
         /// Removing an already-absent task record is a no-op success
