@@ -2080,30 +2080,36 @@ fn converse_ring_unknown_roster_name_is_startup_error() {
     );
 }
 
-/// Reads `/proc/<pid>/status`'s `PPid` field. Linux-only — this crate has no
-/// portable process-parentage lookup, and this regression exists specifically
-/// to prove parentage.
-#[cfg(target_os = "linux")]
+/// Reads a process's parent PID through the portable Unix `ps` interface.
+#[cfg(unix)]
 fn read_ppid(pid: u32) -> Option<u32> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("PPid:")?.trim().parse::<u32>().ok())
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "ppid="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
-/// Reports whether a Linux process is still running rather than a zombie.
-#[cfg(target_os = "linux")]
+/// Reports whether a Unix process is still running rather than a zombie.
+#[cfg(unix)]
 fn process_is_live(pid: u32) -> bool {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+    let Ok(output) = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "state="])
+        .output()
+    else {
         return false;
     };
-    let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+    if !output.status.success() {
         return false;
-    };
-    after_comm
-        .split_whitespace()
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .chars()
         .next()
-        .is_some_and(|state| state != "Z")
+        .is_some_and(|state| state != 'Z')
 }
 
 /// Issue #109 AC #5 (orphan-survival regression): a session started through
@@ -2111,9 +2117,8 @@ fn process_is_live(pid: u32) -> bool {
 /// `baton service run`**, not of the short-lived `service start` client that
 /// submitted it — so it survives that client's exit (and could never have
 /// been taken down by a kill of the client's process tree, since it was never
-/// part of it). Linux-only: the parentage proof reads `/proc/<pid>/status`,
-/// which has no portable equivalent in this crate.
-#[cfg(target_os = "linux")]
+/// part of it). Unix-only: the parentage proof uses the Unix `ps` interface.
+#[cfg(unix)]
 #[test]
 fn service_session_survives_submitting_client_and_is_owned_by_run() {
     use baton::mailbox;
@@ -2257,7 +2262,7 @@ fn service_session_survives_submitting_client_and_is_owned_by_run() {
 /// restarts it to prove the request was discarded. It also stops a submitting
 /// client after its successful response is written, so the response-first
 /// rule is exercised when the supervisor exits before the client resumes.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn service_task_start_discards_unadmitted_request_after_run_loss() {
     let root = TempMailbox::new("task-start-admission-loss");
@@ -2578,7 +2583,7 @@ fn service_task_start_discards_unadmitted_request_after_run_loss() {
 /// by a separate lock. The stop path reaps an already-admitted task, rejects
 /// a racing task request after owner removal, and teardown reaps another
 /// running task whose callback inbox is outside the owning session.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn service_stop_serializes_task_admission_and_reaps_owned_tasks() {
     use baton::mailbox;
@@ -2923,7 +2928,7 @@ fn service_stop_serializes_task_admission_and_reaps_owned_tasks() {
 /// supervisor and teardown clients in different directories, and bounds
 /// teardown below the cooperative-stop grace so a wrong relative inbox would
 /// fail rather than passing after process-group escalation.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn service_start_resolves_relative_paths_from_submitting_client() {
     use baton::mailbox;
@@ -3034,9 +3039,10 @@ fn service_start_resolves_relative_paths_from_submitting_client() {
     let sessions = status_json["sessions"].as_array().expect("sessions array");
     assert_eq!(sessions.len(), 1, "status reports the started session");
     assert_eq!(sessions[0]["live"], true, "the session reads as live");
+    let expected_inbox = inbox.canonicalize().expect("canonicalize inbox path");
     assert_eq!(
         sessions[0]["inbox"],
-        inbox.to_str().expect("inbox path is UTF-8")
+        expected_inbox.to_str().expect("inbox path is UTF-8")
     );
 
     let request = MessageEnvelope::new(
@@ -3089,7 +3095,7 @@ fn service_start_resolves_relative_paths_from_submitting_client() {
 /// proves that teardown is spending its bounded stop grace on session A; a
 /// second start at that point must fail because `service run` has already
 /// released the control lock, so session B cannot become unowned.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn service_teardown_closes_admission_before_draining_sessions() {
     use baton::mailbox;
@@ -3289,9 +3295,8 @@ fn service_teardown_closes_admission_before_draining_sessions() {
 /// long after the submitting client is gone. Uses trivial real thresholds
 /// with no `sleep()` in the test's own assertions: milestone/terminal
 /// delivery is awaited via bounded polling, matching every other live-`serve`
-/// regression in this file. Linux-only: the parentage proof reads
-/// `/proc/<pid>/status`, which has no portable equivalent in this crate.
-#[cfg(target_os = "linux")]
+/// regression in this file. Unix-only: the parentage proof uses `ps`.
+#[cfg(unix)]
 #[test]
 fn service_task_survives_submitting_client_and_is_owned_by_run() {
     use baton::mailbox;
@@ -3532,7 +3537,7 @@ fn service_task_survives_submitting_client_and_is_owned_by_run() {
 /// runs from `supervisor/`, while `task start` runs from `client/`; matching
 /// `work/` and `callback/` names in both directories make either wrong base
 /// directory observable.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn service_task_resolves_relative_paths_from_submitting_client() {
     use baton::mailbox;
@@ -3690,9 +3695,12 @@ fn service_task_resolves_relative_paths_from_submitting_client() {
     );
 
     let stdout = std::fs::read_to_string(&stdout_path).expect("read task stdout");
+    let expected_client_work = client_work
+        .canonicalize()
+        .expect("canonicalize client work path");
     assert_eq!(
         stdout.trim(),
-        client_work.to_str().unwrap(),
+        expected_client_work.to_str().unwrap(),
         "task command runs from the client-relative cwd"
     );
     assert!(callback_inbox.is_dir(), "client callback mailbox exists");
@@ -3722,7 +3730,7 @@ fn service_task_resolves_relative_paths_from_submitting_client() {
 /// remains `timeout` across both graceful and forced termination. All terminal
 /// events use the task's deterministic ids, so replay is deduplicable and
 /// teardown removes the durable records.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn service_tasks_reconcile_after_run_restart() {
     use baton::mailbox;
@@ -3738,7 +3746,9 @@ fn service_tasks_reconcile_after_run_restart() {
     let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
     run.args(["service", "run", "--control", control_str]);
     run.stdout(Stdio::null());
-    run.stderr(Stdio::null());
+    // Captured, like the restart below: a supervisor that exits during
+    // startup otherwise shows up only as an opaque liveness timeout.
+    run.stderr(Stdio::piped());
     let mut run_child = run.spawn().expect("spawn initial baton service run");
 
     let mut live = false;
@@ -3754,10 +3764,17 @@ fn service_tasks_reconcile_after_run_restart() {
         }
         thread::sleep(Duration::from_millis(50));
     }
-    assert!(
-        live,
-        "initial baton service run did not report live in time"
-    );
+    if !live {
+        let _ = run_child.kill();
+        let output = run_child
+            .wait_with_output()
+            .expect("collect initial service stderr");
+        panic!(
+            "initial baton service run did not report live in time; status={:?}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     let session_start = Command::new(env!("CARGO_BIN_EXE_baton"))
         .args([
@@ -3821,6 +3838,12 @@ fn service_tasks_reconcile_after_run_restart() {
         .to_string();
     assert!(!live_task_id.is_empty(), "live task start prints a task id");
 
+    // This task must outlive the supervisor and exit only once it is gone —
+    // that ordering *is* the case under test, so it waits on a sentinel the
+    // test drops after the kill rather than on a wall-clock sleep the
+    // supervisor could outlast on a loaded machine (it would then reap the
+    // task itself, and the case would never be exercised).
+    let finished_release = root.path.join("finished-release");
     let finished_task_start = Command::new(env!("CARGO_BIN_EXE_baton"))
         .args([
             "task",
@@ -3830,11 +3853,16 @@ fn service_tasks_reconcile_after_run_restart() {
             "--session",
             &session_id,
             "--command",
-            "sleep",
+            "sh",
             "--arg",
-            "0.5",
+            "-c",
+            "--arg",
+            &format!(
+                "while [ ! -e '{}' ]; do sleep 0.05; done",
+                finished_release.display()
+            ),
             "--max-duration-ms",
-            "10000",
+            "60000",
             "--callback-inbox",
             callback_inbox.to_str().unwrap(),
         ])
@@ -3930,7 +3958,12 @@ fn service_tasks_reconcile_after_run_restart() {
         "the initial service run was interrupted"
     );
 
+    // The supervisor is now provably gone, so releasing the task here is what
+    // makes "finished while the service was down" a fact rather than a race.
+    std::fs::write(&finished_release, b"").expect("release the finished task");
+
     let mut finished_while_down = false;
+    let mut last_finished_status = serde_json::Value::Null;
     for _ in 0..200 {
         let status = Command::new(env!("CARGO_BIN_EXE_baton"))
             .args([
@@ -3949,11 +3982,13 @@ fn service_tasks_reconcile_after_run_restart() {
             finished_while_down = true;
             break;
         }
+        last_finished_status = json;
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
         finished_while_down,
-        "the finished task remains durable and running until restart reconciliation"
+        "the finished task remains durable and running until restart reconciliation; \
+         last status: {last_finished_status}"
     );
 
     let callback_mailbox = mailbox::Mailbox::open(&callback_inbox).expect("open callback mailbox");
@@ -3961,7 +3996,7 @@ fn service_tasks_reconcile_after_run_restart() {
     let mut restarted_run = Command::new(env!("CARGO_BIN_EXE_baton"));
     restarted_run.args(["service", "run", "--control", control_str]);
     restarted_run.stdout(Stdio::null());
-    restarted_run.stderr(Stdio::null());
+    restarted_run.stderr(Stdio::piped());
     let mut restarted_child = restarted_run.spawn().expect("spawn restarted service run");
 
     let mut restarted_live = false;
@@ -3977,10 +4012,17 @@ fn service_tasks_reconcile_after_run_restart() {
         }
         thread::sleep(Duration::from_millis(50));
     }
-    assert!(
-        restarted_live,
-        "restarted baton service run did not report live in time"
-    );
+    if !restarted_live {
+        let _ = restarted_child.kill();
+        let output = restarted_child
+            .wait_with_output()
+            .expect("collect restarted service stderr");
+        panic!(
+            "restarted baton service run did not report live in time; status={:?}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     let mut seen = Vec::new();
     let mut terminal_events = std::collections::HashMap::new();
@@ -4141,7 +4183,7 @@ fn service_tasks_reconcile_after_run_restart() {
 /// Issue #123 regression: task admission rejects both an absent owner record
 /// and a record whose session process is already dead, before it creates a
 /// child or durable task record.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn service_task_rejects_missing_and_stale_owners_before_spawn() {
     let root = TempMailbox::new("task-owner-rejection");
@@ -4153,7 +4195,7 @@ fn service_task_rejects_missing_and_stale_owners_before_spawn() {
     let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
     run.args(["service", "run", "--control", control.to_str().unwrap()]);
     run.stdout(Stdio::null());
-    run.stderr(Stdio::null());
+    run.stderr(Stdio::piped());
     let mut run_child = run.spawn().expect("spawn baton service run");
     let control_str = control.to_str().unwrap();
 
@@ -4170,7 +4212,17 @@ fn service_task_rejects_missing_and_stale_owners_before_spawn() {
         }
         thread::sleep(Duration::from_millis(50));
     }
-    assert!(live, "baton service run did not report live in time");
+    if !live {
+        let _ = run_child.kill();
+        let output = run_child
+            .wait_with_output()
+            .expect("collect failed service run stderr");
+        panic!(
+            "baton service run did not report live in time; status={:?}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     let stale_start = Command::new(env!("CARGO_BIN_EXE_baton"))
         .args([

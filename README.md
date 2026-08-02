@@ -37,7 +37,7 @@ New here? Start with the conceptual map, then use the reference below.
 - [docs/service.md](docs/service.md) — `baton service`, the host-owned
   supervisor that keeps a `baton serve` session running after the process
   that launched it exits: ownership contract, control surface, lifecycle, and
-  systemd setup.
+  systemd/launchd setup.
 
 The rest of this README is the CLI/reference surface.
 

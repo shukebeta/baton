@@ -27,6 +27,10 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Validate macOS LaunchAgent
+        if: matrix.os == 'macos-latest'
+        run: plutil -lint packaging/launchd/baton.plist
+
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 

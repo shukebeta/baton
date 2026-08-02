@@ -21,6 +21,11 @@
 //! - `service.admission.lock` — a short-lived advisory lock shared by task
 //!   admission and session cleanup. It is separate from `service.lock`,
 //!   which the long-lived `Run` process holds for its entire lifetime.
+//! - `service.probe.lock` — a short-lived advisory lock serializing
+//!   `service.lock`'s acquisition against the liveness probes behind
+//!   `Status`/`Stop`/`Teardown`/`Start`. A probe answers "not running" by
+//!   *taking* `service.lock`, so without this a probe landing on a starting
+//!   `Run` would refuse it as a duplicate instance.
 //! - `service.stop` — the cooperative-stop sentinel `Teardown` drops for a live
 //!   `Run` to observe between polls. Mirrors `serve.stop`.
 //! - `requests/` / `processing/` / `responses/` — the atomic-rename request
@@ -57,9 +62,9 @@
 //! Unix only (Linux and macOS): process groups and the `kill` escalation this
 //! module relies on have no equivalent in this crate's dependency-free design
 //! on Windows. [`execute_service`] fails clearly there rather than silently
-//! degrading. The systemd user-service integration (`packaging/systemd/`) is
-//! Linux-specific and external to this binary; launchd (macOS) and a Windows
-//! host-service integration are tracked separately.
+//! degrading. The systemd user-service integration (`packaging/systemd/`) and
+//! macOS LaunchAgent integration (`packaging/launchd/`) are external to this
+//! binary; a Windows host-service integration is tracked separately.
 
 use std::io::Write;
 #[cfg(unix)]
@@ -196,6 +201,7 @@ mod imp {
     use super::*;
     use std::collections::HashMap;
     use std::fs::{self, File, OpenOptions, TryLockError};
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -217,6 +223,18 @@ mod imp {
     /// Separate from [`CONTROL_LOCK_FILE`], which `Run` holds for its whole
     /// lifetime and therefore cannot be used by `service stop`.
     const ADMISSION_LOCK_FILE: &str = "service.admission.lock";
+    /// Serializes taking the control lock against probing it.
+    ///
+    /// A probe can only answer "is a `Run` live?" by *trying to take*
+    /// [`CONTROL_LOCK_FILE`] — so while it holds that lock it is
+    /// indistinguishable from a live supervisor. Without this guard, a
+    /// client polling `service status` during a supervisor's startup makes
+    /// [`acquire_control_lock`]'s single non-blocking attempt fail with a
+    /// spurious "another baton service already holds the control lock", and
+    /// the supervisor exits. Held only across the control lock's
+    /// open-and-try — never while a session or task is spawned — so blocking
+    /// on it is bounded by a handful of syscalls.
+    const CONTROL_PROBE_LOCK_FILE: &str = "service.probe.lock";
     /// Name of the cooperative-stop sentinel at the control root, mirroring
     /// [`mailbox`]'s `serve.stop`.
     const CONTROL_STOP_FILE: &str = "service.stop";
@@ -235,6 +253,21 @@ mod imp {
     /// several calls within the same millisecond.
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
+    /// Opens any service lock with close-on-exec set. `Run` holds the control
+    /// lock while it spawns sessions and tasks; descendants must not retain
+    /// that lock after the supervisor is killed, or a restart is blocked by
+    /// the descendant's lifetime.
+    fn service_lock_options() -> OpenOptions {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(libc::O_CLOEXEC);
+        options
+    }
+
     /// A durable on-disk record of one session `Run` has spawned: enough to
     /// find, corroborate, and signal the real OS process from any later,
     /// independent `Status`/`Stop`/`Teardown` invocation.
@@ -243,9 +276,9 @@ mod imp {
         id: String,
         spec: SessionSpec,
         pid: u32,
-        /// Linux `/proc/<pid>/stat` starttime field, corroborating `pid`
-        /// against reuse after a `Run` restart; `None` where it could not be
-        /// read (non-Linux Unix, or the field was unavailable).
+        /// Linux `/proc/<pid>/stat` starttime or non-Linux Unix `ps` `lstart`,
+        /// corroborating `pid` against reuse after a `Run` restart; `None`
+        /// where the platform probe could not be read.
         started_at: Option<String>,
     }
 
@@ -397,19 +430,39 @@ mod imp {
         children.retain(|_, child| !matches!(child.try_wait(), Ok(Some(_)) | Err(_)));
     }
 
+    /// Blocks until this process may touch `control`'s control lock, so an
+    /// acquisition and a liveness probe never overlap. See
+    /// [`CONTROL_PROBE_LOCK_FILE`].
+    ///
+    /// Always taken *before* the control lock and released as soon as that
+    /// attempt is done, so it can never participate in a cycle with the
+    /// control or admission locks.
+    fn acquire_control_probe_guard(control: &Path) -> Result<File> {
+        let lock_path = control.join(CONTROL_PROBE_LOCK_FILE);
+        let lock = service_lock_options().open(&lock_path).map_err(|err| {
+            BatonError::Io(format!(
+                "could not open service probe guard {lock_path:?}: {err}"
+            ))
+        })?;
+        lock.lock().map_err(|err| {
+            BatonError::Io(format!(
+                "could not lock service probe guard {control:?}: {err}"
+            ))
+        })?;
+        Ok(lock)
+    }
+
     /// Takes the exclusive control-plane lock, refusing a second live `Run`
     /// on the same `control`.
+    ///
+    /// A `WouldBlock` here means a *supervisor* holds the lock, never a
+    /// passing probe: [`acquire_control_probe_guard`] keeps the two apart.
     fn acquire_control_lock(control: &Path) -> Result<File> {
+        let _guard = acquire_control_probe_guard(control)?;
         let lock_path = control.join(CONTROL_LOCK_FILE);
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|err| {
-                BatonError::Io(format!("could not open service lock {lock_path:?}: {err}"))
-            })?;
+        let lock = service_lock_options().open(&lock_path).map_err(|err| {
+            BatonError::Io(format!("could not open service lock {lock_path:?}: {err}"))
+        })?;
         match lock.try_lock() {
             Ok(()) => Ok(lock),
             Err(TryLockError::WouldBlock) => Err(BatonError::Io(format!(
@@ -432,17 +485,11 @@ mod imp {
             ))
         })?;
         let lock_path = control.join(ADMISSION_LOCK_FILE);
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|err| {
-                BatonError::Io(format!(
-                    "could not open service admission lock {lock_path:?}: {err}"
-                ))
-            })?;
+        let lock = service_lock_options().open(&lock_path).map_err(|err| {
+            BatonError::Io(format!(
+                "could not open service admission lock {lock_path:?}: {err}"
+            ))
+        })?;
         lock.lock().map_err(|err| {
             BatonError::Io(format!(
                 "could not lock service admission {control:?}: {err}"
@@ -463,18 +510,19 @@ mod imp {
         }
     }
 
-    /// Probes whether a live `Run` holds `control`'s lock, without side
-    /// effects (`signal = false`) or, when `signal`, dropping the stop
-    /// sentinel for it to observe. Mirrors [`mailbox::request_stop`].
+    /// Probes whether a live `Run` holds `control`'s lock, leaving the
+    /// control plane untouched (`signal = false`) or, when `signal`,
+    /// dropping the stop sentinel for it to observe. Mirrors
+    /// [`mailbox::request_stop`].
+    ///
+    /// The probe is a read only in its *result*: answering "not running"
+    /// requires actually taking the exclusive lock. That hold is invisible
+    /// to callers but not to a supervisor starting at the same instant, so
+    /// the whole attempt runs under
+    /// [`acquire_control_probe_guard`] — see [`CONTROL_PROBE_LOCK_FILE`].
     fn probe_or_signal_control(control: &Path, signal: bool) -> Result<ControlLiveness> {
         let lock_path = control.join(CONTROL_LOCK_FILE);
-        let lock = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-        {
+        let lock = match service_lock_options().open(&lock_path) {
             Ok(lock) => lock,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(ControlLiveness::NotRunning);
@@ -485,7 +533,12 @@ mod imp {
                 )));
             }
         };
-        match lock.try_lock() {
+        let _guard = acquire_control_probe_guard(control)?;
+        let outcome = lock.try_lock();
+        // Release the probe's own hold *before* the guard is dropped at the
+        // end of this function, so no acquirer can ever observe it.
+        drop(lock);
+        match outcome {
             Ok(()) => Ok(ControlLiveness::NotRunning),
             Err(TryLockError::WouldBlock) => {
                 if signal {
@@ -1605,48 +1658,100 @@ mod imp {
         corroborated_alive(record.pid, &record.started_at)
     }
 
-    /// macOS has no `/proc`; existence-only fallback (`kill -0`). This cannot
-    /// corroborate a PID against reuse across a `Run` restart the way the
-    /// Linux path does — acceptable here because macOS host-service
-    /// ownership (launchd) is explicitly out of scope for this module (see
-    /// the module doc); this fallback exists so `baton service` still
-    /// compiles, spawns, and tears down correctly on macOS in the foreground/
-    /// test/diagnostic mode this module always supports on Unix.
+    /// A non-Linux Unix `ps` sample. macOS has no `/proc`, so `state` and
+    /// `lstart` are the available process-state and start-time corroborators.
+    /// `lstart` is second-granular, weaker than Linux `/proc` ticks, and the
+    /// `state=,lstart=` format is a BSD/procps extension rather than POSIX.
+    /// That tradeoff is accepted because Linux and macOS are the supported
+    /// Unix hosts in CI.
     #[cfg(not(target_os = "linux"))]
-    fn recorded_start_key(_pid: u32) -> Option<String> {
-        None
-    }
-
-    /// No spawn-time corroboration is possible on this host (see
-    /// [`recorded_start_key`]'s doc), so a `None` start key is expected, not a
-    /// spawn failure.
-    #[cfg(not(target_os = "linux"))]
-    fn spawn_start_key_ok(_started_at: &Option<String>) -> bool {
-        true
+    #[derive(Debug, PartialEq, Eq)]
+    struct ProcessProbe {
+        state: String,
+        start_key: String,
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn corroborated_alive(pid: u32) -> bool {
-        if pid <= 1 {
-            return false;
+    impl ProcessProbe {
+        fn is_zombie(&self) -> bool {
+            self.state.starts_with('Z')
         }
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+    }
+
+    /// Parses one `ps -p <pid> -o state=,lstart=` row. Splitting on
+    /// whitespace deliberately normalizes repeated spaces in `lstart`, so
+    /// repeated probes compare the same stable key.
+    #[cfg(not(target_os = "linux"))]
+    fn parse_process_probe(output: &str) -> Option<ProcessProbe> {
+        let mut fields = output.split_whitespace();
+        let state = fields.next()?.to_string();
+        let start_key = fields.collect::<Vec<_>>().join(" ");
+        (!start_key.is_empty()).then_some(ProcessProbe { state, start_key })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn process_probe(pid: u32) -> Option<ProcessProbe> {
+        if pid <= 1 {
+            return None;
+        }
+        let output = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "state=,lstart="])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_process_probe(std::str::from_utf8(&output.stdout).ok()?)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn process_start_key_from_probe(probe: &ProcessProbe) -> Option<String> {
+        (!probe.is_zombie()).then(|| probe.start_key.clone())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn process_start_key(pid: u32) -> Option<String> {
+        process_probe(pid).and_then(|probe| process_start_key_from_probe(&probe))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn recorded_start_key(pid: u32) -> Option<String> {
+        process_start_key(pid)
+    }
+
+    /// A missing start key after spawn means the process was already gone or
+    /// a zombie, so fail closed rather than persisting an uncorroborated PID.
+    #[cfg(not(target_os = "linux"))]
+    fn spawn_start_key_ok(started_at: &Option<String>) -> bool {
+        started_at.is_some()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn corroborated_alive_from_probe(
+        probe: Option<&ProcessProbe>,
+        started_at: &Option<String>,
+    ) -> bool {
+        match (started_at, probe) {
+            (Some(recorded), Some(current)) if !current.is_zombie() => {
+                *recorded == current.start_key
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn corroborated_alive(pid: u32, started_at: &Option<String>) -> bool {
+        corroborated_alive_from_probe(process_probe(pid).as_ref(), started_at)
     }
 
     #[cfg(not(target_os = "linux"))]
     fn is_session_alive(record: &SessionRecord) -> bool {
-        corroborated_alive(record.pid)
+        corroborated_alive(record.pid, &record.started_at)
     }
 
     #[cfg(not(target_os = "linux"))]
     fn is_task_alive(record: &TaskRecord) -> bool {
-        corroborated_alive(record.pid)
+        corroborated_alive(record.pid, &record.started_at)
     }
 
     /// Builds the argv for sending `sig` (e.g. `"-TERM"`) to the process
@@ -2090,6 +2195,41 @@ mod imp {
             }
         }
 
+        /// A child spawned while `Run` owns the control lock must not retain
+        /// that lock after the supervisor exits. Otherwise a killed
+        /// supervisor cannot be restarted until every descendant happens to
+        /// exit, which breaks crash recovery on macOS.
+        #[test]
+        fn spawned_task_does_not_retain_control_lock_after_owner_exits() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("lock-inheritance");
+            let owner_lock = acquire_control_lock(&dir.path).expect("owner lock");
+
+            let log_dir = task_logs_dir(&dir.path, "lock-child");
+            fs::create_dir_all(&log_dir).expect("create child log dir");
+            let mut child = spawn_task_child(
+                &task_spec(
+                    "session",
+                    "sh",
+                    vec!["-c".to_string(), "sleep 30".to_string()],
+                    Vec::new(),
+                    60_000,
+                    "/tmp/callback",
+                ),
+                &log_dir.join("stdout.log"),
+                &log_dir.join("stderr.log"),
+            )
+            .expect("spawn lock inheritance probe child");
+
+            drop(owner_lock);
+            let replacement_lock = acquire_control_lock(&dir.path)
+                .expect("descendant must not retain the owner control lock");
+            drop(replacement_lock);
+
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
         /// A session record round-trips through the atomic-write file
         /// protocol byte-for-byte.
         #[test]
@@ -2285,6 +2425,62 @@ mod imp {
             assert!(
                 !dir.path.join(CONTROL_STOP_FILE).exists(),
                 "a read-only probe never drops the stop sentinel"
+            );
+        }
+
+        /// A concurrent liveness probe must never defeat a starting
+        /// supervisor.
+        ///
+        /// `probe_or_signal_control` decides "not running" by *taking* the
+        /// exclusive control lock, so its hold — however brief — is
+        /// indistinguishable from a live `Run` to
+        /// [`acquire_control_lock`]'s single non-blocking attempt. Every
+        /// client that polls `service status` while a supervisor starts
+        /// (exactly what the restart integration test does) can therefore
+        /// kill it with a spurious "another baton service already holds the
+        /// control lock". The two must be serialized against each other.
+        #[test]
+        fn probe_never_defeats_a_concurrent_control_lock_acquisition() {
+            use std::sync::Arc;
+            use std::sync::atomic::AtomicBool;
+
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("probe-vs-acquire");
+            // Create the lock file up front so the probers spend their time
+            // contending for it rather than creating it.
+            drop(acquire_control_lock(&dir.path).expect("seed the lock file"));
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let probers: Vec<_> = (0..2)
+                .map(|_| {
+                    let path = dir.path.clone();
+                    let stop = Arc::clone(&stop);
+                    std::thread::spawn(move || {
+                        while !stop.load(Ordering::Relaxed) {
+                            probe_control(&path).expect("probe");
+                        }
+                    })
+                })
+                .collect();
+
+            let mut lost = None;
+            for attempt in 0..500 {
+                match acquire_control_lock(&dir.path) {
+                    Ok(lock) => drop(lock),
+                    Err(err) => {
+                        lost = Some((attempt, err));
+                        break;
+                    }
+                }
+            }
+
+            stop.store(true, Ordering::Relaxed);
+            for prober in probers {
+                prober.join().expect("prober thread");
+            }
+            assert!(
+                lost.is_none(),
+                "a concurrent probe defeated the control-lock acquisition: {lost:?}"
             );
         }
 
@@ -2520,7 +2716,6 @@ mod imp {
 
         /// A PID whose current start key does not match the durable record is
         /// finalized as gone and is never signalled as the task.
-        #[cfg(target_os = "linux")]
         #[test]
         fn rehydrate_rejects_pid_reuse_without_signalling() {
             let _guard = serialize_forks_and_locks();
@@ -2578,6 +2773,19 @@ mod imp {
 
             let _ = signal_group(child.id(), "-KILL");
             let _ = child.wait();
+        }
+
+        /// A zombie sample is never accepted as a live, corroborated task
+        /// even when its reported start time matches the durable record.
+        #[cfg(not(target_os = "linux"))]
+        #[test]
+        fn process_probe_rejects_zombie_state() {
+            let probe = parse_process_probe("Z Mon Aug 3 12:34:56 2026\n")
+                .expect("parse zombie process sample");
+            let started_at = Some(probe.start_key.clone());
+            assert!(probe.is_zombie());
+            assert!(process_start_key_from_probe(&probe).is_none());
+            assert!(!corroborated_alive_from_probe(Some(&probe), &started_at));
         }
 
         /// Removing an already-absent task record is a no-op success
