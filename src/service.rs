@@ -18,6 +18,9 @@
 //! - `service.lock` — the exclusive single-instance advisory lock, taken by
 //!   [`ServiceCommand::Run`] for as long as it runs. Mirrors
 //!   [`mailbox::Mailbox`]'s `serve.lock`.
+//! - `service.admission.lock` — a short-lived advisory lock shared by task
+//!   admission and session cleanup. It is separate from `service.lock`,
+//!   which the long-lived `Run` process holds for its entire lifetime.
 //! - `service.stop` — the cooperative-stop sentinel `Teardown` drops for a live
 //!   `Run` to observe between polls. Mirrors `serve.stop`.
 //! - `requests/` / `processing/` / `responses/` — the atomic-rename request
@@ -210,6 +213,10 @@ mod imp {
     /// Name of the control-plane lockfile at the control root, mirroring
     /// [`mailbox`]'s `serve.lock`.
     const CONTROL_LOCK_FILE: &str = "service.lock";
+    /// Short-lived lock serializing task admission with session cleanup.
+    /// Separate from [`CONTROL_LOCK_FILE`], which `Run` holds for its whole
+    /// lifetime and therefore cannot be used by `service stop`.
+    const ADMISSION_LOCK_FILE: &str = "service.admission.lock";
     /// Name of the cooperative-stop sentinel at the control root, mirroring
     /// [`mailbox`]'s `serve.stop`.
     const CONTROL_STOP_FILE: &str = "service.stop";
@@ -412,6 +419,36 @@ mod imp {
                 "could not lock service control {control:?}: {err}"
             ))),
         }
+    }
+
+    /// Takes the short-lived lock shared by task admission and session
+    /// cleanup. This must remain distinct from [`acquire_control_lock`]: the
+    /// long-lived `Run` process owns the control lock while `service stop`
+    /// still needs to run concurrently with it.
+    fn acquire_admission_lock(control: &Path) -> Result<File> {
+        fs::create_dir_all(control).map_err(|err| {
+            BatonError::Io(format!(
+                "could not create service control directory {control:?}: {err}"
+            ))
+        })?;
+        let lock_path = control.join(ADMISSION_LOCK_FILE);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|err| {
+                BatonError::Io(format!(
+                    "could not open service admission lock {lock_path:?}: {err}"
+                ))
+            })?;
+        lock.lock().map_err(|err| {
+            BatonError::Io(format!(
+                "could not lock service admission {control:?}: {err}"
+            ))
+        })?;
+        Ok(lock)
     }
 
     /// Checks for and consumes the cooperative-stop sentinel in one atomic
@@ -796,9 +833,14 @@ mod imp {
     }
 
     /// The `Start` response body, keyed by request id in `task-responses/`.
+    /// An admitted request carries `task_id`; an owner rejection carries
+    /// `error` and no task id.
     #[derive(Debug, Serialize, Deserialize)]
     struct TaskStartResponse {
-        task_id: String,
+        #[serde(default)]
+        task_id: Option<String>,
+        #[serde(default)]
+        error: Option<String>,
     }
 
     /// Submits `spec` to a live `Run` and awaits its task id. Mirrors
@@ -830,7 +872,14 @@ mod imp {
                 let resp: TaskStartResponse = serde_json::from_str(&data).map_err(|err| {
                     BatonError::Decode(format!("malformed task response {path:?}: {err}"))
                 })?;
-                return Ok(resp.task_id);
+                if let Some(error) = resp.error {
+                    return Err(BatonError::Io(error));
+                }
+                return resp.task_id.ok_or_else(|| {
+                    BatonError::Decode(format!(
+                        "task response {path:?} contained neither a task id nor an error"
+                    ))
+                });
             }
             if Instant::now() >= deadline {
                 return Err(BatonError::Io(format!(
@@ -918,9 +967,18 @@ mod imp {
             let claimed_path = processing.join(mailbox::file_name(&key));
             match fs::rename(&path, &claimed_path) {
                 Ok(()) => {
-                    let outcome = handle_task_start_request(control, &key, &claimed_path, clock);
+                    // The lock is intentionally acquired after the request is
+                    // claimed but before owner validation and spawn. If
+                    // session cleanup wins the race, validation observes the
+                    // removed/dead owner; if admission wins, cleanup waits
+                    // and reaps the newly recorded task.
+                    let outcome = acquire_admission_lock(control).and_then(|_admission| {
+                        handle_task_start_request(control, &key, &claimed_path, clock)
+                    });
                     let _ = fs::remove_file(&claimed_path);
-                    let (record, child, started_ms) = outcome?;
+                    let Some((record, child, started_ms)) = outcome? else {
+                        return Ok(None);
+                    };
                     let id = record.id.clone();
                     let running = RunningTask {
                         record,
@@ -938,8 +996,9 @@ mod imp {
         Ok(None)
     }
 
-    /// Spawns the requested task, persists its [`TaskRecord`], and answers
-    /// the request with its task id. Mirrors [`handle_start_request`]'s
+    /// Validates the requested owner, then spawns the task, persists its
+    /// [`TaskRecord`], and answers the request with its task id. Mirrors
+    /// [`handle_start_request`]'s
     /// kill-and-unwind-on-any-later-failure discipline: once spawned, every
     /// early return below this point kills and reaps `child` first, so a
     /// failure here never leaves an unrecorded, unreapable process behind.
@@ -948,12 +1007,34 @@ mod imp {
         request_id: &str,
         spec_path: &Path,
         clock: &dyn Clock,
-    ) -> Result<(TaskRecord, Child, u64)> {
+    ) -> Result<Option<(TaskRecord, Child, u64)>> {
         let data = fs::read_to_string(spec_path)
             .map_err(|err| BatonError::Io(format!("could not read {spec_path:?}: {err}")))?;
         let spec: TaskSpec = serde_json::from_str(&data).map_err(|err| {
             BatonError::Decode(format!("malformed task spec {spec_path:?}: {err}"))
         })?;
+        let owner_live = if mailbox::is_safe_key(&spec.session) {
+            read_session_record(control, &spec.session)?
+                .map(|record| is_session_alive(&record))
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if !owner_live {
+            let error = format!(
+                "task start rejected: --session {:?} does not name a live managed session on {:?} (the session record is absent or its process is no longer live)",
+                spec.session, control
+            );
+            write_task_start_response(
+                control,
+                request_id,
+                &TaskStartResponse {
+                    task_id: None,
+                    error: Some(error),
+                },
+            )?;
+            return Ok(None);
+        }
         let task_id = fresh_task_id();
         let log_dir = task_logs_dir(control, &task_id);
         fs::create_dir_all(&log_dir)
@@ -987,27 +1068,35 @@ mod imp {
             let _ = child.wait();
             return Err(err);
         }
-        let response = TaskStartResponse {
-            task_id: record.id.clone(),
-        };
-        let respond = serde_json::to_string(&response)
-            .map_err(|err| {
-                BatonError::Io(format!("could not serialize task start response: {err}"))
-            })
-            .and_then(|json| {
-                let responses = task_responses_dir(control);
-                fs::create_dir_all(&responses).map_err(|err| {
-                    BatonError::Io(format!("could not create {responses:?}: {err}"))
-                })?;
-                mailbox::atomic_write(&responses, &mailbox::file_name(request_id), &json)
-            });
+        let respond = write_task_start_response(
+            control,
+            request_id,
+            &TaskStartResponse {
+                task_id: Some(record.id.clone()),
+                error: None,
+            },
+        );
         if let Err(err) = respond {
             let _ = signal_group(pid, "-KILL");
             let _ = child.wait();
             let _ = remove_task_record(control, &record.id);
             return Err(err);
         }
-        Ok((record, child, clock.now_ms()))
+        Ok(Some((record, child, clock.now_ms())))
+    }
+
+    fn write_task_start_response(
+        control: &Path,
+        request_id: &str,
+        response: &TaskStartResponse,
+    ) -> Result<()> {
+        let json = serde_json::to_string(response).map_err(|err| {
+            BatonError::Io(format!("could not serialize task start response: {err}"))
+        })?;
+        let responses = task_responses_dir(control);
+        fs::create_dir_all(&responses)
+            .map_err(|err| BatonError::Io(format!("could not create {responses:?}: {err}")))?;
+        mailbox::atomic_write(&responses, &mailbox::file_name(request_id), &json)
     }
 
     /// Spawns `spec`'s command as its own process-group leader, stdout/stderr
@@ -1428,7 +1517,8 @@ mod imp {
         }
     }
 
-    /// Stops one session: cooperative `serve --stop` on its inbox first,
+    /// Stops one session. The caller must hold the admission lock:
+    /// cooperative `serve --stop` on its inbox first,
     /// bounded wait, then `SIGTERM`/`SIGKILL` process-group escalation if
     /// still alive, then reaps every task this session owns
     /// ([`reap_session_tasks`]) and removes the session's own durable
@@ -1556,6 +1646,7 @@ mod imp {
     }
 
     fn execute_stop(control: &Path, session: &str, mut out: impl Write) -> Result<()> {
+        let _admission = acquire_admission_lock(control)?;
         match read_session_record(control, session)? {
             Some(record) => {
                 stop_session_record(control, &record)?;
@@ -1655,6 +1746,7 @@ mod imp {
         if service_liveness == ControlLiveness::Live {
             wait_for_control_release(control)?;
         }
+        let _admission = acquire_admission_lock(control)?;
         for record in list_session_records(control)? {
             stop_session_record(control, &record)?;
         }
@@ -1845,6 +1937,68 @@ mod imp {
             );
         }
 
+        /// Missing and stale session owners are rejected before task log or
+        /// process creation, and the submitting client receives the owner
+        /// error through the task-start response.
+        #[test]
+        fn task_start_rejects_missing_or_dead_session_before_spawn() {
+            for (tag, session, session_record) in [
+                ("owner-absent", "svc-missing", None),
+                ("owner-unsafe", "../svc-unsafe", None),
+                (
+                    "owner-dead",
+                    "svc-dead",
+                    Some(SessionRecord {
+                        id: "svc-dead".to_string(),
+                        spec: spec("/tmp/in", "/tmp/out"),
+                        pid: u32::MAX - 1,
+                        started_at: Some("not-current".to_string()),
+                    }),
+                ),
+            ] {
+                let dir = TempDir::new(tag);
+                if let Some(record) = session_record {
+                    write_session_record(&dir.path, &record).expect("write stale session");
+                }
+                let spec_path = dir.path.join("task-request.json");
+                let task_spec = task_spec(session, "true", vec![], vec![], 1_000, "/tmp/callback");
+                fs::write(
+                    &spec_path,
+                    serde_json::to_string(&task_spec).expect("serialize task spec"),
+                )
+                .expect("write task spec");
+
+                let outcome = handle_task_start_request(
+                    &dir.path,
+                    "reject-request",
+                    &spec_path,
+                    &FakeClock::new(),
+                )
+                .expect("owner rejection is a handled response");
+                assert!(outcome.is_none(), "rejected owner must not return a task");
+                assert!(
+                    !dir.path.join("tasks").exists(),
+                    "rejected owner must not create a task record directory"
+                );
+                assert!(
+                    !dir.path.join("task-logs").exists(),
+                    "rejected owner must not create task logs"
+                );
+
+                let response_path =
+                    task_responses_dir(&dir.path).join(mailbox::file_name("reject-request"));
+                let response: TaskStartResponse = serde_json::from_str(
+                    &fs::read_to_string(response_path).expect("owner rejection response"),
+                )
+                .expect("decode owner rejection response");
+                assert!(response.task_id.is_none());
+                assert!(response
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("does not name a live managed session")));
+            }
+        }
+
         /// An unsafe session id is rejected rather than escaping the control
         /// root, on both the read and remove paths.
         #[test]
@@ -1915,6 +2069,17 @@ mod imp {
             let dir = TempDir::new("lock");
             let _held = acquire_control_lock(&dir.path).expect("first lock");
             assert!(acquire_control_lock(&dir.path).is_err());
+        }
+
+        /// The short-lived admission lock is independent from the
+        /// long-lived control lock, so cleanup can take it while `Run` owns
+        /// the control lock.
+        #[test]
+        fn admission_lock_is_independent_from_control_lock() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("admission-lock");
+            let _control = acquire_control_lock(&dir.path).expect("control lock");
+            let _admission = acquire_admission_lock(&dir.path).expect("admission lock");
         }
 
         /// `probe_control` reports `Live` while a lock is held and
