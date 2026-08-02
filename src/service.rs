@@ -1279,6 +1279,8 @@ mod imp {
             let cancelled = consume_task_cancel_sentinel(control, id)?;
             let state = if cancelled {
                 TaskState::Cancelled
+            } else if running.term_sent_at_ms.is_some() {
+                TaskState::Timeout
             } else {
                 TaskState::Failed
             };

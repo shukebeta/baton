@@ -3718,13 +3718,15 @@ fn service_task_resolves_relative_paths_from_submitting_client() {
 /// Issue #132 regression: durable running tasks are reconciled when the
 /// supervisor is restarted. The live task keeps its milestone schedule under
 /// the new PID-based tracker; the task that exits while `Run` is down becomes
-/// a terminal failure with no guessed exit code. Both terminal events use the
-/// task's deterministic ids, so replay is deduplicable and teardown removes
-/// the durable records.
+/// a terminal failure with no guessed exit code, while timeout escalation
+/// remains `timeout` across both graceful and forced termination. All terminal
+/// events use the task's deterministic ids, so replay is deduplicable and
+/// teardown removes the durable records.
 #[cfg(target_os = "linux")]
 #[test]
 fn service_tasks_reconcile_after_run_restart() {
     use baton::mailbox;
+    use baton::task::{TaskEventBody, TaskState};
 
     let root = TempMailbox::new("task-restart");
     let control = root.path.join("control");
@@ -3851,6 +3853,74 @@ fn service_tasks_reconcile_after_run_restart() {
         "finished task start prints a task id"
     );
 
+    let sigterm_timeout_task_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "task",
+            "start",
+            "--control",
+            control_str,
+            "--session",
+            &session_id,
+            "--command",
+            "sh",
+            "--arg",
+            "-c",
+            "--arg",
+            "trap 'exit 0' TERM; sleep 30",
+            "--max-duration-ms",
+            "2000",
+            "--callback-inbox",
+            callback_inbox.to_str().unwrap(),
+        ])
+        .output()
+        .expect("start task that exits after timeout SIGTERM");
+    assert!(
+        sigterm_timeout_task_start.status.success(),
+        "SIGTERM timeout task start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&sigterm_timeout_task_start.stderr)
+    );
+    let sigterm_timeout_task_id = String::from_utf8_lossy(&sigterm_timeout_task_start.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        !sigterm_timeout_task_id.is_empty(),
+        "SIGTERM timeout task start prints a task id"
+    );
+
+    let kill_timeout_task_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "task",
+            "start",
+            "--control",
+            control_str,
+            "--session",
+            &session_id,
+            "--command",
+            "sh",
+            "--arg",
+            "-c",
+            "--arg",
+            "trap '' TERM; exec sleep 30",
+            "--max-duration-ms",
+            "2000",
+            "--callback-inbox",
+            callback_inbox.to_str().unwrap(),
+        ])
+        .output()
+        .expect("start task that requires timeout SIGKILL");
+    assert!(
+        kill_timeout_task_start.status.success(),
+        "SIGKILL timeout task start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&kill_timeout_task_start.stderr)
+    );
+    let kill_timeout_task_id = String::from_utf8_lossy(&kill_timeout_task_start.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        !kill_timeout_task_id.is_empty(),
+        "SIGKILL timeout task start prints a task id"
+    );
+
     // Kill only the supervisor. Its task children are reparented and remain
     // available for the restarted supervisor's PID-based reconciliation.
     run_child.kill().expect("interrupt initial service run");
@@ -3913,8 +3983,14 @@ fn service_tasks_reconcile_after_run_restart() {
     );
 
     let mut seen = Vec::new();
+    let mut terminal_events = std::collections::HashMap::new();
     for _ in 0..500 {
         while let Some(claimed) = callback_mailbox.claim_next().expect("claim callback event") {
+            let body: TaskEventBody =
+                serde_json::from_str(&claimed.request.body).expect("task event body");
+            if body.kind == "terminal" {
+                terminal_events.insert(body.task_id.clone(), body);
+            }
             seen.push(claimed.key.clone());
             callback_mailbox
                 .complete(claimed)
@@ -3922,6 +3998,8 @@ fn service_tasks_reconcile_after_run_restart() {
         }
         if seen.contains(&format!("{live_task_id}-milestone-0"))
             && seen.contains(&format!("{finished_task_id}-terminal"))
+            && seen.contains(&format!("{sigterm_timeout_task_id}-terminal"))
+            && seen.contains(&format!("{kill_timeout_task_id}-terminal"))
         {
             break;
         }
@@ -3934,6 +4012,14 @@ fn service_tasks_reconcile_after_run_restart() {
     assert!(
         seen.contains(&format!("{finished_task_id}-terminal")),
         "task finished during downtime received a terminal event: {seen:?}"
+    );
+    assert!(
+        seen.contains(&format!("{sigterm_timeout_task_id}-terminal")),
+        "SIGTERM timeout task received a terminal event: {seen:?}"
+    );
+    assert!(
+        seen.contains(&format!("{kill_timeout_task_id}-terminal")),
+        "SIGKILL timeout task received a terminal event: {seen:?}"
     );
 
     let task_status = |task_id: &str| -> serde_json::Value {
@@ -3957,6 +4043,19 @@ fn service_tasks_reconcile_after_run_restart() {
         serde_json::Value::Null
     );
     assert_eq!(finished_status["tasks"][0]["live"], false);
+
+    for task_id in [&sigterm_timeout_task_id, &kill_timeout_task_id] {
+        let status = task_status(task_id);
+        assert_eq!(status["tasks"][0]["state"], "timeout");
+        assert_eq!(status["tasks"][0]["exit_code"], serde_json::Value::Null);
+        assert_eq!(status["tasks"][0]["live"], false);
+
+        let event = terminal_events
+            .get(task_id)
+            .expect("timeout terminal event body");
+        assert_eq!(event.state, Some(TaskState::Timeout));
+        assert_eq!(event.exit_code, None);
+    }
 
     // The live task must remain tracked after the first restart long enough
     // for its post-restart terminal event to arrive. Its exit status is
@@ -3994,23 +4093,23 @@ fn service_tasks_reconcile_after_run_restart() {
         serde_json::from_slice(&all_status.stdout).expect("all task status is JSON");
     assert_eq!(
         all_json["tasks"].as_array().unwrap().len(),
-        2,
+        4,
         "restart reconciliation keeps one durable record per task"
     );
-    assert_eq!(
-        seen.iter()
-            .filter(|key| key.as_str() == format!("{finished_task_id}-terminal"))
-            .count(),
-        1,
-        "finished task terminal delivery is deduplicable"
-    );
-    assert_eq!(
-        seen.iter()
-            .filter(|key| key.as_str() == format!("{live_task_id}-terminal"))
-            .count(),
-        1,
-        "rehydrated task terminal delivery is deduplicable"
-    );
+    for task_id in [
+        &finished_task_id,
+        &live_task_id,
+        &sigterm_timeout_task_id,
+        &kill_timeout_task_id,
+    ] {
+        assert_eq!(
+            seen.iter()
+                .filter(|key| key.as_str() == format!("{task_id}-terminal"))
+                .count(),
+            1,
+            "task terminal delivery is deduplicable"
+        );
+    }
 
     let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
         .args(["service", "teardown", "--control", control_str])
