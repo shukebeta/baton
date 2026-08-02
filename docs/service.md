@@ -81,7 +81,11 @@ baton service teardown --control <dir>
   as soon as `run` has spawned the child and persisted its record — it never
   waits on a served turn. Fails fast, with a clear error, if no `service run`
   is currently live on `--control`, rather than hanging on a request no one
-  will ever answer.
+  will ever answer. Relative `--inbox`, `--outbox`, and `--agent-cwd` values
+  are resolved against the submitting client's current working directory and
+  persisted as absolute paths before the request is sent; resolution is
+  lexical and does not canonicalize or require the target to exist at
+  submission time. Absolute values are preserved unchanged.
 - **`service status`** reports the service's own liveness plus every session's
   (or just `--session <id>`'s). Per-session liveness checks the recorded PID
   against `/proc/<pid>` on Linux — alive, not a zombie, and its start time

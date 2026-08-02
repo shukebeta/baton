@@ -2235,6 +2235,173 @@ fn service_session_survives_submitting_client_and_is_owned_by_run() {
     assert!(run_status.success(), "service run exits 0 on teardown");
 }
 
+/// Issue #119 regression: `service start` resolves relative session paths in
+/// the submitting client's working directory before the independent
+/// `service run` process reconstructs the child argv. The test also keeps the
+/// supervisor and teardown clients in different directories, and bounds
+/// teardown below the cooperative-stop grace so a wrong relative inbox would
+/// fail rather than passing after process-group escalation.
+#[cfg(target_os = "linux")]
+#[test]
+fn service_start_resolves_relative_paths_from_submitting_client() {
+    use baton::mailbox;
+    use baton::message::{MessageEnvelope, MessageKind};
+
+    let server = MockServer::spawn_repeating(200, SUCCESS_BODY);
+    let root = TempMailbox::new("service-relative");
+    let supervisor_dir = root.path.join("supervisor");
+    let client_dir = root.path.join("client");
+    std::fs::create_dir_all(&supervisor_dir).expect("create supervisor directory");
+    std::fs::create_dir_all(&client_dir).expect("create client directory");
+
+    let control = root.path.join("control");
+    let inbox = client_dir.join("inbox");
+    let outbox = client_dir.join("outbox");
+
+    let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    run.args(["service", "run", "--control", control.to_str().unwrap()]);
+    run.current_dir(&supervisor_dir);
+    run.env("ANTHROPIC_API_KEY", "test-key");
+    run.env("ANTHROPIC_BASE_URL", server.base_url());
+    run.env("BATON_MODEL", "model-service");
+    run.env("BATON_TIMEOUT_SECS", "5");
+    run.env_remove("ANTHROPIC_AUTH_TOKEN");
+    run.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+    run.env_remove("BATON_EVENT_LOG");
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::null());
+    let mut run_child = run.spawn().expect("spawn baton service run");
+
+    let control_str = control.to_str().unwrap();
+    let mut live = false;
+    for _ in 0..100 {
+        if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(["service", "status", "--control", control_str])
+            .current_dir(&root.path)
+            .output()
+            && out.status.success()
+            && String::from_utf8_lossy(&out.stdout).contains("\"service_running\":true")
+        {
+            live = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(live, "baton service run did not report live in time");
+
+    let start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str,
+            "--inbox",
+            "inbox",
+            "--outbox",
+            "outbox",
+            "--poll-ms",
+            "20",
+        ])
+        .current_dir(&client_dir)
+        .output()
+        .expect("run baton service start");
+    assert!(
+        start.status.success(),
+        "service start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let session_id = String::from_utf8_lossy(&start.stdout).trim().to_string();
+    assert!(!session_id.is_empty(), "service start prints a session id");
+    let mut inbox_ready = false;
+    for _ in 0..100 {
+        if inbox.is_dir() {
+            inbox_ready = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(inbox_ready, "the session creates its client-relative inbox");
+    assert!(
+        inbox.is_dir(),
+        "relative inbox is created in the client directory"
+    );
+    assert!(
+        !supervisor_dir.join("inbox").exists(),
+        "the supervisor directory must not receive the client-relative inbox"
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "status",
+            "--control",
+            control_str,
+            "--session",
+            &session_id,
+        ])
+        .current_dir(&supervisor_dir)
+        .output()
+        .expect("run baton service status");
+    assert!(
+        status.status.success(),
+        "service status should exit 0; stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status is JSON");
+    let sessions = status_json["sessions"].as_array().expect("sessions array");
+    assert_eq!(sessions.len(), 1, "status reports the started session");
+    assert_eq!(sessions[0]["live"], true, "the session reads as live");
+    assert_eq!(
+        sessions[0]["inbox"],
+        inbox.to_str().expect("inbox path is UTF-8")
+    );
+
+    let request = MessageEnvelope::new(
+        "svc-relative-m1",
+        "conv-svc-relative",
+        "agent-a",
+        "agent-b",
+        MessageKind::Request,
+        "hello",
+        1_700_000_000_000,
+    );
+    mailbox::deliver_to(&inbox, &request).expect("deliver to the client-relative inbox");
+    let mut reply = None;
+    for _ in 0..100 {
+        if let Ok(Some(envelope)) = mailbox::try_claim_response(&outbox, "svc-relative-m1") {
+            reply = Some(envelope);
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let reply = reply.expect("the session answers through the client-relative outbox");
+    assert_eq!(reply.body, "hello from the mock server");
+    assert!(
+        outbox.is_dir(),
+        "the response uses the client-relative outbox"
+    );
+
+    let teardown_started = std::time::Instant::now();
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str])
+        .current_dir(&client_dir)
+        .output()
+        .expect("run baton service teardown");
+    let teardown_elapsed = teardown_started.elapsed();
+    assert!(
+        teardown.status.success(),
+        "teardown should exit 0; stderr: {}",
+        String::from_utf8_lossy(&teardown.stderr)
+    );
+    let run_status = run_child.wait().expect("baton service run exits");
+    assert!(run_status.success(), "service run exits 0 on teardown");
+    assert!(
+        teardown_elapsed < Duration::from_secs(2),
+        "teardown should use cooperative stop, not process-group escalation; took {teardown_elapsed:?}"
+    );
+}
+
 /// Issue #110 AC #1 (task ownership/survival regression): a task started
 /// through `baton task start` is spawned as a direct child of the long-lived
 /// `baton service run`, not of the short-lived `task start` client that
