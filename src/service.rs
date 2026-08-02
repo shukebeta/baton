@@ -196,6 +196,7 @@ mod imp {
     use super::*;
     use std::collections::HashMap;
     use std::fs::{self, File, OpenOptions, TryLockError};
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -235,6 +236,21 @@ mod imp {
     /// several calls within the same millisecond.
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
+    /// Opens any service lock with close-on-exec set. `Run` holds the control
+    /// lock while it spawns sessions and tasks; descendants must not retain
+    /// that lock after the supervisor is killed, or a restart is blocked by
+    /// the descendant's lifetime.
+    fn service_lock_options() -> OpenOptions {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(libc::O_CLOEXEC);
+        options
+    }
+
     /// A durable on-disk record of one session `Run` has spawned: enough to
     /// find, corroborate, and signal the real OS process from any later,
     /// independent `Status`/`Stop`/`Teardown` invocation.
@@ -243,9 +259,9 @@ mod imp {
         id: String,
         spec: SessionSpec,
         pid: u32,
-        /// Linux `/proc/<pid>/stat` starttime field, corroborating `pid`
-        /// against reuse after a `Run` restart; `None` where it could not be
-        /// read (non-Linux Unix, or the field was unavailable).
+        /// Linux `/proc/<pid>/stat` starttime or non-Linux Unix `ps` `lstart`,
+        /// corroborating `pid` against reuse after a `Run` restart; `None`
+        /// where the platform probe could not be read.
         started_at: Option<String>,
     }
 
@@ -401,15 +417,9 @@ mod imp {
     /// on the same `control`.
     fn acquire_control_lock(control: &Path) -> Result<File> {
         let lock_path = control.join(CONTROL_LOCK_FILE);
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|err| {
-                BatonError::Io(format!("could not open service lock {lock_path:?}: {err}"))
-            })?;
+        let lock = service_lock_options().open(&lock_path).map_err(|err| {
+            BatonError::Io(format!("could not open service lock {lock_path:?}: {err}"))
+        })?;
         match lock.try_lock() {
             Ok(()) => Ok(lock),
             Err(TryLockError::WouldBlock) => Err(BatonError::Io(format!(
@@ -432,17 +442,11 @@ mod imp {
             ))
         })?;
         let lock_path = control.join(ADMISSION_LOCK_FILE);
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|err| {
-                BatonError::Io(format!(
-                    "could not open service admission lock {lock_path:?}: {err}"
-                ))
-            })?;
+        let lock = service_lock_options().open(&lock_path).map_err(|err| {
+            BatonError::Io(format!(
+                "could not open service admission lock {lock_path:?}: {err}"
+            ))
+        })?;
         lock.lock().map_err(|err| {
             BatonError::Io(format!(
                 "could not lock service admission {control:?}: {err}"
@@ -468,13 +472,7 @@ mod imp {
     /// sentinel for it to observe. Mirrors [`mailbox::request_stop`].
     fn probe_or_signal_control(control: &Path, signal: bool) -> Result<ControlLiveness> {
         let lock_path = control.join(CONTROL_LOCK_FILE);
-        let lock = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-        {
+        let lock = match service_lock_options().open(&lock_path) {
             Ok(lock) => lock,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(ControlLiveness::NotRunning);
@@ -2140,6 +2138,41 @@ mod imp {
                 term_sent_at_ms: None,
                 kill_sent: false,
             }
+        }
+
+        /// A child spawned while `Run` owns the control lock must not retain
+        /// that lock after the supervisor exits. Otherwise a killed
+        /// supervisor cannot be restarted until every descendant happens to
+        /// exit, which breaks crash recovery on macOS.
+        #[test]
+        fn spawned_task_does_not_retain_control_lock_after_owner_exits() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("lock-inheritance");
+            let owner_lock = acquire_control_lock(&dir.path).expect("owner lock");
+
+            let log_dir = task_logs_dir(&dir.path, "lock-child");
+            fs::create_dir_all(&log_dir).expect("create child log dir");
+            let mut child = spawn_task_child(
+                &task_spec(
+                    "session",
+                    "sh",
+                    vec!["-c".to_string(), "sleep 30".to_string()],
+                    Vec::new(),
+                    60_000,
+                    "/tmp/callback",
+                ),
+                &log_dir.join("stdout.log"),
+                &log_dir.join("stderr.log"),
+            )
+            .expect("spawn lock inheritance probe child");
+
+            drop(owner_lock);
+            let replacement_lock = acquire_control_lock(&dir.path)
+                .expect("descendant must not retain the owner control lock");
+            drop(replacement_lock);
+
+            let _ = child.kill();
+            let _ = child.wait();
         }
 
         /// A session record round-trips through the atomic-write file

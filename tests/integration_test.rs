@@ -4168,7 +4168,7 @@ fn service_task_rejects_missing_and_stale_owners_before_spawn() {
     let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
     run.args(["service", "run", "--control", control.to_str().unwrap()]);
     run.stdout(Stdio::null());
-    run.stderr(Stdio::null());
+    run.stderr(Stdio::piped());
     let mut run_child = run.spawn().expect("spawn baton service run");
     let control_str = control.to_str().unwrap();
 
@@ -4185,7 +4185,17 @@ fn service_task_rejects_missing_and_stale_owners_before_spawn() {
         }
         thread::sleep(Duration::from_millis(50));
     }
-    assert!(live, "baton service run did not report live in time");
+    if !live {
+        let _ = run_child.kill();
+        let output = run_child
+            .wait_with_output()
+            .expect("collect failed service run stderr");
+        panic!(
+            "baton service run did not report live in time; status={:?}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     let stale_start = Command::new(env!("CARGO_BIN_EXE_baton"))
         .args([
