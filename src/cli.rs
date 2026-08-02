@@ -1065,12 +1065,28 @@ impl RoleSessionRecorder {
             request.in_reply_to.as_deref(),
         ))?;
         // The reply's nested exchange is the authoritative outcome (timing +
-        // tokens shared with the response envelope). A reply with no nested record
-        // (a participant that answers without one) still gets both sides: its body
-        // is recorded as a `response_ok` so the seat turn is never one-sided.
-        let outcome = match &response.exchange {
-            Some(wrapped) => ExchangeEvent::from_outcome(&wrapped.exchange.outcome),
-            None => ExchangeEvent::response_ok(now_ms(), 0, &response.body, &TokenUsage::default()),
+        // tokens shared with the response envelope). A recordless response is a
+        // successful participant answer; a recordless error is a participant
+        // machinery failure, so preserve the delivered error instead of calling
+        // the seat turn successful.
+        let outcome = match (&response.exchange, response.kind) {
+            (Some(wrapped), _) => ExchangeEvent::from_outcome(&wrapped.exchange.outcome),
+            (None, MessageKind::Response) => {
+                ExchangeEvent::response_ok(now_ms(), 0, &response.body, &TokenUsage::default())
+            }
+            (None, MessageKind::Error) => ExchangeEvent::ResponseError {
+                schema: crate::events::SCHEMA,
+                ts_ms: now_ms(),
+                duration_ms: 0,
+                kind: "participant".to_string(),
+                message: response.body.clone(),
+            },
+            (None, kind) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("cannot record recordless {kind:?} participant reply"),
+                ));
+            }
         };
         sink.record(&outcome)?;
         Ok(())
@@ -6383,8 +6399,8 @@ mod tests {
         }));
         recorder.record_turn(&req1, &resp1).expect("records turn 1");
 
-        // Turn 2: same conversation, second exchange (no nested record → the reply
-        // body is recorded, so the seat turn is still two-sided).
+        // Turn 2: same conversation, nested provider failure. The nested outcome
+        // remains authoritative even though the envelope itself is an error.
         let req2 = MessageEnvelope::new(
             "m-3",
             "conv-1",
@@ -6399,12 +6415,51 @@ mod tests {
             "conv-1",
             "bob",
             "alice",
-            MessageKind::Response,
-            "sure",
+            MessageKind::Error,
+            "provider unavailable",
             1_004,
         );
         resp2.in_reply_to = Some("m-3".to_string());
+        resp2.exchange = Some(crate::message::WrappedExchange::new(log::Exchange {
+            request: log::RequestRecord {
+                ts_ms: 1_004,
+                model: "m".to_string(),
+                base_url: "u".to_string(),
+                prompt: "again".to_string(),
+                session_id: None,
+                turn_index: None,
+            },
+            outcome: log::Outcome::Error {
+                ts_ms: 1_005,
+                duration_ms: 7,
+                kind: "auth".to_string(),
+                message: "provider unavailable".to_string(),
+            },
+        }));
         recorder.record_turn(&req2, &resp2).expect("records turn 2");
+
+        // Turn 3: same conversation, successful participant answer with no
+        // nested provider record.
+        let req3 = MessageEnvelope::new(
+            "m-5",
+            "conv-1",
+            "alice",
+            "bob",
+            MessageKind::Request,
+            "finally",
+            1_006,
+        );
+        let mut resp3 = MessageEnvelope::new(
+            "m-6",
+            "conv-1",
+            "bob",
+            "alice",
+            MessageKind::Response,
+            "sure",
+            1_007,
+        );
+        resp3.in_reply_to = Some("m-5".to_string());
+        recorder.record_turn(&req3, &resp3).expect("records turn 3");
 
         let path = home.session_path("bob", "conv-1").expect("path");
         let raw = std::fs::read_to_string(&path).expect("reads seat file");
@@ -6427,7 +6482,7 @@ mod tests {
         let s = &report.sessions[0];
         assert_eq!(s.session_id, "conv-1", "session_id mirrors conversation_id");
         assert!(s.started, "the opening marker was written");
-        assert_eq!(s.turns.len(), 2, "both exchanges are recorded");
+        assert_eq!(s.turns.len(), 3, "all exchanges are recorded");
         // Turn 0: the received request + the sent reply (both sides).
         assert_eq!(s.turns[0].request.session_id.as_deref(), Some("conv-1"));
         assert_eq!(s.turns[0].request.prompt, "hello");
@@ -6441,11 +6496,124 @@ mod tests {
                 output_tokens: None,
             })
         );
-        // Turn 1: the fallback path still records the reply body.
+        // Turn 1: the nested provider error remains the recorded outcome.
         assert_eq!(s.turns[1].request.prompt, "again");
         match &s.turns[1].outcome {
+            Some(log::Outcome::Error {
+                duration_ms,
+                kind,
+                message,
+                ..
+            }) => {
+                assert_eq!(*duration_ms, 7);
+                assert_eq!(kind, "auth");
+                assert_eq!(message, "provider unavailable");
+            }
+            other => panic!("expected the nested provider error outcome, got: {other:?}"),
+        }
+        // Turn 2: the recordless participant response still records its body.
+        assert_eq!(s.turns[2].request.prompt, "finally");
+        match &s.turns[2].outcome {
             Some(log::Outcome::Ok { reply, .. }) => assert_eq!(reply, "sure"),
             other => panic!("expected an Ok outcome carrying the reply, got: {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A headless external-agent success has no nested provider record and is
+    /// recorded as a successful participant answer; a non-zero agent exit has
+    /// the same recordless envelope shape but must be recorded as `participant`
+    /// failure, with the delivered body preserved in the parsed seat trail.
+    #[test]
+    fn role_recorder_records_external_agent_success_and_failure() {
+        let (root, home) = temp_role_home("sess-external-agent");
+        std::fs::create_dir_all(&root).expect("create external-agent cwd");
+        let recorder = RoleSessionRecorder {
+            role: "bob".to_string(),
+            identity: vec![id_field("model", "claude-x", "role")],
+            meta: test_meta(),
+            home: home.clone(),
+        };
+
+        let success = ExternalAgentParticipant::new(
+            "sh",
+            ["-c", "cat >/dev/null; printf 'external reply'"],
+            std::iter::empty::<(String, String)>(),
+            &root,
+            OutputAdapter::Raw,
+            Duration::from_secs(5),
+        );
+        let success_request = MessageEnvelope::new(
+            "m-success-request",
+            "conv-success",
+            "alice",
+            "bob",
+            MessageKind::Request,
+            "answer successfully",
+            1_000,
+        );
+        let success_response = success.respond(&success_request);
+        assert_eq!(success_response.kind, MessageKind::Response);
+        assert!(success_response.exchange.is_none());
+        recorder
+            .record_turn(&success_request, &success_response)
+            .expect("records external-agent success");
+
+        let failure = ExternalAgentParticipant::new(
+            "sh",
+            ["-c", "cat >/dev/null; echo agent failed >&2; exit 3"],
+            std::iter::empty::<(String, String)>(),
+            &root,
+            OutputAdapter::Raw,
+            Duration::from_secs(5),
+        );
+        let failure_request = MessageEnvelope::new(
+            "m-failure-request",
+            "conv-failure",
+            "alice",
+            "bob",
+            MessageKind::Request,
+            "fail safely",
+            1_001,
+        );
+        let failure_response = failure.respond(&failure_request);
+        assert_eq!(failure_response.kind, MessageKind::Error);
+        assert!(failure_response.exchange.is_none());
+        let failure_body = failure_response.body.clone();
+        recorder
+            .record_turn(&failure_request, &failure_response)
+            .expect("records external-agent failure");
+
+        let success_path = home
+            .session_path("bob", "conv-success")
+            .expect("success path");
+        let success_report =
+            log::parse_sessions(std::fs::File::open(success_path).expect("open success trail"))
+                .expect("parse success trail");
+        match &success_report.sessions[0].turns[0].outcome {
+            Some(log::Outcome::Ok { reply, .. }) => assert_eq!(reply, "external reply"),
+            other => panic!("expected successful recordless participant outcome, got: {other:?}"),
+        }
+
+        let failure_path = home
+            .session_path("bob", "conv-failure")
+            .expect("failure path");
+        let failure_report =
+            log::parse_sessions(std::fs::File::open(failure_path).expect("open failure trail"))
+                .expect("parse failure trail");
+        match &failure_report.sessions[0].turns[0].outcome {
+            Some(log::Outcome::Error {
+                duration_ms,
+                kind,
+                message,
+                ..
+            }) => {
+                assert_eq!(*duration_ms, 0);
+                assert_eq!(kind, "participant");
+                assert_eq!(message, &failure_body);
+            }
+            other => panic!("expected participant machinery error outcome, got: {other:?}"),
         }
 
         let _ = std::fs::remove_dir_all(&root);

@@ -56,13 +56,18 @@ field within it) still succeeds, and the missing count is simply left off the
 `response_ok` line rather than failing the exchange — so a consumer must treat
 either field as possibly absent.
 
-A `response_error` event's `kind` is one of the six classes an exchange can
-actually fail with (`transport`, `auth`, `rate_limited`, `server`, `api`,
+For provider-backed exchange records, `response_error.kind` is one of the six
+provider failure classes (`transport`, `auth`, `rate_limited`, `server`, `api`,
 `decode`), so consumers can branch on the failure class without parsing the
-human-readable `message`. The other `BatonError` kinds (`config`, `usage`, `io`,
+human-readable `message`. A `serve --role` seat trail can additionally use the
+seventh class `participant` when participant machinery fails before it can
+produce a nested provider record (for example, an external agent exits
+non-zero, times out, or produces no usable result); the delivered error body's
+text is preserved as `message`. `participant` is a seat-trail classification,
+not a `BatonError` kind. The other `BatonError` kinds (`config`, `usage`, `io`,
 `log`) arise only outside an exchange — at startup, CLI parsing, REPL
 stdin/stdout I/O, or event-log parsing — where no `response_error` event is
-emitted, so a trail consumer will never see them in `kind`.
+emitted.
 
 **Consumption model.** Read the file line by line; parse each line as a
 standalone JSON object. A trailing partial line — one with no terminating
