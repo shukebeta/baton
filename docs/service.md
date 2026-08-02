@@ -28,14 +28,17 @@ without ever sharing a process tree with it.
   `kill -<pid>` from `service stop`/`teardown` reaches both the `serve`
   process and any in-flight `--agent-cmd` grandchild it spawned.
 - **`baton service` carries no systemd-specific assumption.** The unit under
-  `packaging/systemd/` is an external liveness wrapper only — start/stop/
-  restart-on-death — layered on top of a control surface that works
-  identically whether or not that unit is ever installed.
+  `packaging/systemd/` and the LaunchAgent under `packaging/launchd/` are
+  external liveness wrappers only — start/stop/restart-on-death — layered on
+  top of a control surface that works identically whether or not either is
+  installed.
 - **Unix only (Linux and macOS).** Process groups and the `kill` escalation
   this module relies on have no equivalent in this crate's dependency-free
   design on Windows; `baton service` fails clearly there instead of silently
-  falling back to a weaker guarantee. A Windows host-service integration is
-  tracked separately.
+  falling back to a weaker guarantee. On Linux, per-session liveness uses
+  `/proc/<pid>/stat`; on macOS, it uses `ps` process state plus the
+  second-granular `lstart` value. Native Windows service support is tracked
+  separately.
 
 ## Control surface
 
@@ -93,9 +96,10 @@ baton service teardown --control <dir>
   (or just `--session <id>`'s). Per-session liveness checks the recorded PID
   against `/proc/<pid>` on Linux — alive, not a zombie, and its start time
   still matches the record — so a PID recycled after a restart is reported as
-  crashed rather than (incorrectly) live; on non-Linux Unix hosts this
-  degrades to an existence-only `kill -0` check, which cannot detect PID
-  reuse.
+  crashed rather than (incorrectly) live. On macOS, the same check uses
+  `ps -p <pid> -o state=,lstart=`; a leading `Z` is treated as gone and the
+  normalized `lstart` value must match the record. `lstart` is second-granular
+  and is a BSD/procps extension rather than a POSIX interface.
 - **`service stop --session <id>`** tries `serve`'s own cooperative stop
   against the session's inbox first, then escalates to a bounded
   `SIGTERM`/`SIGKILL` on the session's process group if it is still alive.
@@ -288,3 +292,46 @@ them on their own eventual exit; a restarted `run` does not re-adopt them,
 so `service status` will report them as no-longer-visible processes needing a
 fresh `service start`. Run `loginctl enable-linger <user>` if the service
 should also survive the user's last session logging out.
+
+## macOS launchd setup
+
+`packaging/launchd/baton.plist` is an example per-user LaunchAgent. It uses
+`KeepAlive` with `SuccessfulExit=false`, so a crash restarts `service run` but
+the clean exit caused by `baton service teardown` does not fight the stop path.
+The example contains `/Users/YOUR_USER` placeholders because LaunchAgent
+`ProgramArguments` entries do not expand `~` or `$HOME`.
+
+Install it for the current login session:
+
+```bash
+AGENT_LABEL=com.shukebeta.baton.service
+AGENT_PATH="$HOME/Library/LaunchAgents/${AGENT_LABEL}.plist"
+mkdir -p "$HOME/Library/LaunchAgents" "$HOME/.baton"
+cp packaging/launchd/baton.plist "$AGENT_PATH"
+# Replace every /Users/YOUR_USER placeholder in "$AGENT_PATH" first.
+plutil -lint "$AGENT_PATH"
+launchctl bootstrap "gui/$(id -u)" "$AGENT_PATH"
+launchctl print "gui/$(id -u)/$AGENT_LABEL"
+```
+
+Check the loaded job with `launchctl print`. For a clean stop, tear down
+managed sessions before unloading the LaunchAgent:
+
+```bash
+AGENT_LABEL=com.shukebeta.baton.service
+baton service teardown --control "$HOME/.baton/service"
+launchctl bootout "gui/$(id -u)/$AGENT_LABEL"
+```
+
+`launchctl bootout` alone is not the clean-stop operation: managed sessions
+are separate process-group leaders and can outlive the LaunchAgent. The
+explicit `service teardown` first stops those sessions and the supervisor;
+`bootout` then removes the stopped job. To uninstall the integration after the
+clean stop, remove the per-user plist:
+
+```bash
+rm -f "$HOME/Library/LaunchAgents/com.shukebeta.baton.service.plist"
+```
+
+This LaunchAgent is login-scoped and is intentionally not a root-owned
+LaunchDaemon; it does not promise survival across logout.
