@@ -223,8 +223,6 @@ mod imp {
     const STOP_GRACE_MS: u64 = 5_000;
     /// Bound on the `SIGTERM`/`SIGKILL` escalation grace.
     const KILL_GRACE_MS: u64 = 2_000;
-    /// Bound on `Run`'s final reap sweep after observing its own stop.
-    const FINAL_REAP_GRACE_MS: u64 = 2_000;
 
     /// Process-local sequence, making request/session ids unique even across
     /// several calls within the same millisecond.
@@ -378,17 +376,10 @@ mod imp {
             }
         }
 
-        // Best-effort final reap: `Teardown` already killed every known
-        // session (and, per session, every task it owns) before dropping the
-        // sentinel, so this is normally instant.
-        let deadline = Instant::now() + Duration::from_millis(FINAL_REAP_GRACE_MS);
-        while (!children.is_empty() || !tasks.is_empty()) && Instant::now() < deadline {
-            reap_exited(&mut children);
-            tick_tasks(control, &mut tasks, &clock);
-            if !children.is_empty() || !tasks.is_empty() {
-                std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
-            }
-        }
+        // `service teardown` waits for this lock to be released before it
+        // snapshots and stops session records. Waiting for children here would
+        // delay that admission barrier while the sessions are still live; the
+        // teardown client owns their PID-based drain after this lock is dropped.
         drop(lock);
         Ok(())
     }
@@ -545,6 +536,11 @@ mod imp {
                     BatonError::Decode(format!("malformed service response {path:?}: {err}"))
                 })?;
                 return Ok(resp.session_id);
+            }
+            if probe_control(control)? == ControlLiveness::NotRunning {
+                return Err(BatonError::Io(format!(
+                    "no live baton service on {control:?}; start request was not admitted"
+                )));
             }
             if Instant::now() >= deadline {
                 return Err(BatonError::Io(format!(
@@ -1655,10 +1651,14 @@ mod imp {
     }
 
     fn execute_teardown(control: &Path, mut out: impl Write) -> Result<()> {
+        let service_liveness = request_control_stop(control)?;
+        if service_liveness == ControlLiveness::Live {
+            wait_for_control_release(control)?;
+        }
         for record in list_session_records(control)? {
             stop_session_record(control, &record)?;
         }
-        match request_control_stop(control)? {
+        match service_liveness {
             ControlLiveness::Live => writeln!(
                 out,
                 "requested teardown of baton service on {}",
@@ -1671,6 +1671,17 @@ mod imp {
             ),
         }
         .map_err(io_err)
+    }
+
+    /// Waits until the supervisor has observed its stop request and released
+    /// the control lock. A released lock is the admission barrier: every
+    /// request handled by the supervisor was committed to a session record
+    /// before this point, and later `service start` calls fail fast.
+    fn wait_for_control_release(control: &Path) -> Result<()> {
+        while probe_control(control)? == ControlLiveness::Live {
+            std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        }
+        Ok(())
     }
 
     #[cfg(test)]

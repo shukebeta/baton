@@ -97,10 +97,14 @@ baton service teardown --control <dir>
   against the session's inbox first, then escalates to a bounded
   `SIGTERM`/`SIGKILL` on the session's process group if it is still alive.
   Idempotent — stopping an already-gone session is a no-op success.
-- **`service teardown`** applies `stop` to every known session, then requests
-  `run`'s own cooperative stop. Idempotent, and safe to call whether or not
-  `run` is currently alive (e.g. to reap stale records left by a `run` that
-  already crashed).
+- **`service teardown`** first requests `run`'s cooperative stop, then waits
+  for `run` to release the control lock before taking its session snapshot and
+  applying `stop` to every record. The released lock is the admission barrier:
+  a concurrent `service start` either was handled before the barrier and is in
+  the snapshot, or fails because no live service remains (an already-written
+  request may remain unprocessed); it cannot spawn a session outside the
+  snapshot. Idempotent, and safe to call whether or not `run` is currently
+  alive (e.g. to reap stale records left by a `run` that already crashed).
 
 Standalone `baton serve` (run directly, without `baton service`) is
 unaffected by any of this — `service` only ever spawns the same `serve`
