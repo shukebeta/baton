@@ -171,6 +171,27 @@ baton task cancel --control <dir> --task <id>
   the resulting terminal event reads `cancelled` rather than `failed`), and a
   no-op success if the task is already gone.
 
+### Supervisor restart reconciliation
+
+`service run` scans durable task records before it accepts new requests. Each
+new running record stores the task's spawn time as Unix epoch milliseconds, so
+milestone and max-duration decisions continue from the original task start
+after a restart. Linux also requires the recorded
+`/proc/<pid>/stat` start key to match the current process; a missing or
+mismatched key is treated as gone and is never adopted or signalled.
+
+The restarted supervisor cannot recover a `std::process::Child` handle for a
+task reparented to init. It therefore tracks a corroborated PID directly:
+milestones and timeout signals continue while the PID is live, and the task is
+finalized when that PID disappears. No exit status can be recovered through
+this path, so a rehydrated task that is already gone or later finishes is
+recorded as `failed` with `exit_code: null`; a timeout or cancellation remains
+`timeout` or `cancelled` when the supervisor initiated that outcome. State is
+persisted before the deterministic terminal callback is delivered, and a
+delivery failure leaves the tracker in place to retry the same event id. A
+terminal record is replayed once on the next startup for the same reason; the
+mailbox's done ledger drops it if delivery already completed.
+
 ### Event delivery and dedup contract
 
 Each configured milestone and the eventual terminal outcome produces exactly
