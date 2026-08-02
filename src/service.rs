@@ -2682,65 +2682,175 @@ mod imp {
         }
 
         /// Exceeding `max_duration_ms` (per the injected clock) escalates
-        /// `SIGTERM`→`SIGKILL` and the eventual reap is attributed to
-        /// `timeout`, not `completed`/`failed`.
+        /// `SIGTERM`→`SIGKILL` when the child remains alive, while an exit
+        /// observed immediately after `SIGTERM` is also attributed to
+        /// `timeout`. Both valid Unix reap outcomes deliver the same terminal
+        /// event.
         #[test]
         fn tick_one_task_enforces_max_duration_and_marks_timeout() {
             let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("tick-timeout");
             let clock = FakeClock::new();
-            let callback_inbox = dir.path.join("callback");
-            let spec = task_spec(
+            let helper = task_timeout_helper_path();
+
+            let immediate_callback = dir.path.join("callback-immediate");
+            let immediate_ready = dir.path.join("immediate.ready");
+            let immediate_spec = task_spec(
                 "svc-1",
-                "sh",
-                vec!["-c".to_string(), "trap '' TERM; sleep 5".to_string()],
+                &helper.display().to_string(),
+                vec![
+                    "--mode".to_string(),
+                    "exit-on-term".to_string(),
+                    "--ready-file".to_string(),
+                    immediate_ready.display().to_string(),
+                ],
                 vec![],
                 100,
-                &callback_inbox.display().to_string(),
+                &immediate_callback.display().to_string(),
             );
-            let mut running = spawn_running_task(&dir.path, "task-t", spec, &clock);
+            let mut immediate =
+                spawn_running_task(&dir.path, "task-t-immediate", immediate_spec, &clock);
+            wait_for_task_helper(&mut immediate, &immediate_ready);
 
             clock.advance(150);
-            let tick = tick_one_task(&dir.path, "task-t", &mut running, &clock).expect("tick");
+            let tick =
+                tick_one_task(&dir.path, "task-t-immediate", &mut immediate, &clock).expect("tick");
             assert!(
-                running.term_sent_at_ms.is_some(),
+                immediate.term_sent_at_ms.is_some(),
+                "max-duration breach must send SIGTERM"
+            );
+            reap_task_until_finished(&dir.path, "task-t-immediate", &mut immediate, &clock, tick);
+            assert!(
+                !immediate.kill_sent,
+                "immediate TERM exit must not need SIGKILL"
+            );
+            assert_eq!(immediate.record.state, TaskState::Timeout);
+            assert_terminal_task_event(&immediate_callback, "task-t-immediate");
+
+            let kill_callback = dir.path.join("callback-kill");
+            let kill_ready = dir.path.join("kill.ready");
+            let kill_spec = task_spec(
+                "svc-1",
+                &helper.display().to_string(),
+                vec![
+                    "--mode".to_string(),
+                    "ignore-term".to_string(),
+                    "--ready-file".to_string(),
+                    kill_ready.display().to_string(),
+                ],
+                vec![],
+                100,
+                &kill_callback.display().to_string(),
+            );
+            let mut kill_task = spawn_running_task(&dir.path, "task-t-kill", kill_spec, &clock);
+            wait_for_task_helper(&mut kill_task, &kill_ready);
+
+            clock.advance(150);
+            let tick =
+                tick_one_task(&dir.path, "task-t-kill", &mut kill_task, &clock).expect("tick");
+            assert!(
+                matches!(tick, TaskTick::StillRunning),
+                "TERM-ignoring helper must remain alive for KILL escalation"
+            );
+            assert!(
+                kill_task.term_sent_at_ms.is_some(),
                 "max-duration breach must send SIGTERM"
             );
 
-            // Some Unix implementations reap the process group immediately
-            // after TERM; others require the documented KILL-grace tick.
-            if matches!(tick, TaskTick::StillRunning) {
-                clock.advance(KILL_GRACE_MS);
-                let _tick = tick_one_task(&dir.path, "task-t", &mut running, &clock).expect("tick");
-                assert!(running.kill_sent, "SIGTERM grace expiry must send SIGKILL");
+            clock.advance(KILL_GRACE_MS);
+            let tick =
+                tick_one_task(&dir.path, "task-t-kill", &mut kill_task, &clock).expect("tick");
+            assert!(
+                kill_task.kill_sent,
+                "SIGTERM grace expiry must send SIGKILL"
+            );
+            reap_task_until_finished(&dir.path, "task-t-kill", &mut kill_task, &clock, tick);
+            assert_eq!(kill_task.record.state, TaskState::Timeout);
 
-                let deadline = Instant::now() + Duration::from_secs(5);
-                loop {
-                    match tick_one_task(&dir.path, "task-t", &mut running, &clock).expect("tick") {
-                        TaskTick::Finished => break,
-                        TaskTick::StillRunning => {
-                            assert!(
-                                Instant::now() < deadline,
-                                "task did not exit after SIGTERM within the test bound"
-                            );
-                            std::thread::sleep(Duration::from_millis(20));
-                        }
-                    }
+            assert_terminal_task_event(&kill_callback, "task-t-kill");
+        }
+
+        /// Builds the explicit-signal child used by the timeout test. The
+        /// helper is an example that runs as a real process-group leader.
+        fn task_timeout_helper_path() -> std::path::PathBuf {
+            let cargo = option_env!("CARGO").unwrap_or("cargo");
+            let built = Command::new(cargo)
+                .args(["build", "--quiet", "--example", "task_timeout_helper"])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .status()
+                .expect("build task_timeout_helper");
+            assert!(built.success(), "task_timeout_helper builds");
+
+            let test_bin = std::env::current_exe().expect("resolve service test executable");
+            let profile_dir = test_bin
+                .parent()
+                .and_then(std::path::Path::parent)
+                .expect("service test executable has a profile directory");
+            let helper = profile_dir.join("examples").join("task_timeout_helper");
+            assert!(
+                helper.is_file(),
+                "task_timeout_helper at {}",
+                helper.display()
+            );
+            helper
+        }
+
+        /// Waits for the helper's signal handler to be installed before the
+        /// fake clock drives the timeout. A readiness file avoids a startup
+        /// race where TERM could arrive before the helper has configured its
+        /// explicit handler.
+        fn wait_for_task_helper(running: &mut RunningTask, ready: &Path) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if ready.is_file() {
+                    return;
                 }
-            } else {
-                assert!(
-                    matches!(tick, TaskTick::Finished),
-                    "a max-duration task must be terminal after fast reaping"
-                );
+                if let Some(child) = running.child.as_mut()
+                    && child.try_wait().expect("poll task helper").is_some()
+                {
+                    panic!("task timeout helper exited before becoming ready");
+                }
+                if Instant::now() >= deadline {
+                    let _ = signal_group(running.record.pid, "-KILL");
+                    let _ = running.child.as_mut().expect("owned helper").wait();
+                    panic!("task timeout helper did not become ready within the test bound");
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
-            assert_eq!(running.record.state, TaskState::Timeout);
+        }
 
-            let mailbox = mailbox::Mailbox::open(&callback_inbox).expect("open");
+        /// Reaps a task after the fake-clock decision has been made. Process
+        /// exit and `Child::try_wait` are real-time OS observations, so keep
+        /// polling at the same fake time under a finite wall-clock bound.
+        fn reap_task_until_finished(
+            control: &Path,
+            id: &str,
+            running: &mut RunningTask,
+            clock: &dyn Clock,
+            first_tick: TaskTick,
+        ) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut tick = first_tick;
+            loop {
+                if matches!(tick, TaskTick::Finished) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "task {id} did not exit within the bounded real-time reap loop"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+                tick = tick_one_task(control, id, running, clock).expect("tick");
+            }
+        }
+
+        fn assert_terminal_task_event(callback_inbox: &Path, task_id: &str) {
+            let mailbox = mailbox::Mailbox::open(callback_inbox).expect("open");
             let claimed = mailbox
                 .claim_next()
                 .expect("claim")
                 .expect("terminal event present");
-            assert_eq!(claimed.key, "task-t-terminal");
+            assert_eq!(claimed.key, format!("{task_id}-terminal"));
         }
 
         /// A task that exits zero on its own, before any max-duration
