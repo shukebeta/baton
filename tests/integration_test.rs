@@ -2402,6 +2402,203 @@ fn service_start_resolves_relative_paths_from_submitting_client() {
     );
 }
 
+/// Issue #120 regression: teardown closes the supervisor's admission barrier
+/// before it starts draining an in-flight session. The mailbox stop sentinel
+/// proves that teardown is spending its bounded stop grace on session A; a
+/// second start at that point must fail because `service run` has already
+/// released the control lock, so session B cannot become unowned.
+#[cfg(target_os = "linux")]
+#[test]
+fn service_teardown_closes_admission_before_draining_sessions() {
+    use baton::mailbox;
+    use baton::message::{MessageEnvelope, MessageKind};
+
+    let root = TempMailbox::new("service-teardown-race");
+    let control = root.path.join("control");
+    let inbox = root.path.join("inbox-a");
+    let outbox = root.path.join("outbox-a");
+    let racing_inbox = root.path.join("inbox-b");
+    let racing_outbox = root.path.join("outbox-b");
+    let agent_started = root.path.join("agent-started");
+
+    let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    run.args(["service", "run", "--control", control.to_str().unwrap()]);
+    run.env_remove("BATON_EVENT_LOG");
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::null());
+    let mut run_child = run.spawn().expect("spawn baton service run");
+
+    let control_str = control.to_str().unwrap();
+    let mut live = false;
+    for _ in 0..100 {
+        if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(["service", "status", "--control", control_str])
+            .output()
+            && out.status.success()
+            && String::from_utf8_lossy(&out.stdout).contains("\"service_running\":true")
+        {
+            live = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(live, "baton service run did not report live in time");
+
+    // The external agent consumes its request, marks the turn as in-flight,
+    // then sleeps long enough for teardown's cooperative-stop window to be
+    // observable. This avoids provider/network setup while keeping the real
+    // `serve` process blocked in its agent request.
+    let start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str,
+            "--inbox",
+            inbox.to_str().unwrap(),
+            "--outbox",
+            outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+            "--agent-cmd",
+            "sh",
+            "--agent-arg",
+            "-c",
+            "--agent-arg",
+            "cat >/dev/null; touch \"$1\"; sleep 2",
+            "--agent-arg",
+            "teardown-race-agent",
+            "--agent-arg",
+            agent_started.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run baton service start");
+    assert!(
+        start.status.success(),
+        "service start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let session_id = String::from_utf8_lossy(&start.stdout).trim().to_string();
+    assert!(!session_id.is_empty(), "service start prints a session id");
+
+    let request = MessageEnvelope::new(
+        "svc-teardown-race-m1",
+        "conv-svc-teardown-race",
+        "agent-a",
+        "agent-b",
+        MessageKind::Request,
+        "hold this turn",
+        1_700_000_000_000,
+    );
+    mailbox::deliver_to(&inbox, &request).expect("deliver the in-flight session request");
+    let mut in_flight = false;
+    for _ in 0..100 {
+        if agent_started.is_file() {
+            in_flight = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        in_flight,
+        "session A did not enter its in-flight agent turn"
+    );
+
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn baton service teardown");
+
+    // This sentinel marks the beginning of session A's bounded stop grace.
+    // The supervisor has already released the control lock by this point, so
+    // admission is closed while the session drain continues.
+    let session_stop = inbox.join("serve.stop");
+    let mut draining = false;
+    for _ in 0..250 {
+        if session_stop.is_file() {
+            draining = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        draining,
+        "teardown did not begin draining session A in time"
+    );
+
+    let racing_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str,
+            "--inbox",
+            racing_inbox.to_str().unwrap(),
+            "--outbox",
+            racing_outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+        ])
+        .output()
+        .expect("run racing baton service start");
+    assert!(
+        !racing_start.status.success(),
+        "a racing start must be rejected; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&racing_start.stdout),
+        String::from_utf8_lossy(&racing_start.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&racing_start.stderr).contains("no live baton service"),
+        "the racing start explains that admission is closed: {}",
+        String::from_utf8_lossy(&racing_start.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&racing_start.stdout)
+            .trim()
+            .is_empty(),
+        "a rejected start prints no session id: {}",
+        String::from_utf8_lossy(&racing_start.stdout)
+    );
+
+    let teardown_output = teardown
+        .wait_with_output()
+        .expect("wait for baton service teardown");
+    assert!(
+        teardown_output.status.success(),
+        "teardown should exit 0; stderr: {}",
+        String::from_utf8_lossy(&teardown_output.stderr)
+    );
+    let run_status = run_child.wait().expect("service run exits");
+    assert!(run_status.success(), "service run exits 0 on teardown");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "status", "--control", control_str])
+        .output()
+        .expect("run baton service status after teardown");
+    assert!(
+        status.status.success(),
+        "service status should exit 0; stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status is JSON");
+    assert_eq!(
+        status_json["service_running"], false,
+        "teardown leaves no live service"
+    );
+    assert_eq!(
+        status_json["sessions"].as_array().unwrap().len(),
+        0,
+        "teardown leaves no managed sessions"
+    );
+    let session_records = std::fs::read_dir(control.join("sessions"))
+        .map(|entries| entries.filter_map(|entry| entry.ok()).count())
+        .unwrap_or(0);
+    assert_eq!(session_records, 0, "teardown removes every session record");
+}
+
 /// Issue #110 AC #1 (task ownership/survival regression): a task started
 /// through `baton task start` is spawned as a direct child of the long-lived
 /// `baton service run`, not of the short-lived `task start` client that
