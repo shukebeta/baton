@@ -148,6 +148,11 @@ baton task cancel --control <dir> --task <id>
   owned and reaped by whichever `baton service` session names it here,
   independent of where its events are delivered — see "Ownership vs. callback"
   below.
+- **`--cwd <dir>`** sets the task command's working directory. A relative path
+  is resolved lexically against the submitting `task start` client's current
+  directory; an absolute path is preserved unchanged. The resolved path is
+  persisted in the task record before the service spawns the command. If the
+  flag is omitted, the command inherits the service's working directory.
 - **`--milestone-ms <n>` is opaque to baton.** The core carries no default
   duration set and no cadence semantics; a caller supplies whichever
   durations (elapsed ms since spawn) it wants an event at, or none. The same
@@ -157,7 +162,10 @@ baton task cancel --control <dir> --task <id>
   root exactly like every other `baton` surface (`SessionSpec.inbox`,
   `send --to`, …): `inbox` is where events land, `role` is an optional
   identity tag carried on the delivered envelope for the recipient's own
-  framing. Neither is used to resolve delivery beyond that.
+  framing. A relative inbox path is resolved lexically against the submitting
+  `task start` client's current directory and persisted as an absolute path;
+  an absolute path is preserved unchanged. Neither the inbox nor role is used
+  to resolve delivery beyond that.
 - **`task status`** reports one task (`--task <id>`) or every known task:
   `running`/`completed`/`failed`/`timeout`/`cancelled` state, exit code,
   elapsed milliseconds, and the following task identity/output fields:
