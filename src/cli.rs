@@ -5384,22 +5384,31 @@ mod tests {
 
     #[test]
     fn parse_service_start_parses_minimal_spec() {
+        let cwd = std::env::current_dir().expect("read current directory");
+        let inbox = cwd
+            .join("service-test-inbox")
+            .to_string_lossy()
+            .into_owned();
+        let outbox = cwd
+            .join("service-test-outbox")
+            .to_string_lossy()
+            .into_owned();
         let cmd = parse_args(&argv(&[
             "service",
             "start",
             "--control",
             "/tmp/ctl",
             "--inbox",
-            "/tmp/in",
+            &inbox,
             "--outbox",
-            "/tmp/out",
+            &outbox,
         ]))
         .expect("parses");
         match cmd {
             Command::Service(service::ServiceCommand::Start { control, spec }) => {
                 assert_eq!(control, "/tmp/ctl");
-                assert_eq!(spec.inbox, "/tmp/in");
-                assert_eq!(spec.outbox, "/tmp/out");
+                assert_eq!(spec.inbox, inbox);
+                assert_eq!(spec.outbox, outbox);
                 assert_eq!(spec.schema, service::SESSION_SPEC_SCHEMA);
                 assert!(spec.agent_cmd.is_none());
             }
@@ -5409,21 +5418,34 @@ mod tests {
 
     #[test]
     fn parse_service_start_parses_agent_flags() {
+        let cwd = std::env::current_dir().expect("read current directory");
+        let inbox = cwd
+            .join("service-test-inbox")
+            .to_string_lossy()
+            .into_owned();
+        let outbox = cwd
+            .join("service-test-outbox")
+            .to_string_lossy()
+            .into_owned();
+        let agent_cwd = cwd
+            .join("service-test-agent")
+            .to_string_lossy()
+            .into_owned();
         let cmd = parse_args(&argv(&[
             "service",
             "start",
             "--control",
             "/tmp/ctl",
             "--inbox",
-            "/tmp/in",
+            &inbox,
             "--outbox",
-            "/tmp/out",
+            &outbox,
             "--agent-cmd",
             "claude",
             "--agent-arg",
             "--print",
             "--agent-cwd",
-            "/work",
+            &agent_cwd,
             "--agent-output",
             "json",
             "--agent-result-key",
@@ -5434,9 +5456,11 @@ mod tests {
         .expect("parses");
         match cmd {
             Command::Service(service::ServiceCommand::Start { spec, .. }) => {
+                assert_eq!(spec.inbox, inbox);
+                assert_eq!(spec.outbox, outbox);
                 assert_eq!(spec.agent_cmd.as_deref(), Some("claude"));
                 assert_eq!(spec.agent_args, vec!["--print".to_string()]);
-                assert_eq!(spec.agent_cwd.as_deref(), Some("/work"));
+                assert_eq!(spec.agent_cwd.as_deref(), Some(agent_cwd.as_str()));
                 assert_eq!(spec.agent_output.as_deref(), Some("json"));
                 assert_eq!(spec.agent_result_key.as_deref(), Some("result"));
                 assert_eq!(spec.role.as_deref(), Some("alice"));
