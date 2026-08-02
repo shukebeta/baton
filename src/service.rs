@@ -46,7 +46,7 @@
 //! makes each `baton serve` child its own group leader
 //! (`std::os::unix::process::CommandExt::process_group(0)`, safe and stable —
 //! deliberately not `pre_exec(setsid)`, which would require `unsafe`), so one
-//! `kill -<pid>` reaches both the `serve` process and its in-flight
+//! `kill -- -<pid>` reaches both the `serve` process and its in-flight
 //! `agent-cmd` grandchild.
 //!
 //! ## Host support
@@ -744,7 +744,7 @@ mod imp {
         command.stdout(Stdio::null());
         command.stderr(Stdio::null());
         // A fresh process group (not this service's own) so a later
-        // `kill -<pid>` escalation reaches exactly this session's `serve`
+        // `kill -- -<pid>` escalation reaches exactly this session's `serve`
         // process and its `agent-cmd` grandchild, nothing else this service
         // manages. Safe and stable — deliberately not `pre_exec(setsid)`,
         // which would require `unsafe`.
@@ -1034,7 +1034,7 @@ mod imp {
         command.stdout(Stdio::from(stdout_file));
         command.stderr(Stdio::from(stderr_file));
         // Own process-group leader, like `spawn_serve_child`, so a later
-        // `kill -<pid>` (max-duration enforcement or `baton task cancel`)
+        // `kill -- -<pid>` (max-duration enforcement or `baton task cancel`)
         // reaches the task's whole subtree, not just this direct child.
         command.process_group(0);
         command.spawn().map_err(|err| {
@@ -1390,19 +1390,27 @@ mod imp {
         corroborated_alive(record.pid)
     }
 
-    /// Sends `sig` (e.g. `"-TERM"`) to the process **group** led by `pid`
-    /// (`kill <sig> -<pid>`). A failure (the group is already gone) is not
-    /// surfaced — only a failure to run `kill` itself is. Refuses `pid <= 1`:
-    /// a corrupt/hand-edited session record must never be able to turn this
-    /// into `kill -TERM -1`, which would signal every process the invoking
-    /// user owns rather than one session's group.
-    fn signal_group(pid: u32, sig: &str) -> Result<()> {
+    /// Builds the argv for sending `sig` (e.g. `"-TERM"`) to the process
+    /// **group** led by `pid`. The `--` is required: procps-ng otherwise parses
+    /// the negative process-group id as another option and can turn
+    /// `kill -TERM -<pid>` into `kill(-1, SIGTERM)`, signalling every process
+    /// the invoking user owns.
+    fn signal_group_arguments(pid: u32, sig: &str) -> Option<[String; 3]> {
         if pid <= 1 {
-            return Ok(());
+            return None;
         }
+        Some([sig.to_string(), "--".to_string(), format!("-{pid}")])
+    }
+
+    /// Sends `sig` to the process **group** led by `pid`. A failure (the group
+    /// is already gone) is not surfaced — only a failure to run `kill` itself
+    /// is.
+    fn signal_group(pid: u32, sig: &str) -> Result<()> {
+        let Some(args) = signal_group_arguments(pid, sig) else {
+            return Ok(());
+        };
         Command::new("kill")
-            .arg(sig)
-            .arg(format!("-{pid}"))
+            .args(&args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -1944,6 +1952,22 @@ mod imp {
             assert!(!dir.path.join(CONTROL_STOP_FILE).exists());
         }
 
+        /// A negative process-group id must follow `--`; without the option
+        /// terminator procps-ng interprets it as an option and can broadcast
+        /// the signal with `kill(-1, ...)`.
+        #[test]
+        fn signal_group_arguments_terminate_options_before_negative_pgid() {
+            assert_eq!(
+                signal_group_arguments(1_072_950, "-TERM"),
+                Some([
+                    "-TERM".to_string(),
+                    "--".to_string(),
+                    "-1072950".to_string(),
+                ])
+            );
+            assert_eq!(signal_group_arguments(1, "-TERM"), None);
+        }
+
         /// `serve_argv` reconstructs a plain daemon invocation with only
         /// `--inbox`/`--outbox`, and folds in the agent flags (in order) only
         /// when `agent_cmd` is set.
@@ -2245,8 +2269,8 @@ mod imp {
             let callback_inbox = dir.path.join("callback");
             let spec = task_spec(
                 "svc-1",
-                "sleep",
-                vec!["5".to_string()],
+                "sh",
+                vec!["-c".to_string(), "trap '' TERM; sleep 5".to_string()],
                 vec![],
                 100,
                 &callback_inbox.display().to_string(),
@@ -2260,6 +2284,10 @@ mod imp {
                 running.term_sent_at_ms.is_some(),
                 "max-duration breach must send SIGTERM"
             );
+
+            clock.advance(KILL_GRACE_MS);
+            let _tick = tick_one_task(&dir.path, "task-t", &mut running, &clock).expect("tick");
+            assert!(running.kill_sent, "SIGTERM grace expiry must send SIGKILL");
 
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
