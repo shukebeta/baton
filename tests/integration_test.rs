@@ -2250,6 +2250,330 @@ fn service_session_survives_submitting_client_and_is_owned_by_run() {
     assert!(run_status.success(), "service run exits 0 on teardown");
 }
 
+/// Issue #136 regression: a task request can be written before `service run`
+/// exits, but must not be replayed after the submitting client observes that
+/// the supervisor never admitted it. The test holds the short-lived admission
+/// lock to freeze the request before spawn, kills the supervisor, and then
+/// restarts it to prove the request was discarded. It also stops a submitting
+/// client after its successful response is written, so the response-first
+/// rule is exercised when the supervisor exits before the client resumes.
+#[cfg(target_os = "linux")]
+#[test]
+fn service_task_start_discards_unadmitted_request_after_run_loss() {
+    let root = TempMailbox::new("task-start-admission-loss");
+    let control = root.path.join("control");
+    let session_inbox = root.path.join("session-inbox");
+    let session_outbox = root.path.join("session-outbox");
+    let callback_inbox = root.path.join("callback");
+    let failed_marker = root.path.join("failed-task-started");
+    let control_str = control.to_str().unwrap();
+
+    let wait_for_live = || {
+        for _ in 0..200 {
+            if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
+                .args(["service", "status", "--control", control_str])
+                .output()
+                && out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains("\"service_running\":true")
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("baton service run did not report live in time");
+    };
+
+    let wait_for_task_request = || -> PathBuf {
+        for _ in 0..200 {
+            for directory in ["task-requests", "task-processing"] {
+                let dir = control.join(directory);
+                if let Ok(entries) = std::fs::read_dir(&dir)
+                    && let Some(path) = entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .find(|path| {
+                            path.extension().and_then(|extension| extension.to_str())
+                                == Some("json")
+                        })
+                {
+                    return path;
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("task-start request was not written or claimed in time");
+    };
+
+    let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    run.args(["service", "run", "--control", control_str]);
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::null());
+    let mut run_child = run.spawn().expect("spawn initial baton service run");
+    wait_for_live();
+
+    let session_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str,
+            "--inbox",
+            session_inbox.to_str().unwrap(),
+            "--outbox",
+            session_outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+            "--agent-cmd",
+            "sh",
+            "--agent-arg",
+            "-c",
+            "--agent-arg",
+            "cat >/dev/null; sleep 30",
+        ])
+        .output()
+        .expect("start task owner session");
+    assert!(
+        session_start.status.success(),
+        "service start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&session_start.stderr)
+    );
+    let session_id = String::from_utf8_lossy(&session_start.stdout)
+        .trim()
+        .to_string();
+    assert!(!session_id.is_empty(), "service start prints a session id");
+
+    let admission_lock_path = control.join("service.admission.lock");
+    let admission_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&admission_lock_path)
+        .expect("open service admission lock");
+    admission_lock.lock().expect("hold service admission lock");
+
+    let mut failed_start = Command::new(env!("CARGO_BIN_EXE_baton"));
+    failed_start.args([
+        "task",
+        "start",
+        "--control",
+        control_str,
+        "--session",
+        &session_id,
+        "--command",
+        "sh",
+        "--arg",
+        "-c",
+        "--arg",
+        "touch \"$1\"; sleep 30",
+        "--arg",
+        "failed-task-start",
+        "--arg",
+        failed_marker.to_str().unwrap(),
+        "--max-duration-ms",
+        "60000",
+        "--callback-inbox",
+        callback_inbox.to_str().unwrap(),
+    ]);
+    failed_start.stdout(Stdio::piped());
+    failed_start.stderr(Stdio::piped());
+    let failed_start = failed_start
+        .spawn()
+        .expect("spawn task start that loses its supervisor");
+    let failed_request = wait_for_task_request();
+    let failed_request_name = failed_request
+        .file_name()
+        .expect("failed request filename")
+        .to_owned();
+
+    let failure_wait_started = std::time::Instant::now();
+    run_child.kill().expect("kill initial service run");
+    let run_status = run_child.wait().expect("initial service run exits");
+    assert!(!run_status.success(), "initial service run was interrupted");
+    drop(admission_lock);
+
+    let failed_output = failed_start
+        .wait_with_output()
+        .expect("wait for failed task start");
+    let failed_message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&failed_output.stdout),
+        String::from_utf8_lossy(&failed_output.stderr)
+    );
+    assert!(
+        failure_wait_started.elapsed() < Duration::from_secs(3),
+        "task start should fail promptly after supervisor loss; stderr: {}",
+        failed_message
+    );
+    assert!(
+        !failed_output.status.success(),
+        "task start must fail when admission is lost"
+    );
+    assert!(
+        failed_message.contains("task start request was not admitted"),
+        "failure should explain the admission loss: {}",
+        failed_message
+    );
+    assert!(
+        !failed_marker.exists(),
+        "an unadmitted task must not spawn its command"
+    );
+    assert!(
+        !control
+            .join("task-requests")
+            .join(&failed_request_name)
+            .exists()
+            && !control
+                .join("task-processing")
+                .join(&failed_request_name)
+                .exists(),
+        "an unadmitted request must be removed from both request states"
+    );
+
+    let mut restarted_run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    restarted_run.args(["service", "run", "--control", control_str]);
+    restarted_run.stdout(Stdio::null());
+    restarted_run.stderr(Stdio::null());
+    let mut restarted_child = restarted_run
+        .spawn()
+        .expect("spawn restarted baton service run");
+    wait_for_live();
+
+    let restarted_status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["task", "status", "--control", control_str])
+        .output()
+        .expect("read tasks after restart");
+    let restarted_json: serde_json::Value =
+        serde_json::from_slice(&restarted_status.stdout).expect("restarted task status is JSON");
+    assert!(
+        restarted_json["tasks"]
+            .as_array()
+            .expect("restarted tasks array")
+            .is_empty(),
+        "a discarded request must not be replayed after restart"
+    );
+
+    let admission_lock_path = control.join("service.admission.lock");
+    let admission_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&admission_lock_path)
+        .expect("reopen service admission lock");
+    admission_lock
+        .lock()
+        .expect("hold admission lock for response race");
+
+    let mut successful_start = Command::new(env!("CARGO_BIN_EXE_baton"));
+    successful_start.args([
+        "task",
+        "start",
+        "--control",
+        control_str,
+        "--session",
+        &session_id,
+        "--command",
+        "sleep",
+        "--arg",
+        "30",
+        "--max-duration-ms",
+        "60000",
+        "--callback-inbox",
+        callback_inbox.to_str().unwrap(),
+    ]);
+    successful_start.stdout(Stdio::piped());
+    successful_start.stderr(Stdio::piped());
+    let successful_start = successful_start
+        .spawn()
+        .expect("spawn task start for response race");
+    let successful_request = wait_for_task_request();
+    let successful_request_name = successful_request
+        .file_name()
+        .expect("successful request filename")
+        .to_owned();
+    let stop_client = Command::new("kill")
+        .arg("-STOP")
+        .arg(successful_start.id().to_string())
+        .status()
+        .expect("stop successful task-start client");
+    assert!(
+        stop_client.success(),
+        "SIGSTOP should stop the task-start client"
+    );
+    drop(admission_lock);
+
+    let response_path = control
+        .join("task-responses")
+        .join(&successful_request_name);
+    for _ in 0..200 {
+        if response_path.is_file() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        response_path.is_file(),
+        "service run should write the successful task response"
+    );
+
+    restarted_child
+        .kill()
+        .expect("kill service run after successful response");
+    let restarted_status = restarted_child.wait().expect("restarted service run exits");
+    assert!(
+        !restarted_status.success(),
+        "restarted service run was interrupted"
+    );
+    let continue_client = Command::new("kill")
+        .arg("-CONT")
+        .arg(successful_start.id().to_string())
+        .status()
+        .expect("resume successful task-start client");
+    assert!(
+        continue_client.success(),
+        "SIGCONT should resume the task-start client"
+    );
+
+    let successful_output = successful_start
+        .wait_with_output()
+        .expect("wait for successful task start");
+    assert!(
+        successful_output.status.success(),
+        "a written task response remains successful after supervisor exit; stderr: {}",
+        String::from_utf8_lossy(&successful_output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&successful_output.stdout)
+            .trim()
+            .is_empty(),
+        "successful task start prints a task id"
+    );
+
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str])
+        .output()
+        .expect("tear down task admission regression processes");
+    assert!(
+        teardown.status.success(),
+        "teardown should exit 0; stderr: {}",
+        String::from_utf8_lossy(&teardown.stderr)
+    );
+    let final_status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["task", "status", "--control", control_str])
+        .output()
+        .expect("read tasks after teardown");
+    let final_json: serde_json::Value =
+        serde_json::from_slice(&final_status.stdout).expect("final task status is JSON");
+    assert!(
+        final_json["tasks"]
+            .as_array()
+            .expect("final tasks array")
+            .is_empty(),
+        "teardown removes the successfully admitted task"
+    );
+}
+
 /// Issue #123 regression: task admission and session cleanup are serialized
 /// by a separate lock. The stop path reaps an already-admitted task, rejects
 /// a racing task request after owner removal, and teardown reaps another
