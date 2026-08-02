@@ -3102,6 +3102,19 @@ fn service_task_survives_submitting_client_and_is_owned_by_run() {
     let tasks = status_json["tasks"].as_array().expect("tasks array");
     assert_eq!(tasks.len(), 1, "status reports the started task");
     let task_pid = tasks[0]["pid"].as_u64().expect("pid") as u32;
+    assert_eq!(tasks[0]["command"], "sh");
+    let stdout_path = PathBuf::from(
+        tasks[0]["stdout_path"]
+            .as_str()
+            .expect("running task stdout path"),
+    );
+    let stderr_path = PathBuf::from(
+        tasks[0]["stderr_path"]
+            .as_str()
+            .expect("running task stderr path"),
+    );
+    assert!(stdout_path.is_file(), "running task stdout log exists");
+    assert!(stderr_path.is_file(), "running task stderr log exists");
     let ppid = read_ppid(task_pid).expect("the task has a PPid");
     assert_eq!(
         ppid, run_pid,
@@ -3160,7 +3173,21 @@ fn service_task_survives_submitting_client_and_is_owned_by_run() {
         .expect("run baton task status");
     let final_json: serde_json::Value =
         serde_json::from_slice(&final_status.stdout).expect("status is JSON");
-    assert_eq!(final_json["tasks"][0]["state"], "completed");
+    let final_task = &final_json["tasks"][0];
+    assert_eq!(final_task["state"], "completed");
+    assert_eq!(final_task["command"], "sh");
+    assert_eq!(
+        final_task["stdout_path"].as_str(),
+        stdout_path.to_str(),
+        "terminal status preserves stdout path"
+    );
+    assert_eq!(
+        final_task["stderr_path"].as_str(),
+        stderr_path.to_str(),
+        "terminal status preserves stderr path"
+    );
+    assert!(stdout_path.is_file(), "terminal task stdout log exists");
+    assert!(stderr_path.is_file(), "terminal task stderr log exists");
 
     // Teardown reaps the task and stops `Run` cooperatively; wait it out.
     let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
