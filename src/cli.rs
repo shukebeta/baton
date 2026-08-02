@@ -2681,9 +2681,9 @@ fn parse_service_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result
             "could not resolve service start working directory: {err}"
         ))
     })?;
-    let inbox = resolve_service_start_path(require_dir(inbox, "--inbox")?, &start_cwd);
-    let outbox = resolve_service_start_path(require_dir(outbox, "--outbox")?, &start_cwd);
-    let agent_cwd = agent_cwd.map(|path| resolve_service_start_path(path, &start_cwd));
+    let inbox = resolve_client_path(require_dir(inbox, "--inbox")?, &start_cwd);
+    let outbox = resolve_client_path(require_dir(outbox, "--outbox")?, &start_cwd);
+    let agent_cwd = agent_cwd.map(|path| resolve_client_path(path, &start_cwd));
     let spec = SessionSpec {
         schema: service::SESSION_SPEC_SCHEMA.to_string(),
         inbox,
@@ -2703,11 +2703,10 @@ fn parse_service_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result
     }))
 }
 
-/// Resolves a path-valued `baton service start` flag from the submitting
-/// client's working directory. Absolute values are retained verbatim; a
-/// relative value is joined lexically and is not required to exist at
-/// submission time.
-fn resolve_service_start_path(raw: String, start_cwd: &Path) -> String {
+/// Resolves a path-valued client flag from the submitting client's working
+/// directory. Absolute values are retained verbatim; a relative value is
+/// joined lexically and is not required to exist at submission time.
+fn resolve_client_path(raw: String, start_cwd: &Path) -> String {
     if Path::new(&raw).is_absolute() {
         raw
     } else {
@@ -2901,7 +2900,14 @@ fn parse_task_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Co
     let control = require_dir(control, "--control")?;
     let session = require_value(session, "--session")?;
     let command = require_value(command, "--command")?;
-    let callback_inbox = require_dir(callback_inbox, "--callback-inbox")?;
+    let start_cwd = std::env::current_dir().map_err(|err| {
+        BatonError::Io(format!(
+            "could not resolve task start working directory: {err}"
+        ))
+    })?;
+    let cwd = cwd.map(|path| resolve_client_path(path, &start_cwd));
+    let callback_inbox =
+        resolve_client_path(require_dir(callback_inbox, "--callback-inbox")?, &start_cwd);
     let max_duration_ms =
         max_duration_ms.ok_or_else(|| usage("--max-duration-ms <n> is required"))?;
     let spec = TaskSpec {
@@ -5724,6 +5730,37 @@ mod tests {
                 assert_eq!(spec.milestones_ms, vec![100, 200]);
                 assert_eq!(spec.max_duration_ms, 5000);
                 assert_eq!(spec.callback.role.as_deref(), Some("reviewer"));
+            }
+            other => panic!("expected Task(Start), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_task_start_resolves_relative_paths_from_client_cwd() {
+        let cwd = std::env::current_dir().expect("read current directory");
+        let cmd = parse_args(&argv(&[
+            "task",
+            "start",
+            "--control",
+            "/tmp/ctl",
+            "--session",
+            "svc-1",
+            "--command",
+            "true",
+            "--cwd",
+            "relative/work",
+            "--max-duration-ms",
+            "1000",
+            "--callback-inbox",
+            "relative/callback",
+        ]))
+        .expect("parses");
+        let expected = |path: &str| cwd.join(path).to_string_lossy().into_owned();
+        let expected_cwd = expected("relative/work");
+        match cmd {
+            Command::Task(task::TaskCommand::Start { spec, .. }) => {
+                assert_eq!(spec.cwd.as_deref(), Some(expected_cwd.as_str()));
+                assert_eq!(spec.callback.inbox, expected("relative/callback"));
             }
             other => panic!("expected Task(Start), got {other:?}"),
         }

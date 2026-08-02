@@ -3203,6 +3203,194 @@ fn service_task_survives_submitting_client_and_is_owned_by_run() {
     assert!(run_status.success(), "service run exits 0 on teardown");
 }
 
+/// Issue #135 regression: relative task paths are resolved by the submitting
+/// client before the task spec reaches the long-lived service. The service
+/// runs from `supervisor/`, while `task start` runs from `client/`; matching
+/// `work/` and `callback/` names in both directories make either wrong base
+/// directory observable.
+#[cfg(target_os = "linux")]
+#[test]
+fn service_task_resolves_relative_paths_from_submitting_client() {
+    use baton::mailbox;
+
+    let root = TempMailbox::new("task-relative");
+    let supervisor_dir = root.path.join("supervisor");
+    let client_dir = root.path.join("client");
+    let supervisor_work = supervisor_dir.join("work");
+    let client_work = client_dir.join("work");
+    let supervisor_callback = supervisor_dir.join("callback");
+    let callback_inbox = client_dir.join("callback");
+    std::fs::create_dir_all(&supervisor_work).expect("create supervisor work directory");
+    std::fs::create_dir_all(&client_work).expect("create client work directory");
+
+    let control = root.path.join("control");
+    let session_inbox = root.path.join("session-inbox");
+    let session_outbox = root.path.join("session-outbox");
+    let control_str = control.to_str().unwrap();
+
+    let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    run.args(["service", "run", "--control", control_str]);
+    run.current_dir(&supervisor_dir);
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::null());
+    let mut run_child = run.spawn().expect("spawn baton service run");
+
+    let mut live = false;
+    for _ in 0..100 {
+        if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(["service", "status", "--control", control_str])
+            .current_dir(&root.path)
+            .output()
+            && out.status.success()
+            && String::from_utf8_lossy(&out.stdout).contains("\"service_running\":true")
+        {
+            live = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(live, "baton service run did not report live in time");
+
+    let session_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str,
+            "--inbox",
+            session_inbox.to_str().unwrap(),
+            "--outbox",
+            session_outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+            "--agent-cmd",
+            "sh",
+            "--agent-arg",
+            "-c",
+            "--agent-arg",
+            "cat >/dev/null; printf ready",
+        ])
+        .current_dir(&supervisor_dir)
+        .output()
+        .expect("run baton service start");
+    assert!(
+        session_start.status.success(),
+        "service start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&session_start.stderr)
+    );
+    let session_id = String::from_utf8_lossy(&session_start.stdout)
+        .trim()
+        .to_string();
+    assert!(!session_id.is_empty(), "service start prints a session id");
+
+    let callback_mailbox = mailbox::Mailbox::open(&callback_inbox).expect("open callback mailbox");
+    let task_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "task",
+            "start",
+            "--control",
+            control_str,
+            "--session",
+            &session_id,
+            "--command",
+            "sh",
+            "--arg",
+            "-c",
+            "--arg",
+            "pwd; sleep 0.3",
+            "--cwd",
+            "work",
+            "--milestone-ms",
+            "1",
+            "--max-duration-ms",
+            "60000",
+            "--callback-inbox",
+            "callback",
+        ])
+        .current_dir(&client_dir)
+        .output()
+        .expect("run baton task start");
+    assert!(
+        task_start.status.success(),
+        "task start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&task_start.stderr)
+    );
+    let task_id = String::from_utf8_lossy(&task_start.stdout)
+        .trim()
+        .to_string();
+    assert!(!task_id.is_empty(), "task start prints a task id");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "task",
+            "status",
+            "--control",
+            control_str,
+            "--task",
+            &task_id,
+        ])
+        .current_dir(&supervisor_dir)
+        .output()
+        .expect("run baton task status");
+    assert!(
+        status.status.success(),
+        "task status should exit 0; stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("task status is JSON");
+    let task = &status_json["tasks"][0];
+    let stdout_path = PathBuf::from(task["stdout_path"].as_str().expect("task stdout path"));
+
+    let mut seen = Vec::new();
+    let terminal_key = format!("{task_id}-terminal");
+    for _ in 0..200 {
+        while let Some(claimed) = callback_mailbox.claim_next().expect("claim callback event") {
+            seen.push(claimed.key.clone());
+            callback_mailbox
+                .complete(claimed)
+                .expect("complete callback event");
+        }
+        if seen.contains(&terminal_key) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        seen.contains(&format!("{task_id}-milestone-0")),
+        "the configured milestone was delivered to the client-relative callback mailbox: {seen:?}"
+    );
+    assert!(
+        seen.contains(&terminal_key),
+        "the terminal event was delivered to the client-relative callback mailbox: {seen:?}"
+    );
+
+    let stdout = std::fs::read_to_string(&stdout_path).expect("read task stdout");
+    assert_eq!(
+        stdout.trim(),
+        client_work.to_str().unwrap(),
+        "task command runs from the client-relative cwd"
+    );
+    assert!(callback_inbox.is_dir(), "client callback mailbox exists");
+    assert!(
+        !supervisor_callback.exists(),
+        "the supervisor directory must not receive the relative callback mailbox"
+    );
+
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str])
+        .current_dir(&client_dir)
+        .output()
+        .expect("run baton service teardown");
+    assert!(
+        teardown.status.success(),
+        "teardown should exit 0; stderr: {}",
+        String::from_utf8_lossy(&teardown.stderr)
+    );
+    let run_status = run_child.wait().expect("baton service run exits");
+    assert!(run_status.success(), "service run exits 0 on teardown");
+}
+
 /// Issue #132 regression: durable running tasks are reconciled when the
 /// supervisor is restarted. The live task keeps its milestone schedule under
 /// the new PID-based tracker; the task that exits while `Run` is down becomes
