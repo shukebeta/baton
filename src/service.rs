@@ -1670,6 +1670,9 @@ mod imp {
         live: bool,
         exit_code: Option<i32>,
         elapsed_ms: Option<u64>,
+        command: &'a str,
+        stdout_path: &'a str,
+        stderr_path: &'a str,
     }
 
     #[derive(Serialize)]
@@ -1693,6 +1696,9 @@ mod imp {
                 live: record.state == TaskState::Running && is_task_alive(record),
                 exit_code: record.exit_code,
                 elapsed_ms: record.elapsed_ms,
+                command: &record.spec.command,
+                stdout_path: &record.stdout_path,
+                stderr_path: &record.stderr_path,
             })
             .collect();
         let report = TaskStatusReport {

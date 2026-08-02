@@ -160,9 +160,12 @@ baton task cancel --control <dir> --task <id>
   framing. Neither is used to resolve delivery beyond that.
 - **`task status`** reports one task (`--task <id>`) or every known task:
   `running`/`completed`/`failed`/`timeout`/`cancelled` state, exit code,
-  elapsed milliseconds, command identity, and the captured stdout/stderr log
-  paths. Reads the durable `TaskRecord` directly by PID, so it works whether
-  or not `run` is currently alive.
+  elapsed milliseconds, and the following task identity/output fields:
+  `command` is the effective executable identity, while `stdout_path` and
+  `stderr_path` are the paths to the captured stdout and stderr logs.
+  These fields are present for both running and terminal tasks. Reads the
+  durable `TaskRecord` directly by PID, so it works whether or not `run` is
+  currently alive.
 - **`task cancel`** is idempotent: kills the task's whole process group if
   still running (cooperative cancel sentinel consumed by the next tick, so
   the resulting terminal event reads `cancelled` rather than `failed`), and a
