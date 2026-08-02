@@ -2676,8 +2676,14 @@ fn parse_service_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result
     }
 
     let control = require_dir(control, "--control")?;
-    let inbox = require_dir(inbox, "--inbox")?;
-    let outbox = require_dir(outbox, "--outbox")?;
+    let start_cwd = std::env::current_dir().map_err(|err| {
+        BatonError::Io(format!(
+            "could not resolve service start working directory: {err}"
+        ))
+    })?;
+    let inbox = resolve_service_start_path(require_dir(inbox, "--inbox")?, &start_cwd);
+    let outbox = resolve_service_start_path(require_dir(outbox, "--outbox")?, &start_cwd);
+    let agent_cwd = agent_cwd.map(|path| resolve_service_start_path(path, &start_cwd));
     let spec = SessionSpec {
         schema: service::SESSION_SPEC_SCHEMA.to_string(),
         inbox,
@@ -2695,6 +2701,18 @@ fn parse_service_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result
         control,
         spec: Box::new(spec),
     }))
+}
+
+/// Resolves a path-valued `baton service start` flag from the submitting
+/// client's working directory. Absolute values are retained verbatim; a
+/// relative value is joined lexically and is not required to exist at
+/// submission time.
+fn resolve_service_start_path(raw: String, start_cwd: &Path) -> String {
+    if Path::new(&raw).is_absolute() {
+        raw
+    } else {
+        start_cwd.join(raw).to_string_lossy().into_owned()
+    }
 }
 
 /// Parses `baton service status --control <dir> [--session <id>]`.
@@ -5366,22 +5384,31 @@ mod tests {
 
     #[test]
     fn parse_service_start_parses_minimal_spec() {
+        let cwd = std::env::current_dir().expect("read current directory");
+        let inbox = cwd
+            .join("service-test-inbox")
+            .to_string_lossy()
+            .into_owned();
+        let outbox = cwd
+            .join("service-test-outbox")
+            .to_string_lossy()
+            .into_owned();
         let cmd = parse_args(&argv(&[
             "service",
             "start",
             "--control",
             "/tmp/ctl",
             "--inbox",
-            "/tmp/in",
+            &inbox,
             "--outbox",
-            "/tmp/out",
+            &outbox,
         ]))
         .expect("parses");
         match cmd {
             Command::Service(service::ServiceCommand::Start { control, spec }) => {
                 assert_eq!(control, "/tmp/ctl");
-                assert_eq!(spec.inbox, "/tmp/in");
-                assert_eq!(spec.outbox, "/tmp/out");
+                assert_eq!(spec.inbox, inbox);
+                assert_eq!(spec.outbox, outbox);
                 assert_eq!(spec.schema, service::SESSION_SPEC_SCHEMA);
                 assert!(spec.agent_cmd.is_none());
             }
@@ -5391,21 +5418,34 @@ mod tests {
 
     #[test]
     fn parse_service_start_parses_agent_flags() {
+        let cwd = std::env::current_dir().expect("read current directory");
+        let inbox = cwd
+            .join("service-test-inbox")
+            .to_string_lossy()
+            .into_owned();
+        let outbox = cwd
+            .join("service-test-outbox")
+            .to_string_lossy()
+            .into_owned();
+        let agent_cwd = cwd
+            .join("service-test-agent")
+            .to_string_lossy()
+            .into_owned();
         let cmd = parse_args(&argv(&[
             "service",
             "start",
             "--control",
             "/tmp/ctl",
             "--inbox",
-            "/tmp/in",
+            &inbox,
             "--outbox",
-            "/tmp/out",
+            &outbox,
             "--agent-cmd",
             "claude",
             "--agent-arg",
             "--print",
             "--agent-cwd",
-            "/work",
+            &agent_cwd,
             "--agent-output",
             "json",
             "--agent-result-key",
@@ -5416,12 +5456,44 @@ mod tests {
         .expect("parses");
         match cmd {
             Command::Service(service::ServiceCommand::Start { spec, .. }) => {
+                assert_eq!(spec.inbox, inbox);
+                assert_eq!(spec.outbox, outbox);
                 assert_eq!(spec.agent_cmd.as_deref(), Some("claude"));
                 assert_eq!(spec.agent_args, vec!["--print".to_string()]);
-                assert_eq!(spec.agent_cwd.as_deref(), Some("/work"));
+                assert_eq!(spec.agent_cwd.as_deref(), Some(agent_cwd.as_str()));
                 assert_eq!(spec.agent_output.as_deref(), Some("json"));
                 assert_eq!(spec.agent_result_key.as_deref(), Some("result"));
                 assert_eq!(spec.role.as_deref(), Some("alice"));
+            }
+            other => panic!("expected Service(Start), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_service_start_resolves_relative_session_paths_from_client_cwd() {
+        let cwd = std::env::current_dir().expect("read current directory");
+        let cmd = parse_args(&argv(&[
+            "service",
+            "start",
+            "--control",
+            "/tmp/ctl",
+            "--inbox",
+            "relative/inbox",
+            "--outbox",
+            "relative/outbox",
+            "--agent-cmd",
+            "agent",
+            "--agent-cwd",
+            "relative/work",
+        ]))
+        .expect("parses");
+        let expected = |path: &str| cwd.join(path).to_string_lossy().into_owned();
+        let expected_agent_cwd = expected("relative/work");
+        match cmd {
+            Command::Service(service::ServiceCommand::Start { spec, .. }) => {
+                assert_eq!(spec.inbox, expected("relative/inbox"));
+                assert_eq!(spec.outbox, expected("relative/outbox"));
+                assert_eq!(spec.agent_cwd.as_deref(), Some(expected_agent_cwd.as_str()));
             }
             other => panic!("expected Service(Start), got {other:?}"),
         }
