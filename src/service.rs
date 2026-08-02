@@ -864,22 +864,22 @@ mod imp {
     }
 
     fn await_task_start_response(control: &Path, request_id: &str) -> Result<String> {
-        let path = task_responses_dir(control).join(mailbox::file_name(request_id));
         let deadline = Instant::now() + Duration::from_millis(START_AWAIT_MS);
         loop {
-            if let Ok(data) = fs::read_to_string(&path) {
-                let _ = fs::remove_file(&path);
-                let resp: TaskStartResponse = serde_json::from_str(&data).map_err(|err| {
-                    BatonError::Decode(format!("malformed task response {path:?}: {err}"))
-                })?;
-                if let Some(error) = resp.error {
-                    return Err(BatonError::Io(error));
+            if let Some(response) = take_task_start_response(control, request_id)? {
+                return task_start_response_id(control, request_id, response);
+            }
+            if probe_control(control)? == ControlLiveness::NotRunning {
+                // The supervisor can write its response just before dropping
+                // the control lock. Re-check the response after observing the
+                // released lock so a successful admission wins this race.
+                if let Some(response) = take_task_start_response(control, request_id)? {
+                    return task_start_response_id(control, request_id, response);
                 }
-                return resp.task_id.ok_or_else(|| {
-                    BatonError::Decode(format!(
-                        "task response {path:?} contained neither a task id nor an error"
-                    ))
-                });
+                discard_pending_task_start_request(control, request_id)?;
+                return Err(BatonError::Io(format!(
+                    "no live baton service on {control:?}; task start request was not admitted"
+                )));
             }
             if Instant::now() >= deadline {
                 return Err(BatonError::Io(format!(
@@ -888,6 +888,63 @@ mod imp {
             }
             std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         }
+    }
+
+    /// Takes a task-start response if the supervisor has written one.
+    ///
+    /// The response is removed after it is read, matching the session-start
+    /// protocol. A response that is not readable yet is the normal polling
+    /// result while the supervisor is preparing its atomic response file.
+    fn take_task_start_response(
+        control: &Path,
+        request_id: &str,
+    ) -> Result<Option<TaskStartResponse>> {
+        let path = task_responses_dir(control).join(mailbox::file_name(request_id));
+        let Ok(data) = fs::read_to_string(&path) else {
+            return Ok(None);
+        };
+        let _ = fs::remove_file(&path);
+        serde_json::from_str(&data)
+            .map(Some)
+            .map_err(|err| BatonError::Decode(format!("malformed task response {path:?}: {err}")))
+    }
+
+    fn task_start_response_id(
+        control: &Path,
+        request_id: &str,
+        response: TaskStartResponse,
+    ) -> Result<String> {
+        if let Some(error) = response.error {
+            return Err(BatonError::Io(error));
+        }
+        response.task_id.ok_or_else(|| {
+            let path = task_responses_dir(control).join(mailbox::file_name(request_id));
+            BatonError::Decode(format!(
+                "task response {path:?} contained neither a task id nor an error"
+            ))
+        })
+    }
+
+    /// Discards a task-start request that has not been answered after the
+    /// supervisor released the control lock. It may still be waiting in
+    /// `task-requests/` or already claimed in `task-processing/`; removing
+    /// both locations prevents a restarted supervisor from replaying a
+    /// request whose client has been told admission failed.
+    fn discard_pending_task_start_request(control: &Path, request_id: &str) -> Result<()> {
+        let file_name = mailbox::file_name(request_id);
+        for dir in [task_requests_dir(control), task_processing_dir(control)] {
+            let path = dir.join(&file_name);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(BatonError::Io(format!(
+                        "could not discard pending task start request {path:?}: {err}"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Returns any `task-processing/` entry a crash left mid-request to

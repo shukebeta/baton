@@ -144,6 +144,14 @@ baton task cancel --control <dir> --task <id>
   and whose recorded process is currently live. A missing record or a stale
   record whose process is no longer live is rejected with a non-zero owner
   error before any task process, log directory, or `TaskRecord` is created.
+  While waiting for the response, the submitting client probes the control
+  lock. If `run` releases that lock before answering, the client re-checks for
+  a response, then removes the still-pending request from `task-requests/` or
+  `task-processing/` and exits non-zero with a `task start request was not
+  admitted` error. A subsequent `service run` therefore does not replay a
+  request whose client was told admission failed. A response already written
+  before the lock is released wins this race and remains a successful task
+  start.
 - **`--session <id>` is the ownership tag, not a routing target.** A task is
   owned and reaped by whichever `baton service` session names it here,
   independent of where its events are delivered — see "Ownership vs. callback"
