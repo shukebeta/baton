@@ -45,8 +45,8 @@ a `ts_ms` wall-clock timestamp (Unix epoch milliseconds). One exchange emits a
 | `event`          | Fields beyond `schema` / `ts_ms`                            | Meaning                                              |
 | ---------------- | ----------------------------------------------------------- | ---------------------------------------------------- |
 | `request`        | `model`, `base_url`, `prompt`, `session_id?`, `turn_index?` | Emitted before the call; carries enough to replay it. `session_id` / `turn_index` are present only on a `session` turn (see below). |
-| `response_ok`    | `duration_ms`, `reply`, `input_tokens`, `output_tokens`     | The call succeeded.                                  |
-| `response_error` | `duration_ms`, `kind`, `message`                            | The call failed; `kind` is the stable machine class. |
+| `response_ok`    | `duration_ms`, `reply`, `input_tokens`, `output_tokens`, `session_id?`, `turn_index?` | The call succeeded.                                  |
+| `response_error` | `duration_ms`, `kind`, `message`, `session_id?`, `turn_index?`                            | The call failed; `kind` is the stable machine class. |
 | `session_start`  | `session_id`                                                | Emitted once at the start of a `baton session` run.  |
 | `session_end`    | `session_id`, `turns`                                       | Emitted once on a clean session exit (EOF / `/exit`); `turns` is the turn count. |
 
@@ -92,13 +92,19 @@ without guessing from line ordering:
 - Each turn's `request` carries that same `session_id` plus a monotonic
   `turn_index` (starting at 0), so every turn is placed within its session. A
   failed turn still emits its `request` and advances the index.
+- Each human↔agent session outcome carries the same `session_id` and
+  `turn_index` as its request. This pair lets the reader close multiple pending
+  turns from interleaved sessions without relying on append order. `ask`
+  outcomes remain sessionless. A2A seat outcomes may also omit the pair because
+  their requests have no `turn_index`; the reader pairs an outcome lacking both
+  correlation fields with the current pending request in file order.
 - One `session_end` line closes the run on a clean exit (EOF / `/exit`), carrying
   the `session_id` and the total `turns` count.
 
 ```jsonl
 {"event":"session_start","schema":"baton.exchange/v1","ts_ms":1700000000000,"session_id":"sess-4171-1700000000000"}
 {"event":"request","schema":"baton.exchange/v1","ts_ms":1700000000001,"model":"claude-sonnet-4-6","base_url":"https://api.anthropic.com","prompt":"hello","session_id":"sess-4171-1700000000000","turn_index":0}
-{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":1700000000420,"duration_ms":418,"reply":"Hi there!","input_tokens":9,"output_tokens":3}
+{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":1700000000420,"duration_ms":418,"reply":"Hi there!","input_tokens":9,"output_tokens":3,"session_id":"sess-4171-1700000000000","turn_index":0}
 {"event":"session_end","schema":"baton.exchange/v1","ts_ms":1700000000500,"session_id":"sess-4171-1700000000000","turns":1}
 ```
 
@@ -107,6 +113,11 @@ killed mid-run leaves a `session_start` and its turns but no `session_end`, and 
 still recovered as one whole session (its final line may be torn — the same
 partial-trail tolerance above covers it). The `ask` path is unframed: its
 `request` line omits `session_id` / `turn_index` and belongs to no session. The
+reader matches an outcome carrying both correlation fields to the exact request
+with that pair. For compatibility, an outcome lacking both fields uses the
+legacy file-order pairing; this covers older sequential session trails and A2A
+seat trails. A correlated outcome with no matching pending request is not
+attached to another session's turn. The
 `session_start` / `session_end` markers ride the same `baton.exchange/v1` trail;
 `baton log show` / `replay` skip them, so they are unaffected.
 

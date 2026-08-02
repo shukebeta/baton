@@ -114,6 +114,10 @@ struct OkRecord {
     input_tokens: Option<u64>,
     #[serde(default)]
     output_tokens: Option<u64>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    turn_index: Option<u64>,
 }
 
 /// Deserialization mirror of a `response_error` line.
@@ -123,6 +127,10 @@ struct ErrRecord {
     duration_ms: u64,
     kind: String,
     message: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    turn_index: Option<u64>,
 }
 
 /// The outcome of parsing an exchange trail: the complete [`Exchange`] pairs and
@@ -337,14 +345,19 @@ struct SessionEndRecord {
 /// Reads the same trail as [`parse_jsonl`], but groups by session framing rather
 /// than pairing bare exchanges: `session_start` / `session_end` markers bound a
 /// session, each session turn's `request` carries the `session_id` + `turn_index`
-/// that place it, and the following outcome line closes that turn. Behaviour at
-/// the edges mirrors [`parse_jsonl`]:
+/// that place it, and a correlated outcome line closes that turn. Outcomes that
+/// lack both correlation fields use the legacy file-order fallback. Behaviour
+/// at the edges mirrors [`parse_jsonl`]:
 ///
 /// - **Sessionless lines** — an `ask` `request`/outcome pair, `baton.message/v1`
 ///   envelopes, unknown tags — are skipped: they belong to no session.
 /// - **Partitioning keys on `session_id`, not on a start/end pair.** A session
 ///   killed mid-run yields a [`SessionRecord`] with `ended == false` and its
 ///   turns intact; two sequential sessions in one file separate cleanly by id.
+/// - **Outcome correlation** — a `response_ok` / `response_error` line carrying
+///   both `session_id` and `turn_index` closes that exact pending request. An
+///   outcome without those fields closes the current pending request in file
+///   order, preserving older session trails and A2A seat trails.
 /// - **Trailing partial line**: the final unterminated line (an unclean
 ///   shutdown's signature) that fails to parse is skipped-with-warning, exactly
 ///   as in [`parse_jsonl`]; any newline-terminated malformed line stays a hard
@@ -356,9 +369,14 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
     // First-seen order is preserved by pushing to `report.sessions`; the map
     // routes later lines (turns, end markers) back to the right record.
     let mut index: HashMap<String, usize> = HashMap::new();
-    // The session turn awaiting its outcome, as (session index, turn index).
-    // Cleared by a sessionless request so a stray outcome is never misattributed.
-    let mut pending: Option<(usize, usize)> = None;
+    // Correlated session turns can be in flight at the same time when several
+    // processes append to one trail. The key is the pair written on both the
+    // request and its new outcome.
+    let mut pending_by_correlation: HashMap<(String, u64), (usize, usize)> = HashMap::new();
+    // Legacy outcomes (and A2A seat outcomes mirrored from a nested exchange)
+    // omit correlation fields. Preserve the old file-order fallback for those
+    // lines; only one such request can be safely pending at a time.
+    let mut pending_without_correlation: Option<(usize, usize)> = None;
     let mut buf: Vec<u8> = Vec::new();
     let mut line_no = 0usize;
 
@@ -394,14 +412,12 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
                 let start: SessionStartRecord = from_value(value, line_no, "session_start")?;
                 let idx = session_index(&mut report.sessions, &mut index, &start.session_id);
                 report.sessions[idx].started = true;
-                pending = None;
             }
             Some("session_end") => {
                 let end: SessionEndRecord = from_value(value, line_no, "session_end")?;
                 let idx = session_index(&mut report.sessions, &mut index, &end.session_id);
                 report.sessions[idx].ended = true;
                 report.sessions[idx].declared_turns = Some(end.turns);
-                pending = None;
             }
             Some("request") => {
                 let record: RequestRecord = from_value(value, line_no, "request")?;
@@ -409,39 +425,81 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
                     Some(session_id) => {
                         let idx = session_index(&mut report.sessions, &mut index, &session_id);
                         let turn_idx = report.sessions[idx].turns.len();
+                        let correlation = record
+                            .turn_index
+                            .map(|turn_index| (session_id.clone(), turn_index));
                         report.sessions[idx].turns.push(SessionTurn {
                             request: record,
                             outcome: None,
                         });
-                        pending = Some((idx, turn_idx));
+                        if let Some((session_id, turn_index)) = correlation {
+                            pending_by_correlation
+                                .insert((session_id, turn_index), (idx, turn_idx));
+                        }
+                        // Requests with no turn_index (A2A seat turns) and
+                        // requests from legacy session trails both rely on the
+                        // outcome's missing-correlation fallback.
+                        pending_without_correlation = Some((idx, turn_idx));
                     }
                     // Sessionless (`ask`) request: not part of any session, and
                     // its outcome must not attach to the previous session turn.
-                    None => pending = None,
+                    None => pending_without_correlation = None,
                 }
             }
             Some("response_ok") => {
                 let ok: OkRecord = from_value(value, line_no, "response_ok")?;
-                if let Some((idx, turn_idx)) = pending.take() {
-                    report.sessions[idx].turns[turn_idx].outcome = Some(Outcome::Ok {
+                let target = match (ok.session_id, ok.turn_index) {
+                    (Some(session_id), Some(turn_index)) => {
+                        let target = pending_by_correlation.remove(&(session_id, turn_index));
+                        if target == pending_without_correlation {
+                            pending_without_correlation = None;
+                        }
+                        target
+                    }
+                    _ => take_uncorrelated_pending(
+                        &report.sessions,
+                        &mut pending_by_correlation,
+                        &mut pending_without_correlation,
+                    ),
+                };
+                complete_pending_turn(
+                    &mut report.sessions,
+                    target,
+                    Outcome::Ok {
                         ts_ms: ok.ts_ms,
                         duration_ms: ok.duration_ms,
                         reply: ok.reply,
                         input_tokens: ok.input_tokens,
                         output_tokens: ok.output_tokens,
-                    });
-                }
+                    },
+                );
             }
             Some("response_error") => {
                 let err: ErrRecord = from_value(value, line_no, "response_error")?;
-                if let Some((idx, turn_idx)) = pending.take() {
-                    report.sessions[idx].turns[turn_idx].outcome = Some(Outcome::Error {
+                let target = match (err.session_id, err.turn_index) {
+                    (Some(session_id), Some(turn_index)) => {
+                        let target = pending_by_correlation.remove(&(session_id, turn_index));
+                        if target == pending_without_correlation {
+                            pending_without_correlation = None;
+                        }
+                        target
+                    }
+                    _ => take_uncorrelated_pending(
+                        &report.sessions,
+                        &mut pending_by_correlation,
+                        &mut pending_without_correlation,
+                    ),
+                };
+                complete_pending_turn(
+                    &mut report.sessions,
+                    target,
+                    Outcome::Error {
                         ts_ms: err.ts_ms,
                         duration_ms: err.duration_ms,
                         kind: err.kind,
                         message: err.message,
-                    });
-                }
+                    },
+                );
             }
             // Unknown or absent event tag (e.g. a `baton.message/v1` envelope):
             // skip, staying forward-compatible.
@@ -450,6 +508,39 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
     }
 
     Ok(report)
+}
+
+/// Takes the legacy file-order target and removes its explicit key too when
+/// the request carried one. An older outcome may close a newer-format request,
+/// so leaving that key pending would let a later duplicate outcome overwrite
+/// the already-closed turn.
+fn take_uncorrelated_pending(
+    sessions: &[SessionRecord],
+    pending_by_correlation: &mut HashMap<(String, u64), (usize, usize)>,
+    pending_without_correlation: &mut Option<(usize, usize)>,
+) -> Option<(usize, usize)> {
+    let target = pending_without_correlation.take();
+    if let Some((session_idx, turn_idx)) = target {
+        let request = &sessions[session_idx].turns[turn_idx].request;
+        if let (Some(session_id), Some(turn_index)) =
+            (request.session_id.as_ref(), request.turn_index)
+        {
+            pending_by_correlation.remove(&(session_id.clone(), turn_index));
+        }
+    }
+    target
+}
+
+/// Attaches an outcome to the request selected by either explicit correlation
+/// or the legacy file-order fallback.
+fn complete_pending_turn(
+    sessions: &mut [SessionRecord],
+    target: Option<(usize, usize)>,
+    outcome: Outcome,
+) {
+    if let Some((session_idx, turn_idx)) = target {
+        sessions[session_idx].turns[turn_idx].outcome = Some(outcome);
+    }
 }
 
 /// Returns the index of the [`SessionRecord`] for `session_id`, creating an
@@ -1369,6 +1460,96 @@ mod tests {
         assert_eq!(report.sessions[1].turns.len(), 2);
         assert_eq!(report.sessions[1].turns[1].request.prompt, "b1");
         assert_eq!(report.sessions[1].declared_turns, Some(2));
+    }
+
+    /// Explicit outcome correlation keeps overlapping session turns attached to
+    /// their own requests even when the shared append log interleaves them.
+    #[test]
+    fn parse_sessions_pairs_interleaved_correlated_outcomes() {
+        let meta = ExchangeMeta {
+            model: "m".to_string(),
+            base_url: "u".to_string(),
+        };
+        let error = BatonError::Auth("bad key".to_string());
+        let trail = [
+            line(&ExchangeEvent::session_start(1, "sess-A")),
+            line(&ExchangeEvent::session_start(2, "sess-B")),
+            line(&ExchangeEvent::session_request(3, &meta, "a0", "sess-A", 0)),
+            line(&ExchangeEvent::session_request(4, &meta, "b0", "sess-B", 0)),
+            line(&ExchangeEvent::session_response_ok(
+                5,
+                1,
+                "reply-A",
+                &TokenUsage::default(),
+                "sess-A",
+                0,
+            )),
+            line(&ExchangeEvent::session_response_error(
+                6, 1, &error, "sess-B", 0,
+            )),
+            line(&ExchangeEvent::session_end(7, "sess-A", 1)),
+            line(&ExchangeEvent::session_end(8, "sess-B", 1)),
+        ]
+        .join("\n")
+            + "\n";
+
+        let report = parse_sessions(Cursor::new(trail)).expect("parses");
+        assert_eq!(report.sessions.len(), 2);
+        assert_eq!(report.sessions[0].session_id, "sess-A");
+        assert_eq!(report.sessions[1].session_id, "sess-B");
+        assert_eq!(report.sessions[0].turns[0].request.prompt, "a0");
+        assert_eq!(
+            report.sessions[0].turns[0].outcome,
+            Some(Outcome::Ok {
+                ts_ms: 5,
+                duration_ms: 1,
+                reply: "reply-A".to_string(),
+                input_tokens: None,
+                output_tokens: None,
+            })
+        );
+        assert_eq!(report.sessions[1].turns[0].request.prompt, "b0");
+        assert_eq!(
+            report.sessions[1].turns[0].outcome,
+            Some(Outcome::Error {
+                ts_ms: 6,
+                duration_ms: 1,
+                kind: "auth".to_string(),
+                message: "authentication error: bad key".to_string(),
+            })
+        );
+    }
+
+    /// Outcome lines from older session trails have no correlation fields and
+    /// continue to pair with the current request in file order.
+    #[test]
+    fn parse_sessions_pairs_legacy_uncorrelated_outcomes() {
+        let meta = ExchangeMeta {
+            model: "m".to_string(),
+            base_url: "u".to_string(),
+        };
+        let error = BatonError::Auth("bad key".to_string());
+        let trail = [
+            line(&ExchangeEvent::session_start(1, "sess-A")),
+            line(&ExchangeEvent::session_request(2, &meta, "a0", "sess-A", 0)),
+            line(&ExchangeEvent::response_ok(
+                3,
+                1,
+                "reply-A",
+                &TokenUsage::default(),
+            )),
+            line(&ExchangeEvent::session_request(4, &meta, "a1", "sess-A", 1)),
+            line(&ExchangeEvent::response_error(5, 1, &error)),
+            line(&ExchangeEvent::session_end(6, "sess-A", 2)),
+        ]
+        .join("\n")
+            + "\n";
+
+        let report = parse_sessions(Cursor::new(trail)).expect("parses");
+        let turns = &report.sessions[0].turns;
+        assert_eq!(turns.len(), 2);
+        assert!(matches!(turns[0].outcome, Some(Outcome::Ok { .. })));
+        assert!(matches!(turns[1].outcome, Some(Outcome::Error { .. })));
     }
 
     /// A session killed mid-run — a `session_start` and turns but no

@@ -1080,6 +1080,8 @@ impl RoleSessionRecorder {
                 duration_ms: 0,
                 kind: "participant".to_string(),
                 message: response.body.clone(),
+                session_id: None,
+                turn_index: None,
             },
             (None, kind) => {
                 return Err(io::Error::new(
@@ -1743,9 +1745,26 @@ fn timed_exchange(
     let result = call();
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    let event = match &result {
-        Ok(reply) => ExchangeEvent::response_ok(now_ms(), duration_ms, &reply.text, &reply.usage),
-        Err(err) => ExchangeEvent::response_error(now_ms(), duration_ms, err),
+    let event = match (&result, session) {
+        (Ok(reply), Some((session_id, turn_index))) => ExchangeEvent::session_response_ok(
+            now_ms(),
+            duration_ms,
+            &reply.text,
+            &reply.usage,
+            session_id,
+            turn_index,
+        ),
+        (Ok(reply), None) => {
+            ExchangeEvent::response_ok(now_ms(), duration_ms, &reply.text, &reply.usage)
+        }
+        (Err(err), Some((session_id, turn_index))) => ExchangeEvent::session_response_error(
+            now_ms(),
+            duration_ms,
+            err,
+            session_id,
+            turn_index,
+        ),
+        (Err(err), None) => ExchangeEvent::response_error(now_ms(), duration_ms, err),
     };
     emit(sink, &event);
 
@@ -3948,8 +3967,19 @@ mod tests {
                 other => panic!("event {event_idx} must be a request, got: {other:?}"),
             }
         }
-        assert!(matches!(sink.events[2], ExchangeEvent::ResponseOk { .. }));
-        assert!(matches!(sink.events[4], ExchangeEvent::ResponseOk { .. }));
+        for (event_idx, expected_turn) in [(2usize, 0u64), (4, 1)] {
+            match &sink.events[event_idx] {
+                ExchangeEvent::ResponseOk {
+                    session_id: sid,
+                    turn_index,
+                    ..
+                } => {
+                    assert_eq!(sid.as_deref(), Some(session_id.as_str()));
+                    assert_eq!(*turn_index, Some(expected_turn));
+                }
+                other => panic!("event {event_idx} must be a response_ok, got: {other:?}"),
+            }
+        }
         // The end marker closes the same session and reports the turn count.
         match &sink.events[5] {
             ExchangeEvent::SessionEnd {
@@ -4052,10 +4082,17 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(
-            sink.events[2],
-            ExchangeEvent::ResponseError { .. }
-        ));
+        match &sink.events[2] {
+            ExchangeEvent::ResponseError {
+                session_id,
+                turn_index,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("sess-test"));
+                assert_eq!(*turn_index, Some(0));
+            }
+            other => panic!("event 2 must be a response_error, got: {other:?}"),
+        }
         assert!(matches!(
             &sink.events[3],
             ExchangeEvent::Request {
@@ -4063,7 +4100,17 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(sink.events[4], ExchangeEvent::ResponseOk { .. }));
+        match &sink.events[4] {
+            ExchangeEvent::ResponseOk {
+                session_id,
+                turn_index,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("sess-test"));
+                assert_eq!(*turn_index, Some(1));
+            }
+            other => panic!("event 4 must be a response_ok, got: {other:?}"),
+        }
         assert!(matches!(
             sink.events[5],
             ExchangeEvent::SessionEnd { turns: 2, .. }

@@ -338,6 +338,10 @@ process leaves a valid partial session — the same torn-tail tolerance
   carries `from` / `to` / `conversation_id` / `message_id` / `in_reply_to`, and
   its `session_id` equals `conversation_id`) followed by a `response_ok` /
   `response_error` outcome line — the two together are **both sides** of the turn.
+  Human↔agent session outcomes repeat the request's `session_id` and
+  `turn_index` so overlapping sessions in one append log can be matched
+  directly. A2A seat outcomes mirrored from nested exchanges omit those fields
+  and use the parser's file-order fallback.
 - `session_end` — closes a cleanly-exited `baton session` (a long-lived `serve`
   daemon does not emit one; the reader tolerates its absence).
 
@@ -444,6 +448,10 @@ cargo run -- session --resume ./session.jsonl
   available ids and exits with a usage error. Selecting a non-existent
   `session_id`, or an empty / malformed trail, is a usage error that exits
   non-zero having written nothing.
+- In a shared append log, outcomes carrying both `session_id` and `turn_index`
+  close the exact matching request, so interleaved sessions resume with their
+  own histories. Outcomes lacking both fields retain the file-order fallback for
+  older sequential trails and A2A seat trails.
 - A trail whose final line is torn (an unclean prior shutdown) resumes from the
   last complete turn — the incomplete trailing record is dropped with a warning,
   matching the trail's [torn-tail handling](docs/protocol.md#session-trail).
