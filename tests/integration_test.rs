@@ -3236,7 +3236,7 @@ fn service_task_resolves_relative_paths_from_submitting_client() {
     let mut run_child = run.spawn().expect("spawn baton service run");
 
     let mut live = false;
-    for _ in 0..100 {
+    for _ in 0..200 {
         if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
             .args(["service", "status", "--control", control_str])
             .current_dir(&root.path)

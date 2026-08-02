@@ -2704,10 +2704,10 @@ fn parse_service_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result
 }
 
 /// Resolves a path-valued client flag from the submitting client's working
-/// directory. Absolute values are retained verbatim; a relative value is
+/// directory. Rooted values are retained verbatim; a path with no root is
 /// joined lexically and is not required to exist at submission time.
 fn resolve_client_path(raw: String, start_cwd: &Path) -> String {
-    if Path::new(&raw).is_absolute() {
+    if Path::new(&raw).has_root() {
         raw
     } else {
         start_cwd.join(raw).to_string_lossy().into_owned()
