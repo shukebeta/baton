@@ -3203,6 +3203,330 @@ fn service_task_survives_submitting_client_and_is_owned_by_run() {
     assert!(run_status.success(), "service run exits 0 on teardown");
 }
 
+/// Issue #132 regression: durable running tasks are reconciled when the
+/// supervisor is restarted. The live task keeps its milestone schedule under
+/// the new PID-based tracker; the task that exits while `Run` is down becomes
+/// a terminal failure with no guessed exit code. Both terminal events use the
+/// task's deterministic ids, so replay is deduplicable and teardown removes
+/// the durable records.
+#[cfg(target_os = "linux")]
+#[test]
+fn service_tasks_reconcile_after_run_restart() {
+    use baton::mailbox;
+
+    let root = TempMailbox::new("task-restart");
+    let control = root.path.join("control");
+    let session_inbox = root.path.join("session-inbox");
+    let session_outbox = root.path.join("session-outbox");
+    let callback_inbox = root.path.join("callback");
+    let control_str = control.to_str().unwrap();
+
+    let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    run.args(["service", "run", "--control", control_str]);
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::null());
+    let mut run_child = run.spawn().expect("spawn initial baton service run");
+
+    let mut live = false;
+    for _ in 0..200 {
+        if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(["service", "status", "--control", control_str])
+            .output()
+            && out.status.success()
+            && String::from_utf8_lossy(&out.stdout).contains("\"service_running\":true")
+        {
+            live = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        live,
+        "initial baton service run did not report live in time"
+    );
+
+    let session_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str,
+            "--inbox",
+            session_inbox.to_str().unwrap(),
+            "--outbox",
+            session_outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+            "--agent-cmd",
+            "sh",
+            "--agent-arg",
+            "-c",
+            "--agent-arg",
+            "cat >/dev/null; printf ready",
+        ])
+        .output()
+        .expect("start task owner session");
+    assert!(
+        session_start.status.success(),
+        "service start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&session_start.stderr)
+    );
+    let session_id = String::from_utf8_lossy(&session_start.stdout)
+        .trim()
+        .to_string();
+    assert!(!session_id.is_empty(), "service start prints a session id");
+
+    let live_task_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "task",
+            "start",
+            "--control",
+            control_str,
+            "--session",
+            &session_id,
+            "--command",
+            "sleep",
+            "--arg",
+            "2",
+            "--milestone-ms",
+            "400",
+            "--max-duration-ms",
+            "10000",
+            "--callback-inbox",
+            callback_inbox.to_str().unwrap(),
+        ])
+        .output()
+        .expect("start live-across-restart task");
+    assert!(
+        live_task_start.status.success(),
+        "live task start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&live_task_start.stderr)
+    );
+    let live_task_id = String::from_utf8_lossy(&live_task_start.stdout)
+        .trim()
+        .to_string();
+    assert!(!live_task_id.is_empty(), "live task start prints a task id");
+
+    let finished_task_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "task",
+            "start",
+            "--control",
+            control_str,
+            "--session",
+            &session_id,
+            "--command",
+            "sleep",
+            "--arg",
+            "0.5",
+            "--max-duration-ms",
+            "10000",
+            "--callback-inbox",
+            callback_inbox.to_str().unwrap(),
+        ])
+        .output()
+        .expect("start task that finishes while service is down");
+    assert!(
+        finished_task_start.status.success(),
+        "finished task start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&finished_task_start.stderr)
+    );
+    let finished_task_id = String::from_utf8_lossy(&finished_task_start.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        !finished_task_id.is_empty(),
+        "finished task start prints a task id"
+    );
+
+    // Kill only the supervisor. Its task children are reparented and remain
+    // available for the restarted supervisor's PID-based reconciliation.
+    run_child.kill().expect("interrupt initial service run");
+    let run_status = run_child.wait().expect("initial service run exits");
+    assert!(
+        !run_status.success(),
+        "the initial service run was interrupted"
+    );
+
+    let mut finished_while_down = false;
+    for _ in 0..200 {
+        let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args([
+                "task",
+                "status",
+                "--control",
+                control_str,
+                "--task",
+                &finished_task_id,
+            ])
+            .output()
+            .expect("read task status while service is down");
+        let json: serde_json::Value =
+            serde_json::from_slice(&status.stdout).expect("task status is JSON");
+        if json["tasks"][0]["state"] == "running" && json["tasks"][0]["live"] == false {
+            finished_while_down = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        finished_while_down,
+        "the finished task remains durable and running until restart reconciliation"
+    );
+
+    let callback_mailbox = mailbox::Mailbox::open(&callback_inbox).expect("open callback mailbox");
+
+    let mut restarted_run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    restarted_run.args(["service", "run", "--control", control_str]);
+    restarted_run.stdout(Stdio::null());
+    restarted_run.stderr(Stdio::null());
+    let mut restarted_child = restarted_run.spawn().expect("spawn restarted service run");
+
+    let mut restarted_live = false;
+    for _ in 0..200 {
+        if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(["service", "status", "--control", control_str])
+            .output()
+            && out.status.success()
+            && String::from_utf8_lossy(&out.stdout).contains("\"service_running\":true")
+        {
+            restarted_live = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        restarted_live,
+        "restarted baton service run did not report live in time"
+    );
+
+    let mut seen = Vec::new();
+    for _ in 0..500 {
+        while let Some(claimed) = callback_mailbox.claim_next().expect("claim callback event") {
+            seen.push(claimed.key.clone());
+            callback_mailbox
+                .complete(claimed)
+                .expect("complete callback event");
+        }
+        if seen.contains(&format!("{live_task_id}-milestone-0"))
+            && seen.contains(&format!("{finished_task_id}-terminal"))
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        seen.contains(&format!("{live_task_id}-milestone-0")),
+        "rehydrated live task delivered its milestone: {seen:?}"
+    );
+    assert!(
+        seen.contains(&format!("{finished_task_id}-terminal")),
+        "task finished during downtime received a terminal event: {seen:?}"
+    );
+
+    let task_status = |task_id: &str| -> serde_json::Value {
+        let output = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args([
+                "task",
+                "status",
+                "--control",
+                control_str,
+                "--task",
+                task_id,
+            ])
+            .output()
+            .expect("read task status");
+        serde_json::from_slice(&output.stdout).expect("task status is JSON")
+    };
+    let finished_status = task_status(&finished_task_id);
+    assert_eq!(finished_status["tasks"][0]["state"], "failed");
+    assert_eq!(
+        finished_status["tasks"][0]["exit_code"],
+        serde_json::Value::Null
+    );
+    assert_eq!(finished_status["tasks"][0]["live"], false);
+
+    // The live task must remain tracked after the first restart long enough
+    // for its post-restart terminal event to arrive. Its exit status is
+    // intentionally unknown because the new supervisor cannot wait on an
+    // adopted PID.
+    for _ in 0..500 {
+        while let Some(claimed) = callback_mailbox.claim_next().expect("claim callback event") {
+            seen.push(claimed.key.clone());
+            callback_mailbox
+                .complete(claimed)
+                .expect("complete callback event");
+        }
+        if seen.contains(&format!("{live_task_id}-terminal")) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        seen.contains(&format!("{live_task_id}-terminal")),
+        "rehydrated live task received its terminal event: {seen:?}"
+    );
+    let live_status = task_status(&live_task_id);
+    assert_eq!(live_status["tasks"][0]["state"], "failed");
+    assert_eq!(
+        live_status["tasks"][0]["exit_code"],
+        serde_json::Value::Null
+    );
+    assert_eq!(live_status["tasks"][0]["live"], false);
+
+    let all_status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["task", "status", "--control", control_str])
+        .output()
+        .expect("read all task status");
+    let all_json: serde_json::Value =
+        serde_json::from_slice(&all_status.stdout).expect("all task status is JSON");
+    assert_eq!(
+        all_json["tasks"].as_array().unwrap().len(),
+        2,
+        "restart reconciliation keeps one durable record per task"
+    );
+    assert_eq!(
+        seen.iter()
+            .filter(|key| key.as_str() == format!("{finished_task_id}-terminal"))
+            .count(),
+        1,
+        "finished task terminal delivery is deduplicable"
+    );
+    assert_eq!(
+        seen.iter()
+            .filter(|key| key.as_str() == format!("{live_task_id}-terminal"))
+            .count(),
+        1,
+        "rehydrated task terminal delivery is deduplicable"
+    );
+
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str])
+        .output()
+        .expect("tear down restarted service");
+    assert!(
+        teardown.status.success(),
+        "teardown should exit 0; stderr: {}",
+        String::from_utf8_lossy(&teardown.stderr)
+    );
+    let restarted_status = restarted_child.wait().expect("restarted service run exits");
+    assert!(
+        restarted_status.success(),
+        "restarted service exits cleanly"
+    );
+
+    let final_status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["task", "status", "--control", control_str])
+        .output()
+        .expect("read task status after teardown");
+    let final_json: serde_json::Value =
+        serde_json::from_slice(&final_status.stdout).expect("final task status is JSON");
+    assert!(
+        final_json["tasks"].as_array().unwrap().is_empty(),
+        "teardown removes reconciled task records"
+    );
+}
+
 /// Issue #123 regression: task admission rejects both an absent owner record
 /// and a record whose session process is already dead, before it creates a
 /// child or durable task record.

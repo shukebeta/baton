@@ -327,11 +327,11 @@ mod imp {
         // behind (reaped the next time it's inspected).
         reclaim_stale_requests(control)?;
         reclaim_stale_task_requests(control)?;
+        let clock = SystemClock;
+        let mut tasks = rehydrate_tasks(control, &clock)?;
         writeln!(out, "baton service running on {}", control.display()).map_err(io_err)?;
 
-        let clock = SystemClock;
         let mut children: HashMap<String, Child> = HashMap::new();
-        let mut tasks: HashMap<String, RunningTask> = HashMap::new();
         loop {
             // A failure to check the stop sentinel (as opposed to a clean
             // present/absent read) must not crash the loop either — the same
@@ -918,14 +918,18 @@ mod imp {
         Ok(())
     }
 
-    /// One task the `Run` loop is currently tracking: the live [`Child`]
-    /// handle (so a non-blocking `try_wait` can reap it), its durable
-    /// [`TaskRecord`] (kept in sync as milestones fire and it goes
-    /// terminal), and the injected-clock timestamps driving milestone/
-    /// max-duration decisions.
+    /// One task the `Run` loop is currently tracking: its durable
+    /// [`TaskRecord`] (kept in sync as milestones fire and it goes terminal),
+    /// either the live [`Child`] handle owned by this supervisor or a
+    /// rehydrated PID identity, and the injected-clock timestamps driving
+    /// milestone/max-duration decisions.
     struct RunningTask {
         record: TaskRecord,
-        child: Child,
+        /// `Some` while this `Run` instance owns the child handle. A task
+        /// restored after a supervisor restart has already been reparented to
+        /// init, so it is represented by `None` and polled by corroborated
+        /// PID liveness instead of `Child::try_wait`.
+        child: Option<Child>,
         started_ms: u64,
         /// Set once this task's max duration has been exceeded and `SIGTERM`
         /// sent, so a later tick knows to escalate to `SIGKILL` after
@@ -934,6 +938,45 @@ mod imp {
         term_sent_at_ms: Option<u64>,
         /// Set once `SIGKILL` has been sent, so it is only ever sent once.
         kill_sent: bool,
+    }
+
+    /// Restores every durable task before the request loop accepts new work.
+    /// Running records are rehydrated for PID-based tracking; terminal
+    /// records are retained for one deterministic callback replay in case the
+    /// previous supervisor persisted state immediately before it exited. The
+    /// child process was reparented when the previous supervisor exited, so
+    /// the new tracker deliberately carries no `Child` handle and lets
+    /// `tick_one_task` use the record's corroborated PID identity instead.
+    fn rehydrate_tasks(control: &Path, clock: &dyn Clock) -> Result<HashMap<String, RunningTask>> {
+        let mut tasks = HashMap::new();
+        for mut record in list_task_records(control)? {
+            let started_ms = match record.started_ms {
+                Some(started_ms) => started_ms,
+                None if record.state == TaskState::Running => {
+                    // Older records have no durable wall-clock origin. They
+                    // cannot be assigned a trustworthy historical elapsed
+                    // time, so preserve the task and start timing from this
+                    // restart while upgrading the record for future restarts.
+                    let started_ms = clock.now_ms();
+                    record.started_ms = Some(started_ms);
+                    write_task_record(control, &record)?;
+                    started_ms
+                }
+                None => clock.now_ms(),
+            };
+            let id = record.id.clone();
+            tasks.insert(
+                id,
+                RunningTask {
+                    record,
+                    child: None,
+                    started_ms,
+                    term_sent_at_ms: None,
+                    kill_sent: false,
+                },
+            );
+        }
+        Ok(tasks)
     }
 
     /// Outcome of one [`tick_one_task`] call.
@@ -982,7 +1025,7 @@ mod imp {
                     let id = record.id.clone();
                     let running = RunningTask {
                         record,
-                        child,
+                        child: Some(child),
                         started_ms,
                         term_sent_at_ms: None,
                         kill_sent: false,
@@ -1051,11 +1094,13 @@ mod imp {
                 "task command (pid {pid}) could not be corroborated right after spawn; treating as a spawn failure"
             )));
         }
+        let started_ms = clock.now_ms();
         let record = TaskRecord {
             id: task_id,
             spec,
             pid,
             started_at,
+            started_ms: Some(started_ms),
             state: TaskState::Running,
             exit_code: None,
             elapsed_ms: None,
@@ -1082,7 +1127,7 @@ mod imp {
             let _ = remove_task_record(control, &record.id);
             return Err(err);
         }
-        Ok(Some((record, child, clock.now_ms())))
+        Ok(Some((record, child, started_ms)))
     }
 
     fn write_task_start_response(
@@ -1144,6 +1189,17 @@ mod imp {
         running: &mut RunningTask,
         clock: &dyn Clock,
     ) -> Result<TaskTick> {
+        // A terminal record can remain in the tracker when callback delivery
+        // failed after state persistence. Retry the deterministic event before
+        // dropping it, including after startup reconciliation.
+        if read_task_record(control, id)?.is_none() {
+            return Ok(TaskTick::Finished);
+        }
+        if running.record.state != TaskState::Running {
+            deliver_task_event(&running.record, TaskEventKind::Terminal)?;
+            return Ok(TaskTick::Finished);
+        }
+
         let elapsed_ms = clock.now_ms().saturating_sub(running.started_ms);
 
         for index in milestones_due(
@@ -1153,7 +1209,23 @@ mod imp {
         ) {
             deliver_task_event(&running.record, TaskEventKind::Milestone { index })?;
             running.record.delivered_milestones = index + 1;
-            write_task_record(control, &running.record)?;
+            if let Err(err) = write_task_record(control, &running.record) {
+                running.record.delivered_milestones = index;
+                return Err(err);
+            }
+        }
+
+        // A rehydrated task has no Child handle. Check its corroborated PID
+        // before any timeout signal so a gone or PID-reused process is never
+        // accidentally signalled as this task.
+        if running.child.is_none() && !is_task_alive(&running.record) {
+            let cancelled = consume_task_cancel_sentinel(control, id)?;
+            let state = if cancelled {
+                TaskState::Cancelled
+            } else {
+                TaskState::Failed
+            };
+            return finalize_task(control, running, state, None, elapsed_ms);
         }
 
         if running.term_sent_at_ms.is_none()
@@ -1165,41 +1237,84 @@ mod imp {
             && !running.kill_sent
             && clock.now_ms().saturating_sub(term_at) >= KILL_GRACE_MS
         {
+            if running.child.is_none() && !is_task_alive(&running.record) {
+                let cancelled = consume_task_cancel_sentinel(control, id)?;
+                let state = if cancelled {
+                    TaskState::Cancelled
+                } else {
+                    TaskState::Timeout
+                };
+                return finalize_task(control, running, state, None, elapsed_ms);
+            }
             let _ = signal_group(running.record.pid, "-KILL");
             running.kill_sent = true;
         }
 
-        match running.child.try_wait() {
-            Ok(Some(status)) => {
-                // An external `Stop`/`Teardown`/`Cancel` may already have
-                // finalized and removed this task's record (they act
-                // directly on the durable PID, independent of this `Run`
-                // loop being alive) — if so, this reap is a no-op besides
-                // dropping our own in-memory tracking below, so a race with
-                // an external reaper never resurrects a torn-down record.
-                if read_task_record(control, id)?.is_none() {
-                    return Ok(TaskTick::Finished);
-                }
-                let cancelled = consume_task_cancel_sentinel(control, id)?;
-                let state = if cancelled {
-                    TaskState::Cancelled
-                } else if running.term_sent_at_ms.is_some() {
-                    TaskState::Timeout
-                } else if status.success() {
-                    TaskState::Completed
+        match running.child.as_mut() {
+            None => {
+                if is_task_alive(&running.record) {
+                    Ok(TaskTick::StillRunning)
                 } else {
-                    TaskState::Failed
-                };
-                running.record.state = state;
-                running.record.exit_code = status.code();
-                running.record.elapsed_ms = Some(elapsed_ms);
-                write_task_record(control, &running.record)?;
-                deliver_task_event(&running.record, TaskEventKind::Terminal)?;
-                Ok(TaskTick::Finished)
+                    let cancelled = consume_task_cancel_sentinel(control, id)?;
+                    let state = if cancelled {
+                        TaskState::Cancelled
+                    } else if running.term_sent_at_ms.is_some() {
+                        TaskState::Timeout
+                    } else {
+                        TaskState::Failed
+                    };
+                    finalize_task(control, running, state, None, elapsed_ms)
+                }
             }
-            Ok(None) => Ok(TaskTick::StillRunning),
-            Err(err) => Err(BatonError::Io(format!("could not poll task {id}: {err}"))),
+            Some(child) => match child.try_wait() {
+                Ok(Some(status)) => {
+                    // An external `Stop`/`Teardown`/`Cancel` may already have
+                    // finalized and removed this task's record (they act
+                    // directly on the durable PID, independent of this `Run`
+                    // loop being alive) — if so, this reap is a no-op besides
+                    // dropping our own in-memory tracking below, so a race with
+                    // an external reaper never resurrects a torn-down record.
+                    if read_task_record(control, id)?.is_none() {
+                        return Ok(TaskTick::Finished);
+                    }
+                    let cancelled = consume_task_cancel_sentinel(control, id)?;
+                    let state = if cancelled {
+                        TaskState::Cancelled
+                    } else if running.term_sent_at_ms.is_some() {
+                        TaskState::Timeout
+                    } else if status.success() {
+                        TaskState::Completed
+                    } else {
+                        TaskState::Failed
+                    };
+                    finalize_task(control, running, state, status.code(), elapsed_ms)
+                }
+                Ok(None) => Ok(TaskTick::StillRunning),
+                Err(err) => Err(BatonError::Io(format!("could not poll task {id}: {err}"))),
+            },
         }
+    }
+
+    /// Persists a terminal task state before delivering its deterministic
+    /// terminal event. If delivery fails, the terminal record remains in the
+    /// tracker and the next tick retries the same event id.
+    fn finalize_task(
+        control: &Path,
+        running: &mut RunningTask,
+        state: TaskState,
+        exit_code: Option<i32>,
+        elapsed_ms: u64,
+    ) -> Result<TaskTick> {
+        let previous = running.record.clone();
+        running.record.state = state;
+        running.record.exit_code = exit_code;
+        running.record.elapsed_ms = Some(elapsed_ms);
+        if let Err(err) = write_task_record(control, &running.record) {
+            running.record = previous;
+            return Err(err);
+        }
+        deliver_task_event(&running.record, TaskEventKind::Terminal)?;
+        Ok(TaskTick::Finished)
     }
 
     /// Ticks every tracked task once, dropping any that finished. One task's
@@ -1892,11 +2007,13 @@ mod imp {
             let stderr_path = log_dir.join("stderr.log");
             let child = spawn_task_child(&spec, &stdout_path, &stderr_path).expect("spawn task");
             let pid = child.id();
+            let started_ms = clock.now_ms();
             let record = TaskRecord {
                 id: id.to_string(),
                 spec,
                 pid,
                 started_at: recorded_start_key(pid),
+                started_ms: Some(started_ms),
                 state: TaskState::Running,
                 exit_code: None,
                 elapsed_ms: None,
@@ -1907,8 +2024,8 @@ mod imp {
             write_task_record(dir, &record).expect("write task record");
             RunningTask {
                 record,
-                child,
-                started_ms: clock.now_ms(),
+                child: Some(child),
+                started_ms,
                 term_sent_at_ms: None,
                 kill_sent: false,
             }
@@ -2282,6 +2399,7 @@ mod imp {
                 spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/cb"),
                 pid: 4242,
                 started_at: Some("123456".to_string()),
+                started_ms: Some(42),
                 state: TaskState::Running,
                 exit_code: None,
                 elapsed_ms: None,
@@ -2322,6 +2440,7 @@ mod imp {
                     spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/cb"),
                     pid: 1000 + i,
                     started_at: None,
+                    started_ms: None,
                     state: TaskState::Running,
                     exit_code: None,
                     elapsed_ms: None,
@@ -2338,6 +2457,68 @@ mod imp {
                 .collect();
             ids.sort();
             assert_eq!(ids, vec!["task-0", "task-1", "task-2"]);
+        }
+
+        /// A PID whose current start key does not match the durable record is
+        /// finalized as gone and is never signalled as the task.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn rehydrate_rejects_pid_reuse_without_signalling() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("task-pid-reuse");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let spec = task_spec(
+                "svc-1",
+                "sleep",
+                vec!["5".to_string()],
+                vec![],
+                10_000,
+                &callback_inbox.display().to_string(),
+            );
+            let log_dir = task_logs_dir(&dir.path, "task-reused");
+            fs::create_dir_all(&log_dir).expect("create log dir");
+            let stdout_path = log_dir.join("stdout.log");
+            let stderr_path = log_dir.join("stderr.log");
+            let mut child =
+                spawn_task_child(&spec, &stdout_path, &stderr_path).expect("spawn task");
+            let record = TaskRecord {
+                id: "task-reused".to_string(),
+                spec,
+                pid: child.id(),
+                started_at: Some("not-the-current-start-key".to_string()),
+                started_ms: Some(clock.now_ms()),
+                state: TaskState::Running,
+                exit_code: None,
+                elapsed_ms: None,
+                stdout_path: stdout_path.display().to_string(),
+                stderr_path: stderr_path.display().to_string(),
+                delivered_milestones: 0,
+            };
+            write_task_record(&dir.path, &record).expect("write task record");
+
+            let mut tasks = rehydrate_tasks(&dir.path, &clock).expect("rehydrate task");
+            let mut running = tasks.remove("task-reused").expect("rehydrated task");
+            assert!(
+                running.child.is_none(),
+                "rehydrated task has no Child handle"
+            );
+            assert!(
+                matches!(
+                    tick_one_task(&dir.path, "task-reused", &mut running, &clock),
+                    Ok(TaskTick::Finished)
+                ),
+                "PID reuse is finalized without adoption"
+            );
+            assert_eq!(running.record.state, TaskState::Failed);
+            assert_eq!(running.record.exit_code, None);
+            assert!(
+                child.try_wait().expect("poll unrelated process").is_none(),
+                "a mismatched PID is not signalled"
+            );
+
+            let _ = signal_group(child.id(), "-KILL");
+            let _ = child.wait();
         }
 
         /// Removing an already-absent task record is a no-op success
@@ -2371,6 +2552,7 @@ mod imp {
                 ),
                 pid: 0,
                 started_at: None,
+                started_ms: None,
                 state: TaskState::Completed,
                 exit_code: Some(0),
                 elapsed_ms: Some(10),
@@ -2437,7 +2619,7 @@ mod imp {
             assert_eq!(running.record.delivered_milestones, 1);
 
             let _ = signal_group(running.record.pid, "-KILL");
-            let _ = running.child.wait();
+            let _ = running.child.as_mut().expect("owned child").wait();
         }
 
         /// Exceeding `max_duration_ms` (per the injected clock) escalates
@@ -2461,28 +2643,36 @@ mod imp {
 
             clock.advance(150);
             let tick = tick_one_task(&dir.path, "task-t", &mut running, &clock).expect("tick");
-            assert!(matches!(tick, TaskTick::StillRunning));
             assert!(
                 running.term_sent_at_ms.is_some(),
                 "max-duration breach must send SIGTERM"
             );
 
-            clock.advance(KILL_GRACE_MS);
-            let _tick = tick_one_task(&dir.path, "task-t", &mut running, &clock).expect("tick");
-            assert!(running.kill_sent, "SIGTERM grace expiry must send SIGKILL");
+            // Some Unix implementations reap the process group immediately
+            // after TERM; others require the documented KILL-grace tick.
+            if matches!(tick, TaskTick::StillRunning) {
+                clock.advance(KILL_GRACE_MS);
+                let _tick = tick_one_task(&dir.path, "task-t", &mut running, &clock).expect("tick");
+                assert!(running.kill_sent, "SIGTERM grace expiry must send SIGKILL");
 
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                match tick_one_task(&dir.path, "task-t", &mut running, &clock).expect("tick") {
-                    TaskTick::Finished => break,
-                    TaskTick::StillRunning => {
-                        assert!(
-                            Instant::now() < deadline,
-                            "task did not exit after SIGTERM within the test bound"
-                        );
-                        std::thread::sleep(Duration::from_millis(20));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match tick_one_task(&dir.path, "task-t", &mut running, &clock).expect("tick") {
+                        TaskTick::Finished => break,
+                        TaskTick::StillRunning => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "task did not exit after SIGTERM within the test bound"
+                            );
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
                     }
                 }
+            } else {
+                assert!(
+                    matches!(tick, TaskTick::Finished),
+                    "a max-duration task must be terminal after fast reaping"
+                );
             }
             assert_eq!(running.record.state, TaskState::Timeout);
 
@@ -2538,6 +2728,7 @@ mod imp {
                 spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/cb-a"),
                 pid: u32::MAX - 1,
                 started_at: None,
+                started_ms: None,
                 state: TaskState::Running,
                 exit_code: None,
                 elapsed_ms: None,
@@ -2550,6 +2741,7 @@ mod imp {
                 spec: task_spec("svc-2", "true", vec![], vec![], 1_000, "/tmp/cb-b"),
                 pid: u32::MAX - 1,
                 started_at: None,
+                started_ms: None,
                 state: TaskState::Running,
                 exit_code: None,
                 elapsed_ms: None,
@@ -2604,6 +2796,7 @@ mod imp {
                 ),
                 pid: u32::MAX - 1,
                 started_at: None,
+                started_ms: None,
                 state: TaskState::Running,
                 exit_code: None,
                 elapsed_ms: None,
@@ -2641,6 +2834,7 @@ mod imp {
                 spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/cb"),
                 pid: u32::MAX - 1,
                 started_at: None,
+                started_ms: None,
                 state: TaskState::Completed,
                 exit_code: Some(0),
                 elapsed_ms: Some(42),
