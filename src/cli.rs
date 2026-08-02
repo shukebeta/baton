@@ -45,6 +45,7 @@ use crate::participant::{
 use crate::registry::Registry;
 use crate::roles::{Identity, RolesHome};
 use crate::service::{self, SessionSpec};
+use crate::task::{self, TaskCallback, TaskSpec};
 use crate::transport::Transport;
 use crate::transport::claude::ClaudeClient;
 
@@ -53,7 +54,7 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session [--role <name>] [--resume <file> [--session <id>]] | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton serve --stop --inbox <dir> | baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]] | baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>... | baton roles | baton role show <name> | baton service run --control <dir> | baton service start --control <dir> --inbox <dir> --outbox <dir> [--poll-ms <n>] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton service status --control <dir> [--session <id>] | baton service stop --control <dir> --session <id> | baton service teardown --control <dir>";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session [--role <name>] [--resume <file> [--session <id>]] | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton serve --stop --inbox <dir> | baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]] | baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>... | baton roles | baton role show <name> | baton service run --control <dir> | baton service start --control <dir> --inbox <dir> --outbox <dir> [--poll-ms <n>] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton service status --control <dir> [--session <id>] | baton service stop --control <dir> --session <id> | baton service teardown --control <dir> | baton task start --control <dir> --session <id> --command <program> [--arg <arg>]... [--cwd <dir>] [--env KEY=VALUE]... [--milestone-ms <n>]... --max-duration-ms <n> --callback-inbox <dir> [--callback-role <name>] | baton task status --control <dir> [--task <id>] | baton task cancel --control <dir> --task <id>";
 
 /// Default `baton serve` inbox poll interval, in milliseconds, when `--poll-ms`
 /// is unset.
@@ -248,6 +249,9 @@ enum Command {
     /// A host-owned `baton service` supervisor invocation — see
     /// [`crate::service`].
     Service(service::ServiceCommand),
+    /// A `baton task` asynchronous-job invocation, owned and reaped by a
+    /// `baton service` session's `Run` loop — see [`crate::task`].
+    Task(task::TaskCommand),
 }
 
 /// Selects the session trail to rehydrate for `baton session --resume`.
@@ -756,6 +760,10 @@ pub fn run() -> Result<()> {
         Command::Service(cmd) => {
             let stdout = std::io::stdout();
             service::execute_service(cmd, stdout.lock())
+        }
+        Command::Task(cmd) => {
+            let stdout = std::io::stdout();
+            service::execute_task(cmd, stdout.lock())
         }
     }
 }
@@ -1830,6 +1838,7 @@ fn parse_args(args: &[String]) -> Result<Command> {
         "roles" => parse_roles(iter),
         "role" => parse_role(iter),
         "service" => parse_service(iter),
+        "task" => parse_task(iter),
         other => Err(usage(&format!("unknown command {other:?}"))),
     }
 }
@@ -2729,6 +2738,192 @@ fn parse_service_teardown<'a>(mut iter: impl Iterator<Item = &'a String>) -> Res
     let control = require_dir(control, "--control")?;
     Ok(Command::Service(service::ServiceCommand::Teardown {
         control,
+    }))
+}
+
+fn parse_task<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let sub = iter
+        .next()
+        .ok_or_else(|| usage("task requires a subcommand: start|status|cancel"))?;
+    match sub.as_str() {
+        "start" => parse_task_start(iter),
+        "status" => parse_task_status(iter),
+        "cancel" => parse_task_cancel(iter),
+        other => Err(usage(&format!("unknown task subcommand {other:?}"))),
+    }
+}
+
+/// Parses one `--env KEY=VALUE` pair, splitting on the first `=`.
+fn parse_env_pair(raw: &str) -> Result<(String, String)> {
+    match raw.split_once('=') {
+        Some((key, value)) if !key.trim().is_empty() => Ok((key.to_string(), value.to_string())),
+        _ => Err(usage(&format!("--env must be KEY=VALUE, got {raw:?}"))),
+    }
+}
+
+/// Parses `baton task start --control <dir> --session <id> --command
+/// <program> [--arg <arg>]... [--cwd <dir>] [--env KEY=VALUE]...
+/// [--milestone-ms <n>]... --max-duration-ms <n> --callback-inbox <dir>
+/// [--callback-role <name>]`.
+fn parse_task_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut control: Option<String> = None;
+    let mut session: Option<String> = None;
+    let mut command: Option<String> = None;
+    let mut args: Vec<String> = Vec::new();
+    let mut cwd: Option<String> = None;
+    let mut env: Vec<(String, String)> = Vec::new();
+    let mut milestones_ms: Vec<u64> = Vec::new();
+    let mut max_duration_ms: Option<u64> = None;
+    let mut callback_inbox: Option<String> = None;
+    let mut callback_role: Option<String> = None;
+
+    while let Some(arg) = iter.next() {
+        let mut take = |flag: &str| -> Result<String> {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| usage(&format!("{flag} requires a value")))
+        };
+        match arg.as_str() {
+            "--control" => control = Some(take("--control")?),
+            other if other.starts_with("--control=") => {
+                control = Some(other["--control=".len()..].to_string());
+            }
+            "--session" => session = Some(take("--session")?),
+            other if other.starts_with("--session=") => {
+                session = Some(other["--session=".len()..].to_string());
+            }
+            "--command" => command = Some(take("--command")?),
+            other if other.starts_with("--command=") => {
+                command = Some(other["--command=".len()..].to_string());
+            }
+            "--arg" => args.push(take("--arg")?),
+            other if other.starts_with("--arg=") => {
+                args.push(other["--arg=".len()..].to_string());
+            }
+            "--cwd" => cwd = Some(take("--cwd")?),
+            other if other.starts_with("--cwd=") => {
+                cwd = Some(other["--cwd=".len()..].to_string());
+            }
+            "--env" => env.push(parse_env_pair(&take("--env")?)?),
+            other if other.starts_with("--env=") => {
+                env.push(parse_env_pair(&other["--env=".len()..])?);
+            }
+            "--milestone-ms" => milestones_ms.push(parse_positive_ms(
+                &take("--milestone-ms")?,
+                "--milestone-ms",
+            )?),
+            other if other.starts_with("--milestone-ms=") => {
+                milestones_ms.push(parse_positive_ms(
+                    &other["--milestone-ms=".len()..],
+                    "--milestone-ms",
+                )?);
+            }
+            "--max-duration-ms" => {
+                max_duration_ms = Some(parse_positive_ms(
+                    &take("--max-duration-ms")?,
+                    "--max-duration-ms",
+                )?)
+            }
+            other if other.starts_with("--max-duration-ms=") => {
+                max_duration_ms = Some(parse_positive_ms(
+                    &other["--max-duration-ms=".len()..],
+                    "--max-duration-ms",
+                )?);
+            }
+            "--callback-inbox" => callback_inbox = Some(take("--callback-inbox")?),
+            other if other.starts_with("--callback-inbox=") => {
+                callback_inbox = Some(other["--callback-inbox=".len()..].to_string());
+            }
+            "--callback-role" => callback_role = Some(take("--callback-role")?),
+            other if other.starts_with("--callback-role=") => {
+                callback_role = Some(other["--callback-role=".len()..].to_string());
+            }
+            other => return Err(usage(&format!("unexpected argument {other:?}"))),
+        }
+    }
+
+    let control = require_dir(control, "--control")?;
+    let session = require_value(session, "--session")?;
+    let command = require_value(command, "--command")?;
+    let callback_inbox = require_dir(callback_inbox, "--callback-inbox")?;
+    let max_duration_ms =
+        max_duration_ms.ok_or_else(|| usage("--max-duration-ms <n> is required"))?;
+    let spec = TaskSpec {
+        schema: task::TASK_SPEC_SCHEMA.to_string(),
+        session,
+        command,
+        args,
+        cwd,
+        env,
+        milestones_ms,
+        max_duration_ms,
+        callback: TaskCallback {
+            inbox: callback_inbox,
+            role: callback_role,
+        },
+    };
+    Ok(Command::Task(task::TaskCommand::Start {
+        control,
+        spec: Box::new(spec),
+    }))
+}
+
+/// Parses `baton task status --control <dir> [--task <id>]`.
+fn parse_task_status<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut control: Option<String> = None;
+    let mut task_id: Option<String> = None;
+    while let Some(arg) = iter.next() {
+        let mut take = |flag: &str| -> Result<String> {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| usage(&format!("{flag} requires a value")))
+        };
+        match arg.as_str() {
+            "--control" => control = Some(take("--control")?),
+            other if other.starts_with("--control=") => {
+                control = Some(other["--control=".len()..].to_string());
+            }
+            "--task" => task_id = Some(take("--task")?),
+            other if other.starts_with("--task=") => {
+                task_id = Some(other["--task=".len()..].to_string());
+            }
+            other => return Err(usage(&format!("unexpected argument {other:?}"))),
+        }
+    }
+    let control = require_dir(control, "--control")?;
+    Ok(Command::Task(task::TaskCommand::Status {
+        control,
+        task: task_id,
+    }))
+}
+
+/// Parses `baton task cancel --control <dir> --task <id>`.
+fn parse_task_cancel<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let mut control: Option<String> = None;
+    let mut task_id: Option<String> = None;
+    while let Some(arg) = iter.next() {
+        let mut take = |flag: &str| -> Result<String> {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| usage(&format!("{flag} requires a value")))
+        };
+        match arg.as_str() {
+            "--control" => control = Some(take("--control")?),
+            other if other.starts_with("--control=") => {
+                control = Some(other["--control=".len()..].to_string());
+            }
+            "--task" => task_id = Some(take("--task")?),
+            other if other.starts_with("--task=") => {
+                task_id = Some(other["--task=".len()..].to_string());
+            }
+            other => return Err(usage(&format!("unexpected argument {other:?}"))),
+        }
+    }
+    let control = require_dir(control, "--control")?;
+    let task_id = require_value(task_id, "--task")?;
+    Ok(Command::Task(task::TaskCommand::Cancel {
+        control,
+        task: task_id,
     }))
 }
 
@@ -5271,6 +5466,208 @@ mod tests {
             parse_args(&argv(&["service", "teardown", "--control", "/tmp/ctl"])).expect("parses"),
             Command::Service(service::ServiceCommand::Teardown {
                 control: "/tmp/ctl".to_string(),
+            })
+        );
+    }
+
+    // -- task / parse_task ----------------------------------------------------
+
+    #[test]
+    fn parse_task_missing_subcommand_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&["task"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_task_unknown_subcommand_is_usage_error() {
+        assert!(matches!(
+            parse_args(&argv(&["task", "nope"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_task_start_requires_control_session_command_callback_and_max_duration() {
+        assert!(matches!(
+            parse_args(&argv(&["task", "start"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+        assert!(matches!(
+            parse_args(&argv(&[
+                "task",
+                "start",
+                "--control",
+                "/tmp/ctl",
+                "--session",
+                "svc-1",
+                "--command",
+                "true",
+                "--callback-inbox",
+                "/tmp/cb",
+            ]))
+            .unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_task_start_parses_minimal_spec() {
+        let cmd = parse_args(&argv(&[
+            "task",
+            "start",
+            "--control",
+            "/tmp/ctl",
+            "--session",
+            "svc-1",
+            "--command",
+            "true",
+            "--max-duration-ms",
+            "1000",
+            "--callback-inbox",
+            "/tmp/cb",
+        ]))
+        .expect("parses");
+        match cmd {
+            Command::Task(task::TaskCommand::Start { control, spec }) => {
+                assert_eq!(control, "/tmp/ctl");
+                assert_eq!(spec.schema, task::TASK_SPEC_SCHEMA);
+                assert_eq!(spec.session, "svc-1");
+                assert_eq!(spec.command, "true");
+                assert!(spec.args.is_empty());
+                assert!(spec.cwd.is_none());
+                assert!(spec.env.is_empty());
+                assert!(spec.milestones_ms.is_empty());
+                assert_eq!(spec.max_duration_ms, 1000);
+                assert_eq!(spec.callback.inbox, "/tmp/cb");
+                assert!(spec.callback.role.is_none());
+            }
+            other => panic!("expected Task(Start), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_task_start_parses_full_spec() {
+        let cmd = parse_args(&argv(&[
+            "task",
+            "start",
+            "--control",
+            "/tmp/ctl",
+            "--session",
+            "svc-1",
+            "--command",
+            "sh",
+            "--arg",
+            "-c",
+            "--arg",
+            "echo hi",
+            "--cwd",
+            "/work",
+            "--env",
+            "FOO=bar",
+            "--milestone-ms",
+            "100",
+            "--milestone-ms",
+            "200",
+            "--max-duration-ms",
+            "5000",
+            "--callback-inbox",
+            "/tmp/cb",
+            "--callback-role",
+            "reviewer",
+        ]))
+        .expect("parses");
+        match cmd {
+            Command::Task(task::TaskCommand::Start { spec, .. }) => {
+                assert_eq!(spec.args, vec!["-c".to_string(), "echo hi".to_string()]);
+                assert_eq!(spec.cwd.as_deref(), Some("/work"));
+                assert_eq!(spec.env, vec![("FOO".to_string(), "bar".to_string())]);
+                assert_eq!(spec.milestones_ms, vec![100, 200]);
+                assert_eq!(spec.max_duration_ms, 5000);
+                assert_eq!(spec.callback.role.as_deref(), Some("reviewer"));
+            }
+            other => panic!("expected Task(Start), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_task_start_rejects_malformed_env_pair() {
+        assert!(matches!(
+            parse_args(&argv(&[
+                "task",
+                "start",
+                "--control",
+                "/tmp/ctl",
+                "--session",
+                "svc-1",
+                "--command",
+                "true",
+                "--max-duration-ms",
+                "1000",
+                "--callback-inbox",
+                "/tmp/cb",
+                "--env",
+                "not-a-pair",
+            ]))
+            .unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_task_status_parses_with_and_without_task() {
+        assert_eq!(
+            parse_args(&argv(&["task", "status", "--control", "/tmp/ctl"])).expect("parses"),
+            Command::Task(task::TaskCommand::Status {
+                control: "/tmp/ctl".to_string(),
+                task: None,
+            })
+        );
+        assert_eq!(
+            parse_args(&argv(&[
+                "task",
+                "status",
+                "--control",
+                "/tmp/ctl",
+                "--task",
+                "task-1"
+            ]))
+            .expect("parses"),
+            Command::Task(task::TaskCommand::Status {
+                control: "/tmp/ctl".to_string(),
+                task: Some("task-1".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_task_cancel_requires_control_and_task() {
+        assert!(matches!(
+            parse_args(&argv(&["task", "cancel", "--control", "/tmp/ctl"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+        assert!(matches!(
+            parse_args(&argv(&["task", "cancel", "--task", "task-1"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn parse_task_cancel_parses() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "task",
+                "cancel",
+                "--control",
+                "/tmp/ctl",
+                "--task",
+                "task-1"
+            ]))
+            .expect("parses"),
+            Command::Task(task::TaskCommand::Cancel {
+                control: "/tmp/ctl".to_string(),
+                task: "task-1".to_string(),
             })
         );
     }

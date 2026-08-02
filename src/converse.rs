@@ -209,7 +209,7 @@ pub fn converse_ring(
         match reply.kind {
             MessageKind::Done => break TerminalReason::Done,
             MessageKind::Error => break TerminalReason::Error,
-            MessageKind::Request | MessageKind::Response => {}
+            MessageKind::Request | MessageKind::Response | MessageKind::Notify => {}
         }
 
         if let Some(budget) = governance.token_budget {

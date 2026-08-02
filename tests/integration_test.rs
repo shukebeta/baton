@@ -2053,3 +2053,177 @@ fn service_session_survives_submitting_client_and_is_owned_by_run() {
     let run_status = run_child.wait().expect("baton service run exits");
     assert!(run_status.success(), "service run exits 0 on teardown");
 }
+
+/// Issue #110 AC #1 (task ownership/survival regression): a task started
+/// through `baton task start` is spawned as a direct child of the long-lived
+/// `baton service run`, not of the short-lived `task start` client that
+/// submitted it (which has already exited by the time this test observes the
+/// task) — so the service remains the owner and can report the task by id
+/// long after the submitting client is gone. Uses trivial real thresholds
+/// with no `sleep()` in the test's own assertions: milestone/terminal
+/// delivery is awaited via bounded polling, matching every other live-`serve`
+/// regression in this file. Linux-only: the parentage proof reads
+/// `/proc/<pid>/status`, which has no portable equivalent in this crate.
+#[cfg(target_os = "linux")]
+#[test]
+fn service_task_survives_submitting_client_and_is_owned_by_run() {
+    use baton::mailbox;
+
+    let root = TempMailbox::new("task");
+    let control = root.path.join("control");
+    let callback_inbox = root.path.join("callback");
+
+    let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    run.args(["service", "run", "--control", control.to_str().unwrap()]);
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::null());
+    let mut run_child = run.spawn().expect("spawn baton service run");
+    let run_pid = run_child.id();
+
+    let control_str = control.to_str().unwrap();
+
+    // Wait for `Run` to acquire its control lock: `task start` fails fast
+    // rather than waiting when no live service is found yet.
+    let mut live = false;
+    for _ in 0..100 {
+        if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(["service", "status", "--control", control_str])
+            .output()
+            && out.status.success()
+            && String::from_utf8_lossy(&out.stdout).contains("\"service_running\":true")
+        {
+            live = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(live, "baton service run did not report live in time");
+
+    // The short-lived submitting client: `task start` waits for `Run` to
+    // spawn and record the task, then exits — there is no lingering process
+    // tree behind it to kill.
+    let start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "task",
+            "start",
+            "--control",
+            control_str,
+            "--session",
+            "svc-task-1",
+            "--command",
+            "sh",
+            "--arg",
+            "-c",
+            "--arg",
+            // Stays alive briefly so the structural PPid check below has a
+            // reliable window before the process exits and is reaped —
+            // `echo hello` alone completes fast enough to race that check.
+            "sleep 0.3; echo hello",
+            "--milestone-ms",
+            "1",
+            "--max-duration-ms",
+            "60000",
+            "--callback-inbox",
+            callback_inbox.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run baton task start");
+    assert!(
+        start.status.success(),
+        "task start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let task_id = String::from_utf8_lossy(&start.stdout).trim().to_string();
+    assert!(!task_id.is_empty(), "task start prints a task id");
+
+    // Structural proof: the task's real PID's parent is `service run`, never
+    // the already-exited `task start` client.
+    let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "task",
+            "status",
+            "--control",
+            control_str,
+            "--task",
+            &task_id,
+        ])
+        .output()
+        .expect("run baton task status");
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status is JSON");
+    let tasks = status_json["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks.len(), 1, "status reports the started task");
+    let task_pid = tasks[0]["pid"].as_u64().expect("pid") as u32;
+    let ppid = read_ppid(task_pid).expect("the task has a PPid");
+    assert_eq!(
+        ppid, run_pid,
+        "the task's parent is the live `service run`, not the exited submitter"
+    );
+
+    // Functional proof: the still-running service delivers both the
+    // milestone and terminal lifecycle events to the callback mailbox, with
+    // no polling loop on the consumer's part beyond claiming what is already
+    // there — the events arrive on the service's own tick, driven by its
+    // real (not injectable, in this live-subprocess path) clock, but the
+    // test performs no `sleep()` of its own beyond bounded polling for the
+    // mailbox to receive them.
+    let callback_mailbox = mailbox::Mailbox::open(&callback_inbox).expect("open callback mailbox");
+    let mut seen = Vec::new();
+    let terminal_key = format!("{task_id}-terminal");
+    'poll: for _ in 0..200 {
+        // Both events can land in `pending/` together (the same tick both
+        // fires the milestone and reaps the already-exited command), and
+        // `claim_next` makes no ordering guarantee across distinct ids — so
+        // fully drain what is pending each iteration before checking whether
+        // the terminal event has been seen, rather than stopping the instant
+        // one claim happens to be the terminal one.
+        while let Ok(Some(claimed)) = callback_mailbox.claim_next() {
+            seen.push(claimed.key.clone());
+            callback_mailbox
+                .complete(claimed)
+                .expect("complete claimed event");
+        }
+        if seen.contains(&terminal_key) {
+            break 'poll;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        seen.contains(&format!("{task_id}-milestone-0")),
+        "the configured milestone was delivered to the callback mailbox: {seen:?}"
+    );
+    assert!(
+        seen.contains(&format!("{task_id}-terminal")),
+        "the terminal event was delivered to the callback mailbox: {seen:?}"
+    );
+
+    // `baton task status` reports the task by id long after the submitting
+    // client exited, without a live `Run` loop being required for status.
+    let final_status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "task",
+            "status",
+            "--control",
+            control_str,
+            "--task",
+            &task_id,
+        ])
+        .output()
+        .expect("run baton task status");
+    let final_json: serde_json::Value =
+        serde_json::from_slice(&final_status.stdout).expect("status is JSON");
+    assert_eq!(final_json["tasks"][0]["state"], "completed");
+
+    // Teardown reaps the task and stops `Run` cooperatively; wait it out.
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str])
+        .output()
+        .expect("run baton service teardown");
+    assert!(
+        teardown.status.success(),
+        "teardown should exit 0; stderr: {}",
+        String::from_utf8_lossy(&teardown.stderr)
+    );
+    let run_status = run_child.wait().expect("baton service run exits");
+    assert!(run_status.success(), "service run exits 0 on teardown");
+}
