@@ -3039,9 +3039,10 @@ fn service_start_resolves_relative_paths_from_submitting_client() {
     let sessions = status_json["sessions"].as_array().expect("sessions array");
     assert_eq!(sessions.len(), 1, "status reports the started session");
     assert_eq!(sessions[0]["live"], true, "the session reads as live");
+    let expected_inbox = inbox.canonicalize().expect("canonicalize inbox path");
     assert_eq!(
         sessions[0]["inbox"],
-        inbox.to_str().expect("inbox path is UTF-8")
+        expected_inbox.to_str().expect("inbox path is UTF-8")
     );
 
     let request = MessageEnvelope::new(
@@ -3694,9 +3695,12 @@ fn service_task_resolves_relative_paths_from_submitting_client() {
     );
 
     let stdout = std::fs::read_to_string(&stdout_path).expect("read task stdout");
+    let expected_client_work = client_work
+        .canonicalize()
+        .expect("canonicalize client work path");
     assert_eq!(
         stdout.trim(),
-        client_work.to_str().unwrap(),
+        expected_client_work.to_str().unwrap(),
         "task command runs from the client-relative cwd"
     );
     assert!(callback_inbox.is_dir(), "client callback mailbox exists");
@@ -3965,7 +3969,7 @@ fn service_tasks_reconcile_after_run_restart() {
     let mut restarted_run = Command::new(env!("CARGO_BIN_EXE_baton"));
     restarted_run.args(["service", "run", "--control", control_str]);
     restarted_run.stdout(Stdio::null());
-    restarted_run.stderr(Stdio::null());
+    restarted_run.stderr(Stdio::piped());
     let mut restarted_child = restarted_run.spawn().expect("spawn restarted service run");
 
     let mut restarted_live = false;
@@ -3981,10 +3985,17 @@ fn service_tasks_reconcile_after_run_restart() {
         }
         thread::sleep(Duration::from_millis(50));
     }
-    assert!(
-        restarted_live,
-        "restarted baton service run did not report live in time"
-    );
+    if !restarted_live {
+        let _ = restarted_child.kill();
+        let output = restarted_child
+            .wait_with_output()
+            .expect("collect restarted service stderr");
+        panic!(
+            "restarted baton service run did not report live in time; status={:?}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     let mut seen = Vec::new();
     let mut terminal_events = std::collections::HashMap::new();
