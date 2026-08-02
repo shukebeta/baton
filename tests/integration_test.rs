@@ -574,6 +574,10 @@ fn event_log_records_request_then_response_ok_to_file() {
     // The provider's token usage is recorded end-to-end.
     assert_eq!(response["input_tokens"], 9);
     assert_eq!(response["output_tokens"], 3);
+    assert!(
+        response.get("session_id").is_none() && response.get("turn_index").is_none(),
+        "ask outcomes remain sessionless: {response:?}"
+    );
 }
 
 #[test]
@@ -758,12 +762,16 @@ fn session_runs_multi_turn_and_records_a_pair_per_turn() {
     assert_eq!(lines[1]["session_id"], session_id);
     assert_eq!(lines[1]["turn_index"], 0);
     assert_eq!(lines[2]["event"], "response_ok");
+    assert_eq!(lines[2]["session_id"], session_id);
+    assert_eq!(lines[2]["turn_index"], 0);
 
     assert_eq!(lines[3]["event"], "request");
     assert_eq!(lines[3]["prompt"], "second turn");
     assert_eq!(lines[3]["session_id"], session_id);
     assert_eq!(lines[3]["turn_index"], 1);
     assert_eq!(lines[4]["event"], "response_ok");
+    assert_eq!(lines[4]["session_id"], session_id);
+    assert_eq!(lines[4]["turn_index"], 1);
 
     assert_eq!(lines[5]["event"], "session_end");
     assert_eq!(lines[5]["session_id"], session_id);

@@ -127,6 +127,14 @@ pub enum ExchangeEvent {
         /// Provider-reported output (completion) tokens; omitted when unknown.
         #[serde(skip_serializing_if = "Option::is_none")]
         output_tokens: Option<u64>,
+        /// Session this outcome belongs to, when emitted for a human↔agent
+        /// session turn. Omitted on the `ask` path and on A2A seat outcomes.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        /// Monotonic turn number matching the session request. Omitted when
+        /// `session_id` is omitted.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_index: Option<u64>,
     },
     /// Emitted by `baton send` when a request is delivered into a mailbox.
     ///
@@ -181,6 +189,14 @@ pub enum ExchangeEvent {
         kind: String,
         /// Human-readable error description.
         message: String,
+        /// Session this outcome belongs to, when emitted for a human↔agent
+        /// session turn. Omitted on the `ask` path and on A2A seat outcomes.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        /// Monotonic turn number matching the session request. Omitted when
+        /// `session_id` is omitted.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_index: Option<u64>,
     },
     /// Emitted once by `baton session` at the start of a run, before any turn.
     ///
@@ -348,6 +364,35 @@ impl ExchangeEvent {
 
     /// Builds the success outcome event, carrying any reported token usage.
     pub fn response_ok(ts_ms: u64, duration_ms: u64, reply: &str, usage: &TokenUsage) -> Self {
+        Self::response_ok_with_correlation(ts_ms, duration_ms, reply, usage, None)
+    }
+
+    /// Builds a success outcome for a human↔agent session turn, carrying the
+    /// same correlation pair as its request.
+    pub fn session_response_ok(
+        ts_ms: u64,
+        duration_ms: u64,
+        reply: &str,
+        usage: &TokenUsage,
+        session_id: &str,
+        turn_index: u64,
+    ) -> Self {
+        Self::response_ok_with_correlation(
+            ts_ms,
+            duration_ms,
+            reply,
+            usage,
+            Some((session_id, turn_index)),
+        )
+    }
+
+    fn response_ok_with_correlation(
+        ts_ms: u64,
+        duration_ms: u64,
+        reply: &str,
+        usage: &TokenUsage,
+        correlation: Option<(&str, u64)>,
+    ) -> Self {
         ExchangeEvent::ResponseOk {
             schema: SCHEMA,
             ts_ms,
@@ -355,6 +400,8 @@ impl ExchangeEvent {
             reply: reply.to_string(),
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
+            session_id: correlation.map(|(session_id, _)| session_id.to_string()),
+            turn_index: correlation.map(|(_, turn_index)| turn_index),
         }
     }
 
@@ -383,12 +430,40 @@ impl ExchangeEvent {
 
     /// Builds the failure outcome event from a [`BatonError`].
     pub fn response_error(ts_ms: u64, duration_ms: u64, err: &BatonError) -> Self {
+        Self::response_error_with_correlation(ts_ms, duration_ms, err, None)
+    }
+
+    /// Builds a failure outcome for a human↔agent session turn, carrying the
+    /// same correlation pair as its request.
+    pub fn session_response_error(
+        ts_ms: u64,
+        duration_ms: u64,
+        err: &BatonError,
+        session_id: &str,
+        turn_index: u64,
+    ) -> Self {
+        Self::response_error_with_correlation(
+            ts_ms,
+            duration_ms,
+            err,
+            Some((session_id, turn_index)),
+        )
+    }
+
+    fn response_error_with_correlation(
+        ts_ms: u64,
+        duration_ms: u64,
+        err: &BatonError,
+        correlation: Option<(&str, u64)>,
+    ) -> Self {
         ExchangeEvent::ResponseError {
             schema: SCHEMA,
             ts_ms,
             duration_ms,
             kind: err.kind().to_string(),
             message: err.to_string(),
+            session_id: correlation.map(|(session_id, _)| session_id.to_string()),
+            turn_index: correlation.map(|(_, turn_index)| turn_index),
         }
     }
 
@@ -414,6 +489,8 @@ impl ExchangeEvent {
                 reply: reply.clone(),
                 input_tokens: *input_tokens,
                 output_tokens: *output_tokens,
+                session_id: None,
+                turn_index: None,
             },
             crate::log::Outcome::Error {
                 ts_ms,
@@ -426,6 +503,8 @@ impl ExchangeEvent {
                 duration_ms: *duration_ms,
                 kind: kind.clone(),
                 message: message.clone(),
+                session_id: None,
+                turn_index: None,
             },
         }
     }
@@ -541,6 +620,22 @@ mod tests {
     }
 
     #[test]
+    fn session_response_ok_event_serializes_with_correlation() {
+        let event = ExchangeEvent::session_response_ok(
+            1_700_000_000_001,
+            42,
+            "hi",
+            &TokenUsage::default(),
+            "sess-A",
+            3,
+        );
+        let value: Value = serde_json::to_value(&event).expect("serializes");
+        assert_eq!(value["event"], "response_ok");
+        assert_eq!(value["session_id"], "sess-A");
+        assert_eq!(value["turn_index"], 3);
+    }
+
+    #[test]
     fn response_error_event_carries_machine_kind_and_message() {
         let err = BatonError::Auth("invalid x-api-key".to_string());
         let event = ExchangeEvent::response_error(1_700_000_000_002, 7, &err);
@@ -549,6 +644,16 @@ mod tests {
         assert_eq!(value["kind"], "auth");
         assert_eq!(value["duration_ms"], 7);
         assert_eq!(value["message"], err.to_string());
+    }
+
+    #[test]
+    fn session_response_error_event_serializes_with_correlation() {
+        let err = BatonError::Auth("invalid x-api-key".to_string());
+        let event = ExchangeEvent::session_response_error(1_700_000_000_002, 7, &err, "sess-B", 4);
+        let value: Value = serde_json::to_value(&event).expect("serializes");
+        assert_eq!(value["event"], "response_error");
+        assert_eq!(value["session_id"], "sess-B");
+        assert_eq!(value["turn_index"], 4);
     }
 
     #[test]
