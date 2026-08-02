@@ -1401,6 +1401,46 @@ impl Drop for TempMailbox {
 }
 
 #[test]
+fn roleless_external_agent_serve_does_not_require_home() {
+    let root = TempMailbox::new("no-role-home");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_baton"));
+    serve.args([
+        "serve",
+        "--inbox",
+        inbox.to_str().unwrap(),
+        "--outbox",
+        outbox.to_str().unwrap(),
+        "--once",
+        "--agent-cmd",
+        "baton-test-agent-stub",
+    ]);
+    // This is the regression boundary: a role-less external agent does not
+    // need any Baton home or provider environment, even on an empty mailbox.
+    serve.env_clear();
+
+    let out = serve.output().expect("run role-less external-agent serve");
+    assert!(
+        out.status.success(),
+        "serve should succeed without a home; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for directory in [
+        inbox.join("pending"),
+        inbox.join("claimed"),
+        inbox.join("done"),
+    ] {
+        assert!(
+            directory.is_dir(),
+            "serve should create mailbox directory {}",
+            directory.display()
+        );
+    }
+}
+
+#[test]
 fn converse_b_mailbox_drives_multi_turn_against_live_serve() {
     let server = MockServer::spawn_repeating(200, SUCCESS_BODY);
     let root = TempMailbox::new("async");
