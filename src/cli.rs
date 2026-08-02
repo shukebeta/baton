@@ -513,13 +513,16 @@ pub fn run() -> Result<()> {
             // A `--role` resolves the role's home once; its values fill any
             // identity the operator did not pass explicitly (flag over role), and
             // the same home records the per-role seat session (#82). Without
-            // `--role` the identity is absent and the path is unchanged.
-            let roles_home = RolesHome::from_env()?;
-            let identity = match &role {
+            // `--role` neither the identity nor the home is resolved, keeping
+            // role-less external-agent mode free of Baton home prerequisites.
+            let (roles_home, identity) = match &role {
                 Some(name) => {
-                    Some(roles_home.resolve_identity(name, |key| std::env::var(key).ok())?)
+                    let roles_home = RolesHome::from_env()?;
+                    let identity =
+                        roles_home.resolve_identity(name, |key| std::env::var(key).ok())?;
+                    (Some(roles_home), Some(identity))
                 }
-                None => None,
+                None => (None, None),
             };
             let role_value = |key: &str| {
                 identity
@@ -582,12 +585,12 @@ pub fn run() -> Result<()> {
             // With a `--role`, record each answered exchange as a per-role seat
             // session (#82). No role ⇒ no recorder, and the drain path is
             // byte-identical to before.
-            let recorder = match (&role, &identity) {
-                (Some(name), Some(id)) => Some(RoleSessionRecorder {
+            let recorder = match (&role, &identity, roles_home) {
+                (Some(name), Some(id), Some(home)) => Some(RoleSessionRecorder {
                     role: name.clone(),
                     identity: id.to_fields(),
                     meta: meta.clone(),
-                    home: roles_home,
+                    home,
                 }),
                 _ => None,
             };

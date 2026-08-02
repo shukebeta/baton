@@ -878,10 +878,13 @@ invocation this same way, driving baton purely as a transport.
 
 In this mode `serve` loads **no `BatonConfig` and needs no API key** — the agent
 carries its own credentials and MCP config, layered through the inherited
-environment or the `--agent-arg` passthrough above. Cross-message state is the agent's own
-job: it reconstructs context across rounds from **durable artifacts** (the git
-branch/worktree it shares run-to-run, the issue thread, prior mailbox history),
-not an in-memory session — headless-per-message is the model. An agent run that
+environment or the `--agent-arg` passthrough above. A role-less external-agent
+serve also has no Baton role-home prerequisite; `--role` is only needed when
+loading per-role identity or recording per-role sessions. Cross-message state is
+the agent's own job: it reconstructs context across rounds from **durable
+artifacts** (the git branch/worktree it shares run-to-run, the issue thread,
+prior mailbox history), not an in-memory session — headless-per-message is the
+model. An agent run that
 exits 0 with a non-empty extracted result is wrapped into a `kind: "response"`
 (it nests no `baton.exchange/v1` record, since a multi-tool run is not one
 provider call baton can vouch for); a spawn failure, non-zero exit, empty output,
