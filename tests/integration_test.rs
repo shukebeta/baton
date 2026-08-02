@@ -2347,6 +2347,7 @@ fn service_task_start_discards_unadmitted_request_after_run_loss() {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&admission_lock_path)
         .expect("open service admission lock");
     admission_lock.lock().expect("hold service admission lock");
@@ -2457,6 +2458,7 @@ fn service_task_start_discards_unadmitted_request_after_run_loss() {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&admission_lock_path)
         .expect("reopen service admission lock");
     admission_lock
