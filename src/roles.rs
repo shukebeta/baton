@@ -1,12 +1,13 @@
 //! Per-role home directories and layered identity resolution.
 //!
-//! A multi-party party has a distinct identity — system prompt, model,
-//! credential, working directory, MCP config. This module makes that identity a
-//! **per-role home directory** under a baton home root: `roles/<name>/` owns a
-//! role's `config.json`, its optional `system.md`, MCP config, and (per #82) its
-//! session history — analogous to `~/.claude` with one subdirectory per role. A
-//! top-level `defaults.json` is inherited by every role, so common settings are
-//! written once.
+//! Each party in a multi-party conversation has a distinct role-owned identity —
+//! system prompt, model, credential, and working directory. This module makes
+//! that identity a **per-role home directory** under a baton home root:
+//! `roles/<name>/` owns a role's `config.json`, its optional `system.md`, and
+//! (per #82) its session history — analogous to `~/.claude` with one
+//! subdirectory per role. External-agent MCP configuration belongs to the
+//! caller's agent command, not the role home. A top-level `defaults.json` is
+//! inherited by every role, so common settings are written once.
 //!
 //! Resolution is layered `env > role config > defaults`, exposed via
 //! [`Identity::as_lookup`] as the exact `Fn(&str) -> Option<String>` the

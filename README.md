@@ -165,8 +165,10 @@ configuration error that fails before any network call.
 
 ### Role homes (`roles/<name>/`)
 
-A multi-party conversation's parties have **distinct identities** — each needs
-its own system prompt, model, credential, working directory, and MCP config.
+A multi-party conversation's parties have **distinct identities** — each can have
+its own system prompt, model, credential, and working directory. External-agent
+MCP configuration belongs to the caller's `--agent-cmd` wrapper or
+`--agent-arg` passthrough, not the role home.
 Rather than hand-assemble those env vars per process *and* a routing entry, Baton
 makes a role's identity a **per-role home directory** under the baton home root
 (`BATON_HOME`, else `$HOME/.baton`), analogous to `~/.claude` with one
@@ -215,6 +217,11 @@ then the built-in default:
 | `cwd`           | `serve --agent-cwd`         | External-agent working directory; relative resolves against the role dir. |
 | `timeout_secs`  | `BATON_TIMEOUT_SECS`        |                                                                      |
 | `max_tokens`    | `BATON_MAX_TOKENS`          |                                                                      |
+
+`mcp_config` is not a supported `RoleConfig` field after #115. Existing role
+configurations that set it must move those agent MCP settings to the caller's
+`--agent-cmd` wrapper or `--agent-arg` passthrough; see [System prompt and MCP:
+the caller's job](#system-prompt-and-mcp-the-callers-job).
 
 **`defaults.json`** uses the same schema; its relative paths resolve against the
 home root. Every role inherits it, so common settings are written once.
@@ -729,12 +736,14 @@ name cannot escape the mailbox root via path components.
 | `participants.<name>.outbox` | The peer `serve`'s `--outbox`; replies are claimed keyed by request id. |
 
 The registry answers only *where* a name's messages go, never *who* that name
-is. A party's **identity** — system prompt, model, credential, cwd, MCP config —
-lives in its [role home](#role-homes-roles-name) (`roles/<name>/`), and each ring
-member is its own `baton serve --role <name>` daemon that loads it. So the two
-surfaces stay cleanly split: the registry is pure routing, the role home is pure
-identity, and standing up a party is "add a `roles/<name>/` directory + a
-registry entry", not hand-assembling per-process env.
+is. A party's **role-owned identity** — system prompt, model, credential, and
+cwd — lives in its [role home](#role-homes-roles-name) (`roles/<name>/`), and
+each ring member is its own `baton serve --role <name>` daemon that loads it.
+External-agent MCP configuration remains caller-owned and must be supplied
+through the `--agent-cmd` wrapper or `--agent-arg` passthrough. So the two
+surfaces stay cleanly split: the registry is pure routing, the role home stores
+Baton-supported identity, and standing up a party is "add a `roles/<name>/`
+directory + a registry entry", not hand-assembling per-process env.
 
 ### Worked example — three peers
 
