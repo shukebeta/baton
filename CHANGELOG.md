@@ -27,6 +27,8 @@ section under a version heading when a tag is cut.
 
 - Documented the recorded decision that provider configuration stays
   inlined-by-reference (#87).
+- Defined mechanical feature-count release versioning and the v0.1.0
+  no-retagging boundary (#122).
 
 ## [0.1.0] - 2026-07-18
 

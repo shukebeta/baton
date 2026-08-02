@@ -65,6 +65,9 @@ Consumers stay frozen by pinning a tag, and upgrade by re-pinning a newer tag
 deliberately. Pinning is the churn-control mechanism. [`CHANGELOG.md`](CHANGELOG.md)
 is the curated record of what each tag bump includes — read it before re-pinning.
 
+The automated release calculation and its no-retagging baseline are documented
+in [docs/versioning.md](docs/versioning.md).
+
 **Stability is an explicit non-goal at 0.1.0.** Neither the Rust library API nor
 the CLI flag surface is promised stable; the CLI is only the *intended*
 integration surface, and pinning a tag is how a consumer insulates itself from
@@ -1100,6 +1103,9 @@ The field is optional and back-compatible: existing registries without it parse
 unchanged and fall back to the `status` default.
 
 ## Development
+
+Release/versioning policy and the release helper test command are documented in
+[docs/versioning.md](docs/versioning.md).
 
 CI runs the following gates; run them locally before opening a PR:
 

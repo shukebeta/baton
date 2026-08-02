@@ -1,0 +1,45 @@
+name: release
+
+on:
+  push:
+    branches: [main, master]
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch tags
+        run: git fetch --force --tags origin
+
+      - name: Configure release identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Calculate and apply release version
+        id: release
+        shell: bash
+        run: |
+          tag="$(bash scripts/release.sh create-tag)"
+          version="${tag#v}"
+          manifest_version="$(bash scripts/release.sh manifest-version)"
+          lockfile_version="$(bash scripts/release.sh lockfile-version)"
+          test "${manifest_version}" = "${version}"
+          test "${lockfile_version}" = "${version}"
+          cargo metadata --locked --no-deps --format-version 1 >/dev/null
+          printf 'tag=%s\n' "${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Push release commit and tag
+        run: git push origin "HEAD:${GITHUB_REF_NAME}" "refs/tags/${{ steps.release.outputs.tag }}"
