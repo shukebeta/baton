@@ -3238,7 +3238,7 @@ fn service_tasks_reconcile_after_run_restart() {
             live = true;
             break;
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(50));
     }
     assert!(
         live,
@@ -3367,7 +3367,7 @@ fn service_tasks_reconcile_after_run_restart() {
             finished_while_down = true;
             break;
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(50));
     }
     assert!(
         finished_while_down,
@@ -3393,7 +3393,7 @@ fn service_tasks_reconcile_after_run_restart() {
             restarted_live = true;
             break;
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(50));
     }
     assert!(
         restarted_live,

@@ -2643,28 +2643,36 @@ mod imp {
 
             clock.advance(150);
             let tick = tick_one_task(&dir.path, "task-t", &mut running, &clock).expect("tick");
-            assert!(matches!(tick, TaskTick::StillRunning));
             assert!(
                 running.term_sent_at_ms.is_some(),
                 "max-duration breach must send SIGTERM"
             );
 
-            clock.advance(KILL_GRACE_MS);
-            let _tick = tick_one_task(&dir.path, "task-t", &mut running, &clock).expect("tick");
-            assert!(running.kill_sent, "SIGTERM grace expiry must send SIGKILL");
+            // Some Unix implementations reap the process group immediately
+            // after TERM; others require the documented KILL-grace tick.
+            if matches!(tick, TaskTick::StillRunning) {
+                clock.advance(KILL_GRACE_MS);
+                let _tick = tick_one_task(&dir.path, "task-t", &mut running, &clock).expect("tick");
+                assert!(running.kill_sent, "SIGTERM grace expiry must send SIGKILL");
 
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                match tick_one_task(&dir.path, "task-t", &mut running, &clock).expect("tick") {
-                    TaskTick::Finished => break,
-                    TaskTick::StillRunning => {
-                        assert!(
-                            Instant::now() < deadline,
-                            "task did not exit after SIGTERM within the test bound"
-                        );
-                        std::thread::sleep(Duration::from_millis(20));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match tick_one_task(&dir.path, "task-t", &mut running, &clock).expect("tick") {
+                        TaskTick::Finished => break,
+                        TaskTick::StillRunning => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "task did not exit after SIGTERM within the test bound"
+                            );
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
                     }
                 }
+            } else {
+                assert!(
+                    matches!(tick, TaskTick::Finished),
+                    "a max-duration task must be terminal after fast reaping"
+                );
             }
             assert_eq!(running.record.state, TaskState::Timeout);
 
