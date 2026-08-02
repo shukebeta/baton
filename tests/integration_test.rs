@@ -17,6 +17,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use baton::config::{BatonConfig, Credential, DEFAULT_MAX_TOKENS};
 use baton::error::BatonError;
 use baton::model::Prompt;
@@ -1446,6 +1449,136 @@ fn roleless_external_agent_serve_does_not_require_home() {
             directory.display()
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn external_agent_serve_forwards_raw_args_and_mailbox_body() {
+    let root = TempMailbox::new("external-agent-args");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+    let stub = root.path.join("agent-stub");
+    let captured_args = root.path.join("agent-args.txt");
+    let captured_stdin = root.path.join("agent-stdin.txt");
+
+    // The stub is the actual `--agent-cmd` executable. Its positional arguments
+    // are recorded before it returns a deterministic free-text response.
+    std::fs::write(
+        &stub,
+        r#"#!/bin/sh
+set -eu
+cat > "$BATON_TEST_STDIN"
+printf '%s\n' "$@" > "$BATON_TEST_ARGS"
+printf 'stub response'
+"#,
+    )
+    .expect("write external-agent stub");
+    let mut permissions = std::fs::metadata(&stub)
+        .expect("stat external-agent stub")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&stub, permissions).expect("make external-agent stub executable");
+
+    let expected_args = [
+        "--append-system-prompt",
+        "caller-owned identity",
+        "--dangerously-skip-permissions",
+        "--mcp-config=/tmp/caller-mcp.json",
+    ];
+    let request_body = "request reaches the external agent";
+
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_baton"));
+    serve.args([
+        "serve",
+        "--inbox",
+        inbox.to_str().unwrap(),
+        "--outbox",
+        outbox.to_str().unwrap(),
+        "--poll-ms",
+        "10",
+        "--agent-cmd",
+        stub.to_str().unwrap(),
+        "--agent-arg",
+        expected_args[0],
+        "--agent-arg",
+        expected_args[1],
+        "--agent-arg",
+        expected_args[2],
+        "--agent-arg",
+        expected_args[3],
+    ]);
+    // External-agent mode must not depend on Baton provider configuration or a
+    // host event-log setting; only the stub's capture paths are inherited.
+    serve
+        .env_clear()
+        .env("BATON_TEST_ARGS", &captured_args)
+        .env("BATON_TEST_STDIN", &captured_stdin)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let serve_child = serve.spawn().expect("spawn external-agent serve");
+
+    let mut send = Command::new(env!("CARGO_BIN_EXE_baton"));
+    send.args([
+        "send",
+        "--inbox",
+        inbox.to_str().unwrap(),
+        "--outbox",
+        outbox.to_str().unwrap(),
+        "--await",
+        "--timeout-ms",
+        "10000",
+        "--to",
+        "worker",
+        "--body",
+        request_body,
+    ]);
+    send.env_clear()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let send_output = send.output().expect("send mailbox request");
+
+    // Stop and reap the daemon before reading captures or asserting, so a
+    // failed assertion cannot leave a live serve process behind.
+    let stop = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["serve", "--stop", "--inbox", inbox.to_str().unwrap()])
+        .env_clear()
+        .output()
+        .expect("stop external-agent serve");
+    let serve_output = serve_child
+        .wait_with_output()
+        .expect("reap external-agent serve");
+
+    assert!(
+        stop.status.success(),
+        "serve stop should succeed; stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(
+        serve_output.status.success(),
+        "serve should exit 0; stderr: {}",
+        String::from_utf8_lossy(&serve_output.stderr)
+    );
+    assert!(
+        send_output.status.success(),
+        "send should receive a response; stderr: {}",
+        String::from_utf8_lossy(&send_output.stderr)
+    );
+
+    let args = std::fs::read_to_string(&captured_args).expect("read captured agent args");
+    assert_eq!(args, format!("{}\n", expected_args.join("\n")));
+    assert_eq!(
+        std::fs::read_to_string(&captured_stdin).expect("read captured agent stdin"),
+        request_body
+    );
+
+    let response: serde_json::Value =
+        serde_json::from_slice(&send_output.stdout).expect("awaited response is JSON");
+    assert_eq!(response["kind"], "response");
+    assert_eq!(response["body"], "stub response");
+    assert!(
+        response["in_reply_to"].is_string(),
+        "mailbox response correlates to the request"
+    );
 }
 
 #[test]
