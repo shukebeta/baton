@@ -44,6 +44,9 @@ without ever sharing a process tree with it.
 - `service.lock` — the exclusive single-instance advisory lock, held by
   `service run` for as long as it runs (mirrors `serve`'s own `serve.lock`).
   A second `service run` against the same `--control` dir is refused.
+- `service.admission.lock` — a short-lived advisory lock shared by task
+  admission and session cleanup. It is separate from `service.lock`, which
+  the long-lived `service run` holds for its entire lifetime.
 - `service.stop` — the cooperative-stop sentinel `service teardown` drops for
   a live `service run` to observe between polls (mirrors `serve.stop`).
 - `requests/` / `processing/` / `responses/` — the atomic-rename request
@@ -96,15 +99,20 @@ baton service teardown --control <dir>
 - **`service stop --session <id>`** tries `serve`'s own cooperative stop
   against the session's inbox first, then escalates to a bounded
   `SIGTERM`/`SIGKILL` on the session's process group if it is still alive.
-  Idempotent — stopping an already-gone session is a no-op success.
+  It serializes that cleanup with task admission, so a task is either
+  admitted before the stop and reaped with the session or rejected after the
+  session is no longer a live owner. Idempotent — stopping an already-gone
+  session is a no-op success.
 - **`service teardown`** first requests `run`'s cooperative stop, then waits
   for `run` to release the control lock before taking its session snapshot and
   applying `stop` to every record. The released lock is the admission barrier:
   a concurrent `service start` either was handled before the barrier and is in
   the snapshot, or fails because no live service remains (an already-written
   request may remain unprocessed); it cannot spawn a session outside the
-  snapshot. Idempotent, and safe to call whether or not `run` is currently
-  alive (e.g. to reap stale records left by a `run` that already crashed).
+  snapshot. Teardown also takes the short-lived admission lock while it
+  drains the snapshot, covering task cleanup as well. Idempotent, and safe to
+  call whether or not `run` is currently alive (e.g. to reap stale records
+  left by a `run` that already crashed).
 
 Standalone `baton serve` (run directly, without `baton service`) is
 unaffected by any of this — `service` only ever spawns the same `serve`
@@ -131,7 +139,11 @@ baton task cancel --control <dir> --task <id>
 - **`task start`** submits a `TaskSpec` (schema `baton.task-spec/v1`) and
   returns a stable task id as soon as `run` has spawned the command and
   persisted its record — like `service start`, it never waits on the command
-  to finish, and fails fast if no `service run` is live on `--control`.
+  to finish, and fails fast if no `service run` is live on `--control`. The
+  `--session` value must name a managed session whose durable record exists
+  and whose recorded process is currently live. A missing record or a stale
+  record whose process is no longer live is rejected with a non-zero owner
+  error before any task process, log directory, or `TaskRecord` is created.
 - **`--session <id>` is the ownership tag, not a routing target.** A task is
   owned and reaped by whichever `baton service` session names it here,
   independent of where its events are delivered — see "Ownership vs. callback"
@@ -185,7 +197,9 @@ names, never to its callback target. `service stop --session <id>` and
 `service teardown` reap every task owned by that session — killing its
 process group and removing its record — even if that task's
 `--callback-inbox` points somewhere entirely outside the owning session's own
-mailbox. The callback is a delivery target only.
+mailbox. Task admission and those cleanup paths share the short-lived
+`service.admission.lock`, so cleanup cannot leave a task admitted after its
+owner record has been removed. The callback is a delivery target only.
 
 ### Injectable clock
 
