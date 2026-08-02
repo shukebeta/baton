@@ -21,6 +21,11 @@
 //! - `service.admission.lock` — a short-lived advisory lock shared by task
 //!   admission and session cleanup. It is separate from `service.lock`,
 //!   which the long-lived `Run` process holds for its entire lifetime.
+//! - `service.probe.lock` — a short-lived advisory lock serializing
+//!   `service.lock`'s acquisition against the liveness probes behind
+//!   `Status`/`Stop`/`Teardown`/`Start`. A probe answers "not running" by
+//!   *taking* `service.lock`, so without this a probe landing on a starting
+//!   `Run` would refuse it as a duplicate instance.
 //! - `service.stop` — the cooperative-stop sentinel `Teardown` drops for a live
 //!   `Run` to observe between polls. Mirrors `serve.stop`.
 //! - `requests/` / `processing/` / `responses/` — the atomic-rename request
@@ -218,6 +223,18 @@ mod imp {
     /// Separate from [`CONTROL_LOCK_FILE`], which `Run` holds for its whole
     /// lifetime and therefore cannot be used by `service stop`.
     const ADMISSION_LOCK_FILE: &str = "service.admission.lock";
+    /// Serializes taking the control lock against probing it.
+    ///
+    /// A probe can only answer "is a `Run` live?" by *trying to take*
+    /// [`CONTROL_LOCK_FILE`] — so while it holds that lock it is
+    /// indistinguishable from a live supervisor. Without this guard, a
+    /// client polling `service status` during a supervisor's startup makes
+    /// [`acquire_control_lock`]'s single non-blocking attempt fail with a
+    /// spurious "another baton service already holds the control lock", and
+    /// the supervisor exits. Held only across the control lock's
+    /// open-and-try — never while a session or task is spawned — so blocking
+    /// on it is bounded by a handful of syscalls.
+    const CONTROL_PROBE_LOCK_FILE: &str = "service.probe.lock";
     /// Name of the cooperative-stop sentinel at the control root, mirroring
     /// [`mailbox`]'s `serve.stop`.
     const CONTROL_STOP_FILE: &str = "service.stop";
@@ -413,9 +430,35 @@ mod imp {
         children.retain(|_, child| !matches!(child.try_wait(), Ok(Some(_)) | Err(_)));
     }
 
+    /// Blocks until this process may touch `control`'s control lock, so an
+    /// acquisition and a liveness probe never overlap. See
+    /// [`CONTROL_PROBE_LOCK_FILE`].
+    ///
+    /// Always taken *before* the control lock and released as soon as that
+    /// attempt is done, so it can never participate in a cycle with the
+    /// control or admission locks.
+    fn acquire_control_probe_guard(control: &Path) -> Result<File> {
+        let lock_path = control.join(CONTROL_PROBE_LOCK_FILE);
+        let lock = service_lock_options().open(&lock_path).map_err(|err| {
+            BatonError::Io(format!(
+                "could not open service probe guard {lock_path:?}: {err}"
+            ))
+        })?;
+        lock.lock().map_err(|err| {
+            BatonError::Io(format!(
+                "could not lock service probe guard {control:?}: {err}"
+            ))
+        })?;
+        Ok(lock)
+    }
+
     /// Takes the exclusive control-plane lock, refusing a second live `Run`
     /// on the same `control`.
+    ///
+    /// A `WouldBlock` here means a *supervisor* holds the lock, never a
+    /// passing probe: [`acquire_control_probe_guard`] keeps the two apart.
     fn acquire_control_lock(control: &Path) -> Result<File> {
+        let _guard = acquire_control_probe_guard(control)?;
         let lock_path = control.join(CONTROL_LOCK_FILE);
         let lock = service_lock_options().open(&lock_path).map_err(|err| {
             BatonError::Io(format!("could not open service lock {lock_path:?}: {err}"))
@@ -467,9 +510,16 @@ mod imp {
         }
     }
 
-    /// Probes whether a live `Run` holds `control`'s lock, without side
-    /// effects (`signal = false`) or, when `signal`, dropping the stop
-    /// sentinel for it to observe. Mirrors [`mailbox::request_stop`].
+    /// Probes whether a live `Run` holds `control`'s lock, leaving the
+    /// control plane untouched (`signal = false`) or, when `signal`,
+    /// dropping the stop sentinel for it to observe. Mirrors
+    /// [`mailbox::request_stop`].
+    ///
+    /// The probe is a read only in its *result*: answering "not running"
+    /// requires actually taking the exclusive lock. That hold is invisible
+    /// to callers but not to a supervisor starting at the same instant, so
+    /// the whole attempt runs under
+    /// [`acquire_control_probe_guard`] — see [`CONTROL_PROBE_LOCK_FILE`].
     fn probe_or_signal_control(control: &Path, signal: bool) -> Result<ControlLiveness> {
         let lock_path = control.join(CONTROL_LOCK_FILE);
         let lock = match service_lock_options().open(&lock_path) {
@@ -483,7 +533,12 @@ mod imp {
                 )));
             }
         };
-        match lock.try_lock() {
+        let _guard = acquire_control_probe_guard(control)?;
+        let outcome = lock.try_lock();
+        // Release the probe's own hold *before* the guard is dropped at the
+        // end of this function, so no acquirer can ever observe it.
+        drop(lock);
+        match outcome {
             Ok(()) => Ok(ControlLiveness::NotRunning),
             Err(TryLockError::WouldBlock) => {
                 if signal {
@@ -2370,6 +2425,62 @@ mod imp {
             assert!(
                 !dir.path.join(CONTROL_STOP_FILE).exists(),
                 "a read-only probe never drops the stop sentinel"
+            );
+        }
+
+        /// A concurrent liveness probe must never defeat a starting
+        /// supervisor.
+        ///
+        /// `probe_or_signal_control` decides "not running" by *taking* the
+        /// exclusive control lock, so its hold — however brief — is
+        /// indistinguishable from a live `Run` to
+        /// [`acquire_control_lock`]'s single non-blocking attempt. Every
+        /// client that polls `service status` while a supervisor starts
+        /// (exactly what the restart integration test does) can therefore
+        /// kill it with a spurious "another baton service already holds the
+        /// control lock". The two must be serialized against each other.
+        #[test]
+        fn probe_never_defeats_a_concurrent_control_lock_acquisition() {
+            use std::sync::Arc;
+            use std::sync::atomic::AtomicBool;
+
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("probe-vs-acquire");
+            // Create the lock file up front so the probers spend their time
+            // contending for it rather than creating it.
+            drop(acquire_control_lock(&dir.path).expect("seed the lock file"));
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let probers: Vec<_> = (0..2)
+                .map(|_| {
+                    let path = dir.path.clone();
+                    let stop = Arc::clone(&stop);
+                    std::thread::spawn(move || {
+                        while !stop.load(Ordering::Relaxed) {
+                            probe_control(&path).expect("probe");
+                        }
+                    })
+                })
+                .collect();
+
+            let mut lost = None;
+            for attempt in 0..500 {
+                match acquire_control_lock(&dir.path) {
+                    Ok(lock) => drop(lock),
+                    Err(err) => {
+                        lost = Some((attempt, err));
+                        break;
+                    }
+                }
+            }
+
+            stop.store(true, Ordering::Relaxed);
+            for prober in probers {
+                prober.join().expect("prober thread");
+            }
+            assert!(
+                lost.is_none(),
+                "a concurrent probe defeated the control-lock acquisition: {lost:?}"
             );
         }
 

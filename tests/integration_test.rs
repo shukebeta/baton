@@ -3746,7 +3746,9 @@ fn service_tasks_reconcile_after_run_restart() {
     let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
     run.args(["service", "run", "--control", control_str]);
     run.stdout(Stdio::null());
-    run.stderr(Stdio::null());
+    // Captured, like the restart below: a supervisor that exits during
+    // startup otherwise shows up only as an opaque liveness timeout.
+    run.stderr(Stdio::piped());
     let mut run_child = run.spawn().expect("spawn initial baton service run");
 
     let mut live = false;
@@ -3762,10 +3764,17 @@ fn service_tasks_reconcile_after_run_restart() {
         }
         thread::sleep(Duration::from_millis(50));
     }
-    assert!(
-        live,
-        "initial baton service run did not report live in time"
-    );
+    if !live {
+        let _ = run_child.kill();
+        let output = run_child
+            .wait_with_output()
+            .expect("collect initial service stderr");
+        panic!(
+            "initial baton service run did not report live in time; status={:?}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     let session_start = Command::new(env!("CARGO_BIN_EXE_baton"))
         .args([
@@ -3829,6 +3838,12 @@ fn service_tasks_reconcile_after_run_restart() {
         .to_string();
     assert!(!live_task_id.is_empty(), "live task start prints a task id");
 
+    // This task must outlive the supervisor and exit only once it is gone —
+    // that ordering *is* the case under test, so it waits on a sentinel the
+    // test drops after the kill rather than on a wall-clock sleep the
+    // supervisor could outlast on a loaded machine (it would then reap the
+    // task itself, and the case would never be exercised).
+    let finished_release = root.path.join("finished-release");
     let finished_task_start = Command::new(env!("CARGO_BIN_EXE_baton"))
         .args([
             "task",
@@ -3838,11 +3853,16 @@ fn service_tasks_reconcile_after_run_restart() {
             "--session",
             &session_id,
             "--command",
-            "sleep",
+            "sh",
             "--arg",
-            "0.5",
+            "-c",
+            "--arg",
+            &format!(
+                "while [ ! -e '{}' ]; do sleep 0.05; done",
+                finished_release.display()
+            ),
             "--max-duration-ms",
-            "10000",
+            "60000",
             "--callback-inbox",
             callback_inbox.to_str().unwrap(),
         ])
@@ -3938,7 +3958,12 @@ fn service_tasks_reconcile_after_run_restart() {
         "the initial service run was interrupted"
     );
 
+    // The supervisor is now provably gone, so releasing the task here is what
+    // makes "finished while the service was down" a fact rather than a race.
+    std::fs::write(&finished_release, b"").expect("release the finished task");
+
     let mut finished_while_down = false;
+    let mut last_finished_status = serde_json::Value::Null;
     for _ in 0..200 {
         let status = Command::new(env!("CARGO_BIN_EXE_baton"))
             .args([
@@ -3957,11 +3982,13 @@ fn service_tasks_reconcile_after_run_restart() {
             finished_while_down = true;
             break;
         }
+        last_finished_status = json;
         thread::sleep(Duration::from_millis(50));
     }
     assert!(
         finished_while_down,
-        "the finished task remains durable and running until restart reconciliation"
+        "the finished task remains durable and running until restart reconciliation; \
+         last status: {last_finished_status}"
     );
 
     let callback_mailbox = mailbox::Mailbox::open(&callback_inbox).expect("open callback mailbox");
