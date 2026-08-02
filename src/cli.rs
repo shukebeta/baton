@@ -2756,12 +2756,8 @@ fn parse_task<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command>
 /// Parses one `--env KEY=VALUE` pair, splitting on the first `=`.
 fn parse_env_pair(raw: &str) -> Result<(String, String)> {
     match raw.split_once('=') {
-        Some((key, value)) if !key.trim().is_empty() => {
-            Ok((key.to_string(), value.to_string()))
-        }
-        _ => Err(usage(&format!(
-            "--env must be KEY=VALUE, got {raw:?}"
-        ))),
+        Some((key, value)) if !key.trim().is_empty() => Ok((key.to_string(), value.to_string())),
+        _ => Err(usage(&format!("--env must be KEY=VALUE, got {raw:?}"))),
     }
 }
 
@@ -2812,9 +2808,10 @@ fn parse_task_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Co
             other if other.starts_with("--env=") => {
                 env.push(parse_env_pair(&other["--env=".len()..])?);
             }
-            "--milestone-ms" => {
-                milestones_ms.push(parse_positive_ms(&take("--milestone-ms")?, "--milestone-ms")?)
-            }
+            "--milestone-ms" => milestones_ms.push(parse_positive_ms(
+                &take("--milestone-ms")?,
+                "--milestone-ms",
+            )?),
             other if other.starts_with("--milestone-ms=") => {
                 milestones_ms.push(parse_positive_ms(
                     &other["--milestone-ms=".len()..],
@@ -2849,8 +2846,8 @@ fn parse_task_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Co
     let session = require_value(session, "--session")?;
     let command = require_value(command, "--command")?;
     let callback_inbox = require_dir(callback_inbox, "--callback-inbox")?;
-    let max_duration_ms = max_duration_ms
-        .ok_or_else(|| usage("--max-duration-ms <n> is required"))?;
+    let max_duration_ms =
+        max_duration_ms.ok_or_else(|| usage("--max-duration-ms <n> is required"))?;
     let spec = TaskSpec {
         schema: task::TASK_SPEC_SCHEMA.to_string(),
         session,
@@ -5629,7 +5626,12 @@ mod tests {
         );
         assert_eq!(
             parse_args(&argv(&[
-                "task", "status", "--control", "/tmp/ctl", "--task", "task-1"
+                "task",
+                "status",
+                "--control",
+                "/tmp/ctl",
+                "--task",
+                "task-1"
             ]))
             .expect("parses"),
             Command::Task(task::TaskCommand::Status {
@@ -5655,7 +5657,12 @@ mod tests {
     fn parse_task_cancel_parses() {
         assert_eq!(
             parse_args(&argv(&[
-                "task", "cancel", "--control", "/tmp/ctl", "--task", "task-1"
+                "task",
+                "cancel",
+                "--control",
+                "/tmp/ctl",
+                "--task",
+                "task-1"
             ]))
             .expect("parses"),
             Command::Task(task::TaskCommand::Cancel {

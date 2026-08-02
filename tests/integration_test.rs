@@ -2115,7 +2115,10 @@ fn service_task_survives_submitting_client_and_is_owned_by_run() {
             "--arg",
             "-c",
             "--arg",
-            "echo hello",
+            // Stays alive briefly so the structural PPid check below has a
+            // reliable window before the process exits and is reaped —
+            // `echo hello` alone completes fast enough to race that check.
+            "sleep 0.3; echo hello",
             "--milestone-ms",
             "1",
             "--max-duration-ms",
@@ -2166,15 +2169,22 @@ fn service_task_survives_submitting_client_and_is_owned_by_run() {
     // mailbox to receive them.
     let callback_mailbox = mailbox::Mailbox::open(&callback_inbox).expect("open callback mailbox");
     let mut seen = Vec::new();
-    for _ in 0..200 {
-        if let Ok(Some(claimed)) = callback_mailbox.claim_next() {
+    let terminal_key = format!("{task_id}-terminal");
+    'poll: for _ in 0..200 {
+        // Both events can land in `pending/` together (the same tick both
+        // fires the milestone and reaps the already-exited command), and
+        // `claim_next` makes no ordering guarantee across distinct ids — so
+        // fully drain what is pending each iteration before checking whether
+        // the terminal event has been seen, rather than stopping the instant
+        // one claim happens to be the terminal one.
+        while let Ok(Some(claimed)) = callback_mailbox.claim_next() {
             seen.push(claimed.key.clone());
             callback_mailbox
                 .complete(claimed)
                 .expect("complete claimed event");
-            if seen.iter().any(|k| k == &format!("{task_id}-terminal")) {
-                break;
-            }
+        }
+        if seen.contains(&terminal_key) {
+            break 'poll;
         }
         thread::sleep(Duration::from_millis(50));
     }

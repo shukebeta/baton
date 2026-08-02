@@ -955,8 +955,9 @@ mod imp {
     ) -> Result<(TaskRecord, Child, u64)> {
         let data = fs::read_to_string(spec_path)
             .map_err(|err| BatonError::Io(format!("could not read {spec_path:?}: {err}")))?;
-        let spec: TaskSpec = serde_json::from_str(&data)
-            .map_err(|err| BatonError::Decode(format!("malformed task spec {spec_path:?}: {err}")))?;
+        let spec: TaskSpec = serde_json::from_str(&data).map_err(|err| {
+            BatonError::Decode(format!("malformed task spec {spec_path:?}: {err}"))
+        })?;
         let task_id = fresh_task_id();
         let log_dir = task_logs_dir(control, &task_id);
         fs::create_dir_all(&log_dir)
@@ -994,7 +995,9 @@ mod imp {
             task_id: record.id.clone(),
         };
         let respond = serde_json::to_string(&response)
-            .map_err(|err| BatonError::Io(format!("could not serialize task start response: {err}")))
+            .map_err(|err| {
+                BatonError::Io(format!("could not serialize task start response: {err}"))
+            })
             .and_then(|json| {
                 let responses = task_responses_dir(control);
                 fs::create_dir_all(&responses).map_err(|err| {
@@ -1665,6 +1668,31 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::sync::{Mutex, MutexGuard};
+
+        /// Serializes every test in this module that either holds the
+        /// control-plane flock directly or forks a real child process
+        /// (`spawn_task_child`/`Mailbox::open`'s own lock).
+        ///
+        /// `fork(2)` duplicates the *whole process's* fd table across every
+        /// thread, not just the caller's — so a flock another `cargo test`
+        /// thread holds at that instant is briefly visible (as still held) to
+        /// the forked child, and vice versa, until the child's `execve`
+        /// closes its `O_CLOEXEC`-marked fds. `cargo test`'s default thread
+        /// parallelism runs this module's flock-assertion tests concurrently
+        /// with tests that spawn real processes, so without this guard the
+        /// two occasionally race (observed empirically: a lock reads back as
+        /// still held, or a fresh mailbox open is transiently refused). This
+        /// never happens in production — a real `baton service run` process
+        /// never shares an address space with unrelated flock-holding code —
+        /// it is purely a same-process test-parallelism artifact.
+        static FORK_LOCK_SERIALIZE: Mutex<()> = Mutex::new(());
+
+        fn serialize_forks_and_locks() -> MutexGuard<'static, ()> {
+            FORK_LOCK_SERIALIZE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
 
         struct TempDir {
             path: std::path::PathBuf,
@@ -1735,7 +1763,12 @@ mod imp {
         /// inside the real request protocol — but callable directly, so a
         /// test can drive [`tick_one_task`] without going through the
         /// request-file dance or the infinite `run_service` loop.
-        fn spawn_running_task(dir: &Path, id: &str, spec: TaskSpec, clock: &dyn Clock) -> RunningTask {
+        fn spawn_running_task(
+            dir: &Path,
+            id: &str,
+            spec: TaskSpec,
+            clock: &dyn Clock,
+        ) -> RunningTask {
             let log_dir = task_logs_dir(dir, id);
             fs::create_dir_all(&log_dir).expect("create log dir");
             let stdout_path = log_dir.join("stdout.log");
@@ -1859,6 +1892,7 @@ mod imp {
         /// `mailbox::second_open_on_locked_root_fails`).
         #[test]
         fn second_control_lock_is_refused() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("lock");
             let _held = acquire_control_lock(&dir.path).expect("first lock");
             assert!(acquire_control_lock(&dir.path).is_err());
@@ -1869,6 +1903,7 @@ mod imp {
         /// sentinel (a pure read).
         #[test]
         fn probe_control_reflects_lock_without_signalling() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("probe");
             {
                 let _held = acquire_control_lock(&dir.path).expect("lock");
@@ -1891,6 +1926,7 @@ mod imp {
         /// reports `NotRunning` (without creating one) when the lock is free.
         #[test]
         fn request_control_stop_signals_only_when_live() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("signal");
             let held = acquire_control_lock(&dir.path).expect("lock");
             assert_eq!(
@@ -1966,6 +2002,7 @@ mod imp {
         /// held, and lists a written session record's liveness.
         #[test]
         fn execute_status_reports_live_service_and_dead_session() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("status-live");
             let _held = acquire_control_lock(&dir.path).expect("lock");
             let record = SessionRecord {
@@ -2113,6 +2150,7 @@ mod imp {
         /// visible event.
         #[test]
         fn task_event_redelivery_is_deduped_by_mailbox_done_ledger() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("event-dedup");
             let callback_inbox = dir.path.join("callback");
             let record = TaskRecord {
@@ -2138,10 +2176,7 @@ mod imp {
             deliver_task_event(&record, TaskEventKind::Terminal).expect("deliver");
             {
                 let mailbox = mailbox::Mailbox::open(&callback_inbox).expect("open");
-                let claimed = mailbox
-                    .claim_next()
-                    .expect("claim")
-                    .expect("event present");
+                let claimed = mailbox.claim_next().expect("claim").expect("event present");
                 assert_eq!(claimed.key, "task-x-terminal");
                 mailbox.complete(claimed).expect("complete");
             }
@@ -2164,6 +2199,7 @@ mod imp {
         /// mailbox under its deterministic id.
         #[test]
         fn tick_one_task_delivers_milestone_via_fake_clock_no_real_sleep() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("tick-milestone");
             let clock = FakeClock::new();
             let callback_inbox = dir.path.join("callback");
@@ -2203,6 +2239,7 @@ mod imp {
         /// `timeout`, not `completed`/`failed`.
         #[test]
         fn tick_one_task_enforces_max_duration_and_marks_timeout() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("tick-timeout");
             let clock = FakeClock::new();
             let callback_inbox = dir.path.join("callback");
@@ -2251,6 +2288,7 @@ mod imp {
         /// breach, is reaped as `completed`.
         #[test]
         fn tick_one_task_reaps_a_clean_exit_as_completed() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("tick-completed");
             let clock = FakeClock::new();
             let callback_inbox = dir.path.join("callback");
@@ -2374,7 +2412,9 @@ mod imp {
                     .is_none()
             );
             assert!(
-                read_task_record(&dir.path, "task-1").expect("read").is_none(),
+                read_task_record(&dir.path, "task-1")
+                    .expect("read")
+                    .is_none(),
                 "the session's task record is reaped too"
             );
         }
@@ -2419,7 +2459,11 @@ mod imp {
             let dir = TempDir::new("cancel-unknown");
             let mut out = Vec::new();
             execute_task_cancel(&dir.path, "nope", &mut out).expect("cancel");
-            assert!(String::from_utf8(out).unwrap().contains("nothing to cancel"));
+            assert!(
+                String::from_utf8(out)
+                    .unwrap()
+                    .contains("nothing to cancel")
+            );
         }
 
         /// Cancelling a running task writes the cooperative cancel sentinel
@@ -2428,6 +2472,7 @@ mod imp {
         /// the exit to `cancelled`, not `failed`.
         #[test]
         fn cancel_then_tick_marks_task_cancelled() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("cancel-then-tick");
             let clock = FakeClock::new();
             let callback_inbox = dir.path.join("callback");
@@ -2446,8 +2491,7 @@ mod imp {
 
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
-                match tick_one_task(&dir.path, "task-cancel", &mut running, &clock).expect("tick")
-                {
+                match tick_one_task(&dir.path, "task-cancel", &mut running, &clock).expect("tick") {
                     TaskTick::Finished => break,
                     TaskTick::StillRunning => {
                         assert!(Instant::now() < deadline, "task did not exit in time");
