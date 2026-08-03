@@ -25,6 +25,10 @@ The classifier recognizes optional scopes and !, so feat(core): ... and feat!:
 major bump: it follows the commit's type, and a feat with that footer still
 takes the ordinary feature path.
 
+The latest-release lookup considers only valid release tags reachable from the
+workflow's current `HEAD` on main or master. Tags that exist only on unrelated
+branches do not affect the release sequence.
+
 ## Baseline and no-retag boundary
 
 v0.1.0 is the historical baseline. The next feature release from it is v0.2.0;

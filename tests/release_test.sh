@@ -133,6 +133,41 @@ test_existing_v0_1_0_head_is_not_retagged() (
     assert_eq "1" "${tag_count}" "no duplicate release tag"
 )
 
+test_unreachable_higher_tag_is_ignored() (
+    set -euo pipefail
+    local repo release_branch latest_tag tag version
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    make_fixture "${repo}"
+    release_branch="$(git -C "${repo}" branch --show-current)"
+
+    git -C "${repo}" checkout -q -b unrelated-release-tag
+    printf 'unrelated release\n' >"${repo}/unrelated.txt"
+    git -C "${repo}" add unrelated.txt
+    git -C "${repo}" commit -q -m "chore: unrelated release tag"
+    git -C "${repo}" tag v9.99.0
+    git -C "${repo}" checkout -q "${release_branch}"
+
+    latest_tag="$(cd "${repo}" && release_latest_tag)"
+    assert_eq "v0.1.0" "${latest_tag}" \
+        "latest release ignores unrelated branch tags"
+
+    printf 'feature\n' >"${repo}/feature.txt"
+    git -C "${repo}" add feature.txt
+    git -C "${repo}" commit -q -m "feat: add release behavior"
+
+    tag="$(cd "${repo}" && release_create_tag)"
+    version="${tag#v}"
+    assert_eq "v0.2.0" "${tag}" "feature release uses reachable baseline"
+    assert_eq "${version}" "$(cd "${repo}" && release_manifest_version)" \
+        "manifest matches reachable release tag"
+    assert_eq "${version}" "$(cd "${repo}" && release_lockfile_version)" \
+        "lockfile matches reachable release tag"
+    assert_eq "$(git -C "${repo}" rev-parse HEAD)" \
+        "$(git -C "${repo}" rev-parse "${tag}^{commit}")" \
+        "release tag points at manifest update"
+)
+
 test_release_updates_manifest_lock_and_matching_tag() (
     set -euo pipefail
     local repo baseline_head tag tag_head version manifest_version lock_version
@@ -189,6 +224,7 @@ tests=(
     test_conventional_commit_classification
     test_invalid_tags_and_bump_kinds_fail
     test_existing_v0_1_0_head_is_not_retagged
+    test_unreachable_higher_tag_is_ignored
     test_release_updates_manifest_lock_and_matching_tag
     test_patch_release_updates_manifest_lock_and_matching_tag
 )
