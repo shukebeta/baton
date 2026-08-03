@@ -221,19 +221,27 @@ terminal record is replayed once on the next startup for the same reason; the
 mailbox's done ledger drops it if delivery already completed.
 
 Task admission is a durable transaction keyed by the task-start request id.
-After spawning and persisting a `TaskRecord`, `run` records the
-`prepared` phase, then durably changes it to `committed` before writing the
-success response, and finally records `responded` after that response write
-succeeds. Startup reconciliation removes every prepared task and every task
-named by a client rollback marker, including its process and task record. For
-rollback, the marker is cleared only after the task record and both pending
-request locations have been removed; repeated startup passes are therefore
-safe if the supervisor crashes during cleanup. A committed task is retained,
-its stale request is discarded, and its success response is restored only if
-the supervisor died before writing it. A responded task is retained without
-recreating a response already consumed by the client. This ordering makes the
-task record and its response boundary recoverable without replaying a spawned
-command.
+After spawning and persisting a `TaskRecord`, `run` records the `prepared`
+phase, then durably changes it to `committed` before publishing the success
+response, and finally records `responded` while holding the admission lock.
+The task-start client takes that same lock, atomically renames the response to
+a private claim, parses it, writes `task-start-ack/<request-id>.json`, and
+removes the claim only after the acknowledgement is durable. A claim without
+an acknowledgement is restored to the response on the next startup.
+
+Startup reconciliation removes every prepared task and every task named by a
+client rollback marker, including its process and task record. For rollback,
+the marker is cleared only after the task record, response/claim files, and
+both pending request locations have been removed; repeated startup passes are
+therefore safe if the supervisor crashes during cleanup. A committed task with
+an acknowledgement is finalized as `responded` without recreating its
+response. A committed task with an existing response or recoverable claim is
+also finalized as `responded`; one with neither gets one response before the
+phase is finalized. Response publication and phase persistence failures leave
+the record `committed` for a later retry, while the task remains tracked and
+is never spawned again. A responded task is retained without recreating a
+response already consumed by the client. This ordering makes the task record
+and its response boundary recoverable without replaying a spawned command.
 
 ### Event delivery and dedup contract
 

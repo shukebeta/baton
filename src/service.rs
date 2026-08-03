@@ -35,6 +35,9 @@
 //!   claimed into `processing/` by `Run`, and answered into `responses/` keyed
 //!   by the request id — the same temp-file-then-`rename` idiom as
 //!   [`mailbox::deliver_to`]/[`mailbox::atomic_write`], reused directly.
+//! - `task-start-ack/` — durable markers written by a task-start client after
+//!   it claims a response, allowing restart reconciliation to distinguish a
+//!   consumed response from one that was never published.
 //! - `sessions/<id>.json` — one durable [`SessionRecord`] per session, holding
 //!   its effective spec and real PID. `Status`/`Stop`/`Teardown` read this
 //!   directly and act on the OS process by PID; none of them need the `Run`
@@ -871,6 +874,10 @@ mod imp {
         control.join("task-responses")
     }
 
+    fn task_start_ack_dir(control: &Path) -> std::path::PathBuf {
+        control.join("task-start-ack")
+    }
+
     fn tasks_dir(control: &Path) -> std::path::PathBuf {
         control.join("tasks")
     }
@@ -907,6 +914,36 @@ mod imp {
         error: Option<String>,
     }
 
+    fn task_start_response_path(control: &Path, request_id: &str) -> Result<std::path::PathBuf> {
+        if !mailbox::is_safe_key(request_id) {
+            return Err(BatonError::Io(format!(
+                "task start request id is not usable as a filename: {request_id:?}"
+            )));
+        }
+        Ok(task_responses_dir(control).join(mailbox::file_name(request_id)))
+    }
+
+    fn task_start_response_claim_path(
+        control: &Path,
+        request_id: &str,
+    ) -> Result<std::path::PathBuf> {
+        let response = task_start_response_path(control, request_id)?;
+        let file_name = response
+            .file_name()
+            .expect("task-start response path has a filename")
+            .to_string_lossy();
+        Ok(response.with_file_name(format!(".{file_name}.claimed")))
+    }
+
+    fn task_start_ack_path(control: &Path, request_id: &str) -> Result<std::path::PathBuf> {
+        if !mailbox::is_safe_key(request_id) {
+            return Err(BatonError::Io(format!(
+                "task start request id is not usable as a filename: {request_id:?}"
+            )));
+        }
+        Ok(task_start_ack_dir(control).join(mailbox::file_name(request_id)))
+    }
+
     /// Submits `spec` to a live `Run` and awaits its task id. Mirrors
     /// [`submit_start_request`] exactly, against the task request
     /// directories instead.
@@ -941,8 +978,13 @@ mod imp {
                 // processing the request between this check and the rollback
                 // marker.
                 let _admission = acquire_admission_lock(control)?;
-                if let Some(response) = take_task_start_response(control, request_id)? {
+                if let Some(response) = take_task_start_response_locked(control, request_id)? {
                     return task_start_response_id(control, request_id, response);
+                }
+                if task_start_ack_exists(control, request_id)? {
+                    return Err(BatonError::Io(format!(
+                        "task start response for {request_id} was already consumed"
+                    )));
                 }
                 mark_task_start_rollback(control, request_id)?;
                 discard_pending_task_start_request(control, request_id)?;
@@ -961,21 +1003,165 @@ mod imp {
 
     /// Takes a task-start response if the supervisor has written one.
     ///
-    /// The response is removed after it is read, matching the session-start
-    /// protocol. A response that is not readable yet is the normal polling
-    /// result while the supervisor is preparing its atomic response file.
+    /// The admission lock serializes the claim with response publication,
+    /// phase persistence, and startup reconciliation. The acknowledgement is
+    /// durable before the private claim is removed.
     fn take_task_start_response(
         control: &Path,
         request_id: &str,
     ) -> Result<Option<TaskStartResponse>> {
-        let path = task_responses_dir(control).join(mailbox::file_name(request_id));
-        let Ok(data) = fs::read_to_string(&path) else {
+        let _admission = acquire_admission_lock(control)?;
+        take_task_start_response_locked(control, request_id)
+    }
+
+    fn take_task_start_response_locked(
+        control: &Path,
+        request_id: &str,
+    ) -> Result<Option<TaskStartResponse>> {
+        let response_path = task_start_response_path(control, request_id)?;
+        let claim_path = task_start_response_claim_path(control, request_id)?;
+
+        if task_start_ack_exists(control, request_id)? {
+            remove_task_start_response_files(control, request_id)?;
             return Ok(None);
+        }
+        restore_task_start_response_claim(control, request_id)?;
+        match fs::rename(&response_path, &claim_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(BatonError::Io(format!(
+                    "could not claim task response {response_path:?}: {err}"
+                )));
+            }
+        }
+        let data = match fs::read_to_string(&claim_path) {
+            Ok(data) => data,
+            Err(err) => {
+                restore_task_start_response_claim(control, request_id)?;
+                return Err(BatonError::Io(format!(
+                    "could not read claimed task response {claim_path:?}: {err}"
+                )));
+            }
         };
-        let _ = fs::remove_file(&path);
-        serde_json::from_str(&data)
-            .map(Some)
-            .map_err(|err| BatonError::Decode(format!("malformed task response {path:?}: {err}")))
+        let response = match serde_json::from_str(&data) {
+            Ok(response) => response,
+            Err(err) => {
+                restore_task_start_response_claim(control, request_id)?;
+                return Err(BatonError::Decode(format!(
+                    "malformed task response {response_path:?}: {err}"
+                )));
+            }
+        };
+        mark_task_start_ack(control, request_id)?;
+        wait_for_test_task_start_ack_barrier();
+        let _ = fs::remove_file(&claim_path);
+        Ok(Some(response))
+    }
+
+    fn restore_task_start_response_claim(control: &Path, request_id: &str) -> Result<()> {
+        let response_path = task_start_response_path(control, request_id)?;
+        let claim_path = task_start_response_claim_path(control, request_id)?;
+        if !claim_path.is_file() {
+            return Ok(());
+        }
+        if response_path.is_file() {
+            return remove_file_if_present(&claim_path, "task response claim");
+        }
+        match fs::rename(&claim_path, &response_path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(BatonError::Io(format!(
+                "could not restore task response claim {claim_path:?}: {err}"
+            ))),
+        }
+    }
+
+    fn remove_task_start_response_files(control: &Path, request_id: &str) -> Result<()> {
+        let response_path = task_start_response_path(control, request_id)?;
+        let claim_path = task_start_response_claim_path(control, request_id)?;
+        remove_file_if_present(&response_path, "task response")?;
+        remove_file_if_present(&claim_path, "task response claim")
+    }
+
+    fn remove_file_if_present(path: &Path, description: &str) -> Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(BatonError::Io(format!(
+                "could not remove {description} {path:?}: {err}"
+            ))),
+        }
+    }
+
+    fn mark_task_start_ack(control: &Path, request_id: &str) -> Result<()> {
+        let dir = task_start_ack_dir(control);
+        fs::create_dir_all(&dir)
+            .map_err(|err| BatonError::Io(format!("could not create {dir:?}: {err}")))?;
+        let path = mailbox::file_name(request_id);
+        mailbox::atomic_write(&dir, &path, "")
+    }
+
+    fn task_start_ack_exists(control: &Path, request_id: &str) -> Result<bool> {
+        Ok(task_start_ack_path(control, request_id)?.is_file())
+    }
+
+    fn remove_task_start_ack(control: &Path, request_id: &str) -> Result<()> {
+        let path = task_start_ack_path(control, request_id)?;
+        remove_file_if_present(&path, "task-start acknowledgement")
+    }
+
+    fn list_task_start_acks(control: &Path) -> Result<Vec<String>> {
+        let dir = task_start_ack_dir(control);
+        let entries = match fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => {
+                return Err(BatonError::Io(format!(
+                    "could not read task-start acknowledgement directory {dir:?}: {err}"
+                )));
+            }
+        };
+        let mut request_ids = Vec::new();
+        for entry in entries {
+            let path = mailbox::dir_entry(entry, &dir)?.path();
+            let Some(key) = mailbox::json_key(&path) else {
+                continue;
+            };
+            request_ids.push(key);
+        }
+        Ok(request_ids)
+    }
+
+    fn list_task_start_response_claims(control: &Path) -> Result<Vec<String>> {
+        let dir = task_responses_dir(control);
+        let entries = match fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => {
+                return Err(BatonError::Io(format!(
+                    "could not read task response directory {dir:?}: {err}"
+                )));
+            }
+        };
+        let mut request_ids = Vec::new();
+        for entry in entries {
+            let path = mailbox::dir_entry(entry, &dir)?.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(response_name) = name
+                .strip_prefix('.')
+                .and_then(|name| name.strip_suffix(".claimed"))
+            else {
+                continue;
+            };
+            let response_path = dir.join(response_name);
+            if let Some(request_id) = mailbox::json_key(&response_path) {
+                request_ids.push(request_id);
+            }
+        }
+        Ok(request_ids)
     }
 
     fn task_start_response_id(
@@ -1073,18 +1259,22 @@ mod imp {
     }
 
     /// Reconciles task-start transactions before the request loop can accept
-    /// new work. Prepared records are never safe to rehydrate; a rollback
-    /// marker also wins over a committed or responded record because the
-    /// client observed no response. Committed records are retained and their
-    /// response is re-delivered if the previous service died before the
-    /// response write; responded records are retained without recreating a
-    /// response the client already consumed. Rollback cleanup removes the
-    /// record and pending request locations before clearing the marker, so a
-    /// restart can retry any interrupted cleanup without replaying the request.
+    /// new work. The caller holds the admission lock for the whole pass.
+    /// Prepared records are never safe to rehydrate; a rollback marker also
+    /// wins over a committed or responded record because the client observed
+    /// no response. A durable acknowledgement wins over any response file and
+    /// upgrades a committed record to responded. A committed record with a
+    /// response or a recoverable claim is finalized as responded, while a
+    /// committed record with neither is given one response before that phase
+    /// is persisted. Rollback, claim, and acknowledgement cleanup is
+    /// idempotent across interrupted startup passes.
     fn reconcile_task_admissions(control: &Path) -> Result<()> {
         let rollback_ids = list_task_start_rollbacks(control)?;
+        let ack_ids = list_task_start_acks(control)?;
+        let claim_ids = list_task_start_response_claims(control)?;
         let records = list_task_records(control)?;
         let mut seen_rollbacks = std::collections::HashSet::new();
+        let mut seen_acks = std::collections::HashSet::new();
 
         for record in records {
             if record.admission == TaskAdmissionPhase::Prepared {
@@ -1100,6 +1290,8 @@ mod imp {
                 }
                 abort_task_admission(control, &record)?;
                 if let Some(request_id) = request_id {
+                    remove_task_start_response_files(control, request_id)?;
+                    remove_task_start_ack(control, request_id)?;
                     if rollback {
                         wait_for_test_task_rollback_cleanup_barrier(
                             "BATON_TEST_TASK_ROLLBACK_RECONCILE_BARRIER",
@@ -1119,6 +1311,8 @@ mod imp {
             if rollback {
                 abort_task_admission(control, &record)?;
                 discard_pending_task_start_request(control, request_id)?;
+                remove_task_start_response_files(control, request_id)?;
+                remove_task_start_ack(control, request_id)?;
                 wait_for_test_task_rollback_cleanup_barrier(
                     "BATON_TEST_TASK_ROLLBACK_RECONCILE_BARRIER",
                 );
@@ -1127,22 +1321,80 @@ mod imp {
             }
 
             discard_pending_task_start_request(control, request_id)?;
-            let response_path = task_responses_dir(control).join(mailbox::file_name(request_id));
-            if record.admission == TaskAdmissionPhase::Committed && !response_path.is_file() {
-                write_task_start_response(
-                    control,
-                    request_id,
-                    &TaskStartResponse {
-                        task_id: Some(record.id.clone()),
-                        error: None,
-                    },
-                )?;
+            if task_start_ack_exists(control, request_id)? {
+                seen_acks.insert(request_id.to_string());
+                remove_task_start_response_files(control, request_id)?;
+                if record.admission == TaskAdmissionPhase::Committed {
+                    let mut responded = record.clone();
+                    responded.admission = TaskAdmissionPhase::Responded;
+                    if let Err(err) = write_task_record(control, &responded) {
+                        eprintln!(
+                            "warning: task {} acknowledgement was durable but responded phase could not be persisted: {err}",
+                            record.id
+                        );
+                        continue;
+                    }
+                }
+                remove_task_start_ack(control, request_id)?;
+                continue;
+            }
+
+            restore_task_start_response_claim(control, request_id)?;
+            if record.admission == TaskAdmissionPhase::Committed {
+                let response_path = task_start_response_path(control, request_id)?;
+                if !response_path.is_file() {
+                    if let Err(err) = write_task_start_response(
+                        control,
+                        request_id,
+                        &TaskStartResponse {
+                            task_id: Some(record.id.clone()),
+                            error: None,
+                        },
+                    ) {
+                        eprintln!(
+                            "warning: task {} response restoration failed; retaining committed admission: {err}",
+                            record.id
+                        );
+                        continue;
+                    }
+                }
+                let mut responded = record.clone();
+                responded.admission = TaskAdmissionPhase::Responded;
+                if let Err(err) = write_task_record(control, &responded) {
+                    eprintln!(
+                        "warning: task {} restored response was written but responded phase could not be persisted: {err}",
+                        record.id
+                    );
+                }
+            }
+        }
+
+        for request_id in ack_ids {
+            if !seen_acks.contains(&request_id) {
+                discard_pending_task_start_request(control, &request_id)?;
+                remove_task_start_response_files(control, &request_id)?;
+                remove_task_start_ack(control, &request_id)?;
+            }
+        }
+
+        for request_id in claim_ids {
+            let claim_path = task_start_response_claim_path(control, &request_id)?;
+            if !claim_path.is_file() {
+                continue;
+            }
+            if task_start_ack_exists(control, &request_id)? {
+                remove_task_start_response_files(control, &request_id)?;
+                remove_task_start_ack(control, &request_id)?;
+            } else {
+                restore_task_start_response_claim(control, &request_id)?;
             }
         }
 
         for request_id in rollback_ids {
             if !seen_rollbacks.contains(&request_id) {
                 discard_pending_task_start_request(control, &request_id)?;
+                remove_task_start_response_files(control, &request_id)?;
+                remove_task_start_ack(control, &request_id)?;
                 wait_for_test_task_rollback_cleanup_barrier(
                     "BATON_TEST_TASK_ROLLBACK_RECONCILE_BARRIER",
                 );
@@ -1324,9 +1576,10 @@ mod imp {
     /// Validates the requested owner, then spawns the task, persists its
     /// [`TaskRecord`], and answers the request with its task id. Mirrors
     /// [`handle_start_request`]'s
-    /// kill-and-unwind-on-any-later-failure discipline: once spawned, every
-    /// early return below this point kills and reaps `child` first, so a
-    /// failure here never leaves an unrecorded, unreapable process behind.
+    /// kill-and-unwind-on-any-later-failure discipline until the committed
+    /// record is durable. After that point the task remains tracked when
+    /// response delivery or phase persistence fails, so restart reconciliation
+    /// can retry the response boundary without spawning again.
     fn handle_task_start_request(
         control: &Path,
         request_id: &str,
@@ -1414,19 +1667,20 @@ mod imp {
             },
         );
         if let Err(err) = respond {
-            let _ = signal_group(pid, "-KILL");
-            let _ = child.wait();
-            let _ = remove_task_record(control, &record.id);
-            return Err(err);
+            eprintln!(
+                "warning: task {id} admission response could not be written; retaining committed admission: {err}",
+                id = record.id
+            );
+            return Ok(Some((record, child, started_ms)));
         }
+        wait_for_test_task_response_phase_barrier();
         record.admission = TaskAdmissionPhase::Responded;
         if let Err(err) = write_task_record(control, &record) {
-            // The response is already durable and the task is admitted. Keep
-            // serving it; a later task tick can persist the responded phase.
             eprintln!(
                 "warning: task {id} response was written but its responded phase could not be persisted: {err}",
                 id = record.id
             );
+            record.admission = TaskAdmissionPhase::Committed;
         }
         Ok(Some((record, child, started_ms)))
     }
@@ -1437,6 +1691,33 @@ mod imp {
     /// production callers never set it.
     fn wait_for_test_task_admission_barrier() {
         let Some(path) = std::env::var_os("BATON_TEST_TASK_ADMISSION_BARRIER") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        while path.exists() {
+            std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        }
+    }
+
+    /// Test-only synchronization seam for the response/phase boundary. A
+    /// service launched with this environment variable waits after publishing
+    /// the response while still holding the admission lock; production callers
+    /// never set it.
+    fn wait_for_test_task_response_phase_barrier() {
+        let Some(path) = std::env::var_os("BATON_TEST_TASK_RESPONSE_PHASE_BARRIER") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        while path.exists() {
+            std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        }
+    }
+
+    /// Test-only synchronization seam for the response claim/ack boundary. A
+    /// task-start client waits after persisting its acknowledgement and before
+    /// removing the private claim; production callers never set it.
+    fn wait_for_test_task_start_ack_barrier() {
+        let Some(path) = std::env::var_os("BATON_TEST_TASK_START_ACK_BARRIER") else {
             return;
         };
         let path = std::path::PathBuf::from(path);
@@ -1464,6 +1745,22 @@ mod imp {
         request_id: &str,
         response: &TaskStartResponse,
     ) -> Result<()> {
+        if let Some(path) = std::env::var_os("BATON_TEST_TASK_START_RESPONSE_WRITE_FAILURE") {
+            let path = std::path::PathBuf::from(path);
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    return Err(BatonError::Io(format!(
+                        "test-injected task-start response write failure at {path:?}"
+                    )));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(BatonError::Io(format!(
+                        "could not consume task-start response failure marker {path:?}: {err}"
+                    )));
+                }
+            }
+        }
         let json = serde_json::to_string(response).map_err(|err| {
             BatonError::Io(format!("could not serialize task start response: {err}"))
         })?;
@@ -2944,6 +3241,149 @@ mod imp {
                 .collect();
             ids.sort();
             assert_eq!(ids, vec!["task-0", "task-1", "task-2"]);
+        }
+
+        /// A response claim writes its acknowledgement before cleanup, and a
+        /// repeated consumer cannot read the response again.
+        #[test]
+        fn task_start_response_claim_records_ack_idempotently() {
+            let dir = TempDir::new("task-response-ack");
+            let request_id = "response-ack-request";
+            let response = TaskStartResponse {
+                task_id: Some("task-1".to_string()),
+                error: None,
+            };
+            write_task_start_response(&dir.path, request_id, &response).expect("write response");
+
+            let consumed = take_task_start_response(&dir.path, request_id)
+                .expect("take response")
+                .expect("response is present");
+            assert_eq!(consumed.task_id, response.task_id);
+            assert!(task_start_ack_exists(&dir.path, request_id).expect("ack exists"));
+            assert!(
+                !task_start_response_path(&dir.path, request_id)
+                    .expect("response path")
+                    .exists()
+            );
+            assert!(
+                !task_start_response_claim_path(&dir.path, request_id)
+                    .expect("claim path")
+                    .exists()
+            );
+            assert!(
+                take_task_start_response(&dir.path, request_id)
+                    .expect("repeat take")
+                    .is_none()
+            );
+            reconcile_task_admissions(&dir.path).expect("reconcile orphan acknowledgement");
+            assert!(!task_start_ack_exists(&dir.path, request_id).expect("ack cleanup"));
+        }
+
+        /// A private claim left by a client before acknowledgement is
+        /// restored even when its response has no task record, such as an
+        /// owner-rejection response.
+        #[test]
+        fn reconcile_orphan_task_response_claim_restores_response() {
+            let dir = TempDir::new("orphan-task-response-claim");
+            let request_id = "orphan-response-claim";
+            let response = TaskStartResponse {
+                task_id: None,
+                error: Some("owner rejected".to_string()),
+            };
+            write_task_start_response(&dir.path, request_id, &response)
+                .expect("write owner rejection response");
+            fs::rename(
+                task_start_response_path(&dir.path, request_id).expect("response path"),
+                task_start_response_claim_path(&dir.path, request_id).expect("claim path"),
+            )
+            .expect("claim owner rejection response");
+
+            reconcile_task_admissions(&dir.path).expect("reconcile orphan claim");
+
+            assert!(
+                task_start_response_path(&dir.path, request_id)
+                    .expect("response path")
+                    .is_file()
+            );
+            assert!(
+                !task_start_response_claim_path(&dir.path, request_id)
+                    .expect("claim path")
+                    .exists()
+            );
+        }
+
+        /// Startup reconciliation finalizes a committed record for an
+        /// acknowledgement, a response, or a recoverable private claim, and
+        /// remains safe when repeated.
+        #[test]
+        fn reconcile_task_admission_finalizes_response_boundaries() {
+            for (index, boundary) in ["ack", "response", "claim", "missing"]
+                .into_iter()
+                .enumerate()
+            {
+                let dir = TempDir::new(&format!("task-response-boundary-{boundary}"));
+                let request_id = format!("response-boundary-request-{index}");
+                let task_id = format!("response-boundary-task-{index}");
+                let record = TaskRecord {
+                    id: task_id.clone(),
+                    request_id: Some(request_id.clone()),
+                    admission: TaskAdmissionPhase::Committed,
+                    spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/callback"),
+                    pid: 0,
+                    started_at: None,
+                    started_ms: None,
+                    state: TaskState::Completed,
+                    exit_code: Some(0),
+                    elapsed_ms: Some(1),
+                    stdout_path: String::new(),
+                    stderr_path: String::new(),
+                    delivered_milestones: 0,
+                };
+                write_task_record(&dir.path, &record).expect("write task record");
+                let response = TaskStartResponse {
+                    task_id: Some(task_id.clone()),
+                    error: None,
+                };
+                if boundary != "missing" {
+                    write_task_start_response(&dir.path, &request_id, &response)
+                        .expect("write task response");
+                }
+                if boundary == "ack" {
+                    take_task_start_response(&dir.path, &request_id)
+                        .expect("take response")
+                        .expect("response is present");
+                } else if boundary == "claim" {
+                    fs::rename(
+                        task_start_response_path(&dir.path, &request_id).expect("response path"),
+                        task_start_response_claim_path(&dir.path, &request_id).expect("claim path"),
+                    )
+                    .expect("claim response");
+                }
+
+                reconcile_task_admissions(&dir.path).expect("reconcile response boundary");
+                reconcile_task_admissions(&dir.path).expect("repeat reconciliation");
+
+                let reconciled = read_task_record(&dir.path, &task_id)
+                    .expect("read reconciled task")
+                    .expect("reconciled task exists");
+                assert_eq!(reconciled.admission, TaskAdmissionPhase::Responded);
+                assert_eq!(
+                    task_start_response_path(&dir.path, &request_id)
+                        .expect("response path")
+                        .is_file(),
+                    boundary != "ack"
+                );
+                assert!(
+                    !task_start_response_claim_path(&dir.path, &request_id)
+                        .expect("claim path")
+                        .exists()
+                );
+                assert!(
+                    !task_start_ack_path(&dir.path, &request_id)
+                        .expect("ack path")
+                        .exists()
+                );
+            }
         }
 
         /// A rollback marker removes every admission phase's task record and

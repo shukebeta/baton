@@ -2577,6 +2577,8 @@ fn service_task_start_discards_unadmitted_request_after_run_loss() {
     let session_outbox = root.path.join("session-outbox");
     let callback_inbox = root.path.join("callback");
     let failed_marker = root.path.join("failed-task-started");
+    let response_phase_barrier = root.path.join("response-phase.barrier");
+    std::fs::write(&response_phase_barrier, "hold").expect("create response phase barrier");
     let control_str = control.to_str().unwrap();
 
     let wait_for_live = || {
@@ -2743,6 +2745,10 @@ fn service_task_start_discards_unadmitted_request_after_run_loss() {
 
     let mut restarted_run = Command::new(env!("CARGO_BIN_EXE_baton"));
     restarted_run.args(["service", "run", "--control", control_str]);
+    restarted_run.env(
+        "BATON_TEST_TASK_RESPONSE_PHASE_BARRIER",
+        &response_phase_barrier,
+    );
     restarted_run.stdout(Stdio::null());
     restarted_run.stderr(Stdio::null());
     let mut restarted_child = restarted_run
@@ -2827,6 +2833,10 @@ fn service_task_start_discards_unadmitted_request_after_run_loss() {
         response_path.is_file(),
         "service run should write the successful task response"
     );
+    assert!(
+        response_phase_barrier.is_file(),
+        "service run should pause before persisting responded"
+    );
 
     restarted_child
         .kill()
@@ -2863,6 +2873,16 @@ fn service_task_start_discards_unadmitted_request_after_run_loss() {
     let successful_task_id = String::from_utf8_lossy(&successful_output.stdout)
         .trim()
         .to_string();
+    let task_record_path = control
+        .join("tasks")
+        .join(format!("{successful_task_id}.json"));
+    let ack_path = control
+        .join("task-start-ack")
+        .join(&successful_request_name);
+    assert!(
+        ack_path.is_file(),
+        "successful task-start consumption writes a durable acknowledgement"
+    );
 
     let mut final_run = Command::new(env!("CARGO_BIN_EXE_baton"));
     final_run.args(["service", "run", "--control", control_str]);
@@ -2879,12 +2899,69 @@ fn service_task_start_discards_unadmitted_request_after_run_loss() {
     let final_tasks = final_json["tasks"].as_array().expect("final tasks array");
     assert_eq!(final_tasks.len(), 1, "restart must not duplicate the task");
     assert_eq!(final_tasks[0]["id"], successful_task_id);
+    let final_record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&task_record_path).expect("read finalized task record"),
+    )
+    .expect("finalized task record is JSON");
+    assert_eq!(
+        final_record["admission"], "responded",
+        "acknowledged response is finalized on restart"
+    );
+    assert!(
+        !ack_path.exists(),
+        "restart cleans the durable acknowledgement"
+    );
     assert!(
         !control
             .join("task-responses")
             .join(&successful_request_name)
             .exists(),
         "restart does not recreate a response already consumed by the client"
+    );
+
+    final_run_child
+        .kill()
+        .expect("kill first response reconciliation run");
+    let final_run_status = final_run_child
+        .wait()
+        .expect("first response reconciliation run exits");
+    assert!(
+        !final_run_status.success(),
+        "first response reconciliation run was interrupted"
+    );
+
+    let mut second_run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    second_run.args(["service", "run", "--control", control_str]);
+    second_run.stdout(Stdio::null());
+    second_run.stderr(Stdio::null());
+    let mut second_run_child = second_run
+        .spawn()
+        .expect("spawn second response reconciliation run");
+    wait_for_live();
+    let second_status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["task", "status", "--control", control_str])
+        .output()
+        .expect("read task after second restart");
+    let second_json: serde_json::Value =
+        serde_json::from_slice(&second_status.stdout).expect("second task status is JSON");
+    let second_tasks = second_json["tasks"].as_array().expect("second tasks array");
+    assert_eq!(second_tasks.len(), 1, "second restart retains one task");
+    assert_eq!(second_tasks[0]["id"], successful_task_id);
+    let second_record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&task_record_path).expect("read second finalized task record"),
+    )
+    .expect("second finalized task record is JSON");
+    assert_eq!(second_record["admission"], "responded");
+    assert!(
+        !ack_path.exists(),
+        "second restart has no acknowledgement garbage"
+    );
+    assert!(
+        !control
+            .join("task-responses")
+            .join(&successful_request_name)
+            .exists(),
+        "second restart does not recreate a consumed response"
     );
 
     let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
@@ -2910,11 +2987,554 @@ fn service_task_start_discards_unadmitted_request_after_run_loss() {
         "teardown removes the successfully admitted task"
     );
     assert!(
-        final_run_child
+        second_run_child
             .wait()
             .expect("final service run exits")
             .success(),
         "final service run exits cleanly on teardown"
+    );
+}
+
+/// A response publication failure leaves the committed task tracked and lets
+/// the next supervisor restore its response without spawning a second task.
+#[cfg(unix)]
+#[test]
+fn service_task_start_response_write_failure_retries_committed_record() {
+    let root = TempMailbox::new("task-start-response-write-failure");
+    let control = root.path.join("control");
+    let session_inbox = root.path.join("session-inbox");
+    let session_outbox = root.path.join("session-outbox");
+    let callback_inbox = root.path.join("callback");
+    let failure_marker = root.path.join("response-write.failure");
+    let request_id = "response-write-failure-request";
+    let response_path = control
+        .join("task-responses")
+        .join(format!("{request_id}.json"));
+    let control_str = control.to_str().unwrap();
+    std::fs::write(&failure_marker, "fail once").expect("create response failure marker");
+
+    let wait_for_live = || {
+        for _ in 0..200 {
+            if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
+                .args(["service", "status", "--control", control_str])
+                .output()
+                && out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains("\"service_running\":true")
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("baton service run did not report live in time");
+    };
+
+    let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    run.args(["service", "run", "--control", control_str]);
+    run.env(
+        "BATON_TEST_TASK_START_RESPONSE_WRITE_FAILURE",
+        &failure_marker,
+    );
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::null());
+    let mut run_child = run.spawn().expect("spawn service run");
+    wait_for_live();
+
+    let session_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str,
+            "--inbox",
+            session_inbox.to_str().unwrap(),
+            "--outbox",
+            session_outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+            "--agent-cmd",
+            "sh",
+            "--agent-arg",
+            "-c",
+            "--agent-arg",
+            "cat >/dev/null; sleep 30",
+        ])
+        .output()
+        .expect("start task owner session");
+    assert!(
+        session_start.status.success(),
+        "service start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&session_start.stderr)
+    );
+    let session_id = String::from_utf8_lossy(&session_start.stdout)
+        .trim()
+        .to_string();
+    assert!(!session_id.is_empty(), "service start prints a session id");
+
+    let task_request = serde_json::json!({
+        "schema": "baton.task-spec/v1",
+        "session": session_id,
+        "command": "sleep",
+        "args": ["30"],
+        "cwd": null,
+        "env": [],
+        "milestones_ms": [],
+        "max_duration_ms": 60000,
+        "callback": {"inbox": callback_inbox, "role": null}
+    });
+    let task_requests = control.join("task-requests");
+    std::fs::create_dir_all(&task_requests).expect("create task requests");
+    std::fs::write(
+        task_requests.join(format!("{request_id}.json")),
+        serde_json::to_vec(&task_request).expect("serialize task request"),
+    )
+    .expect("write task request");
+
+    let task_record_path = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(entries) = std::fs::read_dir(control.join("tasks"))
+                && let Some(path) = entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .find(|path| {
+                        path.extension().and_then(|extension| extension.to_str()) == Some("json")
+                            && std::fs::read_to_string(path)
+                                .ok()
+                                .and_then(|contents| {
+                                    serde_json::from_str::<serde_json::Value>(&contents).ok()
+                                })
+                                .is_some_and(|record| record["request_id"] == request_id)
+                    })
+            {
+                break path;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "committed task record was not persisted"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let committed: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&task_record_path).expect("read committed task record"),
+    )
+    .expect("committed task record is JSON");
+    assert_eq!(committed["admission"], "committed");
+    assert!(
+        !failure_marker.exists(),
+        "response failure marker is consumed"
+    );
+    assert!(!response_path.exists(), "failed response is not published");
+
+    run_child
+        .kill()
+        .expect("kill service after response failure");
+    assert!(
+        !run_child.wait().expect("service run exits").success(),
+        "service run was interrupted"
+    );
+
+    let mut restarted = Command::new(env!("CARGO_BIN_EXE_baton"));
+    restarted.args(["service", "run", "--control", control_str]);
+    restarted.stdout(Stdio::null());
+    restarted.stderr(Stdio::null());
+    let mut restarted_child = restarted.spawn().expect("spawn restarted service run");
+    wait_for_live();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&task_record_path).expect("read restored task record"),
+        )
+        .expect("restored task record is JSON");
+        if response_path.is_file() && record["admission"] == "responded" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restart did not restore and finalize the committed response"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["task", "status", "--control", control_str])
+        .output()
+        .expect("read restored tasks");
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("restored task status is JSON");
+    let tasks = status_json["tasks"]
+        .as_array()
+        .expect("restored tasks array");
+    assert_eq!(tasks.len(), 1, "response retry retains one task");
+    assert_eq!(tasks[0]["id"], committed["id"]);
+
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str])
+        .output()
+        .expect("tear down response failure processes");
+    assert!(teardown.status.success(), "teardown succeeds");
+    assert!(
+        restarted_child
+            .wait()
+            .expect("restarted service exits")
+            .success(),
+        "restarted service exits cleanly on teardown"
+    );
+}
+
+/// A startup response restoration failure leaves the committed record
+/// recoverable, and a later restart retries it without creating another task.
+#[cfg(unix)]
+#[test]
+fn service_task_start_restoration_failure_retries_committed_record() {
+    let root = TempMailbox::new("task-start-restoration-failure");
+    let control = root.path.join("control");
+    let callback_inbox = root.path.join("callback");
+    let failure_marker = root.path.join("restoration-write.failure");
+    let request_id = "restoration-failure-request";
+    let task_id = "restoration-failure-task";
+    let control_str = control.to_str().unwrap();
+    let response_path = control
+        .join("task-responses")
+        .join(format!("{request_id}.json"));
+    let task_record = serde_json::json!({
+        "id": task_id,
+        "request_id": request_id,
+        "admission": "committed",
+        "spec": {
+            "schema": "baton.task-spec/v1",
+            "session": "session-not-needed-for-reconciliation",
+            "command": "true",
+            "args": [],
+            "cwd": null,
+            "env": [],
+            "milestones_ms": [],
+            "max_duration_ms": 60000,
+            "callback": {"inbox": callback_inbox, "role": null}
+        },
+        "pid": 0,
+        "started_at": null,
+        "started_ms": 1,
+        "state": "completed",
+        "exit_code": 0,
+        "elapsed_ms": 1,
+        "stdout_path": "",
+        "stderr_path": "",
+        "delivered_milestones": 0
+    });
+    let tasks_dir = control.join("tasks");
+    std::fs::create_dir_all(&tasks_dir).expect("create task records");
+    std::fs::write(
+        tasks_dir.join(format!("{task_id}.json")),
+        serde_json::to_vec(&task_record).expect("serialize committed task record"),
+    )
+    .expect("write committed task record");
+    std::fs::write(&failure_marker, "fail once").expect("create restoration failure marker");
+
+    let wait_for_live = || {
+        for _ in 0..200 {
+            if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
+                .args(["service", "status", "--control", control_str])
+                .output()
+                && out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains("\"service_running\":true")
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("baton service run did not report live in time");
+    };
+
+    let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    run.args(["service", "run", "--control", control_str]);
+    run.env(
+        "BATON_TEST_TASK_START_RESPONSE_WRITE_FAILURE",
+        &failure_marker,
+    );
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::null());
+    let mut run_child = run.spawn().expect("spawn service run");
+    wait_for_live();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while failure_marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "startup reconciliation did not attempt response restoration"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !failure_marker.exists(),
+        "restoration failure marker is consumed"
+    );
+    assert!(
+        !response_path.exists(),
+        "failed restoration does not publish a response"
+    );
+    let committed: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(tasks_dir.join(format!("{task_id}.json")))
+            .expect("read committed record after failed restoration"),
+    )
+    .expect("committed record after failed restoration is JSON");
+    assert_eq!(committed["admission"], "committed");
+
+    run_child
+        .kill()
+        .expect("kill service after failed restoration");
+    assert!(
+        !run_child.wait().expect("service run exits").success(),
+        "service run was interrupted"
+    );
+
+    let mut restarted = Command::new(env!("CARGO_BIN_EXE_baton"));
+    restarted.args(["service", "run", "--control", control_str]);
+    restarted.stdout(Stdio::null());
+    restarted.stderr(Stdio::null());
+    let mut restarted_child = restarted.spawn().expect("spawn retry service run");
+    wait_for_live();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(tasks_dir.join(format!("{task_id}.json")))
+                .expect("read restored record"),
+        )
+        .expect("restored record is JSON");
+        if response_path.is_file() && record["admission"] == "responded" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "retry did not restore and finalize the response"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["task", "status", "--control", control_str])
+        .output()
+        .expect("read restored task status");
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("restored task status is JSON");
+    let tasks = status_json["tasks"]
+        .as_array()
+        .expect("restored tasks array");
+    assert_eq!(tasks.len(), 1, "restoration retry retains one task");
+    assert_eq!(tasks[0]["id"], task_id);
+
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str])
+        .output()
+        .expect("tear down restoration failure processes");
+    assert!(teardown.status.success(), "teardown succeeds");
+    assert!(
+        restarted_child
+            .wait()
+            .expect("retry service exits")
+            .success(),
+        "retry service exits cleanly on teardown"
+    );
+}
+
+/// A client crash after its response acknowledgement is durable leaves a
+/// private claim that startup reconciliation can clean without replaying the
+/// response or task.
+#[cfg(unix)]
+#[test]
+fn service_task_start_claim_ack_cleanup_survives_client_loss() {
+    let root = TempMailbox::new("task-start-claim-ack-loss");
+    let control = root.path.join("control");
+    let session_inbox = root.path.join("session-inbox");
+    let session_outbox = root.path.join("session-outbox");
+    let callback_inbox = root.path.join("callback");
+    let ack_barrier = root.path.join("task-start-ack.barrier");
+    let control_str = control.to_str().unwrap();
+    std::fs::write(&ack_barrier, "hold").expect("create task-start ack barrier");
+
+    let wait_for_live = || {
+        for _ in 0..200 {
+            if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
+                .args(["service", "status", "--control", control_str])
+                .output()
+                && out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains("\"service_running\":true")
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("baton service run did not report live in time");
+    };
+
+    let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    run.args(["service", "run", "--control", control_str]);
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::null());
+    let mut run_child = run.spawn().expect("spawn service run");
+    wait_for_live();
+
+    let session_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str,
+            "--inbox",
+            session_inbox.to_str().unwrap(),
+            "--outbox",
+            session_outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+            "--agent-cmd",
+            "sh",
+            "--agent-arg",
+            "-c",
+            "--agent-arg",
+            "cat >/dev/null; sleep 30",
+        ])
+        .output()
+        .expect("start task owner session");
+    assert!(
+        session_start.status.success(),
+        "service start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&session_start.stderr)
+    );
+    let session_id = String::from_utf8_lossy(&session_start.stdout)
+        .trim()
+        .to_string();
+    assert!(!session_id.is_empty(), "service start prints a session id");
+
+    let admission_lock_path = control.join("service.admission.lock");
+    let admission_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&admission_lock_path)
+        .expect("open service admission lock");
+    admission_lock.lock().expect("hold service admission lock");
+
+    let mut client = Command::new(env!("CARGO_BIN_EXE_baton"));
+    client.args([
+        "task",
+        "start",
+        "--control",
+        control_str,
+        "--session",
+        &session_id,
+        "--command",
+        "sleep",
+        "--arg",
+        "30",
+        "--max-duration-ms",
+        "60000",
+        "--callback-inbox",
+        callback_inbox.to_str().unwrap(),
+    ]);
+    client.env("BATON_TEST_TASK_START_ACK_BARRIER", &ack_barrier);
+    client.stdout(Stdio::null());
+    client.stderr(Stdio::null());
+    let mut client = client.spawn().expect("spawn task-start client");
+
+    let request_path = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(entries) = std::fs::read_dir(control.join("task-requests"))
+                && let Some(path) = entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .find(|path| {
+                        path.extension().and_then(|extension| extension.to_str()) == Some("json")
+                    })
+            {
+                break path;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "task-start request was not written"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let request_name = request_path
+        .file_name()
+        .expect("request filename")
+        .to_owned();
+    drop(admission_lock);
+
+    let response_path = control.join("task-responses").join(&request_name);
+    let ack_path = control.join("task-start-ack").join(&request_name);
+    let claim_path = control
+        .join("task-responses")
+        .join(format!(".{}.claimed", request_name.to_string_lossy()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if ack_path.is_file() && claim_path.is_file() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "client did not reach the durable acknowledgement boundary"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !response_path.exists(),
+        "claimed response is no longer public"
+    );
+    client
+        .kill()
+        .expect("kill task-start client at claim boundary");
+    assert!(
+        !client.wait().expect("task-start client exits").success(),
+        "task-start client was interrupted at the claim boundary"
+    );
+    assert!(ack_path.is_file(), "acknowledgement survives client loss");
+    assert!(claim_path.is_file(), "private claim survives client loss");
+
+    run_child.kill().expect("kill service after client loss");
+    assert!(
+        !run_child.wait().expect("service run exits").success(),
+        "service run was interrupted"
+    );
+
+    let mut restarted = Command::new(env!("CARGO_BIN_EXE_baton"));
+    restarted.args(["service", "run", "--control", control_str]);
+    restarted.stdout(Stdio::null());
+    restarted.stderr(Stdio::null());
+    let mut restarted_child = restarted.spawn().expect("spawn restarted service run");
+    wait_for_live();
+    assert!(
+        !ack_path.exists(),
+        "restart cleans the durable acknowledgement"
+    );
+    assert!(!claim_path.exists(), "restart cleans the private claim");
+    assert!(
+        !response_path.exists(),
+        "restart does not recreate the consumed response"
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["task", "status", "--control", control_str])
+        .output()
+        .expect("read task status after claim cleanup");
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("claim cleanup task status is JSON");
+    let tasks = status_json["tasks"]
+        .as_array()
+        .expect("claim cleanup tasks array");
+    assert_eq!(tasks.len(), 1, "claim cleanup retains one task");
+
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str])
+        .output()
+        .expect("tear down claim cleanup processes");
+    assert!(teardown.status.success(), "teardown succeeds");
+    assert!(
+        restarted_child
+            .wait()
+            .expect("restarted service exits")
+            .success(),
+        "restarted service exits cleanly on teardown"
     );
 }
 
