@@ -2899,10 +2899,23 @@ fn service_task_start_discards_unadmitted_request_after_run_loss() {
     let final_tasks = final_json["tasks"].as_array().expect("final tasks array");
     assert_eq!(final_tasks.len(), 1, "restart must not duplicate the task");
     assert_eq!(final_tasks[0]["id"], successful_task_id);
-    let final_record: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&task_record_path).expect("read finalized task record"),
-    )
-    .expect("finalized task record is JSON");
+    let final_record = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let record: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&task_record_path).expect("read finalized task record"),
+            )
+            .expect("finalized task record is JSON");
+            if record["admission"] == "responded" && !ack_path.exists() {
+                break record;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "restart did not finish response reconciliation"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
     assert_eq!(
         final_record["admission"], "responded",
         "acknowledged response is finalized on restart"
@@ -2947,10 +2960,23 @@ fn service_task_start_discards_unadmitted_request_after_run_loss() {
     let second_tasks = second_json["tasks"].as_array().expect("second tasks array");
     assert_eq!(second_tasks.len(), 1, "second restart retains one task");
     assert_eq!(second_tasks[0]["id"], successful_task_id);
-    let second_record: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&task_record_path).expect("read second finalized task record"),
-    )
-    .expect("second finalized task record is JSON");
+    let second_record = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let record: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&task_record_path).expect("read second finalized task record"),
+            )
+            .expect("second finalized task record is JSON");
+            if record["admission"] == "responded" && !ack_path.exists() {
+                break record;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "second restart did not finish response reconciliation"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
     assert_eq!(second_record["admission"], "responded");
     assert!(
         !ack_path.exists(),
@@ -3103,7 +3129,10 @@ fn service_task_start_response_write_failure_retries_committed_record() {
                                 .and_then(|contents| {
                                     serde_json::from_str::<serde_json::Value>(&contents).ok()
                                 })
-                                .is_some_and(|record| record["request_id"] == request_id)
+                                .is_some_and(|record| {
+                                    record["request_id"] == request_id
+                                        && record["admission"] == "committed"
+                                })
                     })
             {
                 break path;
