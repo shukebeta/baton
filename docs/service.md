@@ -37,7 +37,9 @@ without ever sharing a process tree with it.
   design on Windows; `baton service` fails clearly there instead of silently
   falling back to a weaker guarantee. On Linux, per-session liveness uses
   `/proc/<pid>/stat`; on macOS, it uses `ps` process state plus the
-  second-granular `lstart` value. The macOS probe always sets
+  second-granular `lstart` value. A probe reports `live`, `dead`, or
+  `unresolved`; the last state means a PID exists but baton cannot prove its
+  identity and is never treated as dead. The macOS probe always sets
   `LC_ALL=C`, `LC_TIME=C`, and `TZ=UTC`, so its process key is independent of
   the environment of the supervisor or the CLI client. Native Windows service
   support is tracked separately.
@@ -75,8 +77,8 @@ baton service start --control <dir> --inbox <dir> --outbox <dir> [--poll-ms <n>]
                      [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]]
                     [--role <name>]
 baton service status --control <dir> [--session <id>]
-baton service stop --control <dir> --session <id>
-baton service teardown --control <dir>
+baton service stop --control <dir> --session <id> [--force]
+baton service teardown --control <dir> [--force]
 ```
 
 - **`service run`** acquires the control lock and blocks, spawning and
@@ -95,19 +97,25 @@ baton service teardown --control <dir>
   lexical and does not canonicalize or require the target to exist at
   submission time. Absolute values are preserved unchanged.
 - **`service status`** reports the service's own liveness plus every session's
-  (or just `--session <id>`'s). Per-session liveness checks the recorded PID
-  against `/proc/<pid>` on Linux — alive, not a zombie, and its start time
-  still matches the record — so a PID recycled after a restart is reported as
-  crashed rather than (incorrectly) live. On macOS, the same check uses
-  `ps -p <pid> -o state=,lstart=`; a leading `Z` is treated as gone and the
-  normalized `lstart` value must match the record. Each macOS probe fixes
-  `LC_ALL` and `LC_TIME` to `C` and `TZ` to `UTC` before invoking `ps`, so
-  `lstart` remains comparable when the supervisor and client inherit different
-  locale or time-zone settings. `lstart` is second-granular and is a
-  BSD/procps extension rather than a POSIX interface.
+  (or just `--session <id>`'s). Each record retains the compatibility boolean
+  `live` (`true` only for `liveness: "live"`) and exposes the full
+  `liveness` state. Per-session liveness checks the recorded PID against
+  `/proc/<pid>` on Linux — alive, not a zombie, and its start time still
+  matches the record — so a PID recycled after a restart is `dead`. On macOS,
+  the check uses `ps -ww -p <pid> -o state=,lstart=,command=`; a leading `Z`
+  is `dead`; a matching normalized `lstart` is `live`, while an absent or
+  mismatched key falls through to the argv/instant corroborators below. Each
+  macOS probe fixes `LC_ALL` and `LC_TIME` to `C` and `TZ` to `UTC` before
+  invoking `ps`, so `lstart` remains comparable when the supervisor and
+  client inherit different locale or time-zone settings. `lstart` is
+  second-granular and is a BSD/procps extension rather than a POSIX interface.
 - **`service stop --session <id>`** tries `serve`'s own cooperative stop
   against the session's inbox first, then escalates to a bounded
-  `SIGTERM`/`SIGKILL` on the session's process group if it is still alive.
+  `SIGTERM`/`SIGKILL` on the session's process group if it is still
+  corroborated live. Without `--force`, an unresolved session or owned task
+  remains durable and the command exits non-zero after printing its id, PID,
+  liveness, and recorded argv to stderr. `--force` asserts the operator's
+  identity claim, signals, and removes unresolved records.
   It serializes that cleanup with task admission, so a task is either
   admitted before the stop and reaped with the session or rejected after the
   session is no longer a live owner. Idempotent — stopping an already-gone
@@ -119,9 +127,55 @@ baton service teardown --control <dir>
   the snapshot, or fails because no live service remains (an already-written
   request may remain unprocessed); it cannot spawn a session outside the
   snapshot. Teardown also takes the short-lived admission lock while it
-  drains the snapshot, covering task cleanup as well. Idempotent, and safe to
-  call whether or not `run` is currently alive (e.g. to reap stale records
-  left by a `run` that already crashed).
+  drains the snapshot, covering task cleanup as well. Without `--force`, it
+  keeps unresolved records, prints their identity details to stderr, and exits
+  non-zero; `--force` signals and removes them on the operator's assertion.
+  Idempotent, and safe to call whether or not `run` is currently alive (e.g.
+  to reap stale records left by a `run` that already crashed).
+
+### Liveness resolution and safe cleanup
+
+Status exposes three identity outcomes for a running record:
+
+- `live` means the process is present and its PID identity is corroborated.
+- `dead` means the PID is absent, a zombie, or positively belongs to a
+  different process. Dead records may be removed.
+- `unresolved` means the PID exists but the available identity evidence is
+  unreadable or insufficient. It is fail-closed: no signal, removal, or failed
+  terminal state is inferred from it.
+
+The resolution ladder is platform-specific:
+
+- On Linux, an unreadable `/proc/<pid>/stat` is `unresolved`; a missing PID or
+  zombie is `dead`; a matching start-time tick is `live`; and a mismatched
+  recorded tick is `dead`. A legacy session with no start key may use the
+  exact NUL-separated `/proc/<pid>/cmdline` argv as a corroborator. A legacy
+  task may use matching argv to confirm `live`, but a mismatch is only
+  `unresolved`, because a task such as `bash -c ...` can exec-replace its argv
+  while retaining the same PID. Linux has no epoch instant leg: `/proc` start
+  ticks are relative to boot, and `/proc/<pid>` directory mtime is not a safe
+  substitute because procfs can restamp it on lookup.
+- On macOS, a mismatch or absent `lstart` key falls through to a session argv
+  suffix match or a task start-instant comparison. The probe is pinned to
+  `LC_ALL=C LC_TIME=C TZ=UTC` and parses `lstart` as a proleptic Gregorian UTC
+  epoch. For a task, `Δ = started_ms - lstart_epoch_seconds * 1000`: a negative
+  delta is `dead`, `0 <= Δ < 6000` ms is `live`, and a larger delta is
+  `unresolved`. The 6000 ms bound allows one second of `lstart` truncation plus
+  5000 ms of spawn-to-record latency; overestimating it can only preserve an
+  unresolved record, never condemn a genuine task. Task argv can confirm only
+  when the durable instant is unavailable and never condemns a mismatch.
+
+`service stop` and `service teardown` always try the identity-free cooperative
+mailbox stop first. They then signal only `live` records, remove only `dead`
+records, and retain `unresolved` records. A retained record's id, PID,
+liveness, and recorded argv are printed to stderr and the command exits
+non-zero. `--force` is the explicit operator assertion of identity: it sends
+the process-group signals and removes the unresolved record. `task cancel` has
+no force flag; it leaves its cooperative cancel sentinel for the supervisor
+and never escalates an unresolved identity.
+
+`TaskRecord.started_ms` and `Clock::now_ms()` are Unix epoch milliseconds.
+`FakeClock::at` initializes that same unit for deterministic instant-leg tests.
 
 Standalone `baton serve` (run directly, without `baton service`) is
 unaffected by any of this — `service` only ever spawns the same `serve`
@@ -188,7 +242,8 @@ baton task cancel --control <dir> --task <id>
   to resolve delivery beyond that.
 - **`task status`** reports one task (`--task <id>`) or every known task:
   `running`/`completed`/`failed`/`timeout`/`cancelled` state, exit code,
-  elapsed milliseconds, and the following task identity/output fields:
+  elapsed milliseconds, `live` plus the distinct `liveness` identity state,
+  and the following task identity/output fields:
   `command` is the effective executable identity, while `stdout_path` and
   `stderr_path` are the paths to the captured stdout and stderr logs.
   These fields are present for both running and terminal tasks. Reads the
@@ -204,21 +259,26 @@ baton task cancel --control <dir> --task <id>
 `service run` scans durable task records before it accepts new requests. Each
 new running record stores the task's spawn time as Unix epoch milliseconds, so
 milestone and max-duration decisions continue from the original task start
-after a restart. Linux also requires the recorded
-`/proc/<pid>/stat` start key to match the current process; a missing or
-mismatched key is treated as gone and is never adopted or signalled.
+after a restart. Linux requires a recorded `/proc/<pid>/stat` start key to
+match the current process; a missing key uses the fail-closed argv fallback,
+while a mismatched key is `dead` and is never adopted or signalled. On macOS,
+an absent or mismatched `lstart` key uses the task instant corroborator
+described above, so a live exec-replaced task remains tracked instead of being
+finalized as failed.
 
 The restarted supervisor cannot recover a `std::process::Child` handle for a
 task reparented to init. It therefore tracks a corroborated PID directly:
-milestones and timeout signals continue while the PID is live, and the task is
-finalized when that PID disappears. No exit status can be recovered through
-this path, so a rehydrated task that is already gone or later finishes is
-recorded as `failed` with `exit_code: null`; a timeout or cancellation remains
-`timeout` or `cancelled` when the supervisor initiated that outcome. State is
-persisted before the deterministic terminal callback is delivered, and a
-delivery failure leaves the tracker in place to retry the same event id. A
-terminal record is replayed once on the next startup for the same reason; the
-mailbox's done ledger drops it if delivery already completed.
+milestones and timeout signals continue while the PID is `live`, and the task
+is finalized when that PID is `dead`. An `unresolved` task remains tracked and
+is not signalled or finalized as failed until a later probe resolves it. No
+exit status can be recovered through this path, so a rehydrated task that is
+already gone or later finishes is recorded as `failed` with `exit_code: null`;
+a timeout or cancellation remains `timeout` or `cancelled` when the supervisor
+initiated that outcome. State is persisted before the deterministic terminal
+callback is delivered, and a delivery failure leaves the tracker in place to
+retry the same event id. A terminal record is replayed once on the next
+startup for the same reason; the mailbox's done ledger drops it if delivery
+already completed.
 
 Task admission is a durable transaction keyed by the task-start request id.
 After spawning and persisting a `TaskRecord`, `run` records the `prepared`
