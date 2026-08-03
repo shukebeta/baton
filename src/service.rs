@@ -1342,21 +1342,21 @@ mod imp {
             restore_task_start_response_claim(control, request_id)?;
             if record.admission == TaskAdmissionPhase::Committed {
                 let response_path = task_start_response_path(control, request_id)?;
-                if !response_path.is_file() {
-                    if let Err(err) = write_task_start_response(
+                if !response_path.is_file()
+                    && let Err(err) = write_task_start_response(
                         control,
                         request_id,
                         &TaskStartResponse {
                             task_id: Some(record.id.clone()),
                             error: None,
                         },
-                    ) {
-                        eprintln!(
-                            "warning: task {} response restoration failed; retaining committed admission: {err}",
-                            record.id
-                        );
-                        continue;
-                    }
+                    )
+                {
+                    eprintln!(
+                        "warning: task {} response restoration failed; retaining committed admission: {err}",
+                        record.id
+                    );
+                    continue;
                 }
                 let mut responded = record.clone();
                 responded.admission = TaskAdmissionPhase::Responded;
