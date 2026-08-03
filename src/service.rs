@@ -1010,8 +1010,20 @@ mod imp {
         control: &Path,
         request_id: &str,
     ) -> Result<Option<TaskStartResponse>> {
+        if !task_start_response_boundary_exists(control, request_id)? {
+            return Ok(None);
+        }
         let _admission = acquire_admission_lock(control)?;
         take_task_start_response_locked(control, request_id)
+    }
+
+    /// Lock-free hint used by the polling client. The result can change
+    /// immediately after this check; the admission lock is acquired before
+    /// any claim, acknowledgement, or cleanup operation.
+    fn task_start_response_boundary_exists(control: &Path, request_id: &str) -> Result<bool> {
+        Ok(task_start_response_path(control, request_id)?.is_file()
+            || task_start_response_claim_path(control, request_id)?.is_file()
+            || task_start_ack_path(control, request_id)?.is_file())
     }
 
     fn take_task_start_response_locked(
@@ -3241,6 +3253,20 @@ mod imp {
                 .collect();
             ids.sort();
             assert_eq!(ids, vec!["task-0", "task-1", "task-2"]);
+        }
+
+        /// An absent response returns without waiting on the admission lock,
+        /// so a polling client cannot hold that lock across the wait interval.
+        #[test]
+        fn absent_task_start_response_poll_is_lock_free() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("task-response-poll");
+            let _admission = acquire_admission_lock(&dir.path).expect("hold admission lock");
+            assert!(
+                take_task_start_response(&dir.path, "poll-request")
+                    .expect("poll response")
+                    .is_none()
+            );
         }
 
         /// A response claim writes its acknowledgement before cleanup, and a
