@@ -10,7 +10,9 @@
 //! building and status mapping via a fake `HttpClient`; these tests add
 //! confidence that the same logic survives a real `ureq` round-trip.
 
-use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::io::{BufRead, BufReader};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
