@@ -48,7 +48,7 @@ release_tags_desc() {
     while IFS= read -r tag; do
         release_is_valid_tag "${tag}" || continue
         printf '%s\n' "${tag}"
-    done < <(git tag --list 'v*' --sort=-version:refname)
+    done < <(git tag --merged HEAD --list 'v*' --sort=-version:refname)
 }
 
 release_latest_tag() {
