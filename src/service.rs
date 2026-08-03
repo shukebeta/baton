@@ -210,8 +210,8 @@ mod imp {
     use crate::mailbox;
     use crate::message::{MessageEnvelope, MessageKind};
     use crate::task::{
-        Clock, SystemClock, TaskEventBody, TaskEventKind, TaskRecord, TaskSpec, TaskState,
-        max_duration_exceeded, milestones_due, task_event_id,
+        Clock, SystemClock, TaskAdmissionPhase, TaskEventBody, TaskEventKind, TaskRecord, TaskSpec,
+        TaskState, max_duration_exceeded, milestones_due, task_event_id,
     };
     #[cfg(test)]
     use crate::task::{FakeClock, TaskCallback};
@@ -350,6 +350,12 @@ mod imp {
         // Discard any stale sentinel a prior instance left, so a fresh start
         // is never killed by a stop meant for an earlier run.
         let _ = fs::remove_file(control.join(CONTROL_STOP_FILE));
+        // Reconcile task admissions while the startup instance is the only
+        // possible request processor. The short-lived lock also serializes
+        // this pass with a submitting client writing a rollback marker after
+        // observing the previous supervisor disappear.
+        let _admission = acquire_admission_lock(control)?;
+        reconcile_task_admissions(control)?;
         // A request left mid-`processing/` by a crash between claim and
         // response is returned to `requests/`, mirroring
         // `Mailbox::reclaim_stale` — reprocessed harmlessly under a fresh
@@ -360,6 +366,7 @@ mod imp {
         // behind (reaped the next time it's inspected).
         reclaim_stale_requests(control)?;
         reclaim_stale_task_requests(control)?;
+        drop(_admission);
         let clock = SystemClock;
         let mut tasks = rehydrate_tasks(control, &clock)?;
         writeln!(out, "baton service running on {}", control.display()).map_err(io_err)?;
@@ -872,6 +879,10 @@ mod imp {
         control.join("task-logs").join(task_id)
     }
 
+    fn task_start_rollback_dir(control: &Path) -> std::path::PathBuf {
+        control.join("task-start-rollback")
+    }
+
     fn task_cancel_dir(control: &Path) -> std::path::PathBuf {
         control.join("task-cancel")
     }
@@ -925,10 +936,15 @@ mod imp {
             if probe_control(control)? == ControlLiveness::NotRunning {
                 // The supervisor can write its response just before dropping
                 // the control lock. Re-check the response after observing the
-                // released lock so a successful admission wins this race.
+                // released lock so a successful admission wins this race. The
+                // admission lock keeps a newly-started supervisor from
+                // processing the request between this check and the rollback
+                // marker.
+                let _admission = acquire_admission_lock(control)?;
                 if let Some(response) = take_task_start_response(control, request_id)? {
                     return task_start_response_id(control, request_id, response);
                 }
+                mark_task_start_rollback(control, request_id)?;
                 discard_pending_task_start_request(control, request_id)?;
                 return Err(BatonError::Io(format!(
                     "no live baton service on {control:?}; task start request was not admitted"
@@ -998,6 +1014,130 @@ mod imp {
             }
         }
         Ok(())
+    }
+
+    /// Records that the submitting client observed admission loss. The marker
+    /// is durable before request files are removed, so a restart can reconcile
+    /// a task record that was written before the response boundary.
+    fn mark_task_start_rollback(control: &Path, request_id: &str) -> Result<()> {
+        let dir = task_start_rollback_dir(control);
+        fs::create_dir_all(&dir)
+            .map_err(|err| BatonError::Io(format!("could not create {dir:?}: {err}")))?;
+        mailbox::atomic_write(&dir, &mailbox::file_name(request_id), "")
+    }
+
+    fn task_start_rollback_path(control: &Path, request_id: &str) -> Result<std::path::PathBuf> {
+        if !mailbox::is_safe_key(request_id) {
+            return Err(BatonError::Io(format!(
+                "task start request id is not usable as a filename: {request_id:?}"
+            )));
+        }
+        Ok(task_start_rollback_dir(control).join(mailbox::file_name(request_id)))
+    }
+
+    fn task_start_rollback_exists(control: &Path, request_id: &str) -> Result<bool> {
+        Ok(task_start_rollback_path(control, request_id)?.is_file())
+    }
+
+    fn remove_task_start_rollback(control: &Path, request_id: &str) -> Result<()> {
+        let path = task_start_rollback_path(control, request_id)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(BatonError::Io(format!(
+                "could not remove task start rollback marker {path:?}: {err}"
+            ))),
+        }
+    }
+
+    fn list_task_start_rollbacks(control: &Path) -> Result<Vec<String>> {
+        let dir = task_start_rollback_dir(control);
+        let entries = match fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => {
+                return Err(BatonError::Io(format!(
+                    "could not read task start rollback directory {dir:?}: {err}"
+                )));
+            }
+        };
+        let mut request_ids = Vec::new();
+        for entry in entries {
+            let path = mailbox::dir_entry(entry, &dir)?.path();
+            let Some(key) = mailbox::json_key(&path) else {
+                continue;
+            };
+            request_ids.push(key);
+        }
+        Ok(request_ids)
+    }
+
+    /// Reconciles task-start transactions before the request loop can accept
+    /// new work. Prepared records are never safe to rehydrate; a rollback
+    /// marker also wins over a committed record because the client observed no
+    /// response. Committed records are retained and their response is
+    /// re-delivered if the previous service died before the client consumed it.
+    fn reconcile_task_admissions(control: &Path) -> Result<()> {
+        let rollback_ids = list_task_start_rollbacks(control)?;
+        let records = list_task_records(control)?;
+        let mut seen_rollbacks = std::collections::HashSet::new();
+
+        for record in records {
+            if record.admission == TaskAdmissionPhase::Prepared {
+                if let Some(request_id) = record.request_id.as_deref() {
+                    remove_task_start_rollback(control, request_id)?;
+                    discard_pending_task_start_request(control, request_id)?;
+                }
+                abort_task_admission(control, &record)?;
+                continue;
+            }
+            let Some(request_id) = record.request_id.as_deref() else {
+                continue;
+            };
+            let rollback = rollback_ids.iter().any(|id| id == request_id);
+            if rollback {
+                seen_rollbacks.insert(request_id.to_string());
+            }
+            if rollback {
+                abort_task_admission(control, &record)?;
+                remove_task_start_rollback(control, request_id)?;
+                discard_pending_task_start_request(control, request_id)?;
+                continue;
+            }
+
+            discard_pending_task_start_request(control, request_id)?;
+            let response_path = task_responses_dir(control).join(mailbox::file_name(request_id));
+            if !response_path.is_file() {
+                write_task_start_response(
+                    control,
+                    request_id,
+                    &TaskStartResponse {
+                        task_id: Some(record.id.clone()),
+                        error: None,
+                    },
+                )?;
+            }
+        }
+
+        for request_id in rollback_ids {
+            if !seen_rollbacks.contains(&request_id) {
+                discard_pending_task_start_request(control, &request_id)?;
+            }
+            remove_task_start_rollback(control, &request_id)?;
+        }
+        Ok(())
+    }
+
+    fn abort_task_admission(control: &Path, record: &TaskRecord) -> Result<()> {
+        if record.state == TaskState::Running && is_task_alive(record) {
+            let _ = signal_group(record.pid, "-TERM");
+            wait_while_task_alive(record, KILL_GRACE_MS);
+            if is_task_alive(record) {
+                let _ = signal_group(record.pid, "-KILL");
+                wait_while_task_alive(record, KILL_GRACE_MS);
+            }
+        }
+        remove_task_record(control, &record.id)
     }
 
     /// Returns any `task-processing/` entry a crash left mid-request to
@@ -1126,6 +1266,10 @@ mod imp {
                     // removed/dead owner; if admission wins, cleanup waits
                     // and reaps the newly recorded task.
                     let outcome = acquire_admission_lock(control).and_then(|_admission| {
+                        if task_start_rollback_exists(control, &key)? {
+                            remove_task_start_rollback(control, &key)?;
+                            return Ok(None);
+                        }
                         handle_task_start_request(control, &key, &claimed_path, clock)
                     });
                     let _ = fs::remove_file(&claimed_path);
@@ -1205,8 +1349,10 @@ mod imp {
             )));
         }
         let started_ms = clock.now_ms();
-        let record = TaskRecord {
+        let mut record = TaskRecord {
             id: task_id,
+            request_id: Some(request_id.to_string()),
+            admission: TaskAdmissionPhase::Prepared,
             spec,
             pid,
             started_at,
@@ -1221,6 +1367,14 @@ mod imp {
         if let Err(err) = write_task_record(control, &record) {
             let _ = signal_group(pid, "-KILL");
             let _ = child.wait();
+            return Err(err);
+        }
+        wait_for_test_task_admission_barrier();
+        record.admission = TaskAdmissionPhase::Committed;
+        if let Err(err) = write_task_record(control, &record) {
+            let _ = signal_group(pid, "-KILL");
+            let _ = child.wait();
+            let _ = remove_task_record(control, &record.id);
             return Err(err);
         }
         let respond = write_task_start_response(
@@ -1238,6 +1392,20 @@ mod imp {
             return Err(err);
         }
         Ok(Some((record, child, started_ms)))
+    }
+
+    /// Test-only synchronization seam for the post-record/pre-response crash
+    /// regression. A service launched with this environment variable waits
+    /// after persisting the prepared record until the named path disappears;
+    /// production callers never set it.
+    fn wait_for_test_task_admission_barrier() {
+        let Some(path) = std::env::var_os("BATON_TEST_TASK_ADMISSION_BARRIER") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        while path.exists() {
+            std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        }
     }
 
     fn write_task_start_response(
@@ -2174,6 +2342,8 @@ mod imp {
             let started_ms = clock.now_ms();
             let record = TaskRecord {
                 id: id.to_string(),
+                request_id: None,
+                admission: TaskAdmissionPhase::Committed,
                 spec,
                 pid,
                 started_at: recorded_start_key(pid),
@@ -2651,6 +2821,8 @@ mod imp {
             let dir = TempDir::new("task-record");
             let record = TaskRecord {
                 id: "task-1".to_string(),
+                request_id: None,
+                admission: TaskAdmissionPhase::Committed,
                 spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/cb"),
                 pid: 4242,
                 started_at: Some("123456".to_string()),
@@ -2692,6 +2864,8 @@ mod imp {
             for i in 0..3 {
                 let record = TaskRecord {
                     id: format!("task-{i}"),
+                    request_id: None,
+                    admission: TaskAdmissionPhase::Committed,
                     spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/cb"),
                     pid: 1000 + i,
                     started_at: None,
@@ -2738,6 +2912,8 @@ mod imp {
                 spawn_task_child(&spec, &stdout_path, &stderr_path).expect("spawn task");
             let record = TaskRecord {
                 id: "task-reused".to_string(),
+                request_id: None,
+                admission: TaskAdmissionPhase::Committed,
                 spec,
                 pid: child.id(),
                 started_at: Some("not-the-current-start-key".to_string()),
@@ -2809,6 +2985,8 @@ mod imp {
             let callback_inbox = dir.path.join("callback");
             let record = TaskRecord {
                 id: "task-x".to_string(),
+                request_id: None,
+                admission: TaskAdmissionPhase::Committed,
                 spec: task_spec(
                     "svc-1",
                     "true",
@@ -3102,6 +3280,8 @@ mod imp {
             let dir = TempDir::new("reap-scoped");
             let owned = TaskRecord {
                 id: "task-owned".to_string(),
+                request_id: None,
+                admission: TaskAdmissionPhase::Committed,
                 spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/cb-a"),
                 pid: u32::MAX - 1,
                 started_at: None,
@@ -3115,6 +3295,8 @@ mod imp {
             };
             let other = TaskRecord {
                 id: "task-other".to_string(),
+                request_id: None,
+                admission: TaskAdmissionPhase::Committed,
                 spec: task_spec("svc-2", "true", vec![], vec![], 1_000, "/tmp/cb-b"),
                 pid: u32::MAX - 1,
                 started_at: None,
@@ -3160,6 +3342,8 @@ mod imp {
             write_session_record(&dir.path, &session_record).expect("write session");
             let task_record = TaskRecord {
                 id: "task-1".to_string(),
+                request_id: None,
+                admission: TaskAdmissionPhase::Committed,
                 spec: task_spec(
                     "svc-1",
                     "true",
@@ -3208,6 +3392,8 @@ mod imp {
             let dir = TempDir::new("task-status");
             let record = TaskRecord {
                 id: "task-1".to_string(),
+                request_id: None,
+                admission: TaskAdmissionPhase::Committed,
                 spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/cb"),
                 pid: u32::MAX - 1,
                 started_at: None,
