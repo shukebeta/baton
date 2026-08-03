@@ -124,12 +124,41 @@ pub enum TaskState {
     Cancelled,
 }
 
+/// Durable admission phase for a task-start request.
+///
+/// A prepared task has a durable record but has not yet reached the response
+/// boundary. A committed task has crossed the record boundary but is still
+/// waiting for the response write; a responded task has a durable response
+/// and needs no response restoration on restart. Older task records omit this
+/// field and deserialize as responded, preserving tasks admitted before the
+/// transaction marker was introduced without creating orphan responses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskAdmissionPhase {
+    /// The task record was persisted, but the successful admission response
+    /// has not crossed the durable commit boundary.
+    Prepared,
+    /// The task record and admission decision are durable; the response may
+    /// still be pending.
+    Committed,
+    /// The task-start response was durably written.
+    #[default]
+    Responded,
+}
+
 /// A durable on-disk record of one task the service has spawned: its
 /// effective spec, live PID, and terminal state once known.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskRecord {
     /// Stable task id, minted at spawn.
     pub id: String,
+    /// Request id that admitted this task. `None` identifies a legacy record
+    /// written before durable task admission was introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Durable admission phase used during supervisor restart reconciliation.
+    #[serde(default)]
+    pub admission: TaskAdmissionPhase,
     /// The effective spec this task was spawned from.
     pub spec: TaskSpec,
     /// OS pid of the task's process-group leader.

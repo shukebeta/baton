@@ -149,13 +149,14 @@ baton task cancel --control <dir> --task <id>
   record whose process is no longer live is rejected with a non-zero owner
   error before any task process, log directory, or `TaskRecord` is created.
   While waiting for the response, the submitting client probes the control
-  lock. If `run` releases that lock before answering, the client re-checks for
-  a response, then removes the still-pending request from `task-requests/` or
-  `task-processing/` and exits non-zero with a `task start request was not
-  admitted` error. A subsequent `service run` therefore does not replay a
-  request whose client was told admission failed. A response already written
-  before the lock is released wins this race and remains a successful task
-  start.
+  lock. If `run` releases that lock before answering, the client takes the
+  short-lived admission lock, re-checks for a response, writes a durable
+  rollback marker, then removes the still-pending request from
+  `task-requests/` or `task-processing/` and exits non-zero with a `task start
+  request was not admitted` error. A subsequent `service run` therefore does
+  not replay a request whose client was told admission failed. A response
+  already written before the lock is released wins this race and remains a
+  successful task start.
 - **`--session <id>` is the ownership tag, not a routing target.** A task is
   owned and reaped by whichever `baton service` session names it here,
   independent of where its events are delivered — see "Ownership vs. callback"
@@ -211,6 +212,18 @@ persisted before the deterministic terminal callback is delivered, and a
 delivery failure leaves the tracker in place to retry the same event id. A
 terminal record is replayed once on the next startup for the same reason; the
 mailbox's done ledger drops it if delivery already completed.
+
+Task admission is a durable transaction keyed by the task-start request id.
+After spawning and persisting a `TaskRecord`, `run` records the
+`prepared` phase, then durably changes it to `committed` before writing the
+success response, and finally records `responded` after that response write
+succeeds. Startup reconciliation removes every prepared task and every task
+named by a client rollback marker, including its process and task record. A
+committed task is retained, its stale request is discarded, and its success
+response is restored only if the supervisor died before writing it. A
+responded task is retained without recreating a response already consumed by
+the client. This ordering makes the task record and its response boundary
+recoverable without replaying a spawned command.
 
 ### Event delivery and dedup contract
 
