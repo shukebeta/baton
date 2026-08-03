@@ -2112,6 +2112,308 @@ fn process_is_live(pid: u32) -> bool {
         .is_some_and(|state| state != 'Z')
 }
 
+/// Issue #147 regression: macOS `ps` start keys must remain stable when the
+/// supervisor records a session under one environment and later CLI probes
+/// run under another. The test covers status, stop, and teardown, including
+/// the process cleanup that depends on a live-session match.
+#[cfg(target_os = "macos")]
+#[test]
+fn service_liveness_keys_ignore_supervisor_and_client_environment() {
+    use baton::mailbox;
+    use baton::message::{MessageEnvelope, MessageKind};
+
+    let root = TempMailbox::new("service-macos-liveness");
+    let control = root.path.join("control");
+    let first_inbox = root.path.join("first-inbox");
+    let first_outbox = root.path.join("first-outbox");
+    let first_agent_started = root.path.join("first-agent-started");
+    let second_inbox = root.path.join("second-inbox");
+    let second_outbox = root.path.join("second-outbox");
+    let second_agent_started = root.path.join("second-agent-started");
+    let control_str = control.to_str().unwrap().to_string();
+
+    let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    run.args(["service", "run", "--control", control_str.as_str()]);
+    run.env("LC_ALL", "C");
+    run.env("LC_TIME", "C");
+    run.env("TZ", "UTC");
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::null());
+    let mut run_child = run.spawn().expect("spawn macOS service run");
+
+    let cli = |args: &[String]| {
+        Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(args)
+            .env("LC_ALL", "POSIX")
+            .env("LC_TIME", "POSIX")
+            .env("TZ", "Pacific/Auckland")
+            .output()
+            .expect("run macOS service client")
+    };
+
+    let status_args = vec![
+        "service".to_string(),
+        "status".to_string(),
+        "--control".to_string(),
+        control_str.clone(),
+    ];
+    let mut service_live = false;
+    for _ in 0..100 {
+        let status = cli(&status_args);
+        if status.status.success()
+            && String::from_utf8_lossy(&status.stdout).contains("\"service_running\":true")
+        {
+            service_live = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        service_live,
+        "macOS service run did not report live in time"
+    );
+
+    let start_args = vec![
+        "service".to_string(),
+        "start".to_string(),
+        "--control".to_string(),
+        control_str.clone(),
+        "--inbox".to_string(),
+        first_inbox.display().to_string(),
+        "--outbox".to_string(),
+        first_outbox.display().to_string(),
+        "--poll-ms".to_string(),
+        "20".to_string(),
+        "--agent-cmd".to_string(),
+        "sh".to_string(),
+        "--agent-arg".to_string(),
+        "-c".to_string(),
+        "--agent-arg".to_string(),
+        "cat >/dev/null; touch \"$1\"; sleep 30".to_string(),
+        "--agent-arg".to_string(),
+        "macos-liveness-agent".to_string(),
+        "--agent-arg".to_string(),
+        first_agent_started.display().to_string(),
+    ];
+    let start = cli(&start_args);
+    assert!(
+        start.status.success(),
+        "first service start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let first_session = String::from_utf8_lossy(&start.stdout).trim().to_string();
+    assert!(
+        !first_session.is_empty(),
+        "first service start prints a session id"
+    );
+
+    let first_request = MessageEnvelope::new(
+        "macos-liveness-first-m1",
+        "macos-liveness-first-conv",
+        "agent-a",
+        "agent-b",
+        MessageKind::Request,
+        "hold the first session",
+        1_700_000_000_000,
+    );
+    mailbox::deliver_to(&first_inbox, &first_request).expect("deliver first in-flight request");
+    let mut first_in_flight = false;
+    for _ in 0..100 {
+        if first_agent_started.is_file() {
+            first_in_flight = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        first_in_flight,
+        "first session did not enter its long-running agent turn"
+    );
+
+    let first_status_args = vec![
+        "service".to_string(),
+        "status".to_string(),
+        "--control".to_string(),
+        control_str.clone(),
+        "--session".to_string(),
+        first_session.clone(),
+    ];
+    let first_status = cli(&first_status_args);
+    assert!(
+        first_status.status.success(),
+        "cross-environment service status should exit 0; stderr: {}",
+        String::from_utf8_lossy(&first_status.stderr)
+    );
+    let first_status_json: serde_json::Value =
+        serde_json::from_slice(&first_status.stdout).expect("first status is JSON");
+    assert_eq!(
+        first_status_json["sessions"][0]["live"], true,
+        "cross-environment status recognizes the recorded session"
+    );
+    let first_pid = first_status_json["sessions"][0]["pid"]
+        .as_u64()
+        .expect("first session pid") as u32;
+
+    let stop_args = vec![
+        "service".to_string(),
+        "stop".to_string(),
+        "--control".to_string(),
+        control_str.clone(),
+        "--session".to_string(),
+        first_session,
+    ];
+    let stop = cli(&stop_args);
+    assert!(
+        stop.status.success(),
+        "cross-environment service stop should exit 0; stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let mut first_stopped = false;
+    for _ in 0..160 {
+        if !process_is_live(first_pid) {
+            first_stopped = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        first_stopped,
+        "cross-environment service stop must terminate the managed process"
+    );
+
+    let second_start_args = vec![
+        "service".to_string(),
+        "start".to_string(),
+        "--control".to_string(),
+        control_str.clone(),
+        "--inbox".to_string(),
+        second_inbox.display().to_string(),
+        "--outbox".to_string(),
+        second_outbox.display().to_string(),
+        "--poll-ms".to_string(),
+        "20".to_string(),
+        "--agent-cmd".to_string(),
+        "sh".to_string(),
+        "--agent-arg".to_string(),
+        "-c".to_string(),
+        "--agent-arg".to_string(),
+        "cat >/dev/null; touch \"$1\"; sleep 30".to_string(),
+        "--agent-arg".to_string(),
+        "macos-liveness-agent".to_string(),
+        "--agent-arg".to_string(),
+        second_agent_started.display().to_string(),
+    ];
+    let second_start = cli(&second_start_args);
+    assert!(
+        second_start.status.success(),
+        "second service start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&second_start.stderr)
+    );
+    let second_session = String::from_utf8_lossy(&second_start.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        !second_session.is_empty(),
+        "second service start prints a session id"
+    );
+
+    let second_request = MessageEnvelope::new(
+        "macos-liveness-second-m1",
+        "macos-liveness-second-conv",
+        "agent-a",
+        "agent-b",
+        MessageKind::Request,
+        "hold the second session",
+        1_700_000_000_000,
+    );
+    mailbox::deliver_to(&second_inbox, &second_request).expect("deliver second in-flight request");
+    let mut second_in_flight = false;
+    for _ in 0..100 {
+        if second_agent_started.is_file() {
+            second_in_flight = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        second_in_flight,
+        "second session did not enter its long-running agent turn"
+    );
+
+    let second_status_args = vec![
+        "service".to_string(),
+        "status".to_string(),
+        "--control".to_string(),
+        control_str.clone(),
+        "--session".to_string(),
+        second_session,
+    ];
+    let second_status = cli(&second_status_args);
+    assert!(
+        second_status.status.success(),
+        "second cross-environment status should exit 0; stderr: {}",
+        String::from_utf8_lossy(&second_status.stderr)
+    );
+    let second_status_json: serde_json::Value =
+        serde_json::from_slice(&second_status.stdout).expect("second status is JSON");
+    assert_eq!(
+        second_status_json["sessions"][0]["live"], true,
+        "cross-environment status recognizes the second session"
+    );
+    let second_pid = second_status_json["sessions"][0]["pid"]
+        .as_u64()
+        .expect("second session pid") as u32;
+
+    let teardown_args = vec![
+        "service".to_string(),
+        "teardown".to_string(),
+        "--control".to_string(),
+        control_str.clone(),
+    ];
+    let teardown = cli(&teardown_args);
+    assert!(
+        teardown.status.success(),
+        "cross-environment service teardown should exit 0; stderr: {}",
+        String::from_utf8_lossy(&teardown.stderr)
+    );
+    let run_status = run_child.wait().expect("macOS service run exits");
+    assert!(
+        run_status.success(),
+        "macOS service run exits 0 on teardown"
+    );
+
+    let mut second_stopped = false;
+    for _ in 0..160 {
+        if !process_is_live(second_pid) {
+            second_stopped = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        second_stopped,
+        "cross-environment service teardown must terminate the managed process"
+    );
+
+    let final_status = cli(&status_args);
+    assert!(
+        final_status.status.success(),
+        "final cross-environment service status should exit 0; stderr: {}",
+        String::from_utf8_lossy(&final_status.stderr)
+    );
+    let final_json: serde_json::Value =
+        serde_json::from_slice(&final_status.stdout).expect("final status is JSON");
+    assert_eq!(final_json["service_running"], false);
+    assert!(
+        final_json["sessions"].as_array().unwrap().is_empty(),
+        "cross-environment teardown removes every session record"
+    );
+    let session_records = std::fs::read_dir(control.join("sessions"))
+        .map(|entries| entries.filter_map(|entry| entry.ok()).count())
+        .unwrap_or(0);
+    assert_eq!(session_records, 0, "teardown removes every session record");
+}
+
 /// Issue #109 AC #5 (orphan-survival regression): a session started through
 /// `baton service start` is spawned as a **direct child of the long-lived
 /// `baton service run`**, not of the short-lived `service start` client that
