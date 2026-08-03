@@ -1092,10 +1092,8 @@ mod imp {
                 let rollback = request_id
                     .map(|id| rollback_ids.iter().any(|rollback_id| rollback_id == id))
                     .unwrap_or(false);
-                if rollback {
-                    if let Some(request_id) = request_id {
-                        seen_rollbacks.insert(request_id.to_string());
-                    }
+                if rollback && let Some(request_id) = request_id {
+                    seen_rollbacks.insert(request_id.to_string());
                 }
                 if let Some(request_id) = request_id {
                     discard_pending_task_start_request(control, request_id)?;
