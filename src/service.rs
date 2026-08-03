@@ -2208,6 +2208,15 @@ mod imp {
         session_id: &str,
         force: bool,
     ) -> Result<Vec<CleanupResidue>> {
+        reap_session_tasks_with_wait(control, session_id, force, wait_while_task_alive)
+    }
+
+    fn reap_session_tasks_with_wait(
+        control: &Path,
+        session_id: &str,
+        force: bool,
+        wait: impl Fn(&TaskRecord, u64),
+    ) -> Result<Vec<CleanupResidue>> {
         let mut residue = Vec::new();
         for record in list_task_records(control)? {
             if record.spec.session != session_id {
@@ -2230,23 +2239,33 @@ mod imp {
                 let _ = fs::remove_file(task_cancel_sentinel_path(control, &record.id));
                 continue;
             }
+            if liveness == Liveness::Unresolved {
+                residue.push(CleanupResidue {
+                    kind: "task",
+                    id: record.id.clone(),
+                    pid: record.pid,
+                    liveness,
+                    argv: task_recorded_argv(&record),
+                });
+                continue;
+            }
             let mut term_sent = false;
             if liveness == Liveness::Live {
                 let _ = signal_group(record.pid, "-TERM");
                 term_sent = true;
             }
             if liveness != Liveness::Dead {
-                wait_while_task_alive(&record, KILL_GRACE_MS);
+                wait(&record, KILL_GRACE_MS);
                 liveness = is_task_alive(&record);
             }
             if liveness == Liveness::Live && !term_sent {
                 let _ = signal_group(record.pid, "-TERM");
-                wait_while_task_alive(&record, KILL_GRACE_MS);
+                wait(&record, KILL_GRACE_MS);
                 liveness = is_task_alive(&record);
             }
             if liveness == Liveness::Live {
                 let _ = signal_group(record.pid, "-KILL");
-                wait_while_task_alive(&record, KILL_GRACE_MS);
+                wait(&record, KILL_GRACE_MS);
                 liveness = is_task_alive(&record);
             }
             if liveness == Liveness::Dead {
@@ -4723,6 +4742,99 @@ mod imp {
                     .is_none(),
                 "the session's task record is reaped too"
             );
+        }
+
+        /// Multiple unresolved task records are retained without entering a
+        /// grace wait or signalling their uncorroborated process groups.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn reap_session_tasks_retains_multiple_unresolved_without_waiting() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("reap-unresolved-fast");
+            let mut children = Vec::new();
+            let mut task_ids = Vec::new();
+
+            for index in 0..3 {
+                let task_id = format!("task-unresolved-{index}");
+                let task_specification = task_spec(
+                    "svc-1",
+                    "bash",
+                    vec!["-c".to_string(), "exec sleep 30".to_string()],
+                    vec![],
+                    60_000,
+                    "/tmp/callback",
+                );
+                let log_dir = task_logs_dir(&dir.path, &task_id);
+                fs::create_dir_all(&log_dir).expect("create task log dir");
+                let stdout_path = log_dir.join("stdout.log");
+                let stderr_path = log_dir.join("stderr.log");
+                let child = spawn_task_child(&task_specification, &stdout_path, &stderr_path)
+                    .expect("spawn task");
+                let task_record = TaskRecord {
+                    id: task_id.clone(),
+                    request_id: None,
+                    admission: TaskAdmissionPhase::Committed,
+                    spec: task_specification,
+                    pid: child.id(),
+                    started_at: None,
+                    started_ms: None,
+                    state: TaskState::Running,
+                    exit_code: None,
+                    elapsed_ms: None,
+                    stdout_path: stdout_path.display().to_string(),
+                    stderr_path: stderr_path.display().to_string(),
+                    delivered_milestones: 0,
+                };
+                write_task_record(&dir.path, &task_record).expect("write unresolved task");
+
+                // Wait only for bash to exec-replace its argv so the fixture
+                // reaches the intended unresolved identity state.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while is_task_alive(&task_record) != Liveness::Unresolved
+                    && Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert_eq!(
+                    is_task_alive(&task_record),
+                    Liveness::Unresolved,
+                    "fixture reaches the unresolved identity state"
+                );
+
+                task_ids.push(task_id);
+                children.push(child);
+            }
+
+            let wait_calls = std::cell::Cell::new(0);
+            let residue = reap_session_tasks_with_wait(&dir.path, "svc-1", false, |_, _| {
+                wait_calls.set(wait_calls.get() + 1)
+            })
+            .expect("reap unresolved tasks");
+
+            assert_eq!(wait_calls.get(), 0, "unresolved tasks skip grace waits");
+            assert_eq!(residue.len(), task_ids.len());
+            assert!(
+                residue
+                    .iter()
+                    .all(|item| { item.kind == "task" && item.liveness == Liveness::Unresolved })
+            );
+            for (task_id, child) in task_ids.iter().zip(children.iter_mut()) {
+                assert!(
+                    read_task_record(&dir.path, task_id)
+                        .expect("read retained task")
+                        .is_some(),
+                    "unresolved task record remains durable"
+                );
+                assert!(
+                    child.try_wait().expect("poll unresolved task").is_none(),
+                    "unresolved task process remains unsignalled"
+                );
+            }
+
+            for mut child in children {
+                signal_group(child.id(), "-KILL").expect("kill unresolved task");
+                child.wait().expect("wait for unresolved task");
+            }
         }
 
         /// Ordinary teardown keeps an unresolved rehydrated task and its
