@@ -1078,7 +1078,9 @@ mod imp {
     /// client observed no response. Committed records are retained and their
     /// response is re-delivered if the previous service died before the
     /// response write; responded records are retained without recreating a
-    /// response the client already consumed.
+    /// response the client already consumed. Rollback cleanup removes the
+    /// record and pending request locations before clearing the marker, so a
+    /// restart can retry any interrupted cleanup without replaying the request.
     fn reconcile_task_admissions(control: &Path) -> Result<()> {
         let rollback_ids = list_task_start_rollbacks(control)?;
         let records = list_task_records(control)?;
@@ -1086,11 +1088,27 @@ mod imp {
 
         for record in records {
             if record.admission == TaskAdmissionPhase::Prepared {
-                if let Some(request_id) = record.request_id.as_deref() {
-                    remove_task_start_rollback(control, request_id)?;
+                let request_id = record.request_id.as_deref();
+                let rollback = request_id
+                    .map(|id| rollback_ids.iter().any(|rollback_id| rollback_id == id))
+                    .unwrap_or(false);
+                if rollback {
+                    if let Some(request_id) = request_id {
+                        seen_rollbacks.insert(request_id.to_string());
+                    }
+                }
+                if let Some(request_id) = request_id {
                     discard_pending_task_start_request(control, request_id)?;
                 }
                 abort_task_admission(control, &record)?;
+                if let Some(request_id) = request_id {
+                    if rollback {
+                        wait_for_test_task_rollback_cleanup_barrier(
+                            "BATON_TEST_TASK_ROLLBACK_RECONCILE_BARRIER",
+                        );
+                    }
+                    remove_task_start_rollback(control, request_id)?;
+                }
                 continue;
             }
             let Some(request_id) = record.request_id.as_deref() else {
@@ -1102,8 +1120,11 @@ mod imp {
             }
             if rollback {
                 abort_task_admission(control, &record)?;
-                remove_task_start_rollback(control, request_id)?;
                 discard_pending_task_start_request(control, request_id)?;
+                wait_for_test_task_rollback_cleanup_barrier(
+                    "BATON_TEST_TASK_ROLLBACK_RECONCILE_BARRIER",
+                );
+                remove_task_start_rollback(control, request_id)?;
                 continue;
             }
 
@@ -1124,6 +1145,9 @@ mod imp {
         for request_id in rollback_ids {
             if !seen_rollbacks.contains(&request_id) {
                 discard_pending_task_start_request(control, &request_id)?;
+                wait_for_test_task_rollback_cleanup_barrier(
+                    "BATON_TEST_TASK_ROLLBACK_RECONCILE_BARRIER",
+                );
             }
             remove_task_start_rollback(control, &request_id)?;
         }
@@ -1269,6 +1293,10 @@ mod imp {
                     // and reaps the newly recorded task.
                     let outcome = acquire_admission_lock(control).and_then(|_admission| {
                         if task_start_rollback_exists(control, &key)? {
+                            discard_pending_task_start_request(control, &key)?;
+                            wait_for_test_task_rollback_cleanup_barrier(
+                                "BATON_TEST_TASK_ROLLBACK_REQUEST_BARRIER",
+                            );
                             remove_task_start_rollback(control, &key)?;
                             return Ok(None);
                         }
@@ -1411,6 +1439,20 @@ mod imp {
     /// production callers never set it.
     fn wait_for_test_task_admission_barrier() {
         let Some(path) = std::env::var_os("BATON_TEST_TASK_ADMISSION_BARRIER") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        while path.exists() {
+            std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        }
+    }
+
+    /// Test-only synchronization seam for rollback cleanup ordering. A
+    /// service launched with one of the named environment variables waits
+    /// after request/record cleanup and before removing the rollback marker;
+    /// production callers never set it.
+    fn wait_for_test_task_rollback_cleanup_barrier(variable: &str) {
+        let Some(path) = std::env::var_os(variable) else {
             return;
         };
         let path = std::path::PathBuf::from(path);
@@ -2904,6 +2946,78 @@ mod imp {
                 .collect();
             ids.sort();
             assert_eq!(ids, vec!["task-0", "task-1", "task-2"]);
+        }
+
+        /// A rollback marker removes every admission phase's task record and
+        /// both request locations before the marker is cleared. Repeating
+        /// reconciliation is harmless once the first pass has completed.
+        #[test]
+        fn reconcile_task_admission_rollback_is_idempotent_across_phases() {
+            for (index, admission) in [
+                TaskAdmissionPhase::Prepared,
+                TaskAdmissionPhase::Committed,
+                TaskAdmissionPhase::Responded,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let dir = TempDir::new(&format!("task-rollback-phase-{index}"));
+                let request_id = format!("request-{index}");
+                let task_id = format!("task-{index}");
+                let record = TaskRecord {
+                    id: task_id.clone(),
+                    request_id: Some(request_id.clone()),
+                    admission,
+                    spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/callback"),
+                    pid: 0,
+                    started_at: None,
+                    started_ms: None,
+                    state: TaskState::Completed,
+                    exit_code: Some(0),
+                    elapsed_ms: Some(1),
+                    stdout_path: String::new(),
+                    stderr_path: String::new(),
+                    delivered_milestones: 0,
+                };
+                write_task_record(&dir.path, &record).expect("write task record");
+
+                for path in [
+                    task_requests_dir(&dir.path),
+                    task_processing_dir(&dir.path),
+                    task_start_rollback_dir(&dir.path),
+                ] {
+                    fs::create_dir_all(&path).expect("create task admission directory");
+                }
+                let file_name = mailbox::file_name(&request_id);
+                fs::write(task_requests_dir(&dir.path).join(&file_name), "{}")
+                    .expect("write request");
+                fs::write(task_processing_dir(&dir.path).join(&file_name), "{}")
+                    .expect("write claimed request");
+                fs::write(task_start_rollback_dir(&dir.path).join(&file_name), "")
+                    .expect("write rollback marker");
+
+                reconcile_task_admissions(&dir.path).expect("reconcile rollback");
+                reconcile_task_admissions(&dir.path).expect("repeat reconciliation");
+
+                assert!(
+                    read_task_record(&dir.path, &task_id)
+                        .expect("read task record")
+                        .is_none(),
+                    "{admission:?} task record is removed"
+                );
+                assert!(
+                    !task_requests_dir(&dir.path).join(&file_name).exists(),
+                    "pending request is removed"
+                );
+                assert!(
+                    !task_processing_dir(&dir.path).join(&file_name).exists(),
+                    "claimed request is removed"
+                );
+                assert!(
+                    !task_start_rollback_dir(&dir.path).join(&file_name).exists(),
+                    "rollback marker is removed last"
+                );
+            }
         }
 
         /// A PID whose current start key does not match the durable record is

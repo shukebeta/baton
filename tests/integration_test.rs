@@ -10,7 +10,7 @@
 //! building and status mapping via a fake `HttpClient`; these tests add
 //! confidence that the same logic survives a real `ureq` round-trip.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -3127,6 +3127,279 @@ fn service_task_start_rolls_back_prepared_record_after_run_loss() {
     assert!(
         restarted_status.success(),
         "restarted service should exit cleanly on teardown"
+    );
+}
+
+/// Issue #151 regression: startup reconciliation must retain a rollback marker
+/// until the task record and both pending request locations are gone. The
+/// barrier kills the supervisor at that durable boundary, then a later start
+/// proves the orphan marker suppresses the request instead of replaying it.
+#[cfg(unix)]
+#[test]
+fn service_task_start_reconcile_keeps_rollback_marker_until_cleanup() {
+    let root = TempMailbox::new("task-rollback-reconcile-boundary");
+    let control = root.path.join("control");
+    let callback_inbox = root.path.join("callback");
+    let barrier = root.path.join("rollback-reconcile.barrier");
+    let request_id = "rollback-reconcile-request";
+    let task_id = "rollback-reconcile-task";
+    let control_str = control.to_str().unwrap();
+    let request_file = control
+        .join("task-requests")
+        .join(format!("{request_id}.json"));
+    let processing_file = control
+        .join("task-processing")
+        .join(format!("{request_id}.json"));
+    let rollback_file = control
+        .join("task-start-rollback")
+        .join(format!("{request_id}.json"));
+    let task_record_file = control.join("tasks").join(format!("{task_id}.json"));
+
+    let task_spec = serde_json::json!({
+        "schema": "baton.task-spec/v1",
+        "session": "session-that-is-not-needed",
+        "command": "true",
+        "args": [],
+        "cwd": null,
+        "env": [],
+        "milestones_ms": [],
+        "max_duration_ms": 60000,
+        "callback": {"inbox": callback_inbox, "role": null}
+    });
+    let task_request = serde_json::json!({
+        "schema": "baton.task-spec/v1",
+        "session": "session-that-is-not-needed",
+        "command": "true",
+        "args": [],
+        "cwd": null,
+        "env": [],
+        "milestones_ms": [],
+        "max_duration_ms": 60000,
+        "callback": {"inbox": root.path.join("callback"), "role": null}
+    });
+    let task_record = serde_json::json!({
+        "id": task_id,
+        "request_id": request_id,
+        "admission": "committed",
+        "spec": task_spec,
+        "pid": 0,
+        "started_at": null,
+        "started_ms": null,
+        "state": "completed",
+        "exit_code": 0,
+        "elapsed_ms": 1,
+        "stdout_path": "",
+        "stderr_path": "",
+        "delivered_milestones": 0
+    });
+
+    std::fs::create_dir_all(control.join("task-requests")).expect("create task requests");
+    std::fs::create_dir_all(control.join("task-processing")).expect("create task processing");
+    std::fs::create_dir_all(control.join("task-start-rollback")).expect("create rollback markers");
+    std::fs::create_dir_all(control.join("tasks")).expect("create task records");
+    std::fs::write(&request_file, serde_json::to_vec(&task_request).unwrap())
+        .expect("write pending task request");
+    std::fs::write(&processing_file, b"{}").expect("write claimed task request");
+    std::fs::write(&rollback_file, b"").expect("write rollback marker");
+    std::fs::write(&task_record_file, serde_json::to_vec(&task_record).unwrap())
+        .expect("write task record");
+    std::fs::write(&barrier, b"hold").expect("create rollback barrier");
+
+    let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    run.args(["service", "run", "--control", control_str]);
+    run.env("BATON_TEST_TASK_ROLLBACK_RECONCILE_BARRIER", &barrier);
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::null());
+    let mut run_child = run.spawn().expect("spawn service run");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "startup reconciliation did not reach the rollback cleanup boundary"
+        );
+        if rollback_file.exists()
+            && !task_record_file.exists()
+            && !request_file.exists()
+            && !processing_file.exists()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    run_child.kill().expect("kill service at rollback boundary");
+    let run_status = run_child.wait().expect("service run exits");
+    assert!(
+        !run_status.success(),
+        "service run was interrupted at the barrier"
+    );
+    assert!(rollback_file.exists(), "rollback marker survives the crash");
+
+    let mut restarted = Command::new(env!("CARGO_BIN_EXE_baton"));
+    restarted.args(["service", "run", "--control", control_str]);
+    restarted.stdout(Stdio::null());
+    restarted.stderr(Stdio::null());
+    let mut restarted_child = restarted.spawn().expect("spawn restarted service run");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while rollback_file.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restart did not clear the completed rollback marker"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["task", "status", "--control", control_str])
+        .output()
+        .expect("read tasks after rollback reconciliation");
+    assert!(
+        status.status.success(),
+        "task status succeeds after restart"
+    );
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("task status is JSON");
+    assert!(
+        status_json["tasks"]
+            .as_array()
+            .expect("tasks array")
+            .is_empty(),
+        "a rollback request is not replayed after startup cleanup"
+    );
+
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str])
+        .output()
+        .expect("tear down restarted service");
+    assert!(teardown.status.success(), "teardown succeeds");
+    assert!(
+        restarted_child
+            .wait()
+            .expect("restarted service exits")
+            .success(),
+        "restarted service exits cleanly on teardown"
+    );
+}
+
+/// Issue #151 regression: a rollback marker can arrive after startup
+/// reconciliation, while its request is already claimed by the request loop.
+/// The loop must remove the claimed request before clearing the marker.
+#[cfg(unix)]
+#[test]
+fn service_task_start_request_loop_keeps_rollback_marker_until_cleanup() {
+    let root = TempMailbox::new("task-rollback-request-boundary");
+    let control = root.path.join("control");
+    let callback_inbox = root.path.join("callback");
+    let barrier = root.path.join("rollback-request.barrier");
+    let request_id = "rollback-request-loop-request";
+    let control_str = control.to_str().unwrap();
+    let request_file = control
+        .join("task-requests")
+        .join(format!("{request_id}.json"));
+    let processing_file = control
+        .join("task-processing")
+        .join(format!("{request_id}.json"));
+    let rollback_file = control
+        .join("task-start-rollback")
+        .join(format!("{request_id}.json"));
+    let task_request = serde_json::json!({
+        "schema": "baton.task-spec/v1",
+        "session": "session-that-is-not-needed",
+        "command": "true",
+        "args": [],
+        "cwd": null,
+        "env": [],
+        "milestones_ms": [],
+        "max_duration_ms": 60000,
+        "callback": {"inbox": callback_inbox, "role": null}
+    });
+    std::fs::write(&barrier, b"hold").expect("create rollback barrier");
+
+    let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    run.args(["service", "run", "--control", control_str]);
+    run.env("BATON_TEST_TASK_ROLLBACK_REQUEST_BARRIER", &barrier);
+    run.stdout(Stdio::piped());
+    run.stderr(Stdio::null());
+    let mut run_child = run.spawn().expect("spawn service run");
+    let stdout = run_child.stdout.take().expect("service stdout");
+    let mut stdout = BufReader::new(stdout);
+    let mut startup_line = String::new();
+    stdout
+        .read_line(&mut startup_line)
+        .expect("read service startup line");
+    assert!(
+        startup_line.contains("baton service running"),
+        "service reached its request loop"
+    );
+
+    std::fs::create_dir_all(control.join("task-requests")).expect("create task requests");
+    std::fs::create_dir_all(control.join("task-start-rollback")).expect("create rollback markers");
+    std::fs::write(&rollback_file, b"").expect("write rollback marker");
+    std::fs::write(&request_file, serde_json::to_vec(&task_request).unwrap())
+        .expect("write task request");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "request loop did not reach the rollback cleanup boundary"
+        );
+        if rollback_file.exists() && !request_file.exists() && !processing_file.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    run_child.kill().expect("kill service at rollback boundary");
+    let run_status = run_child.wait().expect("service run exits");
+    assert!(
+        !run_status.success(),
+        "service run was interrupted at the barrier"
+    );
+    assert!(rollback_file.exists(), "rollback marker survives the crash");
+
+    let mut restarted = Command::new(env!("CARGO_BIN_EXE_baton"));
+    restarted.args(["service", "run", "--control", control_str]);
+    restarted.stdout(Stdio::null());
+    restarted.stderr(Stdio::null());
+    let mut restarted_child = restarted.spawn().expect("spawn restarted service run");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while rollback_file.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restart did not clear the request-loop rollback marker"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["task", "status", "--control", control_str])
+        .output()
+        .expect("read tasks after request-loop rollback");
+    assert!(
+        status.status.success(),
+        "task status succeeds after restart"
+    );
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("task status is JSON");
+    assert!(
+        status_json["tasks"]
+            .as_array()
+            .expect("tasks array")
+            .is_empty(),
+        "a rollback request is not replayed after request-loop cleanup"
+    );
+
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str])
+        .output()
+        .expect("tear down restarted service");
+    assert!(teardown.status.success(), "teardown succeeds");
+    assert!(
+        restarted_child
+            .wait()
+            .expect("restarted service exits")
+            .success(),
+        "restarted service exits cleanly on teardown"
     );
 }
 

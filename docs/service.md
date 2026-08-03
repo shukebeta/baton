@@ -156,10 +156,12 @@ baton task cancel --control <dir> --task <id>
   While waiting for the response, the submitting client probes the control
   lock. If `run` releases that lock before answering, the client takes the
   short-lived admission lock, re-checks for a response, writes a durable
-  rollback marker, then removes the still-pending request from
-  `task-requests/` or `task-processing/` and exits non-zero with a `task start
-  request was not admitted` error. A subsequent `service run` therefore does
-  not replay a request whose client was told admission failed. A response
+  rollback marker, then removes the still-pending request from both
+  `task-requests/` and `task-processing/` and exits non-zero with a `task start
+  request was not admitted` error. Startup reconciliation or the request loop
+  clears the marker only after it has removed any associated task record and
+  process, so a supervisor crash during cleanup leaves the request suppressed
+  on the next restart. A response
   already written before the lock is released wins this race and remains a
   successful task start.
 - **`--session <id>` is the ownership tag, not a routing target.** A task is
@@ -223,12 +225,15 @@ After spawning and persisting a `TaskRecord`, `run` records the
 `prepared` phase, then durably changes it to `committed` before writing the
 success response, and finally records `responded` after that response write
 succeeds. Startup reconciliation removes every prepared task and every task
-named by a client rollback marker, including its process and task record. A
-committed task is retained, its stale request is discarded, and its success
-response is restored only if the supervisor died before writing it. A
-responded task is retained without recreating a response already consumed by
-the client. This ordering makes the task record and its response boundary
-recoverable without replaying a spawned command.
+named by a client rollback marker, including its process and task record. For
+rollback, the marker is cleared only after the task record and both pending
+request locations have been removed; repeated startup passes are therefore
+safe if the supervisor crashes during cleanup. A committed task is retained,
+its stale request is discarded, and its success response is restored only if
+the supervisor died before writing it. A responded task is retained without
+recreating a response already consumed by the client. This ordering makes the
+task record and its response boundary recoverable without replaying a spawned
+command.
 
 ### Event delivery and dedup contract
 
