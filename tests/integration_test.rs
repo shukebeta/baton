@@ -2576,11 +2576,11 @@ fn service_task_start_discards_unadmitted_request_after_run_loss() {
     assert_eq!(final_tasks.len(), 1, "restart must not duplicate the task");
     assert_eq!(final_tasks[0]["id"], successful_task_id);
     assert!(
-        control
+        !control
             .join("task-responses")
             .join(&successful_request_name)
-            .is_file(),
-        "restart restores the committed task-start response"
+            .exists(),
+        "restart does not recreate a response already consumed by the client"
     );
 
     let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))

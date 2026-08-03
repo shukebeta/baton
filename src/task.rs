@@ -127,9 +127,11 @@ pub enum TaskState {
 /// Durable admission phase for a task-start request.
 ///
 /// A prepared task has a durable record but has not yet reached the response
-/// boundary. Only a committed admission may be rehydrated after a supervisor
-/// restart. Older task records omit this field and deserialize as committed,
-/// preserving tasks admitted before the transaction marker was introduced.
+/// boundary. A committed task has crossed the record boundary but is still
+/// waiting for the response write; a responded task has a durable response
+/// and needs no response restoration on restart. Older task records omit this
+/// field and deserialize as responded, preserving tasks admitted before the
+/// transaction marker was introduced without creating orphan responses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskAdmissionPhase {
@@ -137,13 +139,15 @@ pub enum TaskAdmissionPhase {
     /// has not crossed the durable commit boundary.
     Prepared,
     /// The task record and admission decision are durable; the response may
-    /// be pending or may already have been consumed by the client.
+    /// still be pending.
     Committed,
+    /// The task-start response was durably written.
+    Responded,
 }
 
 impl Default for TaskAdmissionPhase {
     fn default() -> Self {
-        Self::Committed
+        Self::Responded
     }
 }
 

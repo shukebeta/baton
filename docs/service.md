@@ -213,15 +213,17 @@ delivery failure leaves the tracker in place to retry the same event id. A
 terminal record is replayed once on the next startup for the same reason; the
 mailbox's done ledger drops it if delivery already completed.
 
-Task admission is a durable two-phase transaction keyed by the task-start
-request id. After spawning and persisting a `TaskRecord`, `run` records the
+Task admission is a durable transaction keyed by the task-start request id.
+After spawning and persisting a `TaskRecord`, `run` records the
 `prepared` phase, then durably changes it to `committed` before writing the
-success response. Startup reconciliation removes every prepared task and
-every task named by a client rollback marker, including its process and task
-record. A committed task is retained, its stale request is discarded, and its
-success response is restored if the previous supervisor died before the
-client consumed it. This ordering makes the task record and its response
-boundary recoverable without replaying a spawned command.
+success response, and finally records `responded` after that response write
+succeeds. Startup reconciliation removes every prepared task and every task
+named by a client rollback marker, including its process and task record. A
+committed task is retained, its stale request is discarded, and its success
+response is restored only if the supervisor died before writing it. A
+responded task is retained without recreating a response already consumed by
+the client. This ordering makes the task record and its response boundary
+recoverable without replaying a spawned command.
 
 ### Event delivery and dedup contract
 

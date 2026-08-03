@@ -1074,9 +1074,11 @@ mod imp {
 
     /// Reconciles task-start transactions before the request loop can accept
     /// new work. Prepared records are never safe to rehydrate; a rollback
-    /// marker also wins over a committed record because the client observed no
-    /// response. Committed records are retained and their response is
-    /// re-delivered if the previous service died before the client consumed it.
+    /// marker also wins over a committed or responded record because the
+    /// client observed no response. Committed records are retained and their
+    /// response is re-delivered if the previous service died before the
+    /// response write; responded records are retained without recreating a
+    /// response the client already consumed.
     fn reconcile_task_admissions(control: &Path) -> Result<()> {
         let rollback_ids = list_task_start_rollbacks(control)?;
         let records = list_task_records(control)?;
@@ -1107,7 +1109,7 @@ mod imp {
 
             discard_pending_task_start_request(control, request_id)?;
             let response_path = task_responses_dir(control).join(mailbox::file_name(request_id));
-            if !response_path.is_file() {
+            if record.admission == TaskAdmissionPhase::Committed && !response_path.is_file() {
                 write_task_start_response(
                     control,
                     request_id,
@@ -1390,6 +1392,15 @@ mod imp {
             let _ = child.wait();
             let _ = remove_task_record(control, &record.id);
             return Err(err);
+        }
+        record.admission = TaskAdmissionPhase::Responded;
+        if let Err(err) = write_task_record(control, &record) {
+            // The response is already durable and the task is admitted. Keep
+            // serving it; a later task tick can persist the responded phase.
+            eprintln!(
+                "warning: task {id} response was written but its responded phase could not be persisted: {err}",
+                id = record.id
+            );
         }
         Ok(Some((record, child, started_ms)))
     }
