@@ -286,11 +286,11 @@ pub fn max_duration_exceeded(elapsed_ms: u64, max_duration_ms: u64) -> bool {
 /// decisions can be driven deterministically in tests instead of by real
 /// sleeps.
 pub trait Clock: Send + Sync {
-    /// The current time, in milliseconds. Must be monotonically
-    /// non-decreasing for a given `Clock` instance; the unit is otherwise
-    /// opaque (wall-clock for [`SystemClock`], a manually-advanced counter
-    /// for [`FakeClock`]) — callers only ever compare two readings from the
-    /// same instance.
+    /// The current Unix epoch time in milliseconds. Must be monotonically
+    /// non-decreasing for a given `Clock` instance. [`FakeClock`] produces
+    /// synthetic readings in the same unit (its default starts at epoch zero)
+    /// so persisted [`TaskRecord::started_ms`] values can be compared with an
+    /// OS process start time after a supervisor restart.
     fn now_ms(&self) -> u64;
 }
 
@@ -318,6 +318,13 @@ impl FakeClock {
     pub fn new() -> Self {
         Self {
             now_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// A clock initialized to a specific Unix epoch millisecond reading.
+    pub fn at(epoch_ms: u64) -> Self {
+        Self {
+            now_ms: AtomicU64::new(epoch_ms),
         }
     }
 
@@ -409,6 +416,14 @@ mod tests {
         assert_eq!(clock.now_ms(), 250);
         clock.advance(750);
         assert_eq!(clock.now_ms(), 1_000);
+    }
+
+    #[test]
+    fn fake_clock_can_start_at_epoch_milliseconds() {
+        let clock = FakeClock::at(1_700_000_000_000);
+        assert_eq!(clock.now_ms(), 1_700_000_000_000);
+        clock.advance(250);
+        assert_eq!(clock.now_ms(), 1_700_000_000_250);
     }
 
     #[test]

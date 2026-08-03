@@ -2114,6 +2114,44 @@ fn process_is_live(pid: u32) -> bool {
         .is_some_and(|state| state != 'Z')
 }
 
+/// Reads Linux's NUL-separated argv snapshot so liveness tests can assert
+/// that a shell task really did exec-replace its command line.
+#[cfg(target_os = "linux")]
+fn read_proc_cmdline(pid: u32) -> Option<Vec<String>> {
+    let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let mut argv = Vec::new();
+    for value in bytes
+        .split(|byte| *byte == 0)
+        .filter(|value| !value.is_empty())
+    {
+        argv.push(std::str::from_utf8(value).ok()?.to_string());
+    }
+    (!argv.is_empty()).then_some(argv)
+}
+
+/// Reads macOS's untruncated command column so liveness tests assert the
+/// exact suffix used by the session argv corroborator.
+#[cfg(target_os = "macos")]
+fn read_ps_command(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "command="])
+        .env("LC_ALL", "C")
+        .env("LC_TIME", "C")
+        .env("TZ", "UTC")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8(output.stdout)
+            .ok()?
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
 /// Issue #147 regression: macOS `ps` start keys must remain stable when the
 /// supervisor records a session under one environment and later CLI probes
 /// run under another. The test covers status, stop, and teardown, including
@@ -2252,9 +2290,21 @@ fn service_liveness_keys_ignore_supervisor_and_client_environment() {
         first_status_json["sessions"][0]["live"], true,
         "cross-environment status recognizes the recorded session"
     );
+    assert_eq!(first_status_json["sessions"][0]["liveness"], "live");
     let first_pid = first_status_json["sessions"][0]["pid"]
         .as_u64()
         .expect("first session pid") as u32;
+    let first_actual_command = read_ps_command(first_pid).expect("read macOS session command");
+    let first_expected_command = format!(
+        "serve --inbox {} --outbox {} --poll-ms 20 --agent-cmd sh --agent-arg -c --agent-arg cat >/dev/null; touch \"$1\"; sleep 30 --agent-arg macos-liveness-agent --agent-arg {}",
+        first_inbox.display(),
+        first_outbox.display(),
+        first_agent_started.display(),
+    );
+    assert!(
+        first_actual_command.ends_with(&first_expected_command),
+        "macOS ps command must expose the session argv suffix; observed {first_actual_command:?}"
+    );
 
     let stop_args = vec![
         "service".to_string(),
@@ -2362,6 +2412,7 @@ fn service_liveness_keys_ignore_supervisor_and_client_environment() {
         second_status_json["sessions"][0]["live"], true,
         "cross-environment status recognizes the second session"
     );
+    assert_eq!(second_status_json["sessions"][0]["liveness"], "live");
     let second_pid = second_status_json["sessions"][0]["pid"]
         .as_u64()
         .expect("second session pid") as u32;
@@ -2414,6 +2465,243 @@ fn service_liveness_keys_ignore_supervisor_and_client_environment() {
         .map(|entries| entries.filter_map(|entry| entry.ok()).count())
         .unwrap_or(0);
     assert_eq!(session_records, 0, "teardown removes every session record");
+}
+
+/// Issue #158 regression: a rehydrated Linux task whose durable start key is
+/// absent must not be finalized as failed merely because bash has
+/// exec-replaced its argv. The fixture asserts the actual `/proc` command line,
+/// survives a supervisor restart, preserves the unresolved record through
+/// ordinary teardown, and removes it only through the explicit force path.
+#[cfg(target_os = "linux")]
+#[test]
+fn service_rehydrated_exec_replaced_task_without_start_key_is_unresolved() {
+    let root = TempMailbox::new("service-linux-unresolved-task");
+    let control = root.path.join("control");
+    let session_inbox = root.path.join("session-inbox");
+    let session_outbox = root.path.join("session-outbox");
+    let callback_inbox = root.path.join("callback");
+    let task_ready = root.path.join("task-ready");
+    let task_command = format!("touch {}; exec sleep 30", task_ready.display());
+    let control_str = control.to_str().unwrap().to_string();
+
+    let spawn_run = || {
+        let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+        run.args(["service", "run", "--control", control_str.as_str()]);
+        run.stdout(Stdio::null());
+        run.stderr(Stdio::null());
+        run.spawn().expect("spawn baton service run")
+    };
+    let wait_for_service = || {
+        for _ in 0..200 {
+            if let Ok(status) = Command::new(env!("CARGO_BIN_EXE_baton"))
+                .args(["service", "status", "--control", control_str.as_str()])
+                .output()
+                && status.status.success()
+                && String::from_utf8_lossy(&status.stdout).contains("\"service_running\":true")
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("baton service run did not report live in time");
+    };
+
+    let mut run = spawn_run();
+    wait_for_service();
+
+    let session_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str.as_str(),
+            "--inbox",
+            session_inbox.to_str().unwrap(),
+            "--outbox",
+            session_outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+            "--agent-cmd",
+            "sh",
+            "--agent-arg",
+            "-c",
+            "--agent-arg",
+            "cat >/dev/null; sleep 30",
+        ])
+        .output()
+        .expect("run baton service start");
+    assert!(
+        session_start.status.success(),
+        "service start should succeed; stderr: {}",
+        String::from_utf8_lossy(&session_start.stderr)
+    );
+    let session_id = String::from_utf8_lossy(&session_start.stdout)
+        .trim()
+        .to_string();
+    assert!(!session_id.is_empty(), "service start prints a session id");
+
+    let task_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "task",
+            "start",
+            "--control",
+            control_str.as_str(),
+            "--session",
+            session_id.as_str(),
+            "--command",
+            "bash",
+            "--arg",
+            "-c",
+            "--arg",
+            task_command.as_str(),
+            "--max-duration-ms",
+            "60000",
+            "--callback-inbox",
+            callback_inbox.to_str().unwrap(),
+        ])
+        .current_dir(&root.path)
+        .output()
+        .expect("run baton task start");
+    assert!(
+        task_start.status.success(),
+        "task start should succeed; stderr: {}",
+        String::from_utf8_lossy(&task_start.stderr)
+    );
+    let task_id = String::from_utf8_lossy(&task_start.stdout)
+        .trim()
+        .to_string();
+    assert!(!task_id.is_empty(), "task start prints a task id");
+
+    let task_status_args = [
+        "task",
+        "status",
+        "--control",
+        control_str.as_str(),
+        "--task",
+        task_id.as_str(),
+    ];
+    let mut task_pid = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut observed_argv = None;
+    while std::time::Instant::now() < deadline {
+        if let Some(argv) = read_proc_cmdline(task_pid.unwrap_or(0))
+            && argv.iter().any(|arg| arg == "sleep")
+        {
+            observed_argv = Some(argv);
+            break;
+        }
+        let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(task_status_args)
+            .output()
+            .expect("read task status");
+        if status.status.success()
+            && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&status.stdout)
+            && let Some(pid) = json["tasks"][0]["pid"].as_u64()
+        {
+            task_pid = Some(pid as u32);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let task_pid = task_pid.expect("task status reports a PID");
+    let actual_argv = observed_argv
+        .or_else(|| read_proc_cmdline(task_pid))
+        .expect("read exec-replaced task argv");
+    assert!(
+        actual_argv.iter().any(|arg| arg == "sleep"),
+        "bash task must exec-replace its argv; observed {actual_argv:?}"
+    );
+    assert_ne!(
+        actual_argv,
+        vec!["bash".to_string(), "-c".to_string(), task_command.clone()],
+        "the fixture must exercise argv replacement rather than a no-op shell"
+    );
+
+    run.kill().expect("kill first service supervisor");
+    let _ = run.wait();
+
+    let task_record_path = control.join("tasks").join(format!("{task_id}.json"));
+    let mut task_record: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&task_record_path).expect("read task record"),
+    )
+    .expect("decode task record");
+    task_record["started_at"] = serde_json::Value::Null;
+    std::fs::write(
+        &task_record_path,
+        serde_json::to_string(&task_record).expect("encode legacy task record"),
+    )
+    .expect("write legacy task record");
+
+    let mut restarted = spawn_run();
+    wait_for_service();
+
+    let mut unresolved_status = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(task_status_args)
+            .output()
+            .expect("read rehydrated task status");
+        if status.status.success()
+            && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&status.stdout)
+            && json["tasks"][0]["liveness"] == "unresolved"
+        {
+            unresolved_status = Some(json);
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let unresolved_status = unresolved_status.expect("rehydrated task remains unresolved");
+    assert_eq!(unresolved_status["tasks"][0]["live"], false);
+    assert_eq!(unresolved_status["tasks"][0]["state"], "running");
+    assert!(
+        process_is_live(task_pid),
+        "unresolved task process survives restart"
+    );
+
+    restarted.kill().expect("kill second service supervisor");
+    let _ = restarted.wait();
+
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str.as_str()])
+        .output()
+        .expect("run ordinary service teardown");
+    assert!(
+        !teardown.status.success(),
+        "ordinary teardown reports unresolved residue; stderr: {}",
+        String::from_utf8_lossy(&teardown.stderr)
+    );
+    assert!(
+        task_record_path.is_file(),
+        "ordinary teardown preserves task record"
+    );
+
+    let forced = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "teardown",
+            "--control",
+            control_str.as_str(),
+            "--force",
+        ])
+        .output()
+        .expect("run forced service teardown");
+    assert!(
+        forced.status.success(),
+        "forced teardown removes unresolved residue; stderr: {}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    assert!(
+        !task_record_path.is_file(),
+        "forced teardown removes the unresolved task record"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while process_is_live(task_pid) && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !process_is_live(task_pid),
+        "forced teardown kills the task process"
+    );
 }
 
 /// Issue #109 AC #5 (orphan-survival regression): a session started through
