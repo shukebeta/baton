@@ -2213,6 +2213,12 @@ mod imp {
             if record.spec.session != session_id {
                 continue;
             }
+            if record.state != TaskState::Running {
+                remove_task_start_transaction(control, &record)?;
+                remove_task_record(control, &record.id)?;
+                let _ = fs::remove_file(task_cancel_sentinel_path(control, &record.id));
+                continue;
+            }
             let mut liveness = is_task_alive(&record);
             if force {
                 if liveness != Liveness::Dead {
@@ -3650,6 +3656,81 @@ mod imp {
                     .unwrap()
                     .contains("no running baton service")
             );
+        }
+
+        /// Teardown removes a terminal legacy task record without probing or
+        /// signalling a live process whose PID and argv happen to match it.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn execute_teardown_does_not_signal_terminal_legacy_task() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("teardown-terminal-task");
+            let task_id = "task-terminal-legacy";
+            let callback_inbox = dir.path.join("callback");
+            let task_specification = task_spec(
+                "svc-1",
+                "sleep",
+                vec!["30".to_string()],
+                Vec::new(),
+                60_000,
+                &callback_inbox.display().to_string(),
+            );
+            let log_dir = task_logs_dir(&dir.path, task_id);
+            fs::create_dir_all(&log_dir).expect("create task log dir");
+            let stdout_path = log_dir.join("stdout.log");
+            let stderr_path = log_dir.join("stderr.log");
+            let mut child = spawn_task_child(&task_specification, &stdout_path, &stderr_path)
+                .expect("spawn unrelated process");
+            let task_record = TaskRecord {
+                id: task_id.to_string(),
+                request_id: None,
+                admission: TaskAdmissionPhase::Responded,
+                spec: task_specification,
+                pid: child.id(),
+                started_at: None,
+                started_ms: None,
+                state: TaskState::Completed,
+                exit_code: Some(0),
+                elapsed_ms: Some(1),
+                stdout_path: stdout_path.display().to_string(),
+                stderr_path: stderr_path.display().to_string(),
+                delivered_milestones: 0,
+            };
+            write_task_record(&dir.path, &task_record).expect("write terminal task record");
+            request_task_cancel_sentinel(&dir.path, task_id).expect("write cancel sentinel");
+            assert_eq!(
+                is_task_alive(&task_record),
+                Liveness::Live,
+                "fixture must match the live process by PID and argv"
+            );
+
+            let session_record = SessionRecord {
+                id: "svc-1".to_string(),
+                spec: spec("/tmp/in", "/tmp/out"),
+                pid: u32::MAX - 1,
+                started_at: None,
+            };
+            write_session_record(&dir.path, &session_record).expect("write session record");
+
+            execute_teardown(&dir.path, false, &mut Vec::new()).expect("teardown");
+
+            assert!(
+                child.try_wait().expect("poll unrelated process").is_none(),
+                "teardown leaves the matching unrelated process alive"
+            );
+            assert!(
+                read_task_record(&dir.path, task_id)
+                    .expect("read removed terminal task")
+                    .is_none(),
+                "teardown removes the terminal task record"
+            );
+            assert!(
+                !task_cancel_sentinel_path(&dir.path, task_id).is_file(),
+                "teardown removes the terminal task cancel sentinel"
+            );
+
+            child.kill().expect("clean up unrelated process");
+            child.wait().expect("wait for unrelated process");
         }
 
         // -- Task records -----------------------------------------------
