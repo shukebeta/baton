@@ -54,7 +54,7 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session [--role <name>] [--resume <file> [--session <id>]] | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton serve --stop --inbox <dir> | baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]] | baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>... | baton roles | baton role show <name> | baton service run --control <dir> | baton service start --control <dir> --inbox <dir> --outbox <dir> [--poll-ms <n>] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton service status --control <dir> [--session <id>] | baton service stop --control <dir> --session <id> | baton service teardown --control <dir> | baton task start --control <dir> --session <id> --command <program> [--arg <arg>]... [--cwd <dir>] [--env KEY=VALUE]... [--milestone-ms <n>]... --max-duration-ms <n> --callback-inbox <dir> [--callback-role <name>] | baton task status --control <dir> [--task <id>] | baton task cancel --control <dir> --task <id>";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session [--role <name>] [--resume <file> [--session <id>]] | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton serve --stop --inbox <dir> | baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]] | baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>... | baton roles | baton role show <name> | baton service run --control <dir> | baton service start --control <dir> --inbox <dir> --outbox <dir> [--poll-ms <n>] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton service status --control <dir> [--session <id>] | baton service stop --control <dir> --session <id> [--force] | baton service teardown --control <dir> [--force] | baton task start --control <dir> --session <id> --command <program> [--arg <arg>]... [--cwd <dir>] [--env KEY=VALUE]... [--milestone-ms <n>]... --max-duration-ms <n> --callback-inbox <dir> [--callback-role <name>] | baton task status --control <dir> [--task <id>] | baton task cancel --control <dir> --task <id>";
 
 /// Default `baton serve` inbox poll interval, in milliseconds, when `--poll-ms`
 /// is unset.
@@ -2743,10 +2743,11 @@ fn parse_service_status<'a>(mut iter: impl Iterator<Item = &'a String>) -> Resul
     }))
 }
 
-/// Parses `baton service stop --control <dir> --session <id>`.
+/// Parses `baton service stop --control <dir> --session <id> [--force]`.
 fn parse_service_stop<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
     let mut control: Option<String> = None;
     let mut session: Option<String> = None;
+    let mut force = false;
     while let Some(arg) = iter.next() {
         let mut take = |flag: &str| -> Result<String> {
             iter.next()
@@ -2762,6 +2763,7 @@ fn parse_service_stop<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<
             other if other.starts_with("--session=") => {
                 session = Some(other["--session=".len()..].to_string());
             }
+            "--force" => force = true,
             other => return Err(usage(&format!("unexpected argument {other:?}"))),
         }
     }
@@ -2770,12 +2772,14 @@ fn parse_service_stop<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<
     Ok(Command::Service(service::ServiceCommand::Stop {
         control,
         session,
+        force,
     }))
 }
 
-/// Parses `baton service teardown --control <dir>`.
+/// Parses `baton service teardown --control <dir> [--force]`.
 fn parse_service_teardown<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
     let mut control: Option<String> = None;
+    let mut force = false;
     while let Some(arg) = iter.next() {
         let mut take = |flag: &str| -> Result<String> {
             iter.next()
@@ -2787,12 +2791,14 @@ fn parse_service_teardown<'a>(mut iter: impl Iterator<Item = &'a String>) -> Res
             other if other.starts_with("--control=") => {
                 control = Some(other["--control=".len()..].to_string());
             }
+            "--force" => force = true,
             other => return Err(usage(&format!("unexpected argument {other:?}"))),
         }
     }
     let control = require_dir(control, "--control")?;
     Ok(Command::Service(service::ServiceCommand::Teardown {
         control,
+        force,
     }))
 }
 
@@ -5600,6 +5606,28 @@ mod tests {
             Command::Service(service::ServiceCommand::Stop {
                 control: "/tmp/ctl".to_string(),
                 session: "svc-1".to_string(),
+                force: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_service_stop_accepts_force() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "service",
+                "stop",
+                "--control",
+                "/tmp/ctl",
+                "--session",
+                "svc-1",
+                "--force"
+            ]))
+            .expect("parses"),
+            Command::Service(service::ServiceCommand::Stop {
+                control: "/tmp/ctl".to_string(),
+                session: "svc-1".to_string(),
+                force: true,
             })
         );
     }
@@ -5610,6 +5638,25 @@ mod tests {
             parse_args(&argv(&["service", "teardown", "--control", "/tmp/ctl"])).expect("parses"),
             Command::Service(service::ServiceCommand::Teardown {
                 control: "/tmp/ctl".to_string(),
+                force: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_service_teardown_accepts_force() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "service",
+                "teardown",
+                "--control",
+                "/tmp/ctl",
+                "--force"
+            ]))
+            .expect("parses"),
+            Command::Service(service::ServiceCommand::Teardown {
+                control: "/tmp/ctl".to_string(),
+                force: true,
             })
         );
     }
