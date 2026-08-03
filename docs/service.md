@@ -130,8 +130,9 @@ baton service teardown --control <dir> [--force]
   snapshot. Teardown also takes the short-lived admission lock while it
   drains the snapshot, covering task cleanup as well. Without `--force`, it
   keeps unresolved records, prints their identity details to stderr, and exits
-  non-zero; `--force` signals and removes them, including task admission
-  files, on the operator's assertion.
+  non-zero; an initially unresolved task is retained immediately without a
+  per-task grace delay. `--force` signals and removes them, including task
+  admission files, on the operator's assertion.
   Idempotent, and safe to call whether or not `run` is currently alive (e.g.
   to reap stale records left by a `run` that already crashed).
 
@@ -170,12 +171,13 @@ The resolution ladder is platform-specific:
 `service stop` and `service teardown` always try the identity-free cooperative
 mailbox stop first. They then signal only `live` records. Dead records are
 removed, terminal task records are removed without probing or signalling their
-recorded PID, and unresolved records are retained. A retained record's id,
-PID, liveness, and recorded argv are printed to stderr and the command exits
-non-zero. `--force` is the explicit operator assertion of identity: it sends
-the process-group signals and removes the unresolved record. `task cancel` has
-no force flag; it leaves its cooperative cancel sentinel for the supervisor
-and never escalates an unresolved identity.
+recorded PID, and initially unresolved records are retained immediately
+without a per-task grace delay. A retained record's id, PID, liveness, and
+recorded argv are printed to stderr and the command exits non-zero. `--force`
+is the explicit operator assertion of identity: it sends the process-group
+signals and removes the unresolved record. `task cancel` has no force flag; it
+leaves its cooperative cancel sentinel for the supervisor and never escalates
+an unresolved identity.
 
 `TaskRecord.started_ms` and `Clock::now_ms()` are Unix epoch milliseconds.
 `FakeClock::at` initializes that same unit for deterministic instant-leg tests.
@@ -343,14 +345,15 @@ resident store or polling loop needed between turns.
 
 A task's ownership and reaping are scoped strictly to the `--session <id>` it
 names, never to its callback target. `service stop --session <id>` and
-`service teardown` reap every task owned by that session: running tasks have
-their process groups stopped and their records removed, while terminal task
-records are removed without signalling their recorded PID. This applies even
-if a task's `--callback-inbox` points somewhere entirely outside the owning
-session's own mailbox. Task admission and those cleanup paths share the
-short-lived `service.admission.lock`, so cleanup cannot leave a task admitted
-after its owner record has been removed. The callback is a delivery target
-only.
+`service teardown` reap every task owned by that session: tasks with a
+corroborated live identity have their process groups stopped and their records
+removed, initially unresolved tasks are retained for a later cleanup attempt,
+and terminal task records are removed without signalling their recorded PID.
+This applies even if a task's `--callback-inbox` points somewhere entirely
+outside the owning session's own mailbox. Task admission and those cleanup
+paths share the short-lived `service.admission.lock`, so cleanup cannot leave a
+task admitted after its owner record has been removed. The callback is a
+delivery target only.
 
 ### Injectable clock
 
