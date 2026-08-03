@@ -4069,6 +4069,277 @@ fn service_task_start_rolls_back_prepared_record_after_run_loss() {
     );
 }
 
+/// Issue #160 regression: an unresolved prepared task admission is retained
+/// as cleanup residue, not rehydrated as active work. The task may exit while
+/// unresolved without being finalized or emitting a terminal callback; a
+/// later startup removes it once the PID is positively dead.
+#[cfg(target_os = "linux")]
+#[test]
+fn service_prepared_unresolved_admission_is_not_rehydrated_or_finalized() {
+    let root = TempMailbox::new("task-start-prepared-unresolved");
+    let control = root.path.join("control");
+    let session_inbox = root.path.join("session-inbox");
+    let session_outbox = root.path.join("session-outbox");
+    let callback_inbox = root.path.join("callback");
+    let task_started = root.path.join("task-started");
+    let admission_barrier = root.path.join("task-admission.barrier");
+    std::fs::write(&admission_barrier, "hold").expect("create admission barrier");
+    let control_str = control.to_str().unwrap();
+
+    let wait_for_live = || {
+        for _ in 0..200 {
+            if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
+                .args(["service", "status", "--control", control_str])
+                .output()
+                && out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains("\"service_running\":true")
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("baton service run did not report live in time");
+    };
+
+    let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    run.args(["service", "run", "--control", control_str]);
+    run.env("BATON_TEST_TASK_ADMISSION_BARRIER", &admission_barrier);
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::null());
+    let mut run_child = run.spawn().expect("spawn initial baton service run");
+    wait_for_live();
+
+    let session_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str,
+            "--inbox",
+            session_inbox.to_str().unwrap(),
+            "--outbox",
+            session_outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+            "--agent-cmd",
+            "sh",
+            "--agent-arg",
+            "-c",
+            "--agent-arg",
+            "cat >/dev/null; sleep 30",
+        ])
+        .output()
+        .expect("start task owner session");
+    assert!(
+        session_start.status.success(),
+        "service start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&session_start.stderr)
+    );
+    let session_id = String::from_utf8_lossy(&session_start.stdout)
+        .trim()
+        .to_string();
+    assert!(!session_id.is_empty(), "service start prints a session id");
+
+    let mut failed_start = Command::new(env!("CARGO_BIN_EXE_baton"));
+    failed_start.args([
+        "task",
+        "start",
+        "--control",
+        control_str,
+        "--session",
+        &session_id,
+        "--command",
+        "bash",
+        "--arg",
+        "-c",
+        "--arg",
+        "touch \"$1\"; exec sleep 30",
+        "--arg",
+        "task-started",
+        "--arg",
+        task_started.to_str().unwrap(),
+        "--max-duration-ms",
+        "60000",
+        "--callback-inbox",
+        callback_inbox.to_str().unwrap(),
+    ]);
+    failed_start.stdout(Stdio::piped());
+    failed_start.stderr(Stdio::piped());
+    let failed_start = failed_start
+        .spawn()
+        .expect("spawn task start that loses its supervisor");
+
+    let task_record_path = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(entries) = std::fs::read_dir(control.join("tasks"))
+                && let Some(path) = entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            {
+                break path;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "prepared task record was not persisted"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let mut task_record: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&task_record_path).expect("read prepared task record"),
+    )
+    .expect("prepared task record is JSON");
+    assert_eq!(task_record["admission"], "prepared");
+    let task_pid = task_record["pid"]
+        .as_u64()
+        .expect("prepared task record has pid") as u32;
+    let request_id = task_record["request_id"]
+        .as_str()
+        .expect("prepared task record has request id")
+        .to_string();
+    let rollback_path = control
+        .join("task-start-rollback")
+        .join(format!("{request_id}.json"));
+
+    run_child.kill().expect("kill initial service run");
+    let run_status = run_child.wait().expect("initial service run exits");
+    assert!(!run_status.success(), "initial service run was interrupted");
+
+    let failed_output = failed_start
+        .wait_with_output()
+        .expect("wait for failed task start");
+    let failed_message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&failed_output.stdout),
+        String::from_utf8_lossy(&failed_output.stderr)
+    );
+    assert!(
+        !failed_output.status.success(),
+        "task start must fail when admission is lost"
+    );
+    assert!(
+        failed_message.contains("task start request was not admitted"),
+        "failure should explain the admission loss: {}",
+        failed_message
+    );
+    let task_started_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !task_started.exists() && std::time::Instant::now() < task_started_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(task_started.exists(), "the prepared task must have spawned");
+
+    let argv_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !read_proc_cmdline(task_pid).is_some_and(|argv| argv.iter().any(|arg| arg == "sleep"))
+        && std::time::Instant::now() < argv_deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let actual_argv = read_proc_cmdline(task_pid).expect("read exec-replaced task argv");
+    assert!(
+        actual_argv.iter().any(|arg| arg == "sleep"),
+        "bash task must exec-replace its argv; observed {actual_argv:?}"
+    );
+    task_record["started_at"] = serde_json::Value::Null;
+    std::fs::write(
+        &task_record_path,
+        serde_json::to_string(&task_record).expect("encode unresolved prepared record"),
+    )
+    .expect("write unresolved prepared record");
+
+    let mut restarted_run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    restarted_run.args(["service", "run", "--control", control_str]);
+    restarted_run.stdout(Stdio::null());
+    restarted_run.stderr(Stdio::null());
+    let mut restarted_child = restarted_run
+        .spawn()
+        .expect("spawn restarted baton service run");
+    wait_for_live();
+
+    let task_status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "task",
+            "status",
+            "--control",
+            control_str,
+            "--task",
+            task_record["id"].as_str().unwrap(),
+        ])
+        .output()
+        .expect("read unresolved prepared task status");
+    assert!(task_status.status.success(), "task status succeeds");
+    let task_status: serde_json::Value =
+        serde_json::from_slice(&task_status.stdout).expect("task status is JSON");
+    assert_eq!(task_status["tasks"][0]["state"], "running");
+    assert_eq!(task_status["tasks"][0]["liveness"], "unresolved");
+    assert!(
+        task_record_path.is_file(),
+        "unresolved record remains durable"
+    );
+    assert!(rollback_path.is_file(), "rollback marker remains durable");
+    thread::sleep(Duration::from_millis(200));
+    let retained_record: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&task_record_path).expect("read retained prepared record"),
+    )
+    .expect("retained prepared record is JSON");
+    assert_eq!(retained_record["admission"], "prepared");
+    assert_eq!(retained_record["state"], "running");
+    assert!(
+        !callback_inbox.join("pending").exists(),
+        "unresolved prepared task emits no terminal callback"
+    );
+
+    Command::new("kill")
+        .args(["-KILL", "--", &format!("-{task_pid}")])
+        .status()
+        .expect("kill unresolved prepared task");
+    let task_exit_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while process_is_live(task_pid) && std::time::Instant::now() < task_exit_deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!process_is_live(task_pid), "prepared task process exits");
+
+    restarted_child.kill().expect("kill unresolved service run");
+    let _ = restarted_child.wait();
+
+    let mut final_run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    final_run.args(["service", "run", "--control", control_str]);
+    final_run.stdout(Stdio::null());
+    final_run.stderr(Stdio::null());
+    let mut final_child = final_run.spawn().expect("spawn final service run");
+    wait_for_live();
+    assert!(
+        !task_record_path.exists(),
+        "dead prepared record is reconciled"
+    );
+    assert!(
+        !rollback_path.exists(),
+        "dead prepared rollback is reconciled"
+    );
+    assert!(
+        !callback_inbox.join("pending").exists(),
+        "dead prepared admission emits no terminal callback"
+    );
+
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str])
+        .output()
+        .expect("tear down final service run");
+    assert!(
+        teardown.status.success(),
+        "teardown should exit 0; stderr: {}",
+        String::from_utf8_lossy(&teardown.stderr)
+    );
+    assert!(
+        final_child
+            .wait()
+            .expect("final service run exits")
+            .success(),
+        "final service exits cleanly on teardown"
+    );
+}
+
 /// Issue #151 regression: startup reconciliation must retain a rollback marker
 /// until the task record and both pending request locations are gone. The
 /// barrier kills the supervisor at that durable boundary, then a later start

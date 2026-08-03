@@ -115,7 +115,8 @@ baton service teardown --control <dir> [--force]
   corroborated live. Without `--force`, an unresolved session or owned task
   remains durable and the command exits non-zero after printing its id, PID,
   liveness, and recorded argv to stderr. `--force` asserts the operator's
-  identity claim, signals, and removes unresolved records.
+  identity claim, signals, removes unresolved records, and clears their task
+  admission files.
   It serializes that cleanup with task admission, so a task is either
   admitted before the stop and reaped with the session or rejected after the
   session is no longer a live owner. Idempotent — stopping an already-gone
@@ -129,7 +130,8 @@ baton service teardown --control <dir> [--force]
   snapshot. Teardown also takes the short-lived admission lock while it
   drains the snapshot, covering task cleanup as well. Without `--force`, it
   keeps unresolved records, prints their identity details to stderr, and exits
-  non-zero; `--force` signals and removes them on the operator's assertion.
+  non-zero; `--force` signals and removes them, including task admission
+  files, on the operator's assertion.
   Idempotent, and safe to call whether or not `run` is currently alive (e.g.
   to reap stale records left by a `run` that already crashed).
 
@@ -280,6 +282,15 @@ retry the same event id. A terminal record is replayed once on the next
 startup for the same reason; the mailbox's done ledger drops it if delivery
 already completed.
 
+Prepared admissions are not active tasks: startup reconciliation owns their
+cleanup, and `rehydrate_tasks` excludes them from the in-memory tracker. If a
+prepared task's PID identity is unresolved, its durable record and rollback
+marker remain in place while pending request locations are discarded. The
+service does not finalize the task or deliver a terminal callback. A later
+startup removes the record and its admission files after the PID is positively
+dead. `service teardown --force` is the explicit operator path for removing
+residue whose identity remains unresolved.
+
 Task admission is a durable transaction keyed by the task-start request id.
 After spawning and persisting a `TaskRecord`, `run` records the `prepared`
 phase, then durably changes it to `committed` before publishing the success
@@ -289,10 +300,12 @@ a private claim, parses it, writes `task-start-ack/<request-id>.json`, and
 removes the claim only after the acknowledgement is durable. A claim without
 an acknowledgement is restored to the response on the next startup.
 
-Startup reconciliation removes every prepared task and every task named by a
-client rollback marker, including its process and task record. For rollback,
-the marker is cleared only after the task record, response/claim files, and
-both pending request locations have been removed; repeated startup passes are
+Startup reconciliation removes a prepared task only after its process is
+positively dead (or its record is already terminal), including its process and
+task record. An unresolved prepared task remains durable and is excluded from
+rehydration until a later probe resolves its identity. For rollback, the
+marker is cleared only after the task record, response/claim files, and both
+pending request locations have been removed; repeated startup passes are
 therefore safe if the supervisor crashes during cleanup. A committed task with
 an acknowledgement is finalized as `responded` without recreating its
 response. A committed task with an existing response or recoverable claim is

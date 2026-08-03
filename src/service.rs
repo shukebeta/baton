@@ -1161,6 +1161,21 @@ mod imp {
         remove_file_if_present(&path, "task-start acknowledgement")
     }
 
+    /// Removes every durable file belonging to a task-start transaction after
+    /// the task record has reached a safe cleanup boundary. Explicit
+    /// ownership teardown uses this after asserting the process identity;
+    /// leaving an admission marker behind after a forced removal would make
+    /// the next supervisor treat an already-removed task as rollback residue.
+    fn remove_task_start_transaction(control: &Path, record: &TaskRecord) -> Result<()> {
+        let Some(request_id) = record.request_id.as_deref() else {
+            return Ok(());
+        };
+        discard_pending_task_start_request(control, request_id)?;
+        remove_task_start_response_files(control, request_id)?;
+        remove_task_start_ack(control, request_id)?;
+        remove_task_start_rollback(control, request_id)
+    }
+
     fn list_task_start_acks(control: &Path) -> Result<Vec<String>> {
         let dir = task_start_ack_dir(control);
         let entries = match fs::read_dir(&dir) {
@@ -1317,13 +1332,16 @@ mod imp {
     /// response or a recoverable claim is finalized as responded, while a
     /// committed record with neither is given one response before that phase
     /// is persisted. Rollback, claim, and acknowledgement cleanup is
-    /// idempotent across interrupted startup passes.
+    /// idempotent across interrupted startup passes. An unresolved prepared
+    /// record remains durable cleanup residue, including its rollback marker,
+    /// until a later liveness probe can prove that its process is dead.
     fn reconcile_task_admissions(control: &Path) -> Result<()> {
         let rollback_ids = list_task_start_rollbacks(control)?;
         let ack_ids = list_task_start_acks(control)?;
         let claim_ids = list_task_start_response_claims(control)?;
         let records = list_task_records(control)?;
         let mut seen_rollbacks = std::collections::HashSet::new();
+        let mut retained_rollbacks = std::collections::HashSet::new();
         let mut seen_acks = std::collections::HashSet::new();
 
         for record in records {
@@ -1339,6 +1357,9 @@ mod imp {
                     discard_pending_task_start_request(control, request_id)?;
                 }
                 if !abort_task_admission(control, &record)? {
+                    if rollback && let Some(request_id) = request_id {
+                        retained_rollbacks.insert(request_id.to_string());
+                    }
                     eprintln!(
                         "warning: task {} admission remains unresolved; preserving its record",
                         record.id
@@ -1366,6 +1387,7 @@ mod imp {
             }
             if rollback {
                 if !abort_task_admission(control, &record)? {
+                    retained_rollbacks.insert(request_id.to_string());
                     eprintln!(
                         "warning: task {} rollback remains unresolved; preserving its record",
                         record.id
@@ -1461,7 +1483,9 @@ mod imp {
                     "BATON_TEST_TASK_ROLLBACK_RECONCILE_BARRIER",
                 );
             }
-            remove_task_start_rollback(control, &request_id)?;
+            if !retained_rollbacks.contains(&request_id) {
+                remove_task_start_rollback(control, &request_id)?;
+            }
         }
         Ok(())
     }
@@ -1546,9 +1570,15 @@ mod imp {
     /// child process was reparented when the previous supervisor exited, so
     /// the new tracker deliberately carries no `Child` handle and lets
     /// `tick_one_task` use the record's corroborated PID identity instead.
+    /// Prepared admission records are intentionally excluded: they have not
+    /// crossed the durable admission boundary, so an unresolved one is
+    /// retained for reconciliation rather than treated as active work.
     fn rehydrate_tasks(control: &Path, clock: &dyn Clock) -> Result<HashMap<String, RunningTask>> {
         let mut tasks = HashMap::new();
         for mut record in list_task_records(control)? {
+            if record.admission == TaskAdmissionPhase::Prepared {
+                continue;
+            }
             let started_ms = match record.started_ms {
                 Some(started_ms) => started_ms,
                 None if record.state == TaskState::Running => {
@@ -2189,6 +2219,7 @@ mod imp {
                     let _ = signal_group(record.pid, "-TERM");
                     let _ = signal_group(record.pid, "-KILL");
                 }
+                remove_task_start_transaction(control, &record)?;
                 remove_task_record(control, &record.id)?;
                 let _ = fs::remove_file(task_cancel_sentinel_path(control, &record.id));
                 continue;
@@ -2213,6 +2244,7 @@ mod imp {
                 liveness = is_task_alive(&record);
             }
             if liveness == Liveness::Dead {
+                remove_task_start_transaction(control, &record)?;
                 remove_task_record(control, &record.id)?;
                 let _ = fs::remove_file(task_cancel_sentinel_path(control, &record.id));
             } else {
@@ -3925,6 +3957,108 @@ mod imp {
             }
         }
 
+        /// An unresolved prepared admission is retained as cleanup residue,
+        /// not rehydrated as active work. Once its PID is positively dead,
+        /// reconciliation removes the record and every admission artifact.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn unresolved_prepared_admission_retains_marker_until_dead_cleanup() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("prepared-unresolved");
+            let request_id = "prepared-unresolved-request";
+            let task_id = "prepared-unresolved-task";
+            let spec = task_spec(
+                "svc-1",
+                "bash",
+                vec!["-c".to_string(), "exec sleep 30".to_string()],
+                vec![],
+                60_000,
+                "/tmp/callback",
+            );
+            let log_dir = task_logs_dir(&dir.path, task_id);
+            fs::create_dir_all(&log_dir).expect("create task logs");
+            let stdout_path = log_dir.join("stdout.log");
+            let stderr_path = log_dir.join("stderr.log");
+            let mut child =
+                spawn_task_child(&spec, &stdout_path, &stderr_path).expect("spawn unresolved task");
+            let record = TaskRecord {
+                id: task_id.to_string(),
+                request_id: Some(request_id.to_string()),
+                admission: TaskAdmissionPhase::Prepared,
+                spec,
+                pid: child.id(),
+                started_at: None,
+                started_ms: Some(1),
+                state: TaskState::Running,
+                exit_code: None,
+                elapsed_ms: None,
+                stdout_path: stdout_path.display().to_string(),
+                stderr_path: stderr_path.display().to_string(),
+                delivered_milestones: 0,
+            };
+            write_task_record(&dir.path, &record).expect("write prepared task");
+            write_task_start_response(
+                &dir.path,
+                request_id,
+                &TaskStartResponse {
+                    task_id: Some(task_id.to_string()),
+                    error: None,
+                },
+            )
+            .expect("write task response");
+            mark_task_start_ack(&dir.path, request_id).expect("write task acknowledgement");
+            mark_task_start_rollback(&dir.path, request_id).expect("write rollback marker");
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while is_task_alive(&record) != Liveness::Unresolved && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(
+                is_task_alive(&record),
+                Liveness::Unresolved,
+                "fixture reaches the unresolved identity state"
+            );
+
+            reconcile_task_admissions(&dir.path).expect("retain unresolved admission");
+            assert!(
+                read_task_record(&dir.path, task_id)
+                    .expect("read retained task")
+                    .is_some(),
+                "unresolved prepared record remains durable"
+            );
+            assert!(
+                task_start_rollback_exists(&dir.path, request_id).expect("rollback marker exists"),
+                "rollback marker remains until cleanup succeeds"
+            );
+            assert!(
+                rehydrate_tasks(&dir.path, &FakeClock::new())
+                    .expect("rehydrate tasks")
+                    .is_empty(),
+                "unresolved prepared record is not active work"
+            );
+
+            signal_group(record.pid, "-KILL").expect("kill unresolved task");
+            child.wait().expect("wait for unresolved task");
+            reconcile_task_admissions(&dir.path).expect("remove dead admission");
+
+            assert!(
+                read_task_record(&dir.path, task_id)
+                    .expect("read removed task")
+                    .is_none(),
+                "dead prepared record is removed"
+            );
+            assert!(
+                !task_start_rollback_exists(&dir.path, request_id)
+                    .expect("rollback marker cleanup"),
+                "dead prepared rollback marker is removed"
+            );
+            assert!(
+                !task_start_response_boundary_exists(&dir.path, request_id)
+                    .expect("response boundary cleanup"),
+                "dead prepared response boundary is removed"
+            );
+        }
+
         /// A PID whose current start key does not match the durable record is
         /// finalized as gone and is never signalled as the task.
         #[test]
@@ -4519,6 +4653,7 @@ mod imp {
         fn teardown_preserves_unresolved_task_until_force() {
             let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("teardown-unresolved");
+            let request_id = "task-unresolved-request";
             let task_specification = task_spec(
                 "svc-1",
                 "bash",
@@ -4541,8 +4676,8 @@ mod imp {
             };
             let task_record = TaskRecord {
                 id: "task-unresolved".to_string(),
-                request_id: None,
-                admission: TaskAdmissionPhase::Committed,
+                request_id: Some(request_id.to_string()),
+                admission: TaskAdmissionPhase::Prepared,
                 spec: task_specification,
                 pid: child.id(),
                 started_at: None,
@@ -4556,6 +4691,18 @@ mod imp {
             };
             write_session_record(&dir.path, &session_record).expect("write session");
             write_task_record(&dir.path, &task_record).expect("write unresolved task");
+            write_task_start_response(
+                &dir.path,
+                request_id,
+                &TaskStartResponse {
+                    task_id: Some(task_record.id.clone()),
+                    error: None,
+                },
+            )
+            .expect("write unresolved task response");
+            mark_task_start_ack(&dir.path, request_id).expect("write unresolved task ack");
+            mark_task_start_rollback(&dir.path, request_id)
+                .expect("write unresolved task rollback");
 
             let deadline = Instant::now() + Duration::from_secs(2);
             while is_task_alive(&task_record) != Liveness::Unresolved && Instant::now() < deadline {
@@ -4600,6 +4747,15 @@ mod imp {
                 read_task_record(&dir.path, "task-unresolved")
                     .expect("read forced task")
                     .is_none()
+            );
+            assert!(
+                !task_start_rollback_exists(&dir.path, request_id).expect("read forced rollback"),
+                "forced teardown removes the rollback marker"
+            );
+            assert!(
+                !task_start_response_boundary_exists(&dir.path, request_id)
+                    .expect("read forced response boundary"),
+                "forced teardown removes the response boundary"
             );
             let _ = child.wait();
         }
