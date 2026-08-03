@@ -132,7 +132,7 @@ pub enum TaskState {
 /// and needs no response restoration on restart. Older task records omit this
 /// field and deserialize as responded, preserving tasks admitted before the
 /// transaction marker was introduced without creating orphan responses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskAdmissionPhase {
     /// The task record was persisted, but the successful admission response
@@ -142,13 +142,8 @@ pub enum TaskAdmissionPhase {
     /// still be pending.
     Committed,
     /// The task-start response was durably written.
+    #[default]
     Responded,
-}
-
-impl Default for TaskAdmissionPhase {
-    fn default() -> Self {
-        Self::Responded
-    }
 }
 
 /// A durable on-disk record of one task the service has spawned: its
