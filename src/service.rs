@@ -1842,7 +1842,8 @@ mod imp {
     /// `lstart` is second-granular, weaker than Linux `/proc` ticks, and the
     /// `state=,lstart=` format is a BSD/procps extension rather than POSIX.
     /// That tradeoff is accepted because Linux and macOS are the supported
-    /// Unix hosts in CI.
+    /// Unix hosts in CI. Every probe pins the locale and time zone below so
+    /// the recorded key remains comparable across independent clients.
     #[cfg(not(target_os = "linux"))]
     #[derive(Debug, PartialEq, Eq)]
     struct ProcessProbe {
@@ -1875,6 +1876,12 @@ mod imp {
         }
         let output = Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "state=,lstart="])
+            // macOS formats `lstart` through the caller's locale and time
+            // zone. Keep the durable process key independent of whether the
+            // probe runs inside `service run` or a later CLI invocation.
+            .env("LC_ALL", "C")
+            .env("LC_TIME", "C")
+            .env("TZ", "UTC")
             .output()
             .ok()?;
         if !output.status.success() {

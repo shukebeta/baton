@@ -37,8 +37,10 @@ without ever sharing a process tree with it.
   design on Windows; `baton service` fails clearly there instead of silently
   falling back to a weaker guarantee. On Linux, per-session liveness uses
   `/proc/<pid>/stat`; on macOS, it uses `ps` process state plus the
-  second-granular `lstart` value. Native Windows service support is tracked
-  separately.
+  second-granular `lstart` value. The macOS probe always sets
+  `LC_ALL=C`, `LC_TIME=C`, and `TZ=UTC`, so its process key is independent of
+  the environment of the supervisor or the CLI client. Native Windows service
+  support is tracked separately.
 
 ## Control surface
 
@@ -98,8 +100,11 @@ baton service teardown --control <dir>
   still matches the record — so a PID recycled after a restart is reported as
   crashed rather than (incorrectly) live. On macOS, the same check uses
   `ps -p <pid> -o state=,lstart=`; a leading `Z` is treated as gone and the
-  normalized `lstart` value must match the record. `lstart` is second-granular
-  and is a BSD/procps extension rather than a POSIX interface.
+  normalized `lstart` value must match the record. Each macOS probe fixes
+  `LC_ALL` and `LC_TIME` to `C` and `TZ` to `UTC` before invoking `ps`, so
+  `lstart` remains comparable when the supervisor and client inherit different
+  locale or time-zone settings. `lstart` is second-granular and is a
+  BSD/procps extension rather than a POSIX interface.
 - **`service stop --session <id>`** tries `serve`'s own cooperative stop
   against the session's inbox first, then escalates to a bounded
   `SIGTERM`/`SIGKILL` on the session's process group if it is still alive.
