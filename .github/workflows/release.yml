@@ -38,6 +38,7 @@ jobs:
           lockfile_version="$(bash scripts/release.sh lockfile-version)"
           test "${manifest_version}" = "${version}"
           test "${lockfile_version}" = "${version}"
+          bash scripts/release.sh verify-docs
           cargo metadata --locked --no-deps --format-version 1 >/dev/null
           printf 'tag=%s\n' "${tag}" >> "${GITHUB_OUTPUT}"
 

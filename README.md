@@ -8,6 +8,8 @@ center of the design.
 
 ## Status
 
+The current blessed release is `v0.2.9`.
+
 Early scaffolding. The crate establishes the module layout and typed runtime
 shape around a non-streaming Claude-compatible Messages client
 (`transport::claude::ClaudeClient`). Its commands wire it to the command line:
@@ -21,7 +23,9 @@ from a file mailbox, `baton send` for posting a request into a mailbox (by path 
 by **role name** via the registry) and consuming the correlated reply, `baton
 status` for reporting a mailbox's liveness (`idle-done` / `busy` / `crashed-stale`
 plus queue depth), and `baton log` for inspecting and replaying the recorded
-exchange trail.
+exchange trail. The surface also includes `baton roles` and `baton role show`
+for role identity inspection, `baton service` for host-owned mailbox
+supervision, and `baton task` for asynchronous jobs managed by that service.
 
 ## Documentation
 
@@ -50,7 +54,7 @@ global flags need no Baton configuration or provider credentials.
 Install the `baton` binary from a pinned git tag with a Rust toolchain (≥ 1.89):
 
 ```bash
-cargo install --git https://github.com/shukebeta/baton --tag v0.1.0 --locked
+cargo install --git https://github.com/shukebeta/baton --tag v0.2.9 --locked
 ```
 
 This puts `baton` on your PATH — the form a consumer that invokes baton as a
@@ -68,13 +72,14 @@ is the curated record of what each tag bump includes — read it before re-pinni
 The automated release calculation and its no-retagging baseline are documented
 in [docs/versioning.md](docs/versioning.md).
 
-**Stability is an explicit non-goal at 0.1.0.** Neither the Rust library API nor
-the CLI flag surface is promised stable; the CLI is only the *intended*
-integration surface, and pinning a tag is how a consumer insulates itself from
-change. This release ships no crates.io publish, no prebuilt or cross-platform
-binaries (no homebrew / apt), and no supported library-dependency recipe — baton
-compiles as lib+bin, but crate consumption is unsupported at 0.1.0 because the
-module layout is intentionally thin and will be reworked.
+**Historical v0.1.0 baseline.** At the initial release, neither the Rust
+library API nor the CLI flag surface was promised stable; the CLI was only the
+*intended* integration surface, and pinning a tag was how a consumer insulated
+itself from change. That baseline shipped no crates.io publish, no prebuilt or
+cross-platform binaries (no homebrew / apt), and no supported library-
+dependency recipe — baton compiled as lib+bin, but crate consumption was
+unsupported at v0.1.0 because the module layout was intentionally thin and
+would be reworked.
 
 ## Quickstart
 
