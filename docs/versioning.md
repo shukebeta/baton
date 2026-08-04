@@ -29,6 +29,16 @@ The latest-release lookup considers only valid release tags reachable from the
 workflow's current `HEAD` on main or master. Tags that exist only on unrelated
 branches do not affect the release sequence.
 
+## README release pin
+
+`README.md` names the current blessed release in its status section and pins
+the install command to the same tag. Both markers must match the package
+version in `Cargo.toml`, which must also match Baton's entry in `Cargo.lock`.
+Run `bash scripts/release.sh verify-docs` to check that contract; CI and the
+release workflow run it automatically. When `create-tag` calculates a new
+release, it updates both README markers before committing the release files,
+so a new tag cannot leave the primary install path on the previous artifact.
+
 ## Baseline and no-retag boundary
 
 v0.1.0 is the historical baseline. The next feature release from it is v0.2.0;

@@ -44,6 +44,10 @@ jobs:
         shell: bash
         run: bash tests/release_test.sh
 
+      - name: Verify release docs
+        shell: bash
+        run: bash scripts/release.sh verify-docs
+
   # Verifies the declared MSRV floor so `cargo install --tag <tag> --locked`
   # can't silently break for a consumer on the exact rustc the README promises.
   # Build/test only — no fmt/clippy (their output is toolchain-version-specific).

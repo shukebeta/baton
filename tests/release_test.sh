@@ -43,7 +43,12 @@ make_fixture() {
         'version = "0.1.0"' \
         'dependencies = []' \
         >"${repo}/Cargo.lock"
-    git -C "${repo}" add Cargo.toml Cargo.lock
+    printf '%s\n' \
+        "The current blessed release is \`v0.1.0\`." \
+        '' \
+        'cargo install --git https://github.com/shukebeta/baton --tag v0.1.0 --locked' \
+        >"${repo}/README.md"
+    git -C "${repo}" add Cargo.toml Cargo.lock README.md
     git -C "${repo}" commit -q -m "chore: release baseline"
     git -C "${repo}" tag v0.1.0
 }
@@ -110,6 +115,23 @@ test_invalid_tags_and_bump_kinds_fail() (
     assert_rc_nonzero "${status}"
     status=0
     release_next_tag v0.1.0 bogus >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+)
+
+test_release_docs_consistency_and_stale_detection() (
+    set -euo pipefail
+    local repo status=0
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    make_fixture "${repo}"
+
+    (cd "${repo}" && release_verify_docs)
+    printf '%s\n' \
+        "The current blessed release is \`v0.1.1\`." \
+        '' \
+        'cargo install --git https://github.com/shukebeta/baton --tag v0.1.1 --locked' \
+        >"${repo}/README.md"
+    (cd "${repo}" && release_verify_docs) >/dev/null 2>&1 || status="$?"
     assert_rc_nonzero "${status}"
 )
 
@@ -195,6 +217,8 @@ test_release_updates_manifest_lock_and_matching_tag() (
         "historical baseline tag is unchanged"
     git -C "${repo}" show "${tag}:Cargo.toml" | grep -Fx 'version = "0.2.0"' >/dev/null
     git -C "${repo}" show "${tag}:Cargo.lock" | grep -Fx 'version = "0.2.0"' >/dev/null
+    git -C "${repo}" show "${tag}:README.md" | grep -Fx "The current blessed release is \`v0.2.0\`." >/dev/null
+    git -C "${repo}" show "${tag}:README.md" | grep -Fx 'cargo install --git https://github.com/shukebeta/baton --tag v0.2.0 --locked' >/dev/null
 )
 
 test_patch_release_updates_manifest_lock_and_matching_tag() (
@@ -223,6 +247,7 @@ tests=(
     test_patch_and_feature_reset_behavior
     test_conventional_commit_classification
     test_invalid_tags_and_bump_kinds_fail
+    test_release_docs_consistency_and_stale_detection
     test_existing_v0_1_0_head_is_not_retagged
     test_unreachable_higher_tag_is_ignored
     test_release_updates_manifest_lock_and_matching_tag
