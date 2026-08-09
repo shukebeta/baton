@@ -63,10 +63,11 @@ without ever sharing a process tree with it.
   operation that must execute *inside* the long-lived process, since spawning
   the child there is the entire point.
 - `sessions/<id>.json` — one durable session record per session (its
-  effective spec, real PID, and recorded start time). `status`/`stop`/
-  `teardown` read this directly and act on the OS process by PID — none of
-  them need `run` to be alive, so a session started by a since-crashed `run`
-  can still be inspected, stopped, or torn down.
+  effective spec, real PID, canonical `started_at` string, and—on macOS—its
+  parsed `start_epoch_secs` format marker). `status`/`stop`/`teardown` read
+  this directly and act on the OS process by PID — none of them need `run` to
+  be alive, so a session started by a since-crashed `run` can still be
+  inspected, stopped, or torn down.
 
 ## Lifecycle contract
 
@@ -102,9 +103,10 @@ baton service teardown --control <dir> [--force]
   `liveness` state. Per-session liveness checks the recorded PID against
   `/proc/<pid>` on Linux — alive, not a zombie, and its start time still
   matches the record — so a PID recycled after a restart is `dead`. On macOS,
-  the check uses `ps -ww -p <pid> -o state=,lstart=,command=`; a leading `Z`
-  is `dead`; a matching normalized `lstart` is `live`, while an absent or
-  mismatched key falls through to the argv/instant corroborators below. Each
+  records with `start_epoch_secs` compare that canonical epoch directly and
+  do not invoke a corroborator; older records use
+  `ps -ww -p <pid> -o state=,lstart=,command=` and fall through from an absent
+  or mismatched `started_at` to the argv/instant corroborators below. Each
   macOS probe fixes `LC_ALL` and `LC_TIME` to `C` and `TZ` to `UTC` before
   invoking `ps`, so `lstart` remains comparable when the supervisor and
   client inherit different locale or time-zone settings. `lstart` is
@@ -158,7 +160,10 @@ The resolution ladder is platform-specific:
   while retaining the same PID. Linux has no epoch instant leg: `/proc` start
   ticks are relative to boot, and `/proc/<pid>` directory mtime is not a safe
   substitute because procfs can restamp it on lookup.
-- On macOS, a mismatch or absent `lstart` key falls through to a session argv
+- On macOS, a record with `start_epoch_secs` compares the probe's parsed
+  canonical UTC epoch: equal is `live`, unequal is `dead`, and an unparseable
+  probe is `unresolved`. A legacy record with no `start_epoch_secs` uses a
+  mismatched or absent `started_at` key as the trigger for a session argv
   suffix match or a task start-instant comparison. The probe is pinned to
   `LC_ALL=C LC_TIME=C TZ=UTC` and parses `lstart` as a proleptic Gregorian UTC
   epoch. For a task, `Δ = started_ms - lstart_epoch_seconds * 1000`: a negative
@@ -167,6 +172,14 @@ The resolution ladder is platform-specific:
   5000 ms of spawn-to-record latency; overestimating it can only preserve an
   unresolved record, never condemn a genuine task. Task argv can confirm only
   when the durable instant is unavailable and never condemns a mismatch.
+
+New macOS records retain `started_at` as the operator-readable UTC string and
+also persist `start_epoch_secs`; the field's presence is the format-version
+marker. A legacy record that is rescued as live by a lock-holding cleanup or
+admission-reconciliation path is rewritten once with the epoch marker. The
+read-only `service status` and the supervisor's lock-free task tick never
+rewrite records, so an unresolved legacy task remains safe to retry until a
+cleanup path can upgrade it.
 
 `service stop` and `service teardown` always try the identity-free cooperative
 mailbox stop first. They then signal only `live` records. Dead records are
@@ -180,6 +193,9 @@ leaves its cooperative cancel sentinel for the supervisor and never escalates
 an unresolved identity.
 
 `TaskRecord.started_ms` and `Clock::now_ms()` are Unix epoch milliseconds.
+`TaskRecord.start_epoch_secs`, when present on macOS, is the canonical
+second-granular process-start epoch parsed from `ps lstart` and is the task's
+version marker and fast-path identity key.
 `FakeClock::at` initializes that same unit for deterministic instant-leg tests.
 
 Standalone `baton serve` (run directly, without `baton service`) is

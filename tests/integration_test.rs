@@ -2152,6 +2152,29 @@ fn read_ps_command(pid: u32) -> Option<String> {
     )
 }
 
+/// Reads macOS's human-readable process start key under a caller-selected
+/// time zone, for constructing a v0.2.1-shaped legacy record.
+#[cfg(target_os = "macos")]
+fn read_ps_lstart(pid: u32, timezone: &str) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .env("LC_ALL", "C")
+        .env("LC_TIME", "C")
+        .env("TZ", timezone)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8(output.stdout)
+            .ok()?
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
 /// Issue #147 regression: macOS `ps` start keys must remain stable when the
 /// supervisor records a session under one environment and later CLI probes
 /// run under another. The test covers status, stop, and teardown, including
@@ -2465,6 +2488,345 @@ fn service_liveness_keys_ignore_supervisor_and_client_environment() {
         .map(|entries| entries.filter_map(|entry| entry.ok()).count())
         .unwrap_or(0);
     assert_eq!(session_records, 0, "teardown removes every session record");
+}
+
+/// Issue #154 regression: v0.2.1-shaped macOS records remain live across a
+/// supervisor restart even when their time-zone-rendered `started_at` keys no
+/// longer match the canonical probe. Session liveness uses argv, task
+/// liveness uses its persisted spawn instant, and lock-holding cleanup can
+/// then stop and remove both records.
+#[cfg(target_os = "macos")]
+#[test]
+fn service_upgrades_legacy_macos_start_epoch_records() {
+    let root = TempMailbox::new("service-macos-legacy-start-epoch");
+    let control = root.path.join("control");
+    let session_inbox = root.path.join("session-inbox");
+    let session_outbox = root.path.join("session-outbox");
+    let callback_inbox = root.path.join("callback");
+    let control_str = control.to_str().unwrap().to_string();
+
+    let spawn_run = || {
+        let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+        run.args(["service", "run", "--control", control_str.as_str()]);
+        run.stdout(Stdio::null());
+        run.stderr(Stdio::null());
+        run.spawn().expect("spawn macOS service run")
+    };
+    let wait_for_service = || {
+        for _ in 0..200 {
+            let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+                .args(["service", "status", "--control", control_str.as_str()])
+                .output()
+                .expect("read service status");
+            if status.status.success()
+                && String::from_utf8_lossy(&status.stdout).contains("\"service_running\":true")
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("macOS service run did not report live in time");
+    };
+    let run_cli = |args: &[String]| {
+        Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(args)
+            .output()
+            .expect("run baton CLI")
+    };
+
+    let mut run = spawn_run();
+    wait_for_service();
+
+    let start_args = vec![
+        "service".to_string(),
+        "start".to_string(),
+        "--control".to_string(),
+        control_str.clone(),
+        "--inbox".to_string(),
+        session_inbox.display().to_string(),
+        "--outbox".to_string(),
+        session_outbox.display().to_string(),
+        "--poll-ms".to_string(),
+        "20".to_string(),
+        "--agent-cmd".to_string(),
+        "sh".to_string(),
+        "--agent-arg".to_string(),
+        "-c".to_string(),
+        "--agent-arg".to_string(),
+        "sleep 30".to_string(),
+    ];
+    let session_start = run_cli(&start_args);
+    assert!(
+        session_start.status.success(),
+        "legacy session start should succeed; stderr: {}",
+        String::from_utf8_lossy(&session_start.stderr)
+    );
+    let session_id = String::from_utf8_lossy(&session_start.stdout)
+        .trim()
+        .to_string();
+    assert!(!session_id.is_empty(), "service start prints a session id");
+
+    let task_start_args = vec![
+        "task".to_string(),
+        "start".to_string(),
+        "--control".to_string(),
+        control_str.clone(),
+        "--session".to_string(),
+        session_id.clone(),
+        "--command".to_string(),
+        "sh".to_string(),
+        "--arg".to_string(),
+        "-c".to_string(),
+        "--arg".to_string(),
+        "exec sleep 30".to_string(),
+        "--max-duration-ms".to_string(),
+        "60000".to_string(),
+        "--callback-inbox".to_string(),
+        callback_inbox.display().to_string(),
+    ];
+    let task_start = run_cli(&task_start_args);
+    assert!(
+        task_start.status.success(),
+        "legacy task start should succeed; stderr: {}",
+        String::from_utf8_lossy(&task_start.stderr)
+    );
+    let task_id = String::from_utf8_lossy(&task_start.stdout)
+        .trim()
+        .to_string();
+    assert!(!task_id.is_empty(), "task start prints a task id");
+
+    let session_status_args = vec![
+        "service".to_string(),
+        "status".to_string(),
+        "--control".to_string(),
+        control_str.clone(),
+        "--session".to_string(),
+        session_id.clone(),
+    ];
+    let task_status_args = vec![
+        "task".to_string(),
+        "status".to_string(),
+        "--control".to_string(),
+        control_str.clone(),
+        "--task".to_string(),
+        task_id.clone(),
+    ];
+    let mut session_pid = None;
+    let mut task_pid = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && (session_pid.is_none() || task_pid.is_none()) {
+        let session_status = run_cli(&session_status_args);
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&session_status.stdout) {
+            session_pid = json["sessions"][0]["pid"].as_u64().map(|pid| pid as u32);
+        }
+        let task_status = run_cli(&task_status_args);
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&task_status.stdout) {
+            task_pid = json["tasks"][0]["pid"].as_u64().map(|pid| pid as u32);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let session_pid = session_pid.expect("session status reports a PID");
+    let task_pid = task_pid.expect("task status reports a PID");
+
+    let session_record_path = control.join("sessions").join(format!("{session_id}.json"));
+    let task_record_path = control.join("tasks").join(format!("{task_id}.json"));
+    let session_record: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&session_record_path).expect("read new session record"),
+    )
+    .expect("decode new session record");
+    let task_record: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&task_record_path).expect("read new task record"),
+    )
+    .expect("decode new task record");
+    assert!(
+        session_record["start_epoch_secs"].is_number(),
+        "new session records carry the epoch marker"
+    );
+    assert!(
+        task_record["start_epoch_secs"].is_number(),
+        "new task records carry the epoch marker"
+    );
+
+    let canonical_session_key =
+        read_ps_lstart(session_pid, "UTC").expect("read canonical session key");
+    let legacy_session_key =
+        read_ps_lstart(session_pid, "Pacific/Auckland").expect("read legacy session key");
+    let canonical_task_key = read_ps_lstart(task_pid, "UTC").expect("read canonical task key");
+    let legacy_task_key =
+        read_ps_lstart(task_pid, "Pacific/Auckland").expect("read legacy task key");
+    assert_ne!(
+        legacy_session_key, canonical_session_key,
+        "legacy session key differs from the canonical key"
+    );
+    assert_ne!(
+        legacy_task_key, canonical_task_key,
+        "legacy task key differs from the canonical key"
+    );
+
+    let mut epoch_only_session = session_record.clone();
+    epoch_only_session["started_at"] = serde_json::Value::String("not-the-current-key".to_string());
+    std::fs::write(
+        &session_record_path,
+        serde_json::to_string(&epoch_only_session).expect("encode epoch-only session record"),
+    )
+    .expect("write epoch-only session record");
+    let mut epoch_only_task = task_record.clone();
+    epoch_only_task["started_at"] = serde_json::Value::String("not-the-current-key".to_string());
+    std::fs::write(
+        &task_record_path,
+        serde_json::to_string(&epoch_only_task).expect("encode epoch-only task record"),
+    )
+    .expect("write epoch-only task record");
+    let epoch_only_session_status = run_cli(&session_status_args);
+    let epoch_only_session_json: serde_json::Value =
+        serde_json::from_slice(&epoch_only_session_status.stdout)
+            .expect("epoch-only session status is JSON");
+    assert_eq!(epoch_only_session_json["sessions"][0]["liveness"], "live");
+    let epoch_only_task_status = run_cli(&task_status_args);
+    let epoch_only_task_json: serde_json::Value =
+        serde_json::from_slice(&epoch_only_task_status.stdout)
+            .expect("epoch-only task status is JSON");
+    assert_eq!(epoch_only_task_json["tasks"][0]["liveness"], "live");
+
+    let mut legacy_session_record = session_record;
+    legacy_session_record["started_at"] = serde_json::Value::String(legacy_session_key);
+    legacy_session_record
+        .as_object_mut()
+        .expect("session record is an object")
+        .remove("start_epoch_secs");
+    std::fs::write(
+        &session_record_path,
+        serde_json::to_string(&legacy_session_record).expect("encode legacy session record"),
+    )
+    .expect("write legacy session record");
+
+    let mut legacy_task_record = task_record;
+    legacy_task_record["started_at"] = serde_json::Value::String(legacy_task_key);
+    legacy_task_record
+        .as_object_mut()
+        .expect("task record is an object")
+        .remove("start_epoch_secs");
+    std::fs::write(
+        &task_record_path,
+        serde_json::to_string(&legacy_task_record).expect("encode legacy task record"),
+    )
+    .expect("write legacy task record");
+
+    let status = run_cli(&session_status_args);
+    assert!(status.status.success(), "legacy service status succeeds");
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("legacy service status is JSON");
+    assert_eq!(status_json["sessions"][0]["live"], true);
+    assert_eq!(status_json["sessions"][0]["liveness"], "live");
+    let task_status = run_cli(&task_status_args);
+    assert!(task_status.status.success(), "legacy task status succeeds");
+    let task_status_json: serde_json::Value =
+        serde_json::from_slice(&task_status.stdout).expect("legacy task status is JSON");
+    assert_eq!(task_status_json["tasks"][0]["live"], true);
+    assert_eq!(task_status_json["tasks"][0]["liveness"], "live");
+    let status_session_record: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&session_record_path).expect("read legacy session after status"),
+    )
+    .expect("decode legacy session after status");
+    let status_task_record: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&task_record_path).expect("read legacy task after status"),
+    )
+    .expect("decode legacy task after status");
+    assert!(
+        !status_session_record
+            .as_object()
+            .expect("session status record is an object")
+            .contains_key("start_epoch_secs"),
+        "service status does not rewrite the session record"
+    );
+    assert!(
+        !status_task_record
+            .as_object()
+            .expect("task status record is an object")
+            .contains_key("start_epoch_secs"),
+        "task status does not rewrite the task record"
+    );
+
+    run.kill().expect("kill initial service supervisor");
+    let _ = run.wait();
+    let mut restarted = spawn_run();
+    wait_for_service();
+
+    let mut rehydrated_live = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let task_status = run_cli(&task_status_args);
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&task_status.stdout)
+            && json["tasks"][0]["live"] == true
+            && json["tasks"][0]["liveness"] == "live"
+        {
+            rehydrated_live = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        rehydrated_live,
+        "legacy task remains live after rehydration"
+    );
+    assert!(
+        process_is_live(task_pid),
+        "rehydrated task process remains live"
+    );
+
+    let stop_args = vec![
+        "service".to_string(),
+        "stop".to_string(),
+        "--control".to_string(),
+        control_str.clone(),
+        "--session".to_string(),
+        session_id,
+    ];
+    let stop = run_cli(&stop_args);
+    assert!(
+        stop.status.success(),
+        "legacy service stop succeeds; stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while (process_is_live(session_pid) || process_is_live(task_pid))
+        && std::time::Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !process_is_live(session_pid),
+        "legacy session process is stopped"
+    );
+    assert!(!process_is_live(task_pid), "legacy task process is stopped");
+    assert!(
+        !session_record_path.is_file(),
+        "stopped session record is removed"
+    );
+    assert!(
+        !task_record_path.is_file(),
+        "stopped task record is removed"
+    );
+
+    let teardown_args = vec![
+        "service".to_string(),
+        "teardown".to_string(),
+        "--control".to_string(),
+        control_str,
+    ];
+    let teardown = run_cli(&teardown_args);
+    assert!(
+        teardown.status.success(),
+        "legacy service teardown succeeds; stderr: {}",
+        String::from_utf8_lossy(&teardown.stderr)
+    );
+    assert!(
+        restarted
+            .wait()
+            .expect("wait for restarted service")
+            .success(),
+        "restarted service exits cleanly on teardown"
+    );
 }
 
 /// Issue #158 regression: a rehydrated Linux task whose durable start key is

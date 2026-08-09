@@ -289,6 +289,11 @@ mod imp {
         /// where the platform probe could not be read or for a legacy record
         /// that must use the platform fallback ladder.
         started_at: Option<String>,
+        /// Canonical Unix epoch seconds parsed from macOS `ps lstart`; its
+        /// presence marks a post-upgrade record that can use the epoch fast
+        /// path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_epoch_secs: Option<i64>,
     }
 
     /// The `Start` response body, keyed by request id in `responses/`.
@@ -767,14 +772,14 @@ mod imp {
         })?;
         let mut child = spawn_serve_child(&spec)?;
         let pid = child.id();
-        let started_at = recorded_start_key(pid);
+        let (started_at, start_epoch_secs) = recorded_start_identity(pid);
         // Everything below this point must kill+reap `child` before
         // returning `Err`: once this function returns an error, nothing else
         // ever tracks this `Child` (it isn't inserted into `Run`'s
         // `children` map, and `Drop` for `std::process::Child` does not
         // kill), so leaving it running here would leak a live, unrecorded,
         // unreapable `serve` process.
-        if !spawn_start_key_ok(&started_at) {
+        if !spawn_start_key_ok(&started_at, &start_epoch_secs) {
             let _ = signal_group(pid, "-KILL");
             let _ = child.wait();
             return Err(BatonError::Io(format!(
@@ -786,6 +791,7 @@ mod imp {
             spec,
             pid,
             started_at,
+            start_epoch_secs,
         };
         if let Err(err) = write_session_record(control, &record) {
             let _ = signal_group(pid, "-KILL");
@@ -1492,18 +1498,20 @@ mod imp {
 
     fn abort_task_admission(control: &Path, record: &TaskRecord) -> Result<bool> {
         if record.state == TaskState::Running {
-            let mut liveness = is_task_alive(record);
+            let mut record = record.clone();
+            upgrade_legacy_task_record(control, &mut record)?;
+            let mut liveness = is_task_alive(&record);
             if liveness == Liveness::Unresolved {
                 return Ok(false);
             }
             if liveness == Liveness::Live {
                 let _ = signal_group(record.pid, "-TERM");
-                wait_while_task_alive(record, KILL_GRACE_MS);
-                liveness = is_task_alive(record);
+                wait_while_task_alive(&record, KILL_GRACE_MS);
+                liveness = is_task_alive(&record);
                 if liveness == Liveness::Live {
                     let _ = signal_group(record.pid, "-KILL");
-                    wait_while_task_alive(record, KILL_GRACE_MS);
-                    liveness = is_task_alive(record);
+                    wait_while_task_alive(&record, KILL_GRACE_MS);
+                    liveness = is_task_alive(&record);
                 }
             }
             if liveness != Liveness::Dead {
@@ -1724,8 +1732,8 @@ mod imp {
         let stderr_path = log_dir.join("stderr.log");
         let mut child = spawn_task_child(&spec, &stdout_path, &stderr_path)?;
         let pid = child.id();
-        let started_at = recorded_start_key(pid);
-        if !spawn_start_key_ok(&started_at) {
+        let (started_at, start_epoch_secs) = recorded_start_identity(pid);
+        if !spawn_start_key_ok(&started_at, &start_epoch_secs) {
             let _ = signal_group(pid, "-KILL");
             let _ = child.wait();
             return Err(BatonError::Io(format!(
@@ -1740,6 +1748,7 @@ mod imp {
             spec,
             pid,
             started_at,
+            start_epoch_secs,
             started_ms: Some(started_ms),
             state: TaskState::Running,
             exit_code: None,
@@ -2228,6 +2237,8 @@ mod imp {
                 let _ = fs::remove_file(task_cancel_sentinel_path(control, &record.id));
                 continue;
             }
+            let mut record = record;
+            upgrade_legacy_task_record(control, &mut record)?;
             let mut liveness = is_task_alive(&record);
             if force {
                 if liveness != Liveness::Dead {
@@ -2459,23 +2470,18 @@ mod imp {
     }
 
     #[cfg(target_os = "linux")]
-    fn process_start_key(pid: u32) -> Option<String> {
+    fn recorded_start_identity(pid: u32) -> (Option<String>, Option<i64>) {
         match process_probe(pid) {
-            ProbeResult::Present(probe) if !probe.is_zombie() => Some(probe.start_key),
-            _ => None,
+            ProbeResult::Present(probe) if !probe.is_zombie() => (Some(probe.start_key), None),
+            _ => (None, None),
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn recorded_start_key(pid: u32) -> Option<String> {
-        process_start_key(pid)
     }
 
     /// Whether a freshly-spawned child's start key is trustworthy enough to
     /// persist. A missing key means the child was already gone or a zombie
     /// microseconds after `spawn()` — fail closed as a spawn failure.
     #[cfg(target_os = "linux")]
-    fn spawn_start_key_ok(started_at: &Option<String>) -> bool {
+    fn spawn_start_key_ok(started_at: &Option<String>, _start_epoch_secs: &Option<i64>) -> bool {
         started_at.is_some()
     }
 
@@ -2494,23 +2500,49 @@ mod imp {
     }
 
     #[cfg(target_os = "linux")]
-    fn is_session_alive(record: &SessionRecord) -> Liveness {
+    fn session_liveness(record: &SessionRecord) -> (Liveness, Option<i64>) {
         match process_probe(record.pid) {
-            ProbeResult::Gone => Liveness::Dead,
-            ProbeResult::Unreadable => Liveness::Unresolved,
-            ProbeResult::Present(probe) if probe.is_zombie() => Liveness::Dead,
+            ProbeResult::Gone => (Liveness::Dead, None),
+            ProbeResult::Unreadable => (Liveness::Unresolved, None),
+            ProbeResult::Present(probe) if probe.is_zombie() => (Liveness::Dead, None),
             ProbeResult::Present(probe) => match &record.started_at {
-                Some(recorded) if recorded == &probe.start_key => Liveness::Live,
-                Some(_) => Liveness::Dead,
+                Some(recorded) if recorded == &probe.start_key => (Liveness::Live, None),
+                Some(_) => (Liveness::Dead, None),
                 None => match process_argv(record.pid) {
-                    ProbeResult::Gone => Liveness::Dead,
-                    ProbeResult::Unreadable => Liveness::Unresolved,
+                    ProbeResult::Gone => (Liveness::Dead, None),
+                    ProbeResult::Unreadable => (Liveness::Unresolved, None),
                     ProbeResult::Present(actual)
                         if linux_session_argv_matches(&actual, &record.spec) =>
                     {
-                        Liveness::Live
+                        (Liveness::Live, None)
                     }
-                    ProbeResult::Present(_) => Liveness::Dead,
+                    ProbeResult::Present(_) => (Liveness::Dead, None),
+                },
+            },
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_session_alive(record: &SessionRecord) -> Liveness {
+        session_liveness(record).0
+    }
+
+    #[cfg(target_os = "linux")]
+    fn task_liveness(record: &TaskRecord) -> (Liveness, Option<i64>) {
+        match process_probe(record.pid) {
+            ProbeResult::Gone => (Liveness::Dead, None),
+            ProbeResult::Unreadable => (Liveness::Unresolved, None),
+            ProbeResult::Present(probe) if probe.is_zombie() => (Liveness::Dead, None),
+            ProbeResult::Present(probe) => match &record.started_at {
+                Some(recorded) if recorded == &probe.start_key => (Liveness::Live, None),
+                Some(_) => (Liveness::Dead, None),
+                None => match process_argv(record.pid) {
+                    ProbeResult::Gone => (Liveness::Dead, None),
+                    ProbeResult::Unreadable => (Liveness::Unresolved, None),
+                    ProbeResult::Present(actual) if linux_task_argv_matches(&actual, record) => {
+                        (Liveness::Live, None)
+                    }
+                    ProbeResult::Present(_) => (Liveness::Unresolved, None),
                 },
             },
         }
@@ -2518,23 +2550,7 @@ mod imp {
 
     #[cfg(target_os = "linux")]
     fn is_task_alive(record: &TaskRecord) -> Liveness {
-        match process_probe(record.pid) {
-            ProbeResult::Gone => Liveness::Dead,
-            ProbeResult::Unreadable => Liveness::Unresolved,
-            ProbeResult::Present(probe) if probe.is_zombie() => Liveness::Dead,
-            ProbeResult::Present(probe) => match &record.started_at {
-                Some(recorded) if recorded == &probe.start_key => Liveness::Live,
-                Some(_) => Liveness::Dead,
-                None => match process_argv(record.pid) {
-                    ProbeResult::Gone => Liveness::Dead,
-                    ProbeResult::Unreadable => Liveness::Unresolved,
-                    ProbeResult::Present(actual) if linux_task_argv_matches(&actual, record) => {
-                        Liveness::Live
-                    }
-                    ProbeResult::Present(_) => Liveness::Unresolved,
-                },
-            },
-        }
+        task_liveness(record).0
     }
 
     /// A non-Linux Unix `ps` sample. macOS has no `/proc`, so `state`,
@@ -2617,28 +2633,27 @@ mod imp {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn process_start_key_from_probe(probe: &ProcessProbe) -> Option<String> {
-        (!probe.is_zombie()).then(|| probe.start_key.clone())
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn process_start_key(pid: u32) -> Option<String> {
-        match process_probe(pid) {
-            ProbeResult::Present(probe) => process_start_key_from_probe(&probe),
-            _ => None,
+    fn start_identity_from_probe(probe: &ProcessProbe) -> (Option<String>, Option<i64>) {
+        if probe.is_zombie() {
+            (None, None)
+        } else {
+            (Some(probe.start_key.clone()), probe.start_epoch_secs)
         }
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn recorded_start_key(pid: u32) -> Option<String> {
-        process_start_key(pid)
+    fn recorded_start_identity(pid: u32) -> (Option<String>, Option<i64>) {
+        match process_probe(pid) {
+            ProbeResult::Present(probe) => start_identity_from_probe(&probe),
+            _ => (None, None),
+        }
     }
 
     /// A missing start key after spawn means the process was already gone or
     /// a zombie, so fail closed rather than persisting an uncorroborated PID.
     #[cfg(not(target_os = "linux"))]
-    fn spawn_start_key_ok(started_at: &Option<String>) -> bool {
-        started_at.is_some()
+    fn spawn_start_key_ok(started_at: &Option<String>, start_epoch_secs: &Option<i64>) -> bool {
+        started_at.is_some() && start_epoch_secs.is_some()
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -2688,31 +2703,113 @@ mod imp {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn is_session_alive(record: &SessionRecord) -> Liveness {
+    fn session_liveness(record: &SessionRecord) -> (Liveness, Option<i64>) {
         match process_probe(record.pid) {
-            ProbeResult::Gone => Liveness::Dead,
-            ProbeResult::Unreadable => Liveness::Unresolved,
-            ProbeResult::Present(probe) if probe.is_zombie() => Liveness::Dead,
-            ProbeResult::Present(probe) => match &record.started_at {
-                Some(recorded) if recorded == &probe.start_key => Liveness::Live,
-                _ if probe.command.is_empty() => Liveness::Unresolved,
-                _ if session_argv_matches(&probe.command, &record.spec) => Liveness::Live,
-                _ => Liveness::Dead,
+            ProbeResult::Gone => (Liveness::Dead, None),
+            ProbeResult::Unreadable => (Liveness::Unresolved, None),
+            ProbeResult::Present(probe) if probe.is_zombie() => (Liveness::Dead, None),
+            ProbeResult::Present(probe) => match record.start_epoch_secs {
+                Some(recorded) => match probe.start_epoch_secs {
+                    Some(current) if current == recorded => (Liveness::Live, Some(current)),
+                    Some(_) => (Liveness::Dead, None),
+                    None => (Liveness::Unresolved, None),
+                },
+                None => match &record.started_at {
+                    Some(recorded) if recorded == &probe.start_key => {
+                        (Liveness::Live, probe.start_epoch_secs)
+                    }
+                    _ if probe.command.is_empty() => (Liveness::Unresolved, None),
+                    _ if session_argv_matches(&probe.command, &record.spec) => {
+                        (Liveness::Live, probe.start_epoch_secs)
+                    }
+                    _ => (Liveness::Dead, None),
+                },
+            },
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn is_session_alive(record: &SessionRecord) -> Liveness {
+        session_liveness(record).0
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn task_liveness(record: &TaskRecord) -> (Liveness, Option<i64>) {
+        match process_probe(record.pid) {
+            ProbeResult::Gone => (Liveness::Dead, None),
+            ProbeResult::Unreadable => (Liveness::Unresolved, None),
+            ProbeResult::Present(probe) if probe.is_zombie() => (Liveness::Dead, None),
+            ProbeResult::Present(probe) => match record.start_epoch_secs {
+                Some(recorded) => match probe.start_epoch_secs {
+                    Some(current) if current == recorded => (Liveness::Live, Some(current)),
+                    Some(_) => (Liveness::Dead, None),
+                    None => (Liveness::Unresolved, None),
+                },
+                None => match &record.started_at {
+                    Some(recorded) if recorded == &probe.start_key => {
+                        (Liveness::Live, probe.start_epoch_secs)
+                    }
+                    _ => {
+                        let liveness = task_instant_liveness(&probe, record);
+                        let epoch = (liveness == Liveness::Live)
+                            .then_some(probe.start_epoch_secs)
+                            .flatten();
+                        (liveness, epoch)
+                    }
+                },
             },
         }
     }
 
     #[cfg(not(target_os = "linux"))]
     fn is_task_alive(record: &TaskRecord) -> Liveness {
-        match process_probe(record.pid) {
-            ProbeResult::Gone => Liveness::Dead,
-            ProbeResult::Unreadable => Liveness::Unresolved,
-            ProbeResult::Present(probe) if probe.is_zombie() => Liveness::Dead,
-            ProbeResult::Present(probe) => match &record.started_at {
-                Some(recorded) if recorded == &probe.start_key => Liveness::Live,
-                _ => task_instant_liveness(&probe, record),
-            },
+        task_liveness(record).0
+    }
+
+    /// Persists the canonical epoch after a legacy macOS record is rescued by
+    /// the fallback ladder. Callers must hold the admission lock; status and
+    /// supervisor tick paths intentionally remain read-only.
+    #[cfg(target_os = "macos")]
+    fn upgrade_legacy_session_record(control: &Path, record: &mut SessionRecord) -> Result<()> {
+        if record.start_epoch_secs.is_some() {
+            return Ok(());
         }
+        let (liveness, start_epoch_secs) = session_liveness(record);
+        if liveness == Liveness::Live
+            && let Some(start_epoch_secs) = start_epoch_secs
+        {
+            record.start_epoch_secs = Some(start_epoch_secs);
+            write_session_record(control, record)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn upgrade_legacy_session_record(_control: &Path, _record: &mut SessionRecord) -> Result<()> {
+        Ok(())
+    }
+
+    /// Persists the canonical epoch after a legacy macOS task record is
+    /// rescued by the fallback ladder. Callers must hold the admission lock;
+    /// the supervisor's rehydration/tick paths deliberately do not rewrite.
+    #[cfg(target_os = "macos")]
+    fn upgrade_legacy_task_record(control: &Path, record: &mut TaskRecord) -> Result<()> {
+        if record.start_epoch_secs.is_some() {
+            return Ok(());
+        }
+        let (liveness, start_epoch_secs) = task_liveness(record);
+        if liveness == Liveness::Live
+            && let Some(start_epoch_secs) = start_epoch_secs
+        {
+            record.start_epoch_secs = Some(start_epoch_secs);
+            write_task_record(control, record)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn upgrade_legacy_task_record(_control: &Path, _record: &mut TaskRecord) -> Result<()> {
+        Ok(())
     }
 
     /// Builds the argv for sending `sig` (e.g. `"-TERM"`) to the process
@@ -2770,8 +2867,10 @@ mod imp {
         record: &SessionRecord,
         force: bool,
     ) -> Result<Vec<CleanupResidue>> {
+        let mut record = record.clone();
+        upgrade_legacy_session_record(control, &mut record)?;
         let _ = mailbox::request_stop(&record.spec.inbox);
-        let mut liveness = is_session_alive(record);
+        let mut liveness = is_session_alive(&record);
         if force {
             if liveness != Liveness::Dead {
                 let _ = signal_group(record.pid, "-TERM");
@@ -2779,16 +2878,16 @@ mod imp {
             }
             liveness = Liveness::Dead;
         } else {
-            wait_while_alive(record, STOP_GRACE_MS);
-            liveness = is_session_alive(record);
+            wait_while_alive(&record, STOP_GRACE_MS);
+            liveness = is_session_alive(&record);
             if liveness == Liveness::Live {
                 let _ = signal_group(record.pid, "-TERM");
-                wait_while_alive(record, KILL_GRACE_MS);
-                liveness = is_session_alive(record);
+                wait_while_alive(&record, KILL_GRACE_MS);
+                liveness = is_session_alive(&record);
                 if liveness == Liveness::Live {
                     let _ = signal_group(record.pid, "-KILL");
-                    wait_while_alive(record, KILL_GRACE_MS);
-                    liveness = is_session_alive(record);
+                    wait_while_alive(&record, KILL_GRACE_MS);
+                    liveness = is_session_alive(&record);
                 }
             }
         }
@@ -2801,7 +2900,7 @@ mod imp {
                 id: record.id.clone(),
                 pid: record.pid,
                 liveness,
-                argv: session_recorded_argv(record),
+                argv: session_recorded_argv(&record),
             });
         }
         Ok(residue)
@@ -3204,13 +3303,15 @@ mod imp {
             let child = spawn_task_child(&spec, &stdout_path, &stderr_path).expect("spawn task");
             let pid = child.id();
             let started_ms = clock.now_ms();
+            let (started_at, start_epoch_secs) = recorded_start_identity(pid);
             let record = TaskRecord {
                 id: id.to_string(),
                 request_id: None,
                 admission: TaskAdmissionPhase::Committed,
                 spec,
                 pid,
-                started_at: recorded_start_key(pid),
+                started_at,
+                start_epoch_secs,
                 started_ms: Some(started_ms),
                 state: TaskState::Running,
                 exit_code: None,
@@ -3274,12 +3375,73 @@ mod imp {
                 spec: spec("/tmp/in", "/tmp/out"),
                 pid: 4242,
                 started_at: Some("123456".to_string()),
+                start_epoch_secs: Some(123456),
             };
             write_session_record(&dir.path, &record).expect("write");
             let read = read_session_record(&dir.path, "svc-1")
                 .expect("read")
                 .expect("present");
             assert_eq!(read, record);
+        }
+
+        /// A legacy macOS task rescued by its spawn instant is upgraded once
+        /// on a lock-holding cleanup path. Session argv rescue is covered by
+        /// the real-binary integration fixture.
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn legacy_macos_task_record_upgrades_after_instant_rescue() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("legacy-macos-upgrade");
+
+            let task_specification = task_spec(
+                "svc-1",
+                "sleep",
+                vec!["30".to_string()],
+                Vec::new(),
+                60_000,
+                &dir.path.join("callback").display().to_string(),
+            );
+            let log_dir = task_logs_dir(&dir.path, "task-legacy");
+            fs::create_dir_all(&log_dir).expect("create task logs");
+            let mut task_child = spawn_task_child(
+                &task_specification,
+                &log_dir.join("stdout.log"),
+                &log_dir.join("stderr.log"),
+            )
+            .expect("spawn task child");
+            let task_record = TaskRecord {
+                id: "task-legacy".to_string(),
+                request_id: None,
+                admission: TaskAdmissionPhase::Responded,
+                spec: task_specification,
+                pid: task_child.id(),
+                started_at: Some("legacy-lstart".to_string()),
+                start_epoch_secs: None,
+                started_ms: Some(SystemClock.now_ms()),
+                state: TaskState::Running,
+                exit_code: None,
+                elapsed_ms: None,
+                stdout_path: log_dir.join("stdout.log").display().to_string(),
+                stderr_path: log_dir.join("stderr.log").display().to_string(),
+                delivered_milestones: 0,
+            };
+            write_task_record(&dir.path, &task_record).expect("write legacy task");
+            let mut upgraded_task = task_record.clone();
+            upgrade_legacy_task_record(&dir.path, &mut upgraded_task).expect("upgrade legacy task");
+            assert!(
+                upgraded_task.start_epoch_secs.is_some(),
+                "instant rescue populates the canonical task epoch"
+            );
+            assert_eq!(
+                read_task_record(&dir.path, "task-legacy")
+                    .expect("read upgraded task")
+                    .expect("upgraded task exists")
+                    .start_epoch_secs,
+                upgraded_task.start_epoch_secs
+            );
+
+            signal_group(task_child.id(), "-KILL").expect("kill task child");
+            task_child.wait().expect("wait for task child");
         }
 
         /// A session id absent from `sessions/` reads as `None`, not an error.
@@ -3309,6 +3471,7 @@ mod imp {
                         spec: spec("/tmp/in", "/tmp/out"),
                         pid: u32::MAX - 1,
                         started_at: Some("not-current".to_string()),
+                        start_epoch_secs: None,
                     }),
                 ),
             ] {
@@ -3382,6 +3545,7 @@ mod imp {
                     spec: spec("/tmp/in", "/tmp/out"),
                     pid: 1000 + i,
                     started_at: None,
+                    start_epoch_secs: None,
                 };
                 write_session_record(&dir.path, &record).expect("write");
             }
@@ -3404,6 +3568,7 @@ mod imp {
                 spec: spec("/tmp/in", "/tmp/out"),
                 pid: 1,
                 started_at: None,
+                start_epoch_secs: None,
             };
             write_session_record(&dir.path, &record).expect("write");
             remove_session_record(&dir.path, "svc-1").expect("remove");
@@ -3624,6 +3789,7 @@ mod imp {
                 // test host, so the recorded session reads as not-alive.
                 pid: u32::MAX - 1,
                 started_at: None,
+                start_epoch_secs: None,
             };
             write_session_record(&dir.path, &record).expect("write");
 
@@ -3659,6 +3825,7 @@ mod imp {
                 spec: spec("/tmp/in", "/tmp/out"),
                 pid: u32::MAX - 1,
                 started_at: None,
+                start_epoch_secs: None,
             };
             write_session_record(&dir.path, &record).expect("write");
 
@@ -3707,6 +3874,7 @@ mod imp {
                 spec: task_specification,
                 pid: child.id(),
                 started_at: None,
+                start_epoch_secs: None,
                 started_ms: None,
                 state: TaskState::Completed,
                 exit_code: Some(0),
@@ -3728,6 +3896,7 @@ mod imp {
                 spec: spec("/tmp/in", "/tmp/out"),
                 pid: u32::MAX - 1,
                 started_at: None,
+                start_epoch_secs: None,
             };
             write_session_record(&dir.path, &session_record).expect("write session record");
 
@@ -3766,6 +3935,7 @@ mod imp {
                 spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/cb"),
                 pid: 4242,
                 started_at: Some("123456".to_string()),
+                start_epoch_secs: Some(123456),
                 started_ms: Some(42),
                 state: TaskState::Running,
                 exit_code: None,
@@ -3809,6 +3979,7 @@ mod imp {
                     spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/cb"),
                     pid: 1000 + i,
                     started_at: None,
+                    start_epoch_secs: None,
                     started_ms: None,
                     state: TaskState::Running,
                     exit_code: None,
@@ -3930,6 +4101,7 @@ mod imp {
                     spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/callback"),
                     pid: 0,
                     started_at: None,
+                    start_epoch_secs: None,
                     started_ms: None,
                     state: TaskState::Completed,
                     exit_code: Some(0),
@@ -4008,6 +4180,7 @@ mod imp {
                     spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/callback"),
                     pid: 0,
                     started_at: None,
+                    start_epoch_secs: None,
                     started_ms: None,
                     state: TaskState::Completed,
                     exit_code: Some(0),
@@ -4088,6 +4261,7 @@ mod imp {
                 spec,
                 pid: child.id(),
                 started_at: None,
+                start_epoch_secs: None,
                 started_ms: Some(1),
                 state: TaskState::Running,
                 exit_code: None,
@@ -4188,6 +4362,7 @@ mod imp {
                 spec,
                 pid: child.id(),
                 started_at: Some("not-the-current-start-key".to_string()),
+                start_epoch_secs: None,
                 started_ms: Some(clock.now_ms()),
                 state: TaskState::Running,
                 exit_code: None,
@@ -4289,6 +4464,7 @@ mod imp {
                 spec: task_specification,
                 pid: child.id(),
                 started_at: None,
+                start_epoch_secs: None,
                 started_ms: None,
                 state: TaskState::Running,
                 exit_code: None,
@@ -4322,7 +4498,9 @@ mod imp {
             let probe = parse_process_probe("Z Mon Aug 3 12:34:56 2026\n")
                 .expect("parse zombie process sample");
             assert!(probe.is_zombie());
-            assert!(process_start_key_from_probe(&probe).is_none());
+            let (started_at, start_epoch_secs) = start_identity_from_probe(&probe);
+            assert!(started_at.is_none());
+            assert!(start_epoch_secs.is_none());
         }
 
         /// Removing an already-absent task record is a no-op success
@@ -4358,6 +4536,7 @@ mod imp {
                 ),
                 pid: 0,
                 started_at: None,
+                start_epoch_secs: None,
                 started_ms: None,
                 state: TaskState::Completed,
                 exit_code: Some(0),
@@ -4646,6 +4825,7 @@ mod imp {
                 spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/cb-a"),
                 pid: u32::MAX - 1,
                 started_at: None,
+                start_epoch_secs: None,
                 started_ms: None,
                 state: TaskState::Running,
                 exit_code: None,
@@ -4661,6 +4841,7 @@ mod imp {
                 spec: task_spec("svc-2", "true", vec![], vec![], 1_000, "/tmp/cb-b"),
                 pid: u32::MAX - 1,
                 started_at: None,
+                start_epoch_secs: None,
                 started_ms: None,
                 state: TaskState::Running,
                 exit_code: None,
@@ -4699,6 +4880,7 @@ mod imp {
                 spec: spec("/tmp/in", "/tmp/out"),
                 pid: u32::MAX - 1,
                 started_at: None,
+                start_epoch_secs: None,
             };
             write_session_record(&dir.path, &session_record).expect("write session");
             let task_record = TaskRecord {
@@ -4718,6 +4900,7 @@ mod imp {
                 ),
                 pid: u32::MAX - 1,
                 started_at: None,
+                start_epoch_secs: None,
                 started_ms: None,
                 state: TaskState::Running,
                 exit_code: None,
@@ -4777,6 +4960,7 @@ mod imp {
                     spec: task_specification,
                     pid: child.id(),
                     started_at: None,
+                    start_epoch_secs: None,
                     started_ms: None,
                     state: TaskState::Running,
                     exit_code: None,
@@ -4866,6 +5050,7 @@ mod imp {
                 spec: spec("/tmp/in", "/tmp/out"),
                 pid: u32::MAX - 1,
                 started_at: None,
+                start_epoch_secs: None,
             };
             let task_record = TaskRecord {
                 id: "task-unresolved".to_string(),
@@ -4874,6 +5059,7 @@ mod imp {
                 spec: task_specification,
                 pid: child.id(),
                 started_at: None,
+                start_epoch_secs: None,
                 started_ms: None,
                 state: TaskState::Running,
                 exit_code: None,
@@ -4967,6 +5153,7 @@ mod imp {
                 spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/cb"),
                 pid: u32::MAX - 1,
                 started_at: None,
+                start_epoch_secs: None,
                 started_ms: None,
                 state: TaskState::Completed,
                 exit_code: Some(0),
