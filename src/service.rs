@@ -3384,45 +3384,17 @@ mod imp {
             assert_eq!(read, record);
         }
 
-        /// A legacy macOS session rescued by argv and a legacy task rescued
-        /// by its spawn instant are each upgraded once on a lock-holding
-        /// cleanup path.
+        /// A legacy macOS task rescued by its spawn instant is upgraded once
+        /// on a lock-holding cleanup path. Session argv rescue is covered by
+        /// the real-binary integration fixture.
         #[cfg(target_os = "macos")]
         #[test]
-        fn legacy_macos_records_upgrade_after_distinct_rescue_legs() {
+        fn legacy_macos_task_record_upgrades_after_instant_rescue() {
             let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("legacy-macos-upgrade");
-            let inbox = dir.path.join("inbox");
-            let outbox = dir.path.join("outbox");
-            fs::create_dir_all(&inbox).expect("create session inbox");
-            fs::create_dir_all(&outbox).expect("create session outbox");
-            let session_spec = spec(&inbox.display().to_string(), &outbox.display().to_string());
-            let mut session_child = spawn_serve_child(&session_spec).expect("spawn session child");
-            let session_record = SessionRecord {
-                id: "svc-legacy".to_string(),
-                spec: session_spec,
-                pid: session_child.id(),
-                started_at: Some("legacy-lstart".to_string()),
-                start_epoch_secs: None,
-            };
-            write_session_record(&dir.path, &session_record).expect("write legacy session");
-            let mut upgraded_session = session_record.clone();
-            upgrade_legacy_session_record(&dir.path, &mut upgraded_session)
-                .expect("upgrade legacy session");
-            assert!(
-                upgraded_session.start_epoch_secs.is_some(),
-                "argv rescue populates the canonical session epoch"
-            );
-            assert_eq!(
-                read_session_record(&dir.path, "svc-legacy")
-                    .expect("read upgraded session")
-                    .expect("upgraded session exists")
-                    .start_epoch_secs,
-                upgraded_session.start_epoch_secs
-            );
 
             let task_specification = task_spec(
-                "svc-legacy",
+                "svc-1",
                 "sleep",
                 vec!["30".to_string()],
                 Vec::new(),
@@ -3468,8 +3440,6 @@ mod imp {
                 upgraded_task.start_epoch_secs
             );
 
-            signal_group(session_child.id(), "-KILL").expect("kill session child");
-            session_child.wait().expect("wait for session child");
             signal_group(task_child.id(), "-KILL").expect("kill task child");
             task_child.wait().expect("wait for task child");
         }
