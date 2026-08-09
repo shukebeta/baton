@@ -2633,16 +2633,18 @@ mod imp {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn process_start_key_from_probe(probe: &ProcessProbe) -> Option<String> {
-        (!probe.is_zombie()).then(|| probe.start_key.clone())
+    fn start_identity_from_probe(probe: &ProcessProbe) -> (Option<String>, Option<i64>) {
+        if probe.is_zombie() {
+            (None, None)
+        } else {
+            (Some(probe.start_key.clone()), probe.start_epoch_secs)
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
     fn recorded_start_identity(pid: u32) -> (Option<String>, Option<i64>) {
         match process_probe(pid) {
-            ProbeResult::Present(probe) if !probe.is_zombie() => {
-                (Some(probe.start_key), probe.start_epoch_secs)
-            }
+            ProbeResult::Present(probe) => start_identity_from_probe(&probe),
             _ => (None, None),
         }
     }
@@ -2773,11 +2775,11 @@ mod imp {
             return Ok(());
         }
         let (liveness, start_epoch_secs) = session_liveness(record);
-        if liveness == Liveness::Live {
-            if let Some(start_epoch_secs) = start_epoch_secs {
-                record.start_epoch_secs = Some(start_epoch_secs);
-                write_session_record(control, record)?;
-            }
+        if liveness == Liveness::Live
+            && let Some(start_epoch_secs) = start_epoch_secs
+        {
+            record.start_epoch_secs = Some(start_epoch_secs);
+            write_session_record(control, record)?;
         }
         Ok(())
     }
@@ -2796,11 +2798,11 @@ mod imp {
             return Ok(());
         }
         let (liveness, start_epoch_secs) = task_liveness(record);
-        if liveness == Liveness::Live {
-            if let Some(start_epoch_secs) = start_epoch_secs {
-                record.start_epoch_secs = Some(start_epoch_secs);
-                write_task_record(control, record)?;
-            }
+        if liveness == Liveness::Live
+            && let Some(start_epoch_secs) = start_epoch_secs
+        {
+            record.start_epoch_secs = Some(start_epoch_secs);
+            write_task_record(control, record)?;
         }
         Ok(())
     }
@@ -4526,7 +4528,9 @@ mod imp {
             let probe = parse_process_probe("Z Mon Aug 3 12:34:56 2026\n")
                 .expect("parse zombie process sample");
             assert!(probe.is_zombie());
-            assert!(process_start_key_from_probe(&probe).is_none());
+            let (started_at, start_epoch_secs) = start_identity_from_probe(&probe);
+            assert!(started_at.is_none());
+            assert!(start_epoch_secs.is_none());
         }
 
         /// Removing an already-absent task record is a no-op success
