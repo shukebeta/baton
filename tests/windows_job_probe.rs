@@ -5,7 +5,7 @@ use std::io::Read;
 use std::mem::size_of;
 use std::os::windows::io::AsRawHandle;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Foundation::{BOOL, CloseHandle, FALSE, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;

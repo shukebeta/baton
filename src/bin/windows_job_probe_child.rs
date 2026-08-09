@@ -1,4 +1,5 @@
 #[cfg(windows)]
+#[allow(clippy::zombie_processes)]
 fn main() {
     use std::env;
     use std::ffi::c_void;
