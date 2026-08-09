@@ -168,6 +168,10 @@ pub struct TaskRecord {
     /// Linux `/proc/<pid>/stat` starttime field, corroborating `pid` against
     /// reuse; `None` where it could not be read (non-Linux Unix).
     pub started_at: Option<String>,
+    /// Canonical Unix epoch seconds parsed from macOS `ps lstart`; its
+    /// presence marks a post-upgrade record that can use the epoch fast path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_epoch_secs: Option<i64>,
     /// Unix epoch milliseconds when the task child was spawned. Records
     /// written before restart reconciliation was introduced may omit this;
     /// the service fills it from its first post-upgrade observation.
