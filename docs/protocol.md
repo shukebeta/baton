@@ -226,15 +226,15 @@ and a `ts_ms` wall-clock timestamp (Unix epoch milliseconds).
 | `conversation_id` | string          | The conversation this message belongs to.                      |
 | `from` / `to`   | string            | Sender / recipient address.                                    |
 | `in_reply_to`   | string \| null    | The `message_id` this replies to, or `null`.                   |
-| `kind`          | string            | One of `request`, `response`, `done`, `error` (see below).     |
+| `kind`          | string            | One of `request`, `response`, `done`, `error`, `notify` (see below). |
 | `body`          | string            | The message body.                                              |
 | `ts_ms`         | number            | Emission time, Unix epoch milliseconds.                        |
 | `exchange`      | object \| null    | The wrapped provider call, or `null` (see nesting below).      |
 
-`kind` is one of four variants: `request` (asks the peer to act), `response`
-(answers a prior `request`), and the terminal markers `done` (turn complete) and
-`error` (turn failed). (`notify` is intentionally not part of this slice; the
-unknown-field skip below lets it be added later without a schema break.)
+`kind` is one of five variants: `request` (asks the peer to act), `response`
+(answers a prior `request`), the terminal markers `done` (turn complete) and
+`error` (turn failed), or `notify` (a fire-and-forget lifecycle event, such as a
+`baton task` milestone or terminal event, with no expected reply).
 
 ### Nesting over `baton.exchange/v1`
 
