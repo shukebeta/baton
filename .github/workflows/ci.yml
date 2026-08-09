@@ -37,6 +37,10 @@ jobs:
       - name: Build
         run: cargo build --verbose
 
+      - name: Probe Windows Job Object semantics
+        if: matrix.os == 'windows-latest'
+        run: cargo test --test windows_job_probe -- --nocapture
+
       - name: Test
         run: cargo test --verbose
 
