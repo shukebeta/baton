@@ -22,27 +22,22 @@ without ever sharing a process tree with it.
   its still-running children to init, which reaps them on their own eventual
   exit — a restart (e.g. systemd `Restart=on-failure`) never orphans a
   zombie either.
-- **Each session is its own process-group leader.** `service start` spawns
-  `baton serve` with `process_group(0)` (safe, stable since Rust 1.64 —
-  deliberately not `pre_exec(setsid)`, which would need `unsafe`), so a
-  `kill -<pid>` from `service stop`/`teardown` reaches both the `serve`
-  process and any in-flight `--agent-cmd` grandchild it spawned.
+- **Each session has an OS ownership boundary.** Unix uses a dedicated process
+  group. Windows uses a non-inheritable Job Object adopted by `baton serve`
+  before it can spawn an `--agent-cmd` child. Both boundaries reach the
+  session's descendants without making the submitting client their owner.
 - **`baton service` carries no systemd-specific assumption.** The unit under
   `packaging/systemd/` and the LaunchAgent under `packaging/launchd/` are
   external liveness wrappers only — start/stop/restart-on-death — layered on
   top of a control surface that works identically whether or not either is
   installed.
-- **Unix only (Linux and macOS).** Process groups and the `kill` escalation
-  this module relies on have no equivalent in this crate's dependency-free
-  design on Windows; `baton service` fails clearly there instead of silently
-  falling back to a weaker guarantee. On Linux, per-session liveness uses
-  `/proc/<pid>/stat`; on macOS, it uses `ps` process state plus the
-  second-granular `lstart` value. A probe reports `live`, `dead`, or
-  `unresolved`; the last state means a PID exists but baton cannot prove its
-  identity and is never treated as dead. The macOS probe always sets
-  `LC_ALL=C`, `LC_TIME=C`, and `TZ=UTC`, so its process key is independent of
-  the environment of the supervisor or the CLI client. Native Windows service
-  support is tracked separately.
+- **Linux, macOS, and Windows.** Linux liveness uses `/proc/<pid>/stat`; macOS
+  uses `ps` process state plus the second-granular `lstart` value; Windows uses
+  `GetProcessTimes` plus the recorded Job Object name. A probe reports `live`,
+  `dead`, or `unresolved`; the last state means baton cannot prove the PID and
+  ownership identity and is never treated as dead. Windows Job Objects are
+  not configured with kill-on-close, and their handles are retained until
+  `ActiveProcesses == 0`.
 
 ## Control surface
 
@@ -63,8 +58,8 @@ without ever sharing a process tree with it.
   operation that must execute *inside* the long-lived process, since spawning
   the child there is the entire point.
 - `sessions/<id>.json` — one durable session record per session (its
-  effective spec, real PID, canonical `started_at` string, and—on macOS—its
-  parsed `start_epoch_secs` format marker). `status`/`stop`/`teardown` read
+  effective spec, real PID, canonical `started_at` string, and on Windows its
+  optional Job Object name). `status`/`stop`/`teardown` read
   this directly and act on the OS process by PID — none of them need `run` to
   be alive, so a session started by a since-crashed `run` can still be
   inspected, stopped, or torn down.
@@ -112,13 +107,14 @@ baton service teardown --control <dir> [--force]
   client inherit different locale or time-zone settings. `lstart` is
   second-granular and is a BSD/procps extension rather than a POSIX interface.
 - **`service stop --session <id>`** tries `serve`'s own cooperative stop
-  against the session's inbox first, then escalates to a bounded
-  `SIGTERM`/`SIGKILL` on the session's process group if it is still
-  corroborated live. Without `--force`, an unresolved session or owned task
+  against the session's inbox first. Unix then escalates with bounded
+  `SIGTERM`/`SIGKILL` process-group signals; Windows escalates with
+  `TerminateJobObject`. Without `--force`, an unresolved session or owned task
   remains durable and the command exits non-zero after printing its id, PID,
   liveness, and recorded argv to stderr. `--force` asserts the operator's
-  identity claim, signals, removes unresolved records, and clears their task
-  admission files.
+  identity claim. If a Windows Job Object cannot be resolved, it terminates
+  only the recorded PID, removes the record, and warns that descendants may
+  survive; it never claims tree reach in that case.
   It serializes that cleanup with task admission, so a task is either
   admitted before the stop and reaped with the session or rejected after the
   session is no longer a live owner. Idempotent — stopping an already-gone
@@ -133,8 +129,8 @@ baton service teardown --control <dir> [--force]
   drains the snapshot, covering task cleanup as well. Without `--force`, it
   keeps unresolved records, prints their identity details to stderr, and exits
   non-zero; an initially unresolved task is retained immediately without a
-  per-task grace delay. `--force` signals and removes them, including task
-  admission files, on the operator's assertion.
+  per-task grace delay. `--force` applies the same platform-specific rule and
+  removes them, including task admission files, on the operator's assertion.
   Idempotent, and safe to call whether or not `run` is currently alive (e.g.
   to reap stale records left by a `run` that already crashed).
 
@@ -173,6 +169,15 @@ The resolution ladder is platform-specific:
   unresolved record, never condemn a genuine task. Task argv can confirm only
   when the durable instant is unavailable and never condemns a mismatch.
 
+- On Windows, `GetProcessTimes` supplies the creation-time start key. A live
+  PID with a matching key is `live` only while its recorded Job Object name
+  resolves; a missing or inaccessible key/job is `unresolved`, and a matching
+  PID with a different start key is `dead`. Startup re-adoption opens the
+  recorded name when the Job Object still exists. The probe recorded for #170
+  shows that a name does not survive the last handle closing while members
+  remain, so a crashed supervisor cannot safely reconstruct a missing handle.
+  The unresolved `--force` path therefore terminates only the recorded PID.
+
 New macOS records retain `started_at` as the operator-readable UTC string and
 also persist `start_epoch_secs`; the field's presence is the format-version
 marker. A legacy record that is rescued as live by a lock-holding cleanup or
@@ -187,10 +192,11 @@ removed, terminal task records are removed without probing or signalling their
 recorded PID, and initially unresolved records are retained immediately
 without a per-task grace delay. A retained record's id, PID, liveness, and
 recorded argv are printed to stderr and the command exits non-zero. `--force`
-is the explicit operator assertion of identity: it sends the process-group
-signals and removes the unresolved record. `task cancel` has no force flag; it
-leaves its cooperative cancel sentinel for the supervisor and never escalates
-an unresolved identity.
+is the explicit operator assertion of identity: Unix sends process-group
+signals; Windows uses `TerminateJobObject` when its name resolves, otherwise
+terminates only the recorded PID and warns that descendants may survive.
+`task cancel` has no force flag; it leaves its cooperative cancel sentinel for
+the supervisor and never escalates an unresolved identity.
 
 `TaskRecord.started_ms` and `Clock::now_ms()` are Unix epoch milliseconds.
 `TaskRecord.start_epoch_secs`, when present on macOS, is the canonical
@@ -270,9 +276,9 @@ baton task cancel --control <dir> --task <id>
   These fields are present for both running and terminal tasks. Reads the
   durable `TaskRecord` directly by PID, so it works whether or not `run` is
   currently alive.
-- **`task cancel`** is idempotent: kills the task's whole process group if
-  still running (cooperative cancel sentinel consumed by the next tick, so
-  the resulting terminal event reads `cancelled` rather than `failed`), and a
+- **`task cancel`** is idempotent: after the cooperative cancel sentinel it
+  terminates the task's Job Object on Windows or process group on Unix, so the
+  resulting terminal event reads `cancelled` rather than `failed`. It is a
   no-op success if the task is already gone.
 
 ### Supervisor restart reconciliation
@@ -362,9 +368,10 @@ resident store or polling loop needed between turns.
 A task's ownership and reaping are scoped strictly to the `--session <id>` it
 names, never to its callback target. `service stop --session <id>` and
 `service teardown` reap every task owned by that session: tasks with a
-corroborated live identity have their process groups stopped and their records
-removed, initially unresolved tasks are retained for a later cleanup attempt,
-and terminal task records are removed without signalling their recorded PID.
+corroborated live identity have their process group stopped on Unix or Job
+Object terminated on Windows and their records removed, initially unresolved
+tasks are retained for a later cleanup attempt, and terminal task records are
+removed without signalling their recorded PID.
 This applies even if a task's `--callback-inbox` points somewhere entirely
 outside the owning session's own mailbox. Task admission and those cleanup
 paths share the short-lived `service.admission.lock`, so cleanup cannot leave a

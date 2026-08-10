@@ -48,29 +48,23 @@
 //!
 //! A spawned `baton serve` child is never `wait()`-ed by its short-lived
 //! submitter — only `Run` holds the [`std::process::Child`] handle, reaping it
-//! (via non-blocking [`std::process::Child::try_wait`]) as its loop ticks, so
-//! it never leaks a zombie while it stays alive. If `Run` itself exits or
-//! crashes, the kernel reparents its still-running children to init, which
-//! reaps them on their own eventual exit — so a `Run` restart (e.g. systemd
-//! `Restart=on-failure`) never orphans a zombie either. Killing a session
-//! (`Stop`/`Teardown`) targets its **process group**: [`spawn_serve_child`]
-//! makes each `baton serve` child its own group leader
-//! (`std::os::unix::process::CommandExt::process_group(0)`, safe and stable —
-//! deliberately not `pre_exec(setsid)`, which would require `unsafe`), so one
-//! `kill -- -<pid>` reaches both the `serve` process and its in-flight
-//! `agent-cmd` grandchild.
+//! (via non-blocking [`std::process::Child::try_wait`]) as its loop ticks. On
+//! Unix, cleanup targets the child's process group. On Windows, each session
+//! and task has a Job Object retained until its active-process count reaches
+//! zero, so an exited `serve` or task parent does not release ownership of a
+//! surviving descendant.
 //!
 //! ## Host support
 //!
-//! Unix only (Linux and macOS): process groups and the `kill` escalation this
-//! module relies on have no equivalent in this crate's dependency-free design
-//! on Windows. [`execute_service`] fails clearly there rather than silently
-//! degrading. The systemd user-service integration (`packaging/systemd/`) and
-//! macOS LaunchAgent integration (`packaging/launchd/`) are external to this
-//! binary; a Windows host-service integration is tracked separately.
+//! Linux and macOS use process groups, `/proc`/`ps` corroboration, and Unix
+//! signal escalation. Windows uses `windows-sys` Job Objects and
+//! `GetProcessTimes` in the separate `cfg(windows)` implementation. The
+//! systemd user-service integration (`packaging/systemd/`) and macOS
+//! LaunchAgent integration (`packaging/launchd/`) are external to this binary;
+//! choosing a Windows host-service manager remains a packaging concern.
 
 use std::io::Write;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -163,21 +157,20 @@ pub enum ServiceCommand {
 }
 
 /// Runs `cmd` to completion, writing any human-readable output to `out`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn execute_service(cmd: ServiceCommand, out: impl Write) -> Result<()> {
     imp::dispatch(cmd, out)
 }
 
 /// `baton service` has no supported implementation on this host: process
-/// groups and the `kill`-based escalation this module relies on have no
-/// equivalent in this crate's dependency-free design on Windows. Fails
-/// clearly rather than silently falling back to an ownership guarantee (e.g.
-/// bare `setsid`/`disown`) this host cannot actually provide.
-#[cfg(not(unix))]
+/// ownership and the platform-specific escalation this module relies on have
+/// no implementation on this host. Fails clearly rather than silently
+/// degrading the ownership guarantee.
+#[cfg(not(any(unix, windows)))]
 pub fn execute_service(cmd: ServiceCommand, _out: impl Write) -> Result<()> {
     let _ = cmd;
     Err(BatonError::Io(
-        "baton service requires a Unix host (Linux or macOS); Windows support is tracked in a follow-up issue".to_string(),
+        "baton service requires a supported host (Linux, macOS, or Windows)".to_string(),
     ))
 }
 
@@ -189,18 +182,18 @@ pub fn execute_service(cmd: ServiceCommand, _out: impl Write) -> Result<()> {
 /// `Cancel` act directly on the durable [`crate::task::TaskRecord`], just as
 /// `Status`/`Stop` do for a [`SessionRecord`](imp), so both keep working even
 /// when `Run` itself is not currently alive.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn execute_task(cmd: TaskCommand, out: impl Write) -> Result<()> {
     imp::dispatch_task(cmd, out)
 }
 
 /// `baton task` has no supported implementation on this host; see
 /// [`execute_service`]'s non-Unix stub for why.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn execute_task(cmd: TaskCommand, _out: impl Write) -> Result<()> {
     let _ = cmd;
     Err(BatonError::Io(
-        "baton task requires a Unix host (Linux or macOS); Windows support is tracked in a follow-up issue".to_string(),
+        "baton task requires a supported host (Linux, macOS, or Windows)".to_string(),
     ))
 }
 
@@ -1749,6 +1742,7 @@ mod imp {
             pid,
             started_at,
             start_epoch_secs,
+            job: None,
             started_ms: Some(started_ms),
             state: TaskState::Running,
             exit_code: None,
@@ -3312,6 +3306,7 @@ mod imp {
                 pid,
                 started_at,
                 start_epoch_secs,
+                job: None,
                 started_ms: Some(started_ms),
                 state: TaskState::Running,
                 exit_code: None,
@@ -3417,6 +3412,7 @@ mod imp {
                 pid: task_child.id(),
                 started_at: Some("legacy-lstart".to_string()),
                 start_epoch_secs: None,
+                job: None,
                 started_ms: Some(SystemClock.now_ms()),
                 state: TaskState::Running,
                 exit_code: None,
@@ -3875,6 +3871,7 @@ mod imp {
                 pid: child.id(),
                 started_at: None,
                 start_epoch_secs: None,
+                job: None,
                 started_ms: None,
                 state: TaskState::Completed,
                 exit_code: Some(0),
@@ -3936,6 +3933,7 @@ mod imp {
                 pid: 4242,
                 started_at: Some("123456".to_string()),
                 start_epoch_secs: Some(123456),
+                job: None,
                 started_ms: Some(42),
                 state: TaskState::Running,
                 exit_code: None,
@@ -3980,6 +3978,7 @@ mod imp {
                     pid: 1000 + i,
                     started_at: None,
                     start_epoch_secs: None,
+                    job: None,
                     started_ms: None,
                     state: TaskState::Running,
                     exit_code: None,
@@ -4102,6 +4101,7 @@ mod imp {
                     pid: 0,
                     started_at: None,
                     start_epoch_secs: None,
+                    job: None,
                     started_ms: None,
                     state: TaskState::Completed,
                     exit_code: Some(0),
@@ -4181,6 +4181,7 @@ mod imp {
                     pid: 0,
                     started_at: None,
                     start_epoch_secs: None,
+                    job: None,
                     started_ms: None,
                     state: TaskState::Completed,
                     exit_code: Some(0),
@@ -4262,6 +4263,7 @@ mod imp {
                 pid: child.id(),
                 started_at: None,
                 start_epoch_secs: None,
+                job: None,
                 started_ms: Some(1),
                 state: TaskState::Running,
                 exit_code: None,
@@ -4363,6 +4365,7 @@ mod imp {
                 pid: child.id(),
                 started_at: Some("not-the-current-start-key".to_string()),
                 start_epoch_secs: None,
+                job: None,
                 started_ms: Some(clock.now_ms()),
                 state: TaskState::Running,
                 exit_code: None,
@@ -4465,6 +4468,7 @@ mod imp {
                 pid: child.id(),
                 started_at: None,
                 start_epoch_secs: None,
+                job: None,
                 started_ms: None,
                 state: TaskState::Running,
                 exit_code: None,
@@ -4537,6 +4541,7 @@ mod imp {
                 pid: 0,
                 started_at: None,
                 start_epoch_secs: None,
+                job: None,
                 started_ms: None,
                 state: TaskState::Completed,
                 exit_code: Some(0),
@@ -4826,6 +4831,7 @@ mod imp {
                 pid: u32::MAX - 1,
                 started_at: None,
                 start_epoch_secs: None,
+                job: None,
                 started_ms: None,
                 state: TaskState::Running,
                 exit_code: None,
@@ -4842,6 +4848,7 @@ mod imp {
                 pid: u32::MAX - 1,
                 started_at: None,
                 start_epoch_secs: None,
+                job: None,
                 started_ms: None,
                 state: TaskState::Running,
                 exit_code: None,
@@ -4901,6 +4908,7 @@ mod imp {
                 pid: u32::MAX - 1,
                 started_at: None,
                 start_epoch_secs: None,
+                job: None,
                 started_ms: None,
                 state: TaskState::Running,
                 exit_code: None,
@@ -4961,6 +4969,7 @@ mod imp {
                     pid: child.id(),
                     started_at: None,
                     start_epoch_secs: None,
+                    job: None,
                     started_ms: None,
                     state: TaskState::Running,
                     exit_code: None,
@@ -5060,6 +5069,7 @@ mod imp {
                 pid: child.id(),
                 started_at: None,
                 start_epoch_secs: None,
+                job: None,
                 started_ms: None,
                 state: TaskState::Running,
                 exit_code: None,
@@ -5154,6 +5164,7 @@ mod imp {
                 pid: u32::MAX - 1,
                 started_at: None,
                 start_epoch_secs: None,
+                job: None,
                 started_ms: None,
                 state: TaskState::Completed,
                 exit_code: Some(0),
@@ -5227,4 +5238,13 @@ mod imp {
             assert_eq!(running.record.state, TaskState::Cancelled);
         }
     }
+}
+
+#[cfg(windows)]
+#[path = "service_windows.rs"]
+mod imp;
+
+#[cfg(windows)]
+pub fn adopt_windows_service_job() -> Result<()> {
+    imp::adopt_service_job()
 }

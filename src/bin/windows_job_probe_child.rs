@@ -15,7 +15,7 @@ fn main() {
 
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
-        Some("--sleep") => thread::sleep(Duration::from_secs(60)),
+        Some("--sleep") => thread::sleep(Duration::from_secs(10)),
         Some("--check-job-handle") => {
             let handle = args
                 .next()
