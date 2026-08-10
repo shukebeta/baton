@@ -571,9 +571,20 @@ fn capture_child_stdout(
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let mut child = command.spawn().map_err(|err| {
-        BatonError::Io(format!("could not spawn child process {program:?}: {err}"))
-    })?;
+    let mut child = {
+        // Under `cargo test` this crate's flock-assertion tests share an
+        // address space with this fork, and a child forked while another
+        // thread holds a lock inherits that descriptor — keeping the lock
+        // held until `execve` closes it. Serializing just the spawn (the
+        // whole fork-to-exec window, which `spawn` does not return before)
+        // removes that same-process artifact; see [`crate::test_support`].
+        // Compiled out entirely for the shipped binary.
+        #[cfg(test)]
+        let _fork_guard = crate::test_support::serialize_forks_and_locks();
+        command.spawn().map_err(|err| {
+            BatonError::Io(format!("could not spawn child process {program:?}: {err}"))
+        })?
+    };
 
     // Drain stdout on its own thread, started *before* writing stdin, so a child
     // that emits before consuming all its input cannot deadlock with us on a

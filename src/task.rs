@@ -172,6 +172,10 @@ pub struct TaskRecord {
     /// presence marks a post-upgrade record that can use the epoch fast path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_epoch_secs: Option<i64>,
+    /// Named Windows Job Object used to own the task tree. Unix records omit
+    /// this field; missing values remain valid for legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
     /// Unix epoch milliseconds when the task child was spawned. Records
     /// written before restart reconciliation was introduced may omit this;
     /// the service fills it from its first post-upgrade observation.

@@ -508,6 +508,8 @@ pub fn run() -> Result<()> {
             agent_result_key,
             role,
         } => {
+            #[cfg(windows)]
+            service::adopt_windows_service_job()?;
             let mut sink = open_event_sink()?;
 
             // A `--role` resolves the role's home once; its values fill any

@@ -33,4 +33,6 @@ pub mod registry;
 pub mod roles;
 pub mod service;
 pub mod task;
+#[cfg(test)]
+mod test_support;
 pub mod transport;

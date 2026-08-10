@@ -48,29 +48,23 @@
 //!
 //! A spawned `baton serve` child is never `wait()`-ed by its short-lived
 //! submitter — only `Run` holds the [`std::process::Child`] handle, reaping it
-//! (via non-blocking [`std::process::Child::try_wait`]) as its loop ticks, so
-//! it never leaks a zombie while it stays alive. If `Run` itself exits or
-//! crashes, the kernel reparents its still-running children to init, which
-//! reaps them on their own eventual exit — so a `Run` restart (e.g. systemd
-//! `Restart=on-failure`) never orphans a zombie either. Killing a session
-//! (`Stop`/`Teardown`) targets its **process group**: [`spawn_serve_child`]
-//! makes each `baton serve` child its own group leader
-//! (`std::os::unix::process::CommandExt::process_group(0)`, safe and stable —
-//! deliberately not `pre_exec(setsid)`, which would require `unsafe`), so one
-//! `kill -- -<pid>` reaches both the `serve` process and its in-flight
-//! `agent-cmd` grandchild.
+//! (via non-blocking [`std::process::Child::try_wait`]) as its loop ticks. On
+//! Unix, cleanup targets the child's process group. On Windows, each session
+//! and task has a Job Object retained until its active-process count reaches
+//! zero, so an exited `serve` or task parent does not release ownership of a
+//! surviving descendant.
 //!
 //! ## Host support
 //!
-//! Unix only (Linux and macOS): process groups and the `kill` escalation this
-//! module relies on have no equivalent in this crate's dependency-free design
-//! on Windows. [`execute_service`] fails clearly there rather than silently
-//! degrading. The systemd user-service integration (`packaging/systemd/`) and
-//! macOS LaunchAgent integration (`packaging/launchd/`) are external to this
-//! binary; a Windows host-service integration is tracked separately.
+//! Linux and macOS use process groups, `/proc`/`ps` corroboration, and Unix
+//! signal escalation. Windows uses `windows-sys` Job Objects and
+//! `GetProcessTimes` in the separate `cfg(windows)` implementation. The
+//! systemd user-service integration (`packaging/systemd/`) and macOS
+//! LaunchAgent integration (`packaging/launchd/`) are external to this binary;
+//! choosing a Windows host-service manager remains a packaging concern.
 
 use std::io::Write;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -163,21 +157,20 @@ pub enum ServiceCommand {
 }
 
 /// Runs `cmd` to completion, writing any human-readable output to `out`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn execute_service(cmd: ServiceCommand, out: impl Write) -> Result<()> {
     imp::dispatch(cmd, out)
 }
 
 /// `baton service` has no supported implementation on this host: process
-/// groups and the `kill`-based escalation this module relies on have no
-/// equivalent in this crate's dependency-free design on Windows. Fails
-/// clearly rather than silently falling back to an ownership guarantee (e.g.
-/// bare `setsid`/`disown`) this host cannot actually provide.
-#[cfg(not(unix))]
+/// ownership and the platform-specific escalation this module relies on have
+/// no implementation on this host. Fails clearly rather than silently
+/// degrading the ownership guarantee.
+#[cfg(not(any(unix, windows)))]
 pub fn execute_service(cmd: ServiceCommand, _out: impl Write) -> Result<()> {
     let _ = cmd;
     Err(BatonError::Io(
-        "baton service requires a Unix host (Linux or macOS); Windows support is tracked in a follow-up issue".to_string(),
+        "baton service requires a supported host (Linux, macOS, or Windows)".to_string(),
     ))
 }
 
@@ -189,18 +182,18 @@ pub fn execute_service(cmd: ServiceCommand, _out: impl Write) -> Result<()> {
 /// `Cancel` act directly on the durable [`crate::task::TaskRecord`], just as
 /// `Status`/`Stop` do for a [`SessionRecord`](imp), so both keep working even
 /// when `Run` itself is not currently alive.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn execute_task(cmd: TaskCommand, out: impl Write) -> Result<()> {
     imp::dispatch_task(cmd, out)
 }
 
 /// `baton task` has no supported implementation on this host; see
 /// [`execute_service`]'s non-Unix stub for why.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn execute_task(cmd: TaskCommand, _out: impl Write) -> Result<()> {
     let _ = cmd;
     Err(BatonError::Io(
-        "baton task requires a Unix host (Linux or macOS); Windows support is tracked in a follow-up issue".to_string(),
+        "baton task requires a supported host (Linux, macOS, or Windows)".to_string(),
     ))
 }
 
@@ -1749,6 +1742,7 @@ mod imp {
             pid,
             started_at,
             start_epoch_secs,
+            job: None,
             started_ms: Some(started_ms),
             state: TaskState::Running,
             exit_code: None,
@@ -3195,31 +3189,22 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::sync::{Mutex, MutexGuard};
 
-        /// Serializes every test in this module that either holds the
-        /// control-plane flock directly or forks a real child process
-        /// (`spawn_task_child`/`Mailbox::open`'s own lock).
-        ///
-        /// `fork(2)` duplicates the *whole process's* fd table across every
-        /// thread, not just the caller's — so a flock another `cargo test`
-        /// thread holds at that instant is briefly visible (as still held) to
-        /// the forked child, and vice versa, until the child's `execve`
-        /// closes its `O_CLOEXEC`-marked fds. `cargo test`'s default thread
-        /// parallelism runs this module's flock-assertion tests concurrently
-        /// with tests that spawn real processes, so without this guard the
-        /// two occasionally race (observed empirically: a lock reads back as
-        /// still held, or a fresh mailbox open is transiently refused). This
-        /// never happens in production — a real `baton service run` process
-        /// never shares an address space with unrelated flock-holding code —
-        /// it is purely a same-process test-parallelism artifact.
-        static FORK_LOCK_SERIALIZE: Mutex<()> = Mutex::new(());
-
-        fn serialize_forks_and_locks() -> MutexGuard<'static, ()> {
-            FORK_LOCK_SERIALIZE
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        }
+        // Serializes every test in this module that either holds the
+        // control-plane flock directly or forks a real child process
+        // (`spawn_task_child`/`Mailbox::open`'s own lock) against the rest of
+        // the crate's forks. The guard is crate-wide rather than module-local
+        // because the fd table it protects is process-wide: a spawn from any
+        // other module's tests is just as capable of pinning this module's
+        // locks open. See `crate::test_support`.
+        //
+        // "Forks a real child" includes the *indirect* forks a liveness check
+        // performs off Linux: `process_probe` shells out to `ps` and
+        // `signal_group` to `kill`, so `execute_status`/`execute_stop`/
+        // `execute_teardown`/`reconcile_task_admissions` and friends fork on
+        // macOS even when the test itself never spawns anything. Every test
+        // that can reach one of those takes the guard.
+        use crate::test_support::serialize_forks_and_locks;
 
         struct TempDir {
             path: std::path::PathBuf,
@@ -3312,6 +3297,7 @@ mod imp {
                 pid,
                 started_at,
                 start_epoch_secs,
+                job: None,
                 started_ms: Some(started_ms),
                 state: TaskState::Running,
                 exit_code: None,
@@ -3417,6 +3403,7 @@ mod imp {
                 pid: task_child.id(),
                 started_at: Some("legacy-lstart".to_string()),
                 start_epoch_secs: None,
+                job: None,
                 started_ms: Some(SystemClock.now_ms()),
                 state: TaskState::Running,
                 exit_code: None,
@@ -3460,6 +3447,7 @@ mod imp {
         /// error through the task-start response.
         #[test]
         fn task_start_rejects_missing_or_dead_session_before_spawn() {
+            let _guard = serialize_forks_and_locks();
             for (tag, session, session_record) in [
                 ("owner-absent", "svc-missing", None),
                 ("owner-unsafe", "../svc-unsafe", None),
@@ -3767,6 +3755,7 @@ mod imp {
         /// reports `service_running: false` and an empty session list.
         #[test]
         fn execute_status_on_fresh_control_is_empty() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("status-fresh");
             let mut out = Vec::new();
             execute_status(&dir.path, None, &mut out).expect("status");
@@ -3808,6 +3797,7 @@ mod imp {
         /// (idempotent), leaving nothing behind.
         #[test]
         fn execute_stop_unknown_session_is_idempotent_success() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("stop-unknown");
             let mut out = Vec::new();
             execute_stop(&dir.path, "nope", false, &mut out).expect("stop");
@@ -3819,6 +3809,7 @@ mod imp {
         /// when `Run` was never (or is no longer) alive.
         #[test]
         fn execute_teardown_reaps_stale_record_without_live_service() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("teardown-stale");
             let record = SessionRecord {
                 id: "svc-1".to_string(),
@@ -3875,6 +3866,7 @@ mod imp {
                 pid: child.id(),
                 started_at: None,
                 start_epoch_secs: None,
+                job: None,
                 started_ms: None,
                 state: TaskState::Completed,
                 exit_code: Some(0),
@@ -3936,6 +3928,7 @@ mod imp {
                 pid: 4242,
                 started_at: Some("123456".to_string()),
                 start_epoch_secs: Some(123456),
+                job: None,
                 started_ms: Some(42),
                 state: TaskState::Running,
                 exit_code: None,
@@ -3980,6 +3973,7 @@ mod imp {
                     pid: 1000 + i,
                     started_at: None,
                     start_epoch_secs: None,
+                    job: None,
                     started_ms: None,
                     state: TaskState::Running,
                     exit_code: None,
@@ -4017,6 +4011,7 @@ mod imp {
         /// repeated consumer cannot read the response again.
         #[test]
         fn task_start_response_claim_records_ack_idempotently() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("task-response-ack");
             let request_id = "response-ack-request";
             let response = TaskStartResponse {
@@ -4054,6 +4049,7 @@ mod imp {
         /// owner-rejection response.
         #[test]
         fn reconcile_orphan_task_response_claim_restores_response() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("orphan-task-response-claim");
             let request_id = "orphan-response-claim";
             let response = TaskStartResponse {
@@ -4087,6 +4083,7 @@ mod imp {
         /// remains safe when repeated.
         #[test]
         fn reconcile_task_admission_finalizes_response_boundaries() {
+            let _guard = serialize_forks_and_locks();
             for (index, boundary) in ["ack", "response", "claim", "missing"]
                 .into_iter()
                 .enumerate()
@@ -4102,6 +4099,7 @@ mod imp {
                     pid: 0,
                     started_at: None,
                     start_epoch_secs: None,
+                    job: None,
                     started_ms: None,
                     state: TaskState::Completed,
                     exit_code: Some(0),
@@ -4162,6 +4160,7 @@ mod imp {
         /// reconciliation is harmless once the first pass has completed.
         #[test]
         fn reconcile_task_admission_rollback_is_idempotent_across_phases() {
+            let _guard = serialize_forks_and_locks();
             for (index, admission) in [
                 TaskAdmissionPhase::Prepared,
                 TaskAdmissionPhase::Committed,
@@ -4181,6 +4180,7 @@ mod imp {
                     pid: 0,
                     started_at: None,
                     start_epoch_secs: None,
+                    job: None,
                     started_ms: None,
                     state: TaskState::Completed,
                     exit_code: Some(0),
@@ -4262,6 +4262,7 @@ mod imp {
                 pid: child.id(),
                 started_at: None,
                 start_epoch_secs: None,
+                job: None,
                 started_ms: Some(1),
                 state: TaskState::Running,
                 exit_code: None,
@@ -4363,6 +4364,7 @@ mod imp {
                 pid: child.id(),
                 started_at: Some("not-the-current-start-key".to_string()),
                 start_epoch_secs: None,
+                job: None,
                 started_ms: Some(clock.now_ms()),
                 state: TaskState::Running,
                 exit_code: None,
@@ -4465,6 +4467,7 @@ mod imp {
                 pid: child.id(),
                 started_at: None,
                 start_epoch_secs: None,
+                job: None,
                 started_ms: None,
                 state: TaskState::Running,
                 exit_code: None,
@@ -4537,6 +4540,7 @@ mod imp {
                 pid: 0,
                 started_at: None,
                 start_epoch_secs: None,
+                job: None,
                 started_ms: None,
                 state: TaskState::Completed,
                 exit_code: Some(0),
@@ -4817,6 +4821,7 @@ mod imp {
         /// session, leaving another session's task record untouched.
         #[test]
         fn reap_session_tasks_is_scoped_to_the_owning_session() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("reap-scoped");
             let owned = TaskRecord {
                 id: "task-owned".to_string(),
@@ -4826,6 +4831,7 @@ mod imp {
                 pid: u32::MAX - 1,
                 started_at: None,
                 start_epoch_secs: None,
+                job: None,
                 started_ms: None,
                 state: TaskState::Running,
                 exit_code: None,
@@ -4842,6 +4848,7 @@ mod imp {
                 pid: u32::MAX - 1,
                 started_at: None,
                 start_epoch_secs: None,
+                job: None,
                 started_ms: None,
                 state: TaskState::Running,
                 exit_code: None,
@@ -4874,6 +4881,7 @@ mod imp {
         /// a delivery target only, never the ownership/reaping boundary.
         #[test]
         fn execute_teardown_reaps_stale_task_records_owned_by_the_session() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("teardown-tasks");
             let session_record = SessionRecord {
                 id: "svc-1".to_string(),
@@ -4901,6 +4909,7 @@ mod imp {
                 pid: u32::MAX - 1,
                 started_at: None,
                 start_epoch_secs: None,
+                job: None,
                 started_ms: None,
                 state: TaskState::Running,
                 exit_code: None,
@@ -4961,6 +4970,7 @@ mod imp {
                     pid: child.id(),
                     started_at: None,
                     start_epoch_secs: None,
+                    job: None,
                     started_ms: None,
                     state: TaskState::Running,
                     exit_code: None,
@@ -5060,6 +5070,7 @@ mod imp {
                 pid: child.id(),
                 started_at: None,
                 start_epoch_secs: None,
+                job: None,
                 started_ms: None,
                 state: TaskState::Running,
                 exit_code: None,
@@ -5145,6 +5156,7 @@ mod imp {
         /// and fields.
         #[test]
         fn execute_task_status_reports_task_fields() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("task-status");
             let record = TaskRecord {
                 id: "task-1".to_string(),
@@ -5154,6 +5166,7 @@ mod imp {
                 pid: u32::MAX - 1,
                 started_at: None,
                 start_epoch_secs: None,
+                job: None,
                 started_ms: None,
                 state: TaskState::Completed,
                 exit_code: Some(0),
@@ -5181,6 +5194,7 @@ mod imp {
         /// (idempotent).
         #[test]
         fn execute_task_cancel_unknown_task_is_idempotent_success() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("cancel-unknown");
             let mut out = Vec::new();
             execute_task_cancel(&dir.path, "nope", &mut out).expect("cancel");
@@ -5227,4 +5241,13 @@ mod imp {
             assert_eq!(running.record.state, TaskState::Cancelled);
         }
     }
+}
+
+#[cfg(windows)]
+#[path = "service_windows.rs"]
+mod imp;
+
+#[cfg(windows)]
+pub fn adopt_windows_service_job() -> Result<()> {
+    imp::adopt_service_job()
 }
