@@ -17,9 +17,17 @@ use std::sync::{Mutex, MutexGuard};
 /// spawn real processes (notably [`crate::participant`]'s subprocess and
 /// external-agent tests), so without this guard the two occasionally race: a
 /// lock reads back as still held, or a fresh mailbox open is transiently
-/// refused. This never happens in production — a real `baton service run`
-/// process never shares an address space with unrelated flock-holding code —
-/// it is purely a same-process test-parallelism artifact.
+/// refused.
+///
+/// A fork is not always visible in the test body. Off Linux there is no
+/// `/proc`, so [`crate::service`]'s process probe runs `ps` and its group
+/// signal runs `kill` — every liveness check is a fork. That makes plain
+/// status/stop/teardown/reconcile tests fork sites on macOS, and they must
+/// take this guard too; a Linux-green run proves nothing about them.
+///
+/// This never happens in production — a real `baton service run` process
+/// never shares an address space with unrelated flock-holding code — it is
+/// purely a same-process test-parallelism artifact.
 static FORK_LOCK_SERIALIZE: Mutex<()> = Mutex::new(());
 
 /// Takes the shared guard described on [`FORK_LOCK_SERIALIZE`]. A poisoned

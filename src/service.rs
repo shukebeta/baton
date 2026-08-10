@@ -3197,6 +3197,13 @@ mod imp {
         // because the fd table it protects is process-wide: a spawn from any
         // other module's tests is just as capable of pinning this module's
         // locks open. See `crate::test_support`.
+        //
+        // "Forks a real child" includes the *indirect* forks a liveness check
+        // performs off Linux: `process_probe` shells out to `ps` and
+        // `signal_group` to `kill`, so `execute_status`/`execute_stop`/
+        // `execute_teardown`/`reconcile_task_admissions` and friends fork on
+        // macOS even when the test itself never spawns anything. Every test
+        // that can reach one of those takes the guard.
         use crate::test_support::serialize_forks_and_locks;
 
         struct TempDir {
@@ -3440,6 +3447,7 @@ mod imp {
         /// error through the task-start response.
         #[test]
         fn task_start_rejects_missing_or_dead_session_before_spawn() {
+            let _guard = serialize_forks_and_locks();
             for (tag, session, session_record) in [
                 ("owner-absent", "svc-missing", None),
                 ("owner-unsafe", "../svc-unsafe", None),
@@ -3747,6 +3755,7 @@ mod imp {
         /// reports `service_running: false` and an empty session list.
         #[test]
         fn execute_status_on_fresh_control_is_empty() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("status-fresh");
             let mut out = Vec::new();
             execute_status(&dir.path, None, &mut out).expect("status");
@@ -3788,6 +3797,7 @@ mod imp {
         /// (idempotent), leaving nothing behind.
         #[test]
         fn execute_stop_unknown_session_is_idempotent_success() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("stop-unknown");
             let mut out = Vec::new();
             execute_stop(&dir.path, "nope", false, &mut out).expect("stop");
@@ -3799,6 +3809,7 @@ mod imp {
         /// when `Run` was never (or is no longer) alive.
         #[test]
         fn execute_teardown_reaps_stale_record_without_live_service() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("teardown-stale");
             let record = SessionRecord {
                 id: "svc-1".to_string(),
@@ -4000,6 +4011,7 @@ mod imp {
         /// repeated consumer cannot read the response again.
         #[test]
         fn task_start_response_claim_records_ack_idempotently() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("task-response-ack");
             let request_id = "response-ack-request";
             let response = TaskStartResponse {
@@ -4037,6 +4049,7 @@ mod imp {
         /// owner-rejection response.
         #[test]
         fn reconcile_orphan_task_response_claim_restores_response() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("orphan-task-response-claim");
             let request_id = "orphan-response-claim";
             let response = TaskStartResponse {
@@ -4070,6 +4083,7 @@ mod imp {
         /// remains safe when repeated.
         #[test]
         fn reconcile_task_admission_finalizes_response_boundaries() {
+            let _guard = serialize_forks_and_locks();
             for (index, boundary) in ["ack", "response", "claim", "missing"]
                 .into_iter()
                 .enumerate()
@@ -4146,6 +4160,7 @@ mod imp {
         /// reconciliation is harmless once the first pass has completed.
         #[test]
         fn reconcile_task_admission_rollback_is_idempotent_across_phases() {
+            let _guard = serialize_forks_and_locks();
             for (index, admission) in [
                 TaskAdmissionPhase::Prepared,
                 TaskAdmissionPhase::Committed,
@@ -4806,6 +4821,7 @@ mod imp {
         /// session, leaving another session's task record untouched.
         #[test]
         fn reap_session_tasks_is_scoped_to_the_owning_session() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("reap-scoped");
             let owned = TaskRecord {
                 id: "task-owned".to_string(),
@@ -4865,6 +4881,7 @@ mod imp {
         /// a delivery target only, never the ownership/reaping boundary.
         #[test]
         fn execute_teardown_reaps_stale_task_records_owned_by_the_session() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("teardown-tasks");
             let session_record = SessionRecord {
                 id: "svc-1".to_string(),
@@ -5139,6 +5156,7 @@ mod imp {
         /// and fields.
         #[test]
         fn execute_task_status_reports_task_fields() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("task-status");
             let record = TaskRecord {
                 id: "task-1".to_string(),
@@ -5176,6 +5194,7 @@ mod imp {
         /// (idempotent).
         #[test]
         fn execute_task_cancel_unknown_task_is_idempotent_success() {
+            let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("cancel-unknown");
             let mut out = Vec::new();
             execute_task_cancel(&dir.path, "nope", &mut out).expect("cancel");
