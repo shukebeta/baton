@@ -2396,166 +2396,6 @@ fn consume_task_cancel_sentinel(control: &Path, task_id: &str) -> Result<bool> {
 }
 
 // -- Liveness ---------------------------------------------------------
-
-/// Converts a canonical UTC `ps lstart` value into Unix epoch seconds.
-/// The weekday is intentionally ignored: `ps` supplies it for humans, but
-/// the calendar date and time are the identity-bearing fields.
-#[cfg(all(any(not(target_os = "linux"), test), not(windows)))]
-fn parse_lstart_epoch_secs(start_key: &str) -> Option<i64> {
-    let fields: Vec<&str> = start_key.split_whitespace().collect();
-    if fields.len() != 5 {
-        return None;
-    }
-    let month = match fields[1] {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
-        _ => return None,
-    };
-    let day = fields[2].parse::<i64>().ok()?;
-    let mut time = fields[3].split(':');
-    let hour = time.next()?.parse::<i64>().ok()?;
-    let minute = time.next()?.parse::<i64>().ok()?;
-    let second = time.next()?.parse::<i64>().ok()?;
-    if time.next().is_some() || !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
-        return None;
-    }
-    if !(0..=59).contains(&second) {
-        return None;
-    }
-    let year = fields[4].parse::<i64>().ok()?;
-    let days = days_from_civil(year, month, day)?;
-    days.checked_mul(86_400)?.checked_add(
-        hour.checked_mul(3_600)?
-            .checked_add(minute.checked_mul(60)?)?
-            .checked_add(second)?,
-    )
-}
-
-/// Returns the number of days from 1970-01-01 to a proleptic Gregorian
-/// date. The arithmetic is the civil-calendar conversion used by the
-/// parser rather than a platform date API, so it behaves identically in
-/// unit tests and on macOS.
-#[cfg(all(any(not(target_os = "linux"), test), not(windows)))]
-fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let days_in_month = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
-        2 => 28,
-        _ => return None,
-    };
-    if !(1..=days_in_month).contains(&day) {
-        return None;
-    }
-    let adjusted_year = year - if month <= 2 { 1 } else { 0 };
-    let era = if adjusted_year >= 0 {
-        adjusted_year / 400
-    } else {
-        (adjusted_year - 399) / 400
-    };
-    let year_of_era = adjusted_year - era * 400;
-    let adjusted_month = month + if month > 2 { -3 } else { 9 };
-    let day_of_year = (153 * adjusted_month + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    Some(era * 146_097 + day_of_era - 719_468)
-}
-
-#[cfg(not(windows))]
-#[derive(Debug, PartialEq, Eq)]
-struct ProcessProbe {
-    state: String,
-    start_key: String,
-}
-
-#[cfg(not(windows))]
-impl ProcessProbe {
-    fn is_zombie(&self) -> bool {
-        self.state.starts_with('Z')
-    }
-}
-
-/// Parses `/proc/<pid>/stat`; the executable name is `(comm)` and may
-/// itself contain `)` or whitespace, so fields are counted from the last
-/// `)` rather than split naively.
-#[cfg(not(windows))]
-fn parse_linux_process_probe(stat: &str) -> Option<ProcessProbe> {
-    let after_comm = stat.rsplit_once(')')?.1;
-    let fields: Vec<&str> = after_comm.split_whitespace().collect();
-    // `fields[0]` is field 3 (state) overall; starttime is field 22
-    // overall, i.e. `fields[19]`.
-    Some(ProcessProbe {
-        state: fields.first()?.to_string(),
-        start_key: fields.get(19)?.to_string(),
-    })
-}
-
-#[cfg(not(windows))]
-fn process_probe(pid: u32) -> ProbeResult<ProcessProbe> {
-    if pid <= 1 {
-        return ProbeResult::Gone;
-    }
-    match fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => parse_linux_process_probe(&stat)
-            .map(ProbeResult::Present)
-            .unwrap_or(ProbeResult::Unreadable),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => ProbeResult::Gone,
-        Err(_) => ProbeResult::Unreadable,
-    }
-}
-
-#[cfg(not(windows))]
-fn process_argv(pid: u32) -> ProbeResult<Vec<String>> {
-    match fs::read(format!("/proc/{pid}/cmdline")) {
-        Ok(bytes) if !bytes.is_empty() => {
-            let mut argv = Vec::new();
-            for value in bytes
-                .split(|byte| *byte == 0)
-                .filter(|value| !value.is_empty())
-            {
-                let Ok(value) = std::str::from_utf8(value) else {
-                    return ProbeResult::Unreadable;
-                };
-                argv.push(value.to_string());
-            }
-            if argv.is_empty() {
-                ProbeResult::Unreadable
-            } else {
-                ProbeResult::Present(argv)
-            }
-        }
-        Ok(_) => ProbeResult::Unreadable,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => ProbeResult::Gone,
-        Err(_) => ProbeResult::Unreadable,
-    }
-}
-
-#[cfg(not(windows))]
-fn recorded_start_identity(pid: u32) -> (Option<String>, Option<i64>) {
-    match process_probe(pid) {
-        ProbeResult::Present(probe) if !probe.is_zombie() => (Some(probe.start_key), None),
-        _ => (None, None),
-    }
-}
-
-/// Whether a freshly-spawned child's start key is trustworthy enough to
-/// persist. A missing key means the child was already gone or a zombie
-/// microseconds after `spawn()` — fail closed as a spawn failure.
-#[cfg(not(windows))]
-fn spawn_start_key_ok(started_at: &Option<String>, _start_epoch_secs: &Option<i64>) -> bool {
-    started_at.is_some()
-}
-
 #[cfg(windows)]
 fn job_name_resolves(name: Option<&str>) -> bool {
     match name {
@@ -2580,287 +2420,6 @@ fn job_tree_liveness(name: Option<&str>) -> Option<Liveness> {
         },
         Ok(None) | Err(_) => Some(Liveness::Unresolved),
     }
-}
-
-#[cfg(not(windows))]
-fn linux_session_argv_matches(actual: &[String], spec: &SessionSpec) -> bool {
-    let expected = serve_argv(spec);
-    actual.len() >= expected.len() && actual.ends_with(&expected)
-}
-
-#[cfg(not(windows))]
-fn linux_task_argv_matches(actual: &[String], record: &TaskRecord) -> bool {
-    let mut expected = Vec::with_capacity(record.spec.args.len() + 1);
-    expected.push(record.spec.command.clone());
-    expected.extend(record.spec.args.iter().cloned());
-    actual == expected
-}
-
-#[cfg(not(windows))]
-fn session_liveness(record: &SessionRecord) -> (Liveness, Option<i64>) {
-    match process_probe(record.pid) {
-        ProbeResult::Gone => (Liveness::Dead, None),
-        ProbeResult::Unreadable => (Liveness::Unresolved, None),
-        ProbeResult::Present(probe) if probe.is_zombie() => (Liveness::Dead, None),
-        ProbeResult::Present(probe) => match &record.started_at {
-            Some(recorded) if recorded == &probe.start_key => (Liveness::Live, None),
-            Some(_) => (Liveness::Dead, None),
-            None => match process_argv(record.pid) {
-                ProbeResult::Gone => (Liveness::Dead, None),
-                ProbeResult::Unreadable => (Liveness::Unresolved, None),
-                ProbeResult::Present(actual)
-                    if linux_session_argv_matches(&actual, &record.spec) =>
-                {
-                    (Liveness::Live, None)
-                }
-                ProbeResult::Present(_) => (Liveness::Dead, None),
-            },
-        },
-    }
-}
-
-#[cfg(not(windows))]
-fn is_session_alive(record: &SessionRecord) -> Liveness {
-    session_liveness(record).0
-}
-
-#[cfg(not(windows))]
-fn task_liveness(record: &TaskRecord) -> (Liveness, Option<i64>) {
-    match process_probe(record.pid) {
-        ProbeResult::Gone => (Liveness::Dead, None),
-        ProbeResult::Unreadable => (Liveness::Unresolved, None),
-        ProbeResult::Present(probe) if probe.is_zombie() => (Liveness::Dead, None),
-        ProbeResult::Present(probe) => match &record.started_at {
-            Some(recorded) if recorded == &probe.start_key => (Liveness::Live, None),
-            Some(_) => (Liveness::Dead, None),
-            None => match process_argv(record.pid) {
-                ProbeResult::Gone => (Liveness::Dead, None),
-                ProbeResult::Unreadable => (Liveness::Unresolved, None),
-                ProbeResult::Present(actual) if linux_task_argv_matches(&actual, record) => {
-                    (Liveness::Live, None)
-                }
-                ProbeResult::Present(_) => (Liveness::Unresolved, None),
-            },
-        },
-    }
-}
-
-#[cfg(not(windows))]
-fn is_task_alive(record: &TaskRecord) -> Liveness {
-    task_liveness(record).0
-}
-
-/// A non-Linux Unix `ps` sample. macOS has no `/proc`, so `state`,
-/// `lstart`, and the untruncated command line are the available process
-/// corroborators. Every probe pins the locale and time zone so the
-/// canonical key is independent of the supervisor/client environment.
-#[cfg(all(not(target_os = "linux"), not(windows)))]
-#[derive(Debug, PartialEq, Eq)]
-struct ProcessProbe {
-    state: String,
-    start_key: String,
-    start_epoch_secs: Option<i64>,
-    command: String,
-}
-
-#[cfg(all(not(target_os = "linux"), not(windows)))]
-impl ProcessProbe {
-    fn is_zombie(&self) -> bool {
-        self.state.starts_with('Z')
-    }
-}
-
-/// Parses one `ps -p <pid> -o state=,lstart=,command=` row. The five
-/// lstart fields are fixed by the C locale; the remaining text is the
-/// command line and is whitespace-normalized for comparison.
-#[cfg(all(not(target_os = "linux"), not(windows)))]
-fn parse_process_probe(output: &str) -> Option<ProcessProbe> {
-    let fields: Vec<&str> = output.split_whitespace().collect();
-    if fields.len() < 6 {
-        return None;
-    }
-    let state = fields[0].to_string();
-    let start_key = fields[1..6].join(" ");
-    Some(ProcessProbe {
-        state,
-        start_epoch_secs: parse_lstart_epoch_secs(&start_key),
-        start_key,
-        command: fields[6..].join(" "),
-    })
-}
-
-#[cfg(all(not(target_os = "linux"), not(windows)))]
-fn process_probe(pid: u32) -> ProbeResult<ProcessProbe> {
-    if pid <= 1 {
-        return ProbeResult::Gone;
-    }
-    let output = match Command::new("ps")
-        .args([
-            "-ww",
-            "-p",
-            &pid.to_string(),
-            "-o",
-            "state=,lstart=,command=",
-        ])
-        // macOS formats `lstart` through the caller's locale and time
-        // zone. Keep the durable process key independent of whether the
-        // probe runs inside `service run` or a later CLI invocation.
-        .env("LC_ALL", "C")
-        .env("LC_TIME", "C")
-        .env("TZ", "UTC")
-        .output()
-    {
-        Ok(output) => output,
-        Err(_) => return ProbeResult::Unreadable,
-    };
-    if !output.status.success() {
-        return if output.stdout.is_empty() {
-            ProbeResult::Gone
-        } else {
-            ProbeResult::Unreadable
-        };
-    }
-    match std::str::from_utf8(&output.stdout)
-        .ok()
-        .and_then(parse_process_probe)
-    {
-        Some(probe) => ProbeResult::Present(probe),
-        None => ProbeResult::Unreadable,
-    }
-}
-
-#[cfg(all(not(target_os = "linux"), not(windows)))]
-fn start_identity_from_probe(probe: &ProcessProbe) -> (Option<String>, Option<i64>) {
-    if probe.is_zombie() {
-        (None, None)
-    } else {
-        (Some(probe.start_key.clone()), probe.start_epoch_secs)
-    }
-}
-
-#[cfg(all(not(target_os = "linux"), not(windows)))]
-fn recorded_start_identity(pid: u32) -> (Option<String>, Option<i64>) {
-    match process_probe(pid) {
-        ProbeResult::Present(probe) => start_identity_from_probe(&probe),
-        _ => (None, None),
-    }
-}
-
-/// A missing start key after spawn means the process was already gone or
-/// a zombie, so fail closed rather than persisting an uncorroborated PID.
-#[cfg(all(not(target_os = "linux"), not(windows)))]
-fn spawn_start_key_ok(started_at: &Option<String>, start_epoch_secs: &Option<i64>) -> bool {
-    started_at.is_some() && start_epoch_secs.is_some()
-}
-
-#[cfg(all(not(target_os = "linux"), not(windows)))]
-fn normalize_process_text(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-#[cfg(all(not(target_os = "linux"), not(windows)))]
-fn session_argv_matches(command: &str, spec: &SessionSpec) -> bool {
-    let command = normalize_process_text(command);
-    let expected = serve_argv(spec).join(" ");
-    if expected.is_empty() {
-        return false;
-    }
-    command == expected || command.ends_with(&format!(" {expected}"))
-}
-
-#[cfg(all(not(target_os = "linux"), not(windows)))]
-fn task_argv_matches(command: &str, record: &TaskRecord) -> bool {
-    let mut expected = Vec::with_capacity(record.spec.args.len() + 1);
-    expected.push(record.spec.command.as_str());
-    expected.extend(record.spec.args.iter().map(String::as_str));
-    normalize_process_text(command) == normalize_process_text(&expected.join(" "))
-}
-
-#[cfg(all(not(target_os = "linux"), not(windows)))]
-fn task_instant_liveness(probe: &ProcessProbe, record: &TaskRecord) -> Liveness {
-    let Some(started_ms) = record.started_ms else {
-        return if task_argv_matches(&probe.command, record) {
-            Liveness::Live
-        } else {
-            Liveness::Unresolved
-        };
-    };
-    let Some(start_epoch_secs) = probe.start_epoch_secs else {
-        return Liveness::Unresolved;
-    };
-    let delta = i128::from(started_ms) - i128::from(start_epoch_secs) * 1_000;
-    const TASK_START_LATENCY_MS: i128 = 5_000;
-    if delta < 0 {
-        Liveness::Dead
-    } else if delta < 1_000 + TASK_START_LATENCY_MS {
-        Liveness::Live
-    } else {
-        Liveness::Unresolved
-    }
-}
-
-#[cfg(all(not(target_os = "linux"), not(windows)))]
-fn session_liveness(record: &SessionRecord) -> (Liveness, Option<i64>) {
-    match process_probe(record.pid) {
-        ProbeResult::Gone => (Liveness::Dead, None),
-        ProbeResult::Unreadable => (Liveness::Unresolved, None),
-        ProbeResult::Present(probe) if probe.is_zombie() => (Liveness::Dead, None),
-        ProbeResult::Present(probe) => match record.start_epoch_secs {
-            Some(recorded) => match probe.start_epoch_secs {
-                Some(current) if current == recorded => (Liveness::Live, Some(current)),
-                Some(_) => (Liveness::Dead, None),
-                None => (Liveness::Unresolved, None),
-            },
-            None => match &record.started_at {
-                Some(recorded) if recorded == &probe.start_key => {
-                    (Liveness::Live, probe.start_epoch_secs)
-                }
-                _ if probe.command.is_empty() => (Liveness::Unresolved, None),
-                _ if session_argv_matches(&probe.command, &record.spec) => {
-                    (Liveness::Live, probe.start_epoch_secs)
-                }
-                _ => (Liveness::Dead, None),
-            },
-        },
-    }
-}
-
-#[cfg(all(not(target_os = "linux"), not(windows)))]
-fn is_session_alive(record: &SessionRecord) -> Liveness {
-    session_liveness(record).0
-}
-
-#[cfg(all(not(target_os = "linux"), not(windows)))]
-fn task_liveness(record: &TaskRecord) -> (Liveness, Option<i64>) {
-    match process_probe(record.pid) {
-        ProbeResult::Gone => (Liveness::Dead, None),
-        ProbeResult::Unreadable => (Liveness::Unresolved, None),
-        ProbeResult::Present(probe) if probe.is_zombie() => (Liveness::Dead, None),
-        ProbeResult::Present(probe) => match record.start_epoch_secs {
-            Some(recorded) => match probe.start_epoch_secs {
-                Some(current) if current == recorded => (Liveness::Live, Some(current)),
-                Some(_) => (Liveness::Dead, None),
-                None => (Liveness::Unresolved, None),
-            },
-            None => match &record.started_at {
-                Some(recorded) if recorded == &probe.start_key => {
-                    (Liveness::Live, probe.start_epoch_secs)
-                }
-                _ => {
-                    let liveness = task_instant_liveness(&probe, record);
-                    let epoch = (liveness == Liveness::Live)
-                        .then_some(probe.start_epoch_secs)
-                        .flatten();
-                    (liveness, epoch)
-                }
-            },
-        },
-    }
-}
-
-#[cfg(all(not(target_os = "linux"), not(windows)))]
-fn is_task_alive(record: &TaskRecord) -> Liveness {
-    task_liveness(record).0
 }
 
 /// Returns a Windows process creation-time key only while the PID still
@@ -2982,48 +2541,10 @@ fn is_task_alive(record: &TaskRecord) -> Liveness {
     task_liveness(record).0
 }
 
-/// Persists the canonical epoch after a legacy macOS record is rescued by
-/// the fallback ladder. Callers must hold the admission lock; status and
-/// supervisor tick paths intentionally remain read-only.
-#[cfg(all(target_os = "macos", not(windows)))]
-fn upgrade_legacy_session_record(control: &Path, record: &mut SessionRecord) -> Result<()> {
-    if record.start_epoch_secs.is_some() {
-        return Ok(());
-    }
-    let (liveness, start_epoch_secs) = session_liveness(record);
-    if liveness == Liveness::Live
-        && let Some(start_epoch_secs) = start_epoch_secs
-    {
-        record.start_epoch_secs = Some(start_epoch_secs);
-        write_session_record(control, record)?;
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
 fn upgrade_legacy_session_record(_control: &Path, _record: &mut SessionRecord) -> Result<()> {
     Ok(())
 }
 
-/// Persists the canonical epoch after a legacy macOS task record is
-/// rescued by the fallback ladder. Callers must hold the admission lock;
-/// the supervisor's rehydration/tick paths deliberately do not rewrite.
-#[cfg(all(target_os = "macos", not(windows)))]
-fn upgrade_legacy_task_record(control: &Path, record: &mut TaskRecord) -> Result<()> {
-    if record.start_epoch_secs.is_some() {
-        return Ok(());
-    }
-    let (liveness, start_epoch_secs) = task_liveness(record);
-    if liveness == Liveness::Live
-        && let Some(start_epoch_secs) = start_epoch_secs
-    {
-        record.start_epoch_secs = Some(start_epoch_secs);
-        write_task_record(control, record)?;
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
 fn upgrade_legacy_task_record(_control: &Path, _record: &mut TaskRecord) -> Result<()> {
     Ok(())
 }
@@ -3054,7 +2575,7 @@ fn terminate_record_pid(pid: u32, phase: &str) -> Result<()> {
     Ok(())
 }
 
-fn terminate_record_job(job_name: Option<&str>, pid: u32, phase: &str) -> Result<bool> {
+fn terminate_record_job(job_name: Option<&str>, _pid: u32, _phase: &str) -> Result<bool> {
     if let Some(name) = job_name {
         if let Some(job) = open_job(name)? {
             terminate_job(&job)?;
@@ -3062,7 +2583,6 @@ fn terminate_record_job(job_name: Option<&str>, pid: u32, phase: &str) -> Result
         }
         return Ok(false);
     }
-    terminate_record_pid(pid, phase)?;
     Ok(false)
 }
 
@@ -3438,4 +2958,222 @@ fn wait_for_control_release(control: &Path) -> Result<()> {
         std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::{TASK_SPEC_SCHEMA, TaskCallback};
+    use std::path::PathBuf;
+
+    fn session_spec() -> SessionSpec {
+        SessionSpec {
+            schema: SESSION_SPEC_SCHEMA.to_string(),
+            inbox: "test-inbox".to_string(),
+            outbox: "test-outbox".to_string(),
+            poll_ms: None,
+            agent_cmd: None,
+            agent_args: Vec::new(),
+            agent_cwd: None,
+            agent_timeout_ms: None,
+            agent_output: None,
+            agent_result_key: None,
+            role: None,
+        }
+    }
+
+    fn task_spec(session: &str) -> TaskSpec {
+        TaskSpec {
+            schema: TASK_SPEC_SCHEMA.to_string(),
+            session: session.to_string(),
+            command: "cmd.exe".to_string(),
+            args: vec!["/D".to_string(), "/C".to_string(), "exit 0".to_string()],
+            cwd: None,
+            env: Vec::new(),
+            milestones_ms: Vec::new(),
+            max_duration_ms: 60_000,
+            callback: TaskCallback {
+                inbox: "test-callback".to_string(),
+                role: None,
+            },
+        }
+    }
+
+    fn session_record(pid: u32, started_at: Option<String>, job: Option<String>) -> SessionRecord {
+        SessionRecord {
+            id: "svc-test".to_string(),
+            spec: session_spec(),
+            pid,
+            started_at,
+            start_epoch_secs: None,
+            job,
+        }
+    }
+
+    fn task_record(
+        session: &str,
+        pid: u32,
+        started_at: Option<String>,
+        job: Option<String>,
+    ) -> TaskRecord {
+        TaskRecord {
+            id: "task-test".to_string(),
+            request_id: None,
+            admission: TaskAdmissionPhase::Responded,
+            spec: TaskSpec {
+                session: session.to_string(),
+                ..task_spec(session)
+            },
+            pid,
+            started_at,
+            start_epoch_secs: None,
+            job,
+            started_ms: Some(0),
+            state: TaskState::Running,
+            exit_code: None,
+            elapsed_ms: None,
+            stdout_path: "stdout.log".to_string(),
+            stderr_path: "stderr.log".to_string(),
+            delivered_milestones: 0,
+        }
+    }
+
+    fn temp_control(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "baton-windows-service-unit-{}-{}-{tag}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("create test control directory");
+        path
+    }
+
+    #[test]
+    fn windows_liveness_ladder_is_fail_closed() {
+        let start_key = recorded_start_identity(std::process::id())
+            .0
+            .expect("current test process has a Windows creation key");
+        assert!(spawn_start_key_ok(&Some(start_key.clone()), &None));
+        assert!(!spawn_start_key_ok(&None, &None));
+
+        let job_name = fresh_job_name("liveness");
+        let job = create_job(&job_name).expect("create liveness job");
+        let mut session = session_record(
+            std::process::id(),
+            Some(start_key.clone()),
+            Some(job_name.clone()),
+        );
+        assert_eq!(session_liveness(&session).0, Liveness::Live);
+
+        session.started_at = Some("different-process".to_string());
+        assert_eq!(session_liveness(&session).0, Liveness::Dead);
+
+        session.started_at = Some(start_key.clone());
+        session.job = Some(fresh_job_name("missing"));
+        assert_eq!(session_liveness(&session).0, Liveness::Unresolved);
+
+        let mut task = task_record(
+            "svc-test",
+            std::process::id(),
+            Some(start_key.clone()),
+            Some(job_name.clone()),
+        );
+        assert_eq!(task_liveness(&task).0, Liveness::Live);
+        task.started_at = Some("different-process".to_string());
+        assert_eq!(task_liveness(&task).0, Liveness::Dead);
+        task.started_at = Some(start_key);
+        task.job = Some(fresh_job_name("missing-task"));
+        assert_eq!(task_liveness(&task).0, Liveness::Unresolved);
+
+        assert_eq!(job_tree_liveness(Some(&job_name)), Some(Liveness::Dead));
+        assert_eq!(
+            job_tree_liveness(Some(&fresh_job_name("missing-tree"))),
+            Some(Liveness::Unresolved)
+        );
+
+        let gone = session_record(
+            1,
+            Some("stale-process".to_string()),
+            Some(fresh_job_name("missing-gone")),
+        );
+        assert_eq!(session_liveness(&gone).0, Liveness::Unresolved);
+        drop(job);
+    }
+
+    #[test]
+    fn rehydrate_reopens_recorded_job_handles() {
+        let control = temp_control("rehydrate");
+        let session_job_name = fresh_job_name("rehydrate-session");
+        let task_job_name = fresh_job_name("rehydrate-task");
+        let session_job = create_job(&session_job_name).expect("create session job");
+        let task_job = create_job(&task_job_name).expect("create task job");
+        let start_key = recorded_start_identity(std::process::id())
+            .0
+            .expect("current test process has a Windows creation key");
+
+        write_session_record(
+            &control,
+            &session_record(
+                std::process::id(),
+                Some(start_key.clone()),
+                Some(session_job_name),
+            ),
+        )
+        .expect("write session record");
+        let sessions = rehydrate_sessions(&control).expect("rehydrate sessions");
+        assert!(sessions["svc-test"].job.is_some());
+
+        write_task_record(
+            &control,
+            &task_record(
+                "svc-test",
+                std::process::id(),
+                Some(start_key),
+                Some(task_job_name),
+            ),
+        )
+        .expect("write task record");
+        let clock = SystemClock;
+        let tasks = rehydrate_tasks(&control, &clock).expect("rehydrate tasks");
+        assert!(tasks["task-test"].job.is_some());
+
+        drop(tasks);
+        drop(sessions);
+        drop(task_job);
+        drop(session_job);
+        let _ = fs::remove_dir_all(control);
+    }
+
+    #[test]
+    fn unresolved_task_cleanup_retains_then_force_removes_record() {
+        let control = temp_control("unresolved-cleanup");
+        let record = task_record(
+            "svc-test",
+            1,
+            Some("stale-process".to_string()),
+            Some(fresh_job_name("missing-cleanup")),
+        );
+        write_task_record(&control, &record).expect("write unresolved task");
+
+        let residue = reap_session_tasks_with_wait(&control, "svc-test", false, |_, _| {})
+            .expect("retain unresolved task");
+        assert_eq!(residue.len(), 1);
+        assert_eq!(residue[0].liveness, Liveness::Unresolved);
+        assert!(
+            read_task_record(&control, &record.id)
+                .expect("read retained task")
+                .is_some()
+        );
+
+        let residue = reap_session_tasks_with_wait(&control, "svc-test", true, |_, _| {})
+            .expect("force unresolved task cleanup");
+        assert!(residue.is_empty());
+        assert!(
+            read_task_record(&control, &record.id)
+                .expect("read removed task")
+                .is_none()
+        );
+        let _ = fs::remove_dir_all(control);
+    }
 }
