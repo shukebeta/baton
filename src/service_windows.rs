@@ -2068,6 +2068,18 @@ fn tick_one_task(
         },
         Some(child) => match child.try_wait() {
             Ok(Some(status)) => {
+                if let Some(job) = running.job.as_ref() {
+                    match active_job_processes(job) {
+                        Ok(0) => {}
+                        Ok(_) | Err(_) => {
+                            // The direct command may have exited while a
+                            // descendant remains. Keep the Job Object handle
+                            // and continue tracking the tree until it drains.
+                            running.child = None;
+                            return Ok(TaskTick::StillRunning);
+                        }
+                    }
+                }
                 // An external `Stop`/`Teardown`/`Cancel` may already have
                 // finalized and removed this task's record (they act
                 // directly on the durable PID, independent of this `Run`
@@ -2539,6 +2551,7 @@ fn spawn_start_key_ok(started_at: &Option<String>, _start_epoch_secs: &Option<i6
     started_at.is_some()
 }
 
+#[cfg(windows)]
 fn job_name_resolves(name: Option<&str>) -> bool {
     match name {
         None => true,
@@ -2546,8 +2559,22 @@ fn job_name_resolves(name: Option<&str>) -> bool {
     }
 }
 
+#[cfg(windows)]
 fn record_job_available(name: Option<&str>) -> bool {
     name.is_some() && job_name_resolves(name)
+}
+
+#[cfg(windows)]
+fn job_tree_liveness(name: Option<&str>) -> Option<Liveness> {
+    let name = name?;
+    match open_job(name) {
+        Ok(Some(job)) => match active_job_processes(&job) {
+            Ok(0) => Some(Liveness::Dead),
+            Ok(_) => Some(Liveness::Live),
+            Err(_) => Some(Liveness::Unresolved),
+        },
+        Ok(None) | Err(_) => Some(Liveness::Unresolved),
+    }
 }
 
 #[cfg(not(windows))]
@@ -2908,10 +2935,10 @@ fn spawn_start_key_ok(started_at: &Option<String>, _start_epoch_secs: &Option<i6
 
 fn session_liveness(record: &SessionRecord) -> (Liveness, Option<i64>) {
     match process_probe(record.pid) {
-        ProbeResult::Gone if record.job.is_some() && !job_name_resolves(record.job.as_deref()) => {
-            (Liveness::Unresolved, None)
-        }
-        ProbeResult::Gone => (Liveness::Dead, None),
+        ProbeResult::Gone => (
+            job_tree_liveness(record.job.as_deref()).unwrap_or(Liveness::Dead),
+            None,
+        ),
         ProbeResult::Unreadable => (Liveness::Unresolved, None),
         ProbeResult::Present(current) => match &record.started_at {
             Some(expected) if expected == &current && job_name_resolves(record.job.as_deref()) => {
@@ -2930,10 +2957,10 @@ fn is_session_alive(record: &SessionRecord) -> Liveness {
 
 fn task_liveness(record: &TaskRecord) -> (Liveness, Option<i64>) {
     match process_probe(record.pid) {
-        ProbeResult::Gone if record.job.is_some() && !job_name_resolves(record.job.as_deref()) => {
-            (Liveness::Unresolved, None)
-        }
-        ProbeResult::Gone => (Liveness::Dead, None),
+        ProbeResult::Gone => (
+            job_tree_liveness(record.job.as_deref()).unwrap_or(Liveness::Dead),
+            None,
+        ),
         ProbeResult::Unreadable => (Liveness::Unresolved, None),
         ProbeResult::Present(current) => match &record.started_at {
             Some(expected) if expected == &current && job_name_resolves(record.job.as_deref()) => {
