@@ -14,8 +14,6 @@ use crate::task::{
     Clock, SystemClock, TaskAdmissionPhase, TaskEventBody, TaskEventKind, TaskRecord, TaskSpec,
     TaskState, max_duration_exceeded, milestones_due, task_event_id,
 };
-#[cfg(test)]
-use crate::task::{FakeClock, TaskCallback};
 use windows_sys::Win32::Foundation::{
     CloseHandle, FALSE, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
@@ -30,8 +28,8 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, GetCurrentProcess, GetProcessTimes, OpenProcess, OpenThread,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-    ResumeThread, THREAD_SUSPEND_RESUME, TerminateProcess, WaitForSingleObject,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, ResumeThread,
+    THREAD_SUSPEND_RESUME, TerminateProcess, WaitForSingleObject,
 };
 
 /// A non-inheritable Windows Job Object handle owned by the supervisor.
@@ -2028,7 +2026,7 @@ fn tick_one_task(
     if running.term_sent_at_ms.is_none()
         && max_duration_exceeded(elapsed_ms, running.record.spec.max_duration_ms)
     {
-        let _ = terminate_record_job(running.record.job.as_deref(), running.record.pid, "-TERM");
+        let _ = terminate_running_task(running, "-TERM");
         running.term_sent_at_ms = Some(clock.now_ms());
     } else if let Some(term_at) = running.term_sent_at_ms
         && !running.kill_sent
@@ -2049,7 +2047,7 @@ fn tick_one_task(
                 Liveness::Unresolved => return Ok(TaskTick::StillRunning),
             }
         }
-        let _ = terminate_record_job(running.record.job.as_deref(), running.record.pid, "-KILL");
+        let _ = terminate_running_task(running, "-KILL");
         running.kill_sent = true;
     }
 
@@ -2910,6 +2908,9 @@ fn spawn_start_key_ok(started_at: &Option<String>, _start_epoch_secs: &Option<i6
 
 fn session_liveness(record: &SessionRecord) -> (Liveness, Option<i64>) {
     match process_probe(record.pid) {
+        ProbeResult::Gone if record.job.is_some() && !job_name_resolves(record.job.as_deref()) => {
+            (Liveness::Unresolved, None)
+        }
         ProbeResult::Gone => (Liveness::Dead, None),
         ProbeResult::Unreadable => (Liveness::Unresolved, None),
         ProbeResult::Present(current) => match &record.started_at {
@@ -2929,6 +2930,9 @@ fn is_session_alive(record: &SessionRecord) -> Liveness {
 
 fn task_liveness(record: &TaskRecord) -> (Liveness, Option<i64>) {
     match process_probe(record.pid) {
+        ProbeResult::Gone if record.job.is_some() && !job_name_resolves(record.job.as_deref()) => {
+            (Liveness::Unresolved, None)
+        }
         ProbeResult::Gone => (Liveness::Dead, None),
         ProbeResult::Unreadable => (Liveness::Unresolved, None),
         ProbeResult::Present(current) => match &record.started_at {
@@ -3019,14 +3023,22 @@ fn signal_group(pid: u32, sig: &str) -> Result<()> {
 }
 
 fn terminate_record_job(job_name: Option<&str>, pid: u32, sig: &str) -> Result<bool> {
-    if let Some(name) = job_name {
-        if let Some(job) = open_job(name)? {
-            terminate_job(&job)?;
-            return Ok(true);
-        }
+    if let Some(name) = job_name
+        && let Some(job) = open_job(name)?
+    {
+        terminate_job(&job)?;
+        return Ok(true);
     }
     signal_group(pid, sig)?;
     Ok(false)
+}
+
+fn terminate_running_task(running: &RunningTask, sig: &str) -> Result<()> {
+    if let Some(job) = running.job.as_ref() {
+        terminate_job(job)
+    } else {
+        signal_group(running.record.pid, sig)
+    }
 }
 
 fn wait_while_alive(record: &SessionRecord, grace_ms: u64) {
