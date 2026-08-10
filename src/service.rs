@@ -3189,31 +3189,15 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::sync::{Mutex, MutexGuard};
 
-        /// Serializes every test in this module that either holds the
-        /// control-plane flock directly or forks a real child process
-        /// (`spawn_task_child`/`Mailbox::open`'s own lock).
-        ///
-        /// `fork(2)` duplicates the *whole process's* fd table across every
-        /// thread, not just the caller's — so a flock another `cargo test`
-        /// thread holds at that instant is briefly visible (as still held) to
-        /// the forked child, and vice versa, until the child's `execve`
-        /// closes its `O_CLOEXEC`-marked fds. `cargo test`'s default thread
-        /// parallelism runs this module's flock-assertion tests concurrently
-        /// with tests that spawn real processes, so without this guard the
-        /// two occasionally race (observed empirically: a lock reads back as
-        /// still held, or a fresh mailbox open is transiently refused). This
-        /// never happens in production — a real `baton service run` process
-        /// never shares an address space with unrelated flock-holding code —
-        /// it is purely a same-process test-parallelism artifact.
-        static FORK_LOCK_SERIALIZE: Mutex<()> = Mutex::new(());
-
-        fn serialize_forks_and_locks() -> MutexGuard<'static, ()> {
-            FORK_LOCK_SERIALIZE
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        }
+        // Serializes every test in this module that either holds the
+        // control-plane flock directly or forks a real child process
+        // (`spawn_task_child`/`Mailbox::open`'s own lock) against the rest of
+        // the crate's forks. The guard is crate-wide rather than module-local
+        // because the fd table it protects is process-wide: a spawn from any
+        // other module's tests is just as capable of pinning this module's
+        // locks open. See `crate::test_support`.
+        use crate::test_support::serialize_forks_and_locks;
 
         struct TempDir {
             path: std::path::PathBuf,
