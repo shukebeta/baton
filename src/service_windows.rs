@@ -202,9 +202,9 @@ const POLL_INTERVAL_MS: u64 = 100;
 /// Bound on how long `Start` waits for a live `Run` to answer.
 const START_AWAIT_MS: u64 = 10_000;
 /// Bound on the cooperative `serve --stop` grace before escalating to
-/// `SIGTERM`.
+/// `TerminateJobObject`.
 const STOP_GRACE_MS: u64 = 5_000;
-/// Bound on the `SIGTERM`/`SIGKILL` escalation grace.
+/// Bound on the second `TerminateJobObject` attempt's grace.
 const KILL_GRACE_MS: u64 = 2_000;
 
 /// Process-local sequence, making request/session ids unique even across
@@ -228,14 +228,11 @@ struct SessionRecord {
     id: String,
     spec: SessionSpec,
     pid: u32,
-    /// Linux `/proc/<pid>/stat` starttime or non-Linux Unix `ps` `lstart`,
+    /// Windows process creation-time key from `GetProcessTimes`,
     /// corroborating `pid` against reuse after a `Run` restart; `None`
-    /// where the platform probe could not be read or for a legacy record
-    /// that must use the platform fallback ladder.
+    /// where the platform probe could not be read or for a legacy record.
     started_at: Option<String>,
-    /// Canonical Unix epoch seconds parsed from macOS `ps lstart`; its
-    /// presence marks a post-upgrade record that can use the epoch fast
-    /// path.
+    /// Legacy Unix epoch field retained for cross-platform record decoding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     start_epoch_secs: Option<i64>,
     /// Named Job Object owned by the session's supervisor and serve child.
@@ -1551,12 +1548,13 @@ struct RunningTask {
     /// unresolved identity and is never replaced by a PID tree walk.
     job: Option<JobHandle>,
     started_ms: u64,
-    /// Set once this task's max duration has been exceeded and `SIGTERM`
-    /// sent, so a later tick knows to escalate to `SIGKILL` after
+    /// Set once this task's max duration has been exceeded and a first Job
+    /// Object termination was sent, so a later tick knows to escalate after
     /// `KILL_GRACE_MS`, and a successful reap after this is set is
     /// attributed to `timeout`, not `completed`/`failed`.
     term_sent_at_ms: Option<u64>,
-    /// Set once `SIGKILL` has been sent, so it is only ever sent once.
+    /// Set once the second Job Object termination has been sent, so it is
+    /// only ever sent once.
     kill_sent: bool,
 }
 
@@ -1969,7 +1967,7 @@ fn spawn_task_child(
 }
 
 /// Advances one tracked task by one loop tick: delivers any
-/// newly-due milestone events, escalates `SIGTERM`→`SIGKILL` past
+/// newly-due milestone events, escalates Job Object termination past
 /// `max_duration_ms`, and — once the process has actually exited —
 /// persists its terminal state and delivers its terminal event.
 ///
@@ -2374,7 +2372,7 @@ fn reap_session_tasks_with_wait(
 // Mirrors `service.stop`/`serve.stop`: a per-task cooperative sentinel
 // `Cancel` drops before signalling, so `Run`'s own tick — the sole
 // writer of terminal state — can attribute the reap it later observes to
-// `cancelled` rather than misreading a `SIGTERM` exit as `failed`.
+// `cancelled` rather than misreading a forced exit as `failed`.
 
 fn task_cancel_sentinel_path(control: &Path, task_id: &str) -> std::path::PathBuf {
     task_cancel_dir(control).join(mailbox::file_name(task_id))
@@ -3033,7 +3031,7 @@ fn upgrade_legacy_task_record(_control: &Path, _record: &mut TaskRecord) -> Resu
 /// Terminates only the recorded PID. This is the explicit force fallback
 /// after a named Job Object can no longer be resolved; it makes no claim
 /// about descendants.
-fn signal_group(pid: u32, sig: &str) -> Result<()> {
+fn terminate_record_pid(pid: u32, phase: &str) -> Result<()> {
     if pid <= 1 {
         return Ok(());
     }
@@ -3049,14 +3047,14 @@ fn signal_group(pid: u32, sig: &str) -> Result<()> {
     unsafe { CloseHandle(process) };
     if result == FALSE {
         return Err(BatonError::Io(format!(
-            "could not terminate recorded Windows pid {pid} for {sig}: {}",
+            "could not terminate recorded Windows pid {pid} during {phase}: {}",
             std::io::Error::last_os_error()
         )));
     }
     Ok(())
 }
 
-fn terminate_record_job(job_name: Option<&str>, pid: u32, sig: &str) -> Result<bool> {
+fn terminate_record_job(job_name: Option<&str>, pid: u32, phase: &str) -> Result<bool> {
     if let Some(name) = job_name {
         if let Some(job) = open_job(name)? {
             terminate_job(&job)?;
@@ -3064,23 +3062,23 @@ fn terminate_record_job(job_name: Option<&str>, pid: u32, sig: &str) -> Result<b
         }
         return Ok(false);
     }
-    signal_group(pid, sig)?;
+    terminate_record_pid(pid, phase)?;
     Ok(false)
 }
 
-fn force_terminate_record_job(job_name: Option<&str>, pid: u32, sig: &str) -> Result<()> {
-    match terminate_record_job(job_name, pid, sig) {
+fn force_terminate_record_job(job_name: Option<&str>, pid: u32, phase: &str) -> Result<()> {
+    match terminate_record_job(job_name, pid, phase) {
         Ok(true) => Ok(()),
-        Ok(false) => signal_group(pid, sig),
-        Err(_) => signal_group(pid, sig),
+        Ok(false) => terminate_record_pid(pid, phase),
+        Err(_) => terminate_record_pid(pid, phase),
     }
 }
 
-fn terminate_running_task(running: &RunningTask, sig: &str) -> Result<()> {
+fn terminate_running_task(running: &RunningTask, phase: &str) -> Result<()> {
     if let Some(job) = running.job.as_ref() {
         terminate_job(job)
     } else {
-        signal_group(running.record.pid, sig)
+        terminate_record_pid(running.record.pid, phase)
     }
 }
 
@@ -3100,8 +3098,8 @@ fn wait_while_task_alive(record: &TaskRecord, grace_ms: u64) {
 
 /// Stops one session. The caller must hold the admission lock:
 /// cooperative `serve --stop` on its inbox first,
-/// bounded wait, then `SIGTERM`/`SIGKILL` process-group escalation if
-/// still alive, then reaps every task this session owns
+/// bounded wait, then Job Object termination if still alive, then reaps
+/// every task this session owns
 /// ([`reap_session_tasks`]) and removes the session's own durable
 /// record. Idempotent — a session already gone just gets its (possibly
 /// already-absent) record, and its tasks', cleaned up. Returns any
