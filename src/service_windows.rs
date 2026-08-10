@@ -27,9 +27,9 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, GetCurrentProcess, GetProcessTimes, OpenProcess, OpenThread,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, ResumeThread,
-    THREAD_SUSPEND_RESUME, TerminateProcess, WaitForSingleObject,
+    CREATE_SUSPENDED, GetProcessTimes, OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, ResumeThread, THREAD_SUSPEND_RESUME, TerminateProcess,
+    WaitForSingleObject,
 };
 
 /// A non-inheritable Windows Job Object handle owned by the supervisor.
@@ -156,9 +156,9 @@ fn terminate_job(job: &JobHandle) -> Result<()> {
     Ok(())
 }
 
-/// `baton serve` calls this before constructing its participant. The job
-/// handle is retained for the process lifetime so the job name remains
-/// available while an agent descendant is still active.
+/// `baton serve` calls this before constructing its participant. `Run` has
+/// already assigned the child process to the Job Object; this handle is
+/// retained so the named job remains available while descendants are active.
 pub(super) fn adopt_service_job() -> Result<()> {
     let Some(name) = std::env::var_os("BATON_SERVICE_JOB") else {
         return Ok(());
@@ -169,10 +169,6 @@ pub(super) fn adopt_service_job() -> Result<()> {
             "baton serve could not resolve its Windows Job Object {name:?}"
         ))
     })?;
-    // SAFETY: GetCurrentProcess returns the current process pseudo-handle,
-    // which is valid for AssignProcessToJobObject and must not be closed.
-    let process = unsafe { GetCurrentProcess() };
-    assign_job_to_process(&job, process)?;
     SERVICE_JOB
         .set(job)
         .map_err(|_| BatonError::Io("baton serve Windows Job Object was adopted twice".to_string()))
@@ -453,11 +449,13 @@ fn reap_exited(sessions: &mut HashMap<String, RunningSession>) {
                 Ok(None) => {}
             }
         }
-        running
-            .job
-            .as_ref()
-            .map(|job| active_job_processes(job).map_or(true, |count| count != 0))
-            .unwrap_or_else(|| running.child.is_some())
+        match running.job.as_ref() {
+            Some(job) => match active_job_processes(job) {
+                Ok(0) => running.child.is_some(),
+                Ok(_) | Err(_) => true,
+            },
+            None => running.child.is_some(),
+        }
     });
 }
 
@@ -757,6 +755,11 @@ fn handle_start_request(
             return Err(err);
         }
     };
+    if let Err(err) = assign_job_to_child(&job, &child) {
+        let _ = terminate_job(&job);
+        let _ = child.wait();
+        return Err(err);
+    }
     let pid = child.id();
     let (started_at, start_epoch_secs) = recorded_start_identity(pid);
     // Everything below this point must kill+reap `child` before
