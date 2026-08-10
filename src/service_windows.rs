@@ -60,8 +60,9 @@ fn wide_null(value: &str) -> Vec<u16> {
 
 fn fresh_job_name(kind: &str) -> String {
     format!(
-        r"Local\baton-{kind}-{}-{}",
+        r"Local\baton-{kind}-{}-{}-{}",
         std::process::id(),
+        crate::events::now_ms(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     )
 }
@@ -2308,8 +2309,8 @@ fn reap_session_tasks_with_wait(
                         record.id, record.pid
                     );
                 }
-                let _ = terminate_record_job(record.job.as_deref(), record.pid, "-TERM");
-                let _ = terminate_record_job(record.job.as_deref(), record.pid, "-KILL");
+                let _ = force_terminate_record_job(record.job.as_deref(), record.pid, "-TERM");
+                let _ = force_terminate_record_job(record.job.as_deref(), record.pid, "-KILL");
             }
             remove_task_start_transaction(control, &record)?;
             remove_task_record(control, &record.id)?;
@@ -3050,14 +3051,23 @@ fn signal_group(pid: u32, sig: &str) -> Result<()> {
 }
 
 fn terminate_record_job(job_name: Option<&str>, pid: u32, sig: &str) -> Result<bool> {
-    if let Some(name) = job_name
-        && let Some(job) = open_job(name)?
-    {
-        terminate_job(&job)?;
-        return Ok(true);
+    if let Some(name) = job_name {
+        if let Some(job) = open_job(name)? {
+            terminate_job(&job)?;
+            return Ok(true);
+        }
+        return Ok(false);
     }
     signal_group(pid, sig)?;
     Ok(false)
+}
+
+fn force_terminate_record_job(job_name: Option<&str>, pid: u32, sig: &str) -> Result<()> {
+    match terminate_record_job(job_name, pid, sig) {
+        Ok(true) => Ok(()),
+        Ok(false) => signal_group(pid, sig),
+        Err(_) => signal_group(pid, sig),
+    }
 }
 
 fn terminate_running_task(running: &RunningTask, sig: &str) -> Result<()> {
@@ -3107,8 +3117,8 @@ fn stop_session_record(
                     record.id, record.pid
                 );
             }
-            let _ = terminate_record_job(record.job.as_deref(), record.pid, "-TERM");
-            let _ = terminate_record_job(record.job.as_deref(), record.pid, "-KILL");
+            let _ = force_terminate_record_job(record.job.as_deref(), record.pid, "-TERM");
+            let _ = force_terminate_record_job(record.job.as_deref(), record.pid, "-KILL");
         }
         liveness = Liveness::Dead;
     } else {

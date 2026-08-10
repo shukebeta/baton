@@ -133,11 +133,11 @@ fn windows_task_job_owns_and_terminates_command_tree() {
     let mut running = false;
     for _ in 0..100 {
         let status = baton(&["task", "status", "--control", &control, "--task", &task_id]);
-        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&status.stdout) {
-            if json["tasks"][0]["state"] == "running" {
-                running = true;
-                break;
-            }
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&status.stdout)
+            && json["tasks"][0]["state"] == "running"
+        {
+            running = true;
+            break;
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -151,10 +151,10 @@ fn windows_task_job_owns_and_terminates_command_tree() {
     );
     for _ in 0..100 {
         let status = baton(&["task", "status", "--control", &control, "--task", &task_id]);
-        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&status.stdout) {
-            if json["tasks"][0]["state"] != "running" {
-                return;
-            }
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&status.stdout)
+            && json["tasks"][0]["state"] != "running"
+        {
+            return;
         }
         thread::sleep(Duration::from_millis(50));
     }
