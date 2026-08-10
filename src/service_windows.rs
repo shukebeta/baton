@@ -755,7 +755,9 @@ fn handle_start_request(
             return Err(err);
         }
     };
-    if let Err(err) = assign_job_to_child(&job, &child) {
+    if let Err(err) =
+        assign_job_to_child(&job, &child).and_then(|_| resume_initial_thread(child.id()))
+    {
         let _ = terminate_job(&job);
         let _ = child.wait();
         return Err(err);
@@ -878,6 +880,7 @@ fn spawn_serve_child(spec: &SessionSpec, job_name: &str) -> Result<Child> {
     command.stdout(Stdio::null());
     command.stderr(Stdio::null());
     command.env("BATON_SERVICE_JOB", job_name);
+    command.creation_flags(CREATE_SUSPENDED);
     command
         .spawn()
         .map_err(|err| BatonError::Io(format!("could not spawn baton serve: {err}")))
