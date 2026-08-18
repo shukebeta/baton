@@ -67,7 +67,7 @@ and GitHub releases anchor over it.
 
 Consumers stay frozen by pinning a tag, and upgrade by re-pinning a newer tag
 deliberately. Pinning is the churn-control mechanism. [`CHANGELOG.md`](CHANGELOG.md)
-is the curated record of what each tag bump includes — read it before re-pinning.
+records what each tag bump includes — read it before re-pinning.
 
 The automated release calculation and its no-retagging baseline are documented
 in [docs/versioning.md](docs/versioning.md).

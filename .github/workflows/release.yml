@@ -42,5 +42,18 @@ jobs:
           cargo metadata --locked --no-deps --format-version 1 >/dev/null
           printf 'tag=%s\n' "${tag}" >> "${GITHUB_OUTPUT}"
 
+      # The changelog is its own commit layered on the tagged release commit, so
+      # its parent carries the tag and the single push below ships both. The
+      # [skip ci] suffix keeps that push from re-triggering this workflow and
+      # keeps the commit out of the next release's entries.
+      - name: Regenerate changelog
+        shell: bash
+        run: |
+          bash scripts/release.sh generate-changelog CHANGELOG.md
+          if ! git diff --quiet -- CHANGELOG.md; then
+            git add CHANGELOG.md
+            git commit -m "docs: regenerate changelog [skip ci]" >/dev/null
+          fi
+
       - name: Push release commit and tag
         run: git push origin "HEAD:${GITHUB_REF_NAME}" "refs/tags/${{ steps.release.outputs.tag }}"
