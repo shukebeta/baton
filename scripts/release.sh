@@ -43,12 +43,17 @@ release_is_valid_tag() {
 }
 
 release_tags_desc() {
-    local tag=""
+    local tag="" tag_list=""
+
+    # Enumerate before filtering so a failing `git tag` is reported rather than
+    # read as an empty list. Callers that generate a file from this list would
+    # otherwise mistake a broken lookup for a repository with no releases.
+    tag_list="$(git tag --merged HEAD --list 'v*' --sort=-version:refname)" || return 1
 
     while IFS= read -r tag; do
         release_is_valid_tag "${tag}" || continue
         printf '%s\n' "${tag}"
-    done < <(git tag --merged HEAD --list 'v*' --sort=-version:refname)
+    done <<< "${tag_list}"
 }
 
 release_latest_tag() {
@@ -437,6 +442,217 @@ release_create_tag() {
     printf '%s\n' "${next_tag}"
 }
 
+release_changelog_bucket_for_subject() {
+    local subject="${1:-}" type=""
+    type="$(release_commit_type_for_subject "${subject}")"
+
+    case "${type}" in
+        feat)
+            printf 'Features\n'
+            ;;
+        fix)
+            printf 'Fixes\n'
+            ;;
+        refactor)
+            printf 'Refactors\n'
+            ;;
+        perf)
+            printf 'Performance\n'
+            ;;
+        docs)
+            printf 'Docs\n'
+            ;;
+        *)
+            printf 'Other Changes\n'
+            ;;
+    esac
+}
+
+release_render_changelog_section() {
+    local title="${1:-}" body="${2:-}"
+
+    [[ -n "${body}" ]] || return 0
+    printf '### %s\n%s\n' "${title}" "${body}"
+}
+
+# Render the section bodies for one group of release tags sharing a date.
+# Buckets accumulate as newline-delimited scalars rather than arrays: a commit
+# subject is always exactly one `git log --format=%s` line, so nothing is lost,
+# and appending to a scalar needs none of the bash 4.3+ array handling the
+# oldest shell in the CI matrix would have to support.
+release_changelog_group_body() {
+    local previous_tag="${1:-}" first_tag="${2:-}" last_tag="${3:-}"
+    local subject="" log_output=""
+    local features="" fixes="" refactors="" performance="" docs="" other=""
+    local -a log_args=()
+
+    if [[ -n "${previous_tag}" ]]; then
+        log_args=("${previous_tag}..${first_tag}")
+    else
+        # Oldest group, so there is no lower bound to subtract but the group's
+        # own oldest tag. Excluding its parents with ^@ rather than ^ keeps a
+        # root commit in range: ^@ expands to nothing when there is no parent,
+        # where ^ would make git reject the range and silently empty the group.
+        log_args=("${first_tag}" --not "${last_tag}^@")
+    fi
+
+    # Collect first rather than reading straight from a process substitution:
+    # git's status is visible here, so a bad range fails the release job instead
+    # of silently rendering the group as empty.
+    log_output="$(git log --reverse --format=%s "${log_args[@]}")" || return 1
+
+    while IFS= read -r subject; do
+        [[ -n "${subject}" ]] || continue
+        case "${subject}" in
+            *'[skip ci]'*)
+                continue
+                ;;
+        esac
+        case "$(release_changelog_bucket_for_subject "${subject}")" in
+            Features)
+                features+="- ${subject}"$'\n'
+                ;;
+            Fixes)
+                fixes+="- ${subject}"$'\n'
+                ;;
+            Refactors)
+                refactors+="- ${subject}"$'\n'
+                ;;
+            Performance)
+                performance+="- ${subject}"$'\n'
+                ;;
+            Docs)
+                docs+="- ${subject}"$'\n'
+                ;;
+            *)
+                other+="- ${subject}"$'\n'
+                ;;
+        esac
+    done <<< "${log_output}"
+
+    release_render_changelog_section "Features" "${features}"
+    release_render_changelog_section "Fixes" "${fixes}"
+    release_render_changelog_section "Refactors" "${refactors}"
+    release_render_changelog_section "Performance" "${performance}"
+    release_render_changelog_section "Docs" "${docs}"
+    release_render_changelog_section "Other Changes" "${other}"
+}
+
+# Print one tag group, heading included, or nothing when the group has no
+# entries. The leading newline separates this group from whatever precedes it,
+# so the document never ends on a blank line.
+release_changelog_group() {
+    local previous_tag="${1:-}" first_tag="${2:-}" last_tag="${3:-}" release_date="${4:-}"
+    local body=""
+
+    body="$(release_changelog_group_body "${previous_tag}" "${first_tag}" "${last_tag}")" || return 1
+    [[ -n "${body}" ]] || return 0
+
+    if [[ "${first_tag}" == "${last_tag}" ]]; then
+        printf '\n## %s (%s)\n\n%s\n' "${first_tag}" "${release_date}" "${body}"
+    else
+        printf '\n## %s … %s (%s)\n\n%s\n' "${first_tag}" "${last_tag}" "${release_date}" "${body}"
+    fi
+}
+
+release_changelog_preamble() {
+    cat <<'EOF'
+# Changelog
+
+All notable changes to this project are recorded here.
+
+Baton is installed by pinning a git tag (see [README](README.md#install)), and
+stability is an explicit non-goal at 0.1.0 — breaking changes are expected
+between tags. This file records what a tag bump includes, so a consumer can
+decide whether to re-pin deliberately. Versions do **not** yet follow semantic
+versioning.
+
+_Generated from release tags with `bash scripts/release.sh generate-changelog`._
+EOF
+}
+
+# Walk the release tags newest-first, grouping consecutive tags that share a
+# committer date, and print the whole changelog document to stdout.
+release_changelog_document() {
+    local tag="" tag_date="" group_first="" group_last="" group_date="" any_tag=0
+    local tag_list=""
+
+    # Enumerate before rendering anything: reading straight from a process
+    # substitution would hide a failing tag lookup as an empty tag list, and an
+    # empty changelog would then replace a valid one.
+    tag_list="$(release_tags_desc)" || return 1
+
+    release_changelog_preamble
+
+    while IFS= read -r tag; do
+        [[ -n "${tag}" ]] || continue
+        tag_date="$(git log -1 --format=%cs "${tag}^{commit}")" || return 1
+
+        if [[ -n "${group_first}" && "${tag_date}" == "${group_date}" ]]; then
+            group_last="${tag}"
+            continue
+        fi
+        if [[ -n "${group_first}" ]]; then
+            release_changelog_group "${tag}" "${group_first}" "${group_last}" "${group_date}" \
+                || return 1
+        fi
+        any_tag=1
+        group_first="${tag}"
+        group_last="${tag}"
+        group_date="${tag_date}"
+    done <<< "${tag_list}"
+
+    if [[ -n "${group_first}" ]]; then
+        release_changelog_group "" "${group_first}" "${group_last}" "${group_date}" || return 1
+    fi
+
+    if (( any_tag == 0 )); then
+        printf '\nNo release tags yet.\n'
+    fi
+}
+
+release_generate_changelog() {
+    local output_path="${1:-CHANGELOG.md}" temporary_path=""
+
+    if [[ "${output_path}" == "-" ]]; then
+        release_changelog_document || return 1
+        return 0
+    fi
+
+    # Stage beside the target so the last step is a same-directory rename: the
+    # existing changelog is replaced in one operation and stays intact whenever
+    # any earlier step fails. This also rejects an unwritable or missing output
+    # directory before anything else runs.
+    temporary_path="$(mktemp "${output_path}.XXXXXX")" || return 1
+
+    # mktemp creates 0600, and a rename carries that mode onto a tracked file
+    # whose permissions git does not restore. Seeding the staging file from the
+    # target copies the mode already in effect; with no target yet, fall back to
+    # what a plain redirect would have created under the current umask.
+    if [[ -f "${output_path}" ]]; then
+        if ! cp -p -- "${output_path}" "${temporary_path}"; then
+            rm -f -- "${temporary_path}"
+            printf "release: cannot read existing changelog '%s'\n" "${output_path}" >&2
+            return 1
+        fi
+    elif ! chmod "$(printf '%o' "$(( 0666 & ~0$(umask) ))")" "${temporary_path}"; then
+        rm -f -- "${temporary_path}"
+        return 1
+    fi
+
+    if ! release_changelog_document >"${temporary_path}"; then
+        rm -f -- "${temporary_path}"
+        printf "release: failed to generate changelog for '%s'\n" "${output_path}" >&2
+        return 1
+    fi
+
+    if ! mv -- "${temporary_path}" "${output_path}"; then
+        rm -f -- "${temporary_path}"
+        printf "release: failed to replace changelog '%s'\n" "${output_path}" >&2
+        return 1
+    fi
+}
+
 release_usage() {
     cat >&2 <<'EOF'
 usage:
@@ -446,6 +662,7 @@ usage:
   scripts/release.sh manifest-version [path]
   scripts/release.sh lockfile-version [path]
   scripts/release.sh verify-docs [manifest] [lockfile] [README]
+  scripts/release.sh generate-changelog [output-path]
 EOF
 }
 
@@ -471,6 +688,9 @@ release_main() {
             ;;
         verify-docs)
             release_verify_docs "${1:-Cargo.toml}" "${2:-Cargo.lock}" "${3:-README.md}"
+            ;;
+        generate-changelog)
+            release_generate_changelog "${1:-CHANGELOG.md}"
             ;;
         *)
             release_usage

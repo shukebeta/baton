@@ -241,6 +241,265 @@ test_patch_release_updates_manifest_lock_and_matching_tag() (
         "patch lockfile matches tag"
 )
 
+# Commit and tag with pinned dates so the changelog's date grouping is
+# deterministic regardless of when or where the suite runs.
+changelog_commit() {
+    local repo="${1}" date="${2}" subject="${3}"
+
+    printf '%s\n' "${subject}" >>"${repo}/log.txt"
+    git -C "${repo}" add log.txt
+    GIT_AUTHOR_DATE="${date}T12:00:00+0000" GIT_COMMITTER_DATE="${date}T12:00:00+0000" \
+        git -C "${repo}" commit -q -m "${subject}"
+}
+
+changelog_tag() {
+    local repo="${1}" date="${2}" tag="${3}"
+
+    GIT_COMMITTER_DATE="${date}T12:00:00+0000" git -C "${repo}" tag -f "${tag}" >/dev/null
+}
+
+# Baseline v0.1.0, then a 2026-02-01 day carrying v0.2.0 and v0.2.1 with one
+# commit per bucket (committed out of bucket order on purpose), then a lone
+# v0.2.2 on 2026-03-05.
+make_changelog_fixture() {
+    local repo="${1}"
+
+    make_fixture "${repo}"
+    # make_fixture commits at wall-clock time; re-stamp the baseline so no group
+    # date in this fixture depends on the current date.
+    GIT_AUTHOR_DATE="2026-01-01T12:00:00+0000" GIT_COMMITTER_DATE="2026-01-01T12:00:00+0000" \
+        git -C "${repo}" commit -q --amend --no-edit --date="2026-01-01T12:00:00+0000"
+    changelog_tag "${repo}" 2026-01-01 v0.1.0
+
+    changelog_commit "${repo}" 2026-02-01 "docs: describe the first feature"
+    changelog_commit "${repo}" 2026-02-01 "feat: add the first feature"
+    changelog_commit "${repo}" 2026-02-01 "feat: add the second feature"
+    changelog_commit "${repo}" 2026-02-01 "chore(release): v0.2.0 [skip ci]"
+    changelog_tag "${repo}" 2026-02-01 v0.2.0
+    changelog_commit "${repo}" 2026-02-01 "unconventional subject line"
+    changelog_commit "${repo}" 2026-02-01 "perf: speed up the first feature"
+    changelog_commit "${repo}" 2026-02-01 "fix: correct the first feature"
+    changelog_commit "${repo}" 2026-02-01 "refactor: tidy the first feature"
+    changelog_commit "${repo}" 2026-02-01 "docs: regenerate changelog [skip ci]"
+    changelog_tag "${repo}" 2026-02-01 v0.2.1
+
+    changelog_commit "${repo}" 2026-03-05 "fix: adjust after the release"
+    changelog_tag "${repo}" 2026-03-05 v0.2.2
+}
+
+test_generate_changelog_headings_and_tag_grouping() (
+    set -euo pipefail
+    local repo generated
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    make_changelog_fixture "${repo}"
+
+    generated="$(cd "${repo}" && release_generate_changelog -)"
+
+    assert_eq "_Generated from release tags with \`bash scripts/release.sh generate-changelog\`._" \
+        "$(printf '%s\n' "${generated}" | grep -F 'Generated from release tags')" \
+        "generated-from-tags header"
+
+    # Newest-first; same-day tags collapse into one newest-to-oldest heading,
+    # and the oldest tag stands alone even though it is a root commit.
+    assert_eq "## v0.2.2 (2026-03-05)
+## v0.2.1 … v0.2.0 (2026-02-01)
+## v0.1.0 (2026-01-01)" \
+        "$(printf '%s\n' "${generated}" | grep '^## ')" \
+        "tag group headings"
+)
+
+test_generate_changelog_bucket_order_and_skip_ci_filtering() (
+    set -euo pipefail
+    local repo generated group
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    make_changelog_fixture "${repo}"
+
+    generated="$(cd "${repo}" && release_generate_changelog -)"
+    group="$(printf '%s\n' "${generated}" | sed -n '/^## v0.2.1 /,/^## v0.1.0 /p')"
+
+    # Rendered in the fixed order, not the order the commits landed in.
+    assert_eq "### Features
+### Fixes
+### Refactors
+### Performance
+### Docs
+### Other Changes" \
+        "$(printf '%s\n' "${group}" | grep '^### ')" \
+        "fixed section order within a group"
+
+    assert_eq "- feat: add the first feature
+- feat: add the second feature" \
+        "$(printf '%s\n' "${group}" | sed -n '/^### Features$/,/^$/p' | grep '^- ')" \
+        "feature entries in commit order"
+    assert_eq "- unconventional subject line" \
+        "$(printf '%s\n' "${group}" | sed -n '/^### Other Changes$/,/^$/p' | grep '^- ')" \
+        "non-conventional subject falls into Other Changes"
+
+    assert_eq "" "$(printf '%s\n' "${generated}" | grep -F '[skip ci]' || true)" \
+        "release and changelog commits never appear as entries"
+
+    # The lone-tag group has only the one bucket its single commit belongs to.
+    assert_eq "### Fixes" \
+        "$(printf '%s\n' "${generated}" | sed -n '/^## v0.2.2 /,/^## v0.2.1 /p' | grep '^### ')" \
+        "empty sections are omitted"
+)
+
+test_generate_changelog_writes_file_idempotently() (
+    set -euo pipefail
+    local repo generated
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    make_changelog_fixture "${repo}"
+
+    generated="$(cd "${repo}" && release_generate_changelog -)"
+    ( cd "${repo}" && release_generate_changelog CHANGELOG.md )
+    assert_eq "${generated}" "$(cat "${repo}/CHANGELOG.md")" \
+        "file output matches stdout output"
+
+    ( cd "${repo}" && release_generate_changelog CHANGELOG.md )
+    assert_eq "${generated}" "$(cat "${repo}/CHANGELOG.md")" \
+        "a second run leaves the file unchanged"
+
+    # A failed generation must not truncate the existing file.
+    printf 'sentinel\n' >"${repo}/CHANGELOG.md"
+    status=0
+    (
+        cd "${repo}"
+        # shellcheck disable=SC2329  # invoked indirectly by the helper below
+        release_changelog_document() { return 1; }
+        release_generate_changelog CHANGELOG.md
+    ) >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+    assert_eq "sentinel" "$(cat "${repo}/CHANGELOG.md")" \
+        "a failed run leaves the existing changelog intact"
+    assert_eq "" "$(cd "${repo}" && find . -maxdepth 1 -name 'CHANGELOG.md.*' -print)" \
+        "a failed run leaves no staging file behind"
+)
+
+# Make `git tag` fail while every other git subcommand keeps working, so a
+# caller can distinguish an unreadable tag list from a tag-less repository.
+# Defining it as a shell function shadows the real binary for release.sh, which
+# keeps this portable to the Windows leg of the matrix.
+fail_git_tag() {
+    # shellcheck disable=SC2329  # invoked indirectly, through release.sh
+    git() {
+        case "${1:-}" in
+            tag)
+                return 1
+                ;;
+        esac
+        command git "$@"
+    }
+}
+
+# The final replacement is the only step that can touch the target, so each way
+# it can fail must leave the previous changelog readable and unchanged.
+test_generate_changelog_failures_preserve_the_existing_file() (
+    set -euo pipefail
+    local repo status
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    make_changelog_fixture "${repo}"
+    printf 'sentinel\n' >"${repo}/CHANGELOG.md"
+
+    # Failure of the rename itself, i.e. after the content is fully generated.
+    status=0
+    (
+        cd "${repo}"
+        # shellcheck disable=SC2329  # shadows the external mv for release.sh
+        mv() { return 1; }
+        release_generate_changelog CHANGELOG.md
+    ) >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+    assert_eq "sentinel" "$(cat "${repo}/CHANGELOG.md")" \
+        "a failed replacement leaves the existing changelog intact"
+    assert_eq "" "$(cd "${repo}" && find . -maxdepth 1 -name 'CHANGELOG.md.*' -print)" \
+        "a failed replacement leaves no staging file behind"
+
+    # A broken tag lookup must not render an empty changelog over a valid one.
+    status=0
+    (
+        cd "${repo}"
+        # shellcheck disable=SC2329  # invoked indirectly by the helper below
+        release_tags_desc() { return 1; }
+        release_generate_changelog CHANGELOG.md
+    ) >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+    assert_eq "sentinel" "$(cat "${repo}/CHANGELOG.md")" \
+        "a failed tag lookup leaves the existing changelog intact"
+
+    # The same must hold when `git tag` itself is what fails, rather than the
+    # enumeration helper: an unreadable tag list is not a tag-less repository.
+    status=0
+    (
+        cd "${repo}"
+        fail_git_tag
+        release_tags_desc
+    ) >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+    status=0
+    (
+        cd "${repo}"
+        fail_git_tag
+        release_generate_changelog CHANGELOG.md
+    ) >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+    assert_eq "sentinel" "$(cat "${repo}/CHANGELOG.md")" \
+        "a failing git tag leaves the existing changelog intact"
+    assert_eq "" "$(cd "${repo}" && find . -maxdepth 1 -name 'CHANGELOG.md.*' -print)" \
+        "a failing git tag leaves no staging file behind"
+
+    # A missing target directory is refused before anything is staged.
+    status=0
+    (cd "${repo}" && release_generate_changelog no/such/dir/CHANGELOG.md) >/dev/null 2>&1 \
+        || status="$?"
+    assert_rc_nonzero "${status}"
+)
+
+test_generate_changelog_covers_a_root_commit_in_a_multi_tag_group() (
+    set -euo pipefail
+    local repo generated
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    make_fixture "${repo}"
+    # The baseline is the root commit; putting a second tag on the same date
+    # makes the oldest group span down to a commit with no parent.
+    GIT_AUTHOR_DATE="2026-01-01T12:00:00+0000" GIT_COMMITTER_DATE="2026-01-01T12:00:00+0000" \
+        git -C "${repo}" commit -q --amend --no-edit --date="2026-01-01T12:00:00+0000"
+    changelog_tag "${repo}" 2026-01-01 v0.1.0
+    changelog_commit "${repo}" 2026-01-01 "fix: repair the baseline"
+    changelog_tag "${repo}" 2026-01-01 v0.1.1
+
+    generated="$(cd "${repo}" && release_generate_changelog -)"
+
+    assert_eq "## v0.1.1 … v0.1.0 (2026-01-01)" \
+        "$(printf '%s\n' "${generated}" | grep '^## ')" \
+        "root-commit group heading"
+    assert_eq "- chore: release baseline" \
+        "$(printf '%s\n' "${generated}" | sed -n '/^### Other Changes$/,/^$/p' | grep '^- ')" \
+        "the root commit is still listed"
+    assert_eq "- fix: repair the baseline" \
+        "$(printf '%s\n' "${generated}" | sed -n '/^### Fixes$/,/^$/p' | grep '^- ')" \
+        "the non-root commit is still listed"
+)
+
+test_generate_changelog_without_release_tags() (
+    set -euo pipefail
+    local repo
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    git -C "${repo}" init -q
+    git -C "${repo}" config user.email "release-test@baton.local"
+    git -C "${repo}" config user.name "baton release test"
+    changelog_commit "${repo}" 2026-01-01 "feat: untagged work"
+
+    assert_eq "No release tags yet." \
+        "$(cd "${repo}" && release_generate_changelog - | grep -F 'No release tags')" \
+        "untagged repository renders the empty-changelog notice"
+)
+
 tests=(
     test_next_version_baseline_and_empty_repo
     test_next_version_mid_range_and_boundaries
@@ -252,6 +511,12 @@ tests=(
     test_unreachable_higher_tag_is_ignored
     test_release_updates_manifest_lock_and_matching_tag
     test_patch_release_updates_manifest_lock_and_matching_tag
+    test_generate_changelog_headings_and_tag_grouping
+    test_generate_changelog_bucket_order_and_skip_ci_filtering
+    test_generate_changelog_writes_file_idempotently
+    test_generate_changelog_covers_a_root_commit_in_a_multi_tag_group
+    test_generate_changelog_failures_preserve_the_existing_file
+    test_generate_changelog_without_release_tags
 )
 
 for test_name in "${tests[@]}"; do
