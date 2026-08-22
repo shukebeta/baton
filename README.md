@@ -8,7 +8,7 @@ center of the design.
 
 ## Status
 
-The current blessed release is `v0.3.0`.
+The current blessed release is `v0.3.1`.
 
 Early scaffolding. The crate establishes the module layout and typed runtime
 shape around a non-streaming Claude-compatible Messages client
@@ -76,7 +76,7 @@ global flags need no Baton configuration or provider credentials.
 Install the `baton` binary from a pinned git tag with a Rust toolchain (≥ 1.89):
 
 ```bash
-cargo install --git https://github.com/shukebeta/baton --tag v0.3.0 --locked
+cargo install --git https://github.com/shukebeta/baton --tag v0.3.1 --locked
 ```
 
 This puts `baton` on your PATH — the form a consumer that invokes baton as a
