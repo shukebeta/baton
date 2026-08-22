@@ -10,6 +10,14 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
+## v0.3.1 (2026-08-22)
+
+### Features
+- feat(release): generate CHANGELOG.md from release tags (#174)
+
+### Docs
+- docs: split README into a landing page plus docs/ topic pages (#177)
+
 ## v0.3.0 (2026-08-10)
 
 ### Features
