@@ -61,6 +61,31 @@ still pushes branch and tag together in its single `git push`. Generation is
 idempotent, so a run whose changelog is already current produces no diff and
 therefore no commit.
 
+## Published binaries
+
+The same workflow run builds and publishes a GitHub Release after the tag job
+finishes. The build matrix uses native GitHub-hosted runners for these targets:
+
+    x86_64-unknown-linux-gnu
+    aarch64-unknown-linux-gnu
+    x86_64-apple-darwin
+    aarch64-apple-darwin
+    x86_64-pc-windows-msvc
+
+Every build runs `cargo build --locked --release`. The resulting archive names
+are `baton-<version>-<target>.tar.gz` for Unix targets and
+`baton-<version>-<target>.zip` for Windows. Each archive contains one binary at
+its root. The published `SHA256SUMS` asset covers all five archives, so a
+consumer can construct the download URL from a version and target without an
+API query.
+
+The publish job depends on every matrix build and stages the release as a draft
+until all archive uploads succeed; only then is the release made public. Its
+notes come from `bash scripts/release.sh generate-release-notes <tag>`, which
+renders commits after the previous reachable tag. This is intentional: the
+workflow adds the generated `CHANGELOG.md` in a commit after the tag, so reading
+the tagged tree alone would otherwise return the previous release's changelog.
+
 ## Baseline and no-retag boundary
 
 v0.1.0 is the historical baseline. The next feature release from it is v0.2.0;
@@ -71,4 +96,5 @@ changing the manifest, lockfile, or commit history.
 Release tests cover the baseline boundary, mid-range and carry calculations,
 invalid tags and bump kinds, conventional-commit classification, the
 manifest/lockfile/tag consistency contract, and changelog generation (date
-grouping, bucket order, `[skip ci]` filtering, and idempotency).
+grouping, bucket order, `[skip ci]` filtering, idempotency, and single-tag
+release-note rendering).

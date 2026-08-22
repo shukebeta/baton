@@ -15,6 +15,8 @@ jobs:
   tag:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,18 +44,194 @@ jobs:
           cargo metadata --locked --no-deps --format-version 1 >/dev/null
           printf 'tag=%s\n' "${tag}" >> "${GITHUB_OUTPUT}"
 
-      # The changelog is its own commit layered on the tagged release commit, so
-      # its parent carries the tag and the single push below ships both. The
-      # [skip ci] suffix keeps that push from re-triggering this workflow and
-      # keeps the commit out of the next release's entries.
-      - name: Regenerate changelog
+      # The changelog is its own commit layered on the tagged release commit,
+      # so its parent carries the tag and the single push below ships both.
+      # [skip ci] keeps that push from re-triggering this workflow and keeps the
+      # commit out of the next release's entries.
+      - name: Regenerate changelog and release notes
         shell: bash
         run: |
+          tag="${{ steps.release.outputs.tag }}"
           bash scripts/release.sh generate-changelog CHANGELOG.md
+          bash scripts/release.sh generate-release-notes "${tag}" > release-notes.md
           if ! git diff --quiet -- CHANGELOG.md; then
             git add CHANGELOG.md
             git commit -m "docs: regenerate changelog [skip ci]" >/dev/null
           fi
 
+      - name: Upload release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+
       - name: Push release commit and tag
         run: git push origin "HEAD:${GITHUB_REF_NAME}" "refs/tags/${{ steps.release.outputs.tag }}"
+
+  build:
+    needs: tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      RELEASE_TAG: ${{ needs.tag.outputs.tag }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.tag.outputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build locked release binary
+        shell: bash
+        run: cargo build --locked --release --target "${TARGET}"
+
+      - name: Verify binary version
+        shell: bash
+        run: |
+          version="${RELEASE_TAG#v}"
+          binary="target/${TARGET}/release/baton"
+          if [[ "${TARGET}" == *-windows-* ]]; then
+            binary="${binary}.exe"
+          fi
+          test "$("./${binary}" --version)" = "baton ${version}"
+
+      - name: Archive Unix binary
+        if: ${{ matrix.archive == 'tar.gz' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          archive="baton-${version}-${TARGET}.tar.gz"
+          staging="$(mktemp -d)"
+          trap 'rm -rf "${staging}"' EXIT
+          cp "target/${TARGET}/release/baton" "${staging}/baton"
+          tar -C "${staging}" -czf "${archive}" baton
+
+      - name: Archive Windows binary
+        if: ${{ matrix.archive == 'zip' }}
+        shell: pwsh
+        run: |
+          $version = $env:RELEASE_TAG.Substring(1)
+          $archive = "baton-$version-$($env:TARGET).zip"
+          $staging = Join-Path $env:RUNNER_TEMP "baton-archive-$($env:TARGET)"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item "target/$($env:TARGET)/release/baton.exe" (Join-Path $staging "baton.exe")
+          Compress-Archive -LiteralPath (Join-Path $staging "baton.exe") -DestinationPath $archive -Force
+
+      - name: Upload target archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: baton-${{ matrix.target }}
+          path: baton-*-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+  publish:
+    needs: [tag, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RELEASE_TAG: ${{ needs.tag.outputs.tag }}
+    steps:
+      - name: Download release notes
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes
+
+      - name: Download target archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: baton-*
+          path: dist
+          merge-multiple: true
+
+      - name: Validate archives and create checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          assets=(
+            "baton-${version}-x86_64-unknown-linux-gnu.tar.gz"
+            "baton-${version}-aarch64-unknown-linux-gnu.tar.gz"
+            "baton-${version}-x86_64-apple-darwin.tar.gz"
+            "baton-${version}-aarch64-apple-darwin.tar.gz"
+            "baton-${version}-x86_64-pc-windows-msvc.zip"
+          )
+
+          for asset in "${assets[@]}"; do
+            test -f "dist/${asset}"
+            case "${asset}" in
+              *.tar.gz)
+                test "$(tar -tzf "dist/${asset}")" = "baton"
+                ;;
+              *.zip)
+                test "$(unzip -Z1 "dist/${asset}")" = "baton.exe"
+                ;;
+            esac
+          done
+
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq "${#assets[@]}"
+          (
+            cd dist
+            sha256sum "${assets[@]}"
+          ) > SHA256SUMS
+          (
+            cd dist
+            sha256sum --check ../SHA256SUMS
+          )
+
+      - name: Stage and publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          assets=(
+            "baton-${version}-x86_64-unknown-linux-gnu.tar.gz"
+            "baton-${version}-aarch64-unknown-linux-gnu.tar.gz"
+            "baton-${version}-x86_64-apple-darwin.tar.gz"
+            "baton-${version}-aarch64-apple-darwin.tar.gz"
+            "baton-${version}-x86_64-pc-windows-msvc.zip"
+          )
+          upload_paths=(SHA256SUMS)
+          for asset in "${assets[@]}"; do
+            upload_paths+=("dist/${asset}")
+          done
+
+          # Keep the release draft until every asset upload succeeds; a failed
+          # upload therefore cannot expose an incomplete release to consumers.
+          gh release create "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --draft \
+            --title "Baton ${RELEASE_TAG}" \
+            --notes-file release-notes/release-notes.md \
+            "${upload_paths[@]}"
+          gh release edit "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false

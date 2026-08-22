@@ -485,6 +485,33 @@ test_generate_changelog_covers_a_root_commit_in_a_multi_tag_group() (
         "the non-root commit is still listed"
 )
 
+test_generate_release_notes_for_one_tag() (
+    set -euo pipefail
+    local repo generated
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    make_changelog_fixture "${repo}"
+
+    # v0.2.1 is not HEAD, proving that notes use the requested tag's reachable
+    # history rather than the later changelog/tag history at HEAD.
+    generated="$(cd "${repo}" && release_generate_release_notes v0.2.1)"
+    assert_eq "## v0.2.1 (2026-02-01)" \
+        "$(printf '%s\n' "${generated}" | grep '^## ')" \
+        "single-tag release-notes heading"
+    assert_eq "- fix: correct the first feature
+- refactor: tidy the first feature
+- perf: speed up the first feature
+- unconventional subject line" \
+        "$(printf '%s\n' "${generated}" | grep '^- ')" \
+        "single-tag release entries"
+    assert_eq "" \
+        "$(printf '%s\n' "${generated}" | grep -F 'fix: adjust after the release' || true)" \
+        "later tag entries stay out of release notes"
+    assert_eq "" \
+        "$(printf '%s\n' "${generated}" | grep -F '[skip ci]' || true)" \
+        "skip-ci entries stay out of release notes"
+)
+
 test_generate_changelog_without_release_tags() (
     set -euo pipefail
     local repo
@@ -515,6 +542,7 @@ tests=(
     test_generate_changelog_bucket_order_and_skip_ci_filtering
     test_generate_changelog_writes_file_idempotently
     test_generate_changelog_covers_a_root_commit_in_a_multi_tag_group
+    test_generate_release_notes_for_one_tag
     test_generate_changelog_failures_preserve_the_existing_file
     test_generate_changelog_without_release_tags
 )
