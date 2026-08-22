@@ -1,6 +1,6 @@
 # Baton architecture & onboarding
 
-This is the conceptual map the [`README.md`](../README.md) reference does not
+This is the conceptual map the CLI reference pages do not
 give: what Baton is, the two ways a participant can answer a message, how the
 crate is laid out, and how each CLI verb maps to the agent-to-agent (A2A) model.
 It is written to stand on its own — you do not need to have read the source to
@@ -51,8 +51,8 @@ stdin delivery, output capture). Cross-round memory is the agent's job,
 reconstructed from durable artifacts (the shared git branch/worktree, the issue
 thread, prior mailbox history) — headless-per-message, no in-memory session.
 
-Wired at the CLI by `baton serve --agent-cmd` (see [README
-§External-agent role](../README.md#external-agent-role---agent-cmd)).
+Wired at the CLI by `baton serve --agent-cmd` (see
+[external-agent.md](external-agent.md#external-agent-role---agent-cmd)).
 
 ### Phase 2 — local path (`LocalParticipant` + `Transport`)
 
@@ -97,9 +97,10 @@ concern:
 
 ## CLI verb → A2A model map
 
-Each verb is a projection of the A2A model onto the command line. The
-[README](../README.md) documents each verb's flags in full; this is the map from
-verb to concept.
+Each verb is a projection of the A2A model onto the command line.
+[conversations.md](conversations.md), [mailbox.md](mailbox.md), and
+[external-agent.md](external-agent.md) document each verb's flags in full; this
+is the map from verb to concept.
 
 | Verb | A2A concept |
 |---|---|
@@ -115,7 +116,7 @@ verb to concept.
 
 ## For contributors
 
-A companion to the README's `## Development` section — where the code lives when
+A companion to [development.md](development.md) — where the code lives when
 you go to change it:
 
 - **Adding a way to answer a message** → `src/participant.rs`. Implement

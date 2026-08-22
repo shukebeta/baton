@@ -4,7 +4,8 @@ This is the authoritative reference for Baton's versioned **wire contracts** —
 the schemas other tools serialize against. Each is version-suffixed and changes
 under compatibility pressure, independent of CLI ergonomics; a consumer
 implementing against them should not have to read the getting-started
-walkthrough in [`README.md`](../README.md) to find a field. It is written to
+walkthrough in [`README.md`](../README.md) or the CLI reference pages to find a
+field. It is written to
 stand on its own.
 
 Two schemas and their trail:
