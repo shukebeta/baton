@@ -73,19 +73,50 @@ global flags need no Baton configuration or provider credentials.
 
 ## Install
 
-Install the `baton` binary from a pinned git tag with a Rust toolchain (≥ 1.89):
+The primary install path is a prebuilt, checksummed archive from the current
+blessed release. Release assets use this constructible pattern:
+
+```text
+https://github.com/shukebeta/baton/releases/download/v<version>/baton-<version>-<target>.<archive>
+```
+
+Supported targets are `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+`x86_64-apple-darwin`, `aarch64-apple-darwin`, and
+`x86_64-pc-windows-msvc`. Set `<version>` to the release shown in the Status
+section and choose `.tar.gz` for Unix targets or `.zip` for Windows. Each
+archive contains only `baton` (or `baton.exe`) at its root.
+
+For example, from a shell with `curl`, `sha256sum`, and the appropriate archive
+tool available:
+
+```bash
+version="<version>"
+target="<target>"
+archive="baton-${version}-${target}.tar.gz" # use .zip for Windows
+base_url="https://github.com/shukebeta/baton/releases/download/v${version}"
+
+curl --fail --location --remote-name "${base_url}/${archive}"
+curl --fail --location --remote-name "${base_url}/SHA256SUMS"
+grep -F "  ${archive}" SHA256SUMS | sha256sum --check -
+tar -xzf "${archive}" # use unzip for the Windows .zip
+```
+
+Put the extracted executable on your `PATH`. On macOS, use
+`shasum -a 256` in place of `sha256sum` when checking the selected checksum.
+
+If a Rust toolchain (≥ 1.89) is available, the from-source alternative is:
 
 ```bash
 cargo install --git https://github.com/shukebeta/baton --tag v0.3.1 --locked
 ```
 
-This puts `baton` on your PATH — the form a consumer that invokes baton as a
-binary uses. The `--locked` flag is **required**: without it `cargo install
---git` ignores the tracked `Cargo.lock` and resolves fresh dependency versions,
-losing the reproducibility the lockfile exists to guarantee. `--tag <tag>` pins
-the build to a blessed commit; `cargo install --git … --rev <sha> --locked` pins
-just as immutably if you prefer a raw SHA — the tag is the human-memorable name
-and GitHub releases anchor over it.
+This puts `baton` on your PATH. The `--locked` flag is **required**: without it
+`cargo install --git` ignores the tracked `Cargo.lock` and resolves fresh
+dependency versions, losing the reproducibility the lockfile exists to
+guarantee. `--tag <tag>` pins the build to a blessed commit;
+`cargo install --git … --rev <sha> --locked` pins just as immutably if you prefer
+a raw SHA — the tag is the human-memorable name and GitHub releases anchor over
+it.
 
 Consumers stay frozen by pinning a tag, and upgrade by re-pinning a newer tag
 deliberately. Pinning is the churn-control mechanism. [`CHANGELOG.md`](CHANGELOG.md)
@@ -155,4 +186,3 @@ baton serve --inbox /tmp/mbox/inbox --outbox /tmp/mbox/outbox
 baton send --inbox /tmp/mbox/inbox --outbox /tmp/mbox/outbox \
   --await --body "Ping over the mailbox."
 ```
-
