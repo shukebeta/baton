@@ -555,6 +555,48 @@ release_changelog_group() {
     fi
 }
 
+# Find the newest valid release tag older than the requested tag. The tag's
+# own commit is used as the reachability boundary so the result is stable
+# while the release workflow has a post-tag changelog commit at HEAD.
+release_previous_tag() {
+    local target_tag="${1:-}" tag="" tag_list=""
+
+    release_validate_tag "${target_tag}" || return 1
+    if ! git rev-parse --verify --quiet "${target_tag}^{commit}" >/dev/null; then
+        printf "release: tag '%s' is not present\n" "${target_tag}" >&2
+        return 1
+    fi
+
+    tag_list="$(git tag --merged "${target_tag}^{commit}" --list 'v*' --sort=-version:refname)" \
+        || return 1
+    while IFS= read -r tag; do
+        release_is_valid_tag "${tag}" || continue
+        [[ "${tag}" == "${target_tag}" ]] && continue
+        printf '%s\n' "${tag}"
+        return 0
+    done <<< "${tag_list}"
+}
+
+# Render the notes for exactly one tag. This deliberately does not read
+# CHANGELOG.md: the release workflow tags the release commit first and adds
+# the generated changelog in a later commit, while the notes must describe the
+# tagged commit's entries.
+release_generate_release_notes() {
+    local tag="${1:-}" previous_tag="" release_date="" body=""
+
+    release_validate_tag "${tag}" || return 1
+    previous_tag="$(release_previous_tag "${tag}")" || return 1
+    release_date="$(git log -1 --format=%cs "${tag}^{commit}")" || return 1
+    body="$(release_changelog_group_body "${previous_tag}" "${tag}" "${tag}")" || return 1
+
+    printf '## %s (%s)\n\n' "${tag}" "${release_date}"
+    if [[ -n "${body}" ]]; then
+        printf '%s\n' "${body}"
+    else
+        printf 'No notable changes.\n'
+    fi
+}
+
 release_changelog_preamble() {
     cat <<'EOF'
 # Changelog
@@ -663,6 +705,7 @@ usage:
   scripts/release.sh lockfile-version [path]
   scripts/release.sh verify-docs [manifest] [lockfile] [README]
   scripts/release.sh generate-changelog [output-path]
+  scripts/release.sh generate-release-notes <tag>
 EOF
 }
 
@@ -691,6 +734,9 @@ release_main() {
             ;;
         generate-changelog)
             release_generate_changelog "${1:-CHANGELOG.md}"
+            ;;
+        generate-release-notes)
+            release_generate_release_notes "${1:-}"
             ;;
         *)
             release_usage
