@@ -10,10 +10,13 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.3.3 (2026-08-23)
+## v0.3.4 … v0.3.3 (2026-08-23)
 
 ### Fixes
 - fix: use supported Intel macOS runner for releases (#179)
+
+### Other Changes
+- ci: migrate actions to Node 24 (#180)
 
 ## v0.3.2 … v0.3.1 (2026-08-22)
 
