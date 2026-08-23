@@ -18,7 +18,7 @@ jobs:
     outputs:
       tag: ${{ steps.release.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -60,7 +60,7 @@ jobs:
           fi
 
       - name: Upload release notes
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: release-notes
           path: release-notes.md
@@ -96,7 +96,7 @@ jobs:
       RELEASE_TAG: ${{ needs.tag.outputs.tag }}
       TARGET: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.tag.outputs.tag }}
 
@@ -143,7 +143,7 @@ jobs:
           Compress-Archive -LiteralPath (Join-Path $staging "baton.exe") -DestinationPath $archive -Force
 
       - name: Upload target archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: baton-${{ matrix.target }}
           path: baton-*-${{ matrix.target }}.${{ matrix.archive }}
@@ -157,13 +157,13 @@ jobs:
       RELEASE_TAG: ${{ needs.tag.outputs.tag }}
     steps:
       - name: Download release notes
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: release-notes
           path: release-notes
 
       - name: Download target archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: baton-*
           path: dist
