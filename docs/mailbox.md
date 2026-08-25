@@ -112,6 +112,27 @@ second `serve` is refused until the first exits.
 The client side of this mailbox — posting a request and reading the correlated
 reply — is [`baton send`](#posting-to-a-mailbox-baton-send).
 
+### Agent stderr capture (`--agent-cmd` only)
+
+When `serve` runs an external agent (`--agent-cmd`), the agent's stderr is
+captured on every turn — success and failure alike — and persisted to:
+
+```
+<inbox>/agent-stderr/<message-id>.stderr
+```
+
+This mirrors the per-task `<control>/task-logs/<task-id>/stderr.log` convention
+established by `baton task start` (see [Service § Task
+logs](service.md#task-lifecycle)). The directory is created on the first write.
+
+Stderr is capped at **1 MiB** per turn; output beyond the cap is discarded and a
+`[truncated at 1 MiB]` marker is appended. The persist is best-effort: a write
+failure (disk full, permissions) does not turn a successful agent turn into an
+error.
+
+On a **failed** turn (non-zero exit), stderr is additionally inlined into the
+`BatonError::Transport` error message, as before.
+
 ## Posting to a mailbox (`baton send`)
 
 `baton send` is the producer for a mailbox: it drops a `baton.message/v1` request

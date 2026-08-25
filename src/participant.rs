@@ -15,7 +15,7 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -199,7 +199,7 @@ impl SubprocessParticipant {
             BatonError::Io(format!("could not serialize request envelope: {err}"))
         })?;
 
-        let stdout = capture_child_stdout(
+        let (stdout, _stderr) = capture_child_output(
             &self.program,
             &self.args,
             &self.envs,
@@ -395,6 +395,9 @@ pub struct ExternalAgentParticipant {
     /// error. Should be *generous*: a headless agent run is many tool calls, not
     /// one provider turn.
     read_timeout: Duration,
+    /// When set, non-empty stderr from successful turns is persisted as
+    /// `<stderr_dir>/<message-id>.stderr`. `None` is a strict no-op.
+    stderr_dir: Option<PathBuf>,
 }
 
 /// Isolates the agent's final *result* from its raw stdout.
@@ -475,7 +478,16 @@ impl ExternalAgentParticipant {
             cwd: cwd.into(),
             output,
             read_timeout,
+            stderr_dir: None,
         }
+    }
+
+    /// Sets the directory where non-empty stderr from successful turns is
+    /// persisted as `<dir>/<message-id>.stderr`. The directory is created on
+    /// first write.
+    pub fn with_stderr_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.stderr_dir = Some(dir.into());
+        self
     }
 
     /// Runs one headless agent turn, returning the reply body (the agent's final
@@ -485,7 +497,7 @@ impl ExternalAgentParticipant {
     /// [`Participant::respond`] reconciles that `Err` into a delivered error
     /// envelope.
     fn try_respond(&self, request: &MessageEnvelope) -> Result<String> {
-        let stdout = capture_child_stdout(
+        let (stdout, stderr) = capture_child_output(
             &self.program,
             &self.args,
             &self.envs,
@@ -493,6 +505,8 @@ impl ExternalAgentParticipant {
             request.body.as_bytes(),
             self.read_timeout,
         )?;
+
+        self.persist_stderr(&request.message_id, &stderr);
 
         if stdout.trim().is_empty() {
             return Err(BatonError::Decode(
@@ -506,6 +520,24 @@ impl ExternalAgentParticipant {
             ));
         }
         Ok(body)
+    }
+
+    /// Best-effort persist of agent stderr. A failed write must not turn a
+    /// successful agent turn into an error.
+    fn persist_stderr(&self, message_id: &str, stderr: &str) {
+        if stderr.trim().is_empty() {
+            return;
+        }
+        let Some(dir) = &self.stderr_dir else { return };
+        if let Err(_) = std::fs::create_dir_all(dir) {
+            return;
+        }
+        let safe_id: String = message_id
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        let path = dir.join(format!("{safe_id}.stderr"));
+        let _ = std::fs::write(&path, stderr.as_bytes());
     }
 }
 
@@ -531,25 +563,33 @@ impl Participant for ExternalAgentParticipant {
     }
 }
 
+/// Maximum bytes retained from a child's stderr. Beyond this the buffer is
+/// truncated and a marker appended so the reader knows output was lost.
+const MAX_STDERR_BYTES: usize = 1024 * 1024;
+
 /// Spawns `program` with `args`/`envs` (optionally in `cwd`), writes `payload`
-/// to its stdin, and returns its stdout captured to EOF — the shared process
-/// machinery behind [`SubprocessParticipant`] and [`ExternalAgentParticipant`].
+/// to its stdin, and returns `(stdout, stderr)` captured to EOF — the shared
+/// process machinery behind [`SubprocessParticipant`] and
+/// [`ExternalAgentParticipant`].
 ///
-/// stdout is drained on its own thread, started *before* the stdin write, so a
-/// child that emits before consuming all its input cannot deadlock against a
-/// full pipe buffer. A child that holds stdout open past `read_timeout` is
-/// killed and reaped. Returns `Ok(stdout)` only when the child exits 0 (the
-/// string may be empty — the caller decides what empty means); a spawn failure,
-/// a non-zero exit (stderr folded into the message), a timeout, or an I/O error
+/// Both stdout and stderr are drained on their own threads, started *before*
+/// the stdin write, so a child that emits before consuming all its input — or
+/// that writes more than a pipe buffer to stderr — cannot deadlock against a
+/// full pipe. Stderr is capped at [`MAX_STDERR_BYTES`].
+///
+/// A child that holds stdout open past `read_timeout` is killed and reaped.
+/// Returns `Ok((stdout, stderr))` only when the child exits 0 (either string
+/// may be empty — the caller decides what empty means); a spawn failure, a
+/// non-zero exit (stderr folded into the message), a timeout, or an I/O error
 /// is an `Err`.
-fn capture_child_stdout(
+fn capture_child_output(
     program: &Path,
     args: &[String],
     envs: &[(String, String)],
     cwd: Option<&Path>,
     payload: &[u8],
     read_timeout: Duration,
-) -> Result<String> {
+) -> Result<(String, String)> {
     // `CreateProcessW` does not consult `PATHEXT`, so `Command::new` cannot
     // resolve an installed Windows CLI's `.cmd` shim by its command name.
     // `cmd /C` performs that resolution for both participant implementations.
@@ -586,16 +626,39 @@ fn capture_child_stdout(
         })?
     };
 
-    // Drain stdout on its own thread, started *before* writing stdin, so a child
-    // that emits before consuming all its input cannot deadlock with us on a
-    // full pipe buffer.
-    let mut stdout = child.stdout.take().expect("child stdout is piped");
-    let (tx, rx) = mpsc::channel();
+    // Drain stdout and stderr on their own threads, started *before* writing
+    // stdin, so a child that emits before consuming all its input — or that
+    // writes more than a pipe buffer to stderr — cannot deadlock.
+    let mut stdout_pipe = child.stdout.take().expect("child stdout is piped");
+    let (stdout_tx, stdout_rx) = mpsc::channel();
     thread::spawn(move || {
         let mut buf = String::new();
-        let result = stdout.read_to_string(&mut buf).map(|_| buf);
-        // A dropped receiver (the parent already timed out) is expected.
-        let _ = tx.send(result);
+        let result = stdout_pipe.read_to_string(&mut buf).map(|_| buf);
+        let _ = stdout_tx.send(result);
+    });
+
+    let mut stderr_pipe = child.stderr.take().expect("child stderr is piped");
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = vec![0u8; 0];
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stderr_pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let remaining = MAX_STDERR_BYTES.saturating_sub(buf.len());
+                    if remaining > 0 {
+                        buf.extend_from_slice(&chunk[..n.min(remaining)]);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let mut s = String::from_utf8_lossy(&buf).into_owned();
+        if buf.len() >= MAX_STDERR_BYTES {
+            s.push_str("\n[truncated at 1 MiB]");
+        }
+        let _ = stderr_tx.send(s);
     });
 
     // Write the payload, then drop stdin so the child sees EOF.
@@ -606,7 +669,10 @@ fn capture_child_stdout(
             .map_err(|err| BatonError::Io(format!("could not write to child stdin: {err}")))?;
     }
 
-    match rx.recv_timeout(read_timeout) {
+    // Collect stderr best-effort (it may arrive before or after stdout).
+    let collect_stderr = || stderr_rx.recv().unwrap_or_default();
+
+    match stdout_rx.recv_timeout(read_timeout) {
         Ok(read_result) => {
             let stdout = read_result
                 .map_err(|err| BatonError::Io(format!("could not read child stdout: {err}")))?;
@@ -614,7 +680,7 @@ fn capture_child_stdout(
                 .wait()
                 .map_err(|err| BatonError::Io(format!("could not reap child process: {err}")))?;
             if !status.success() {
-                let stderr = read_stderr(&mut child);
+                let stderr = collect_stderr();
                 let detail = if stderr.trim().is_empty() {
                     String::new()
                 } else {
@@ -624,11 +690,9 @@ fn capture_child_stdout(
                     "child process exited with {status}{detail}"
                 )));
             }
-            Ok(stdout)
+            Ok((stdout, collect_stderr()))
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            // The child is still holding stdout open past the deadline; kill and
-            // reap it before surfacing the timeout.
             let _ = child.kill();
             let _ = child.wait();
             Err(BatonError::Transport(format!(
@@ -643,17 +707,6 @@ fn capture_child_stdout(
             ))
         }
     }
-}
-
-/// Reads the child's stderr to a string, best-effort, for enriching an
-/// exit-failure message. Called only after the child has been reaped, so the
-/// pipe is at EOF and the read is bounded.
-fn read_stderr(child: &mut Child) -> String {
-    let mut buf = String::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        let _ = stderr.read_to_string(&mut buf);
-    }
-    buf
 }
 
 /// Builds a delivered `kind: "error"` envelope for a machinery failure,
@@ -1451,6 +1504,109 @@ mod tests {
             "body names the extraction failure: {}",
             response.body
         );
+    }
+
+    // -- stderr capture ----------------------------------------------------
+
+    /// A successful turn that writes to stderr has that output returned from
+    /// `capture_child_output` alongside stdout.
+    #[test]
+    fn capture_child_output_returns_stderr_on_success() {
+        let (stdout, stderr) = capture_child_output(
+            Path::new("sh"),
+            &["-c".to_string(), "cat >/dev/null; echo OUT; echo ERR >&2".to_string()],
+            &[],
+            None,
+            b"",
+            Duration::from_secs(5),
+        )
+        .expect("exits 0");
+        assert_eq!(stdout.trim(), "OUT");
+        assert_eq!(stderr.trim(), "ERR");
+    }
+
+    /// A failed turn still folds stderr into the transport error.
+    #[test]
+    fn capture_child_output_folds_stderr_on_failure() {
+        let err = capture_child_output(
+            Path::new("sh"),
+            &["-c".to_string(), "cat >/dev/null; echo BOOM >&2; exit 1".to_string()],
+            &[],
+            None,
+            b"",
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("BOOM"),
+            "transport error includes stderr: {err}"
+        );
+    }
+
+    /// Stderr exceeding `MAX_STDERR_BYTES` is truncated with a marker.
+    #[test]
+    fn capture_child_output_truncates_large_stderr() {
+        let script = format!(
+            "cat >/dev/null; dd if=/dev/zero bs=1024 count=1100 status=none | tr '\\0' 'X' >&2"
+        );
+        let (_, stderr) = capture_child_output(
+            Path::new("sh"),
+            &["-c".to_string(), script],
+            &[],
+            None,
+            b"",
+            Duration::from_secs(10),
+        )
+        .expect("exits 0");
+        assert!(
+            stderr.ends_with("[truncated at 1 MiB]"),
+            "expected truncation marker, got tail: ...{}",
+            &stderr[stderr.len().saturating_sub(40)..]
+        );
+        assert!(
+            stderr.len() <= MAX_STDERR_BYTES + 30,
+            "stderr should be near the cap, got {} bytes",
+            stderr.len()
+        );
+    }
+
+    /// `ExternalAgentParticipant` with `stderr_dir` persists non-empty stderr
+    /// from a successful turn to disk.
+    #[test]
+    fn external_agent_persists_stderr_on_success() {
+        let dir = TempDir::new("ext-stderr");
+        let stderr_dir = dir.path.join("agent-stderr");
+        let participant = ExternalAgentParticipant::new(
+            "sh",
+            ["-c", "cat >/dev/null; echo diag >&2; printf 'ok'"],
+            std::iter::empty::<(String, String)>(),
+            &dir.path,
+            OutputAdapter::Raw,
+            Duration::from_secs(5),
+        )
+        .with_stderr_dir(&stderr_dir);
+
+        let response = participant.respond(&request_with_body("m-req-1", "go"));
+        assert_eq!(response.kind, MessageKind::Response);
+        assert_eq!(response.body, "ok");
+
+        let persisted = std::fs::read_to_string(stderr_dir.join("m-req-1.stderr"))
+            .expect("stderr file exists");
+        assert_eq!(persisted.trim(), "diag");
+    }
+
+    /// `ExternalAgentParticipant` without `stderr_dir` does not create any files.
+    #[test]
+    fn external_agent_no_stderr_dir_is_noop() {
+        let dir = TempDir::new("ext-no-stderr-dir");
+        let participant = external_agent(
+            "cat >/dev/null; echo diag >&2; printf 'ok'",
+            &dir.path,
+            Duration::from_secs(5),
+        );
+        let response = participant.respond(&request_with_body("m-req-1", "go"));
+        assert_eq!(response.kind, MessageKind::Response);
+        assert!(!dir.path.join("agent-stderr").exists());
     }
 
     // -- MailboxParticipant -----------------------------------------------

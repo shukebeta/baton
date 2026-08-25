@@ -560,6 +560,7 @@ pub fn run() -> Result<()> {
                         model: program.clone(),
                         base_url: "external-agent".to_string(),
                     };
+                    let stderr_dir = PathBuf::from(&inbox).join("agent-stderr");
                     let participant = ExternalAgentParticipant::new(
                         program,
                         args,
@@ -567,7 +568,8 @@ pub fn run() -> Result<()> {
                         cwd,
                         output,
                         read_timeout,
-                    );
+                    )
+                    .with_stderr_dir(stderr_dir);
                     (Box::new(participant), meta)
                 }
                 None => {
