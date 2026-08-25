@@ -10,6 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
+## v0.3.5 (2026-08-25)
+
+### Fixes
+- fix: raise exec-replace poll deadline from 2s to 10s in four service tests (#184)
+
 ## v0.3.4 … v0.3.3 (2026-08-23)
 
 ### Fixes
