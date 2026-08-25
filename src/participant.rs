@@ -642,20 +642,26 @@ fn capture_child_output(
     thread::spawn(move || {
         let mut buf = vec![0u8; 0];
         let mut chunk = [0u8; 8192];
+        let mut truncated = false;
         loop {
             match stderr_pipe.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => {
                     let remaining = MAX_STDERR_BYTES.saturating_sub(buf.len());
-                    if remaining > 0 {
-                        buf.extend_from_slice(&chunk[..n.min(remaining)]);
+                    if remaining >= n {
+                        buf.extend_from_slice(&chunk[..n]);
+                    } else {
+                        if remaining > 0 {
+                            buf.extend_from_slice(&chunk[..remaining]);
+                        }
+                        truncated = true;
                     }
                 }
                 Err(_) => break,
             }
         }
         let mut s = String::from_utf8_lossy(&buf).into_owned();
-        if buf.len() >= MAX_STDERR_BYTES {
+        if truncated {
             s.push_str("\n[truncated at 1 MiB]");
         }
         let _ = stderr_tx.send(s);
@@ -669,8 +675,14 @@ fn capture_child_output(
             .map_err(|err| BatonError::Io(format!("could not write to child stdin: {err}")))?;
     }
 
-    // Collect stderr best-effort (it may arrive before or after stdout).
-    let collect_stderr = || stderr_rx.recv().unwrap_or_default();
+    // Collect stderr best-effort. The child is reaped before this runs on the
+    // success path, so the pipe is at EOF; the timeout is a safety net against
+    // a leaked descriptor from a descendant process.
+    let collect_stderr = || {
+        stderr_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_default()
+    };
 
     match stdout_rx.recv_timeout(read_timeout) {
         Ok(read_result) => {
