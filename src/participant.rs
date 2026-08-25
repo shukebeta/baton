@@ -529,7 +529,7 @@ impl ExternalAgentParticipant {
             return;
         }
         let Some(dir) = &self.stderr_dir else { return };
-        if let Err(_) = std::fs::create_dir_all(dir) {
+        if std::fs::create_dir_all(dir).is_err() {
             return;
         }
         let safe_id: String = message_id
@@ -1570,9 +1570,9 @@ mod tests {
     /// Stderr exceeding `MAX_STDERR_BYTES` is truncated with a marker.
     #[test]
     fn capture_child_output_truncates_large_stderr() {
-        let script = format!(
+        let script =
             "cat >/dev/null; dd if=/dev/zero bs=1024 count=1100 status=none | tr '\\0' 'X' >&2"
-        );
+                .to_string();
         let (_, stderr) = capture_child_output(
             Path::new("sh"),
             &["-c".to_string(), script],
