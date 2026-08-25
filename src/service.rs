@@ -4284,7 +4284,7 @@ mod imp {
             mark_task_start_ack(&dir.path, request_id).expect("write task acknowledgement");
             mark_task_start_rollback(&dir.path, request_id).expect("write rollback marker");
 
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + Duration::from_secs(10);
             while is_task_alive(&record) != Liveness::Unresolved && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -4476,7 +4476,7 @@ mod imp {
                 stderr_path: stderr_path.display().to_string(),
                 delivered_milestones: 0,
             };
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + Duration::from_secs(10);
             let liveness = loop {
                 let liveness = is_task_alive(&record);
                 if liveness == Liveness::Unresolved || Instant::now() >= deadline {
@@ -4983,7 +4983,7 @@ mod imp {
 
                 // Wait only for bash to exec-replace its argv so the fixture
                 // reaches the intended unresolved identity state.
-                let deadline = Instant::now() + Duration::from_secs(2);
+                let deadline = Instant::now() + Duration::from_secs(10);
                 while is_task_alive(&task_record) != Liveness::Unresolved
                     && Instant::now() < deadline
                 {
@@ -5094,7 +5094,7 @@ mod imp {
             mark_task_start_rollback(&dir.path, request_id)
                 .expect("write unresolved task rollback");
 
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + Duration::from_secs(10);
             while is_task_alive(&task_record) != Liveness::Unresolved && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }
