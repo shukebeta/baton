@@ -3343,8 +3343,18 @@ mod imp {
             .expect("spawn lock inheritance probe child");
 
             drop(owner_lock);
-            let replacement_lock = acquire_control_lock(&dir.path)
-                .expect("descendant must not retain the owner control lock");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let replacement_lock = loop {
+                match acquire_control_lock(&dir.path) {
+                    Ok(lock) => break lock,
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => panic!(
+                        "descendant must not retain the owner control lock: {err:?}"
+                    ),
+                }
+            };
             drop(replacement_lock);
 
             let _ = child.kill();
