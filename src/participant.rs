@@ -534,7 +534,13 @@ impl ExternalAgentParticipant {
         }
         let safe_id: String = message_id
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let path = dir.join(format!("{safe_id}.stderr"));
         let _ = std::fs::write(&path, stderr.as_bytes());
@@ -1526,7 +1532,10 @@ mod tests {
     fn capture_child_output_returns_stderr_on_success() {
         let (stdout, stderr) = capture_child_output(
             Path::new("sh"),
-            &["-c".to_string(), "cat >/dev/null; echo OUT; echo ERR >&2".to_string()],
+            &[
+                "-c".to_string(),
+                "cat >/dev/null; echo OUT; echo ERR >&2".to_string(),
+            ],
             &[],
             None,
             b"",
@@ -1542,7 +1551,10 @@ mod tests {
     fn capture_child_output_folds_stderr_on_failure() {
         let err = capture_child_output(
             Path::new("sh"),
-            &["-c".to_string(), "cat >/dev/null; echo BOOM >&2; exit 1".to_string()],
+            &[
+                "-c".to_string(),
+                "cat >/dev/null; echo BOOM >&2; exit 1".to_string(),
+            ],
             &[],
             None,
             b"",
@@ -1602,8 +1614,8 @@ mod tests {
         assert_eq!(response.kind, MessageKind::Response);
         assert_eq!(response.body, "ok");
 
-        let persisted = std::fs::read_to_string(stderr_dir.join("m-req-1.stderr"))
-            .expect("stderr file exists");
+        let persisted =
+            std::fs::read_to_string(stderr_dir.join("m-req-1.stderr")).expect("stderr file exists");
         assert_eq!(persisted.trim(), "diag");
     }
 
