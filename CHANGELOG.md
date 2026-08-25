@@ -10,11 +10,12 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.3.6 … v0.3.5 (2026-08-25)
+## v0.3.7 … v0.3.5 (2026-08-25)
 
 ### Fixes
 - fix: raise exec-replace poll deadline from 2s to 10s in four service tests (#184)
 - fix: retry control-lock acquisition in lock-inheritance test to cover fork-to-exec window (#185)
+- fix(serve): capture and persist agent stderr on every turn, not only on failure (#186)
 
 ## v0.3.4 … v0.3.3 (2026-08-23)
 
