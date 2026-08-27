@@ -10,6 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
+## v0.3.8 (2026-08-27)
+
+### Fixes
+- fix(participant): keep quoted program paths intact through cmd /D /S /C on Windows (#197)
+
 ## v0.3.7 … v0.3.5 (2026-08-25)
 
 ### Fixes
