@@ -573,6 +573,49 @@ impl Participant for ExternalAgentParticipant {
 /// truncated and a marker appended so the reader knows output was lost.
 const MAX_STDERR_BYTES: usize = 1024 * 1024;
 
+/// Appends `token` to `line` with the quoting `Command::arg()` would apply on
+/// Windows: a token containing whitespace or a quote is wrapped in quotes,
+/// with embedded quotes backslash-escaped and backslashes preceding them
+/// doubled (the MSVC convention the child's C runtime reverses). Replicated
+/// here because the `cmd /D /S /C` tail must be assembled as one raw string
+/// with an outer quote pair — `arg()` cannot produce that shape.
+#[cfg(windows)]
+fn append_windows_arg(line: &mut String, token: &str) {
+    if token.is_empty() {
+        line.push_str("\"\"");
+        return;
+    }
+    if !token.contains([' ', '\t', '"']) {
+        line.push_str(token);
+        return;
+    }
+    line.push('"');
+    let mut backslashes = 0usize;
+    for ch in token.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                for _ in 0..=backslashes {
+                    line.push('\\');
+                }
+                line.push('"');
+                backslashes = 0;
+            }
+            other => {
+                for _ in 0..backslashes {
+                    line.push('\\');
+                }
+                backslashes = 0;
+                line.push(other);
+            }
+        }
+    }
+    for _ in 0..backslashes {
+        line.push('\\');
+    }
+    line.push('"');
+}
+
 /// Spawns `program` with `args`/`envs` (optionally in `cwd`), writes `payload`
 /// to its stdin, and returns `(stdout, stderr)` captured to EOF — the shared
 /// process machinery behind [`SubprocessParticipant`] and
@@ -599,10 +642,31 @@ fn capture_child_output(
     // `CreateProcessW` does not consult `PATHEXT`, so `Command::new` cannot
     // resolve an installed Windows CLI's `.cmd` shim by its command name.
     // `cmd /C` performs that resolution for both participant implementations.
+    //
+    // The program+args tail is assembled here as one raw argument wrapped in
+    // an extra outer quote pair, with each token quoted the way `arg()` would
+    // quote it (spaces force quotes, embedded quotes backslash-escaped):
+    // `/S` strips exactly that outer pair, so the token quoting survives.
+    // Letting `arg()` build the tail instead exposes the same `/S` strip to
+    // the program's own quotes, which splits any program path containing a
+    // space at its first space (`C:\Users\Jane Doe\...` — the integration
+    // tests hit this via `CARGO_BIN_EXE_baton`).
     #[cfg(windows)]
     let mut command = {
+        use std::os::windows::process::CommandExt;
+        let mut line = String::new();
+        for token in
+            std::iter::once(program.to_string_lossy().into_owned()).chain(args.iter().cloned())
+        {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            append_windows_arg(&mut line, &token);
+        }
         let mut command = Command::new("cmd");
-        command.args(["/D", "/S", "/C"]).arg(program).args(args);
+        command
+            .args(["/D", "/S", "/C"])
+            .raw_arg(format!("\"{line}\""));
         command
     };
     #[cfg(not(windows))]
@@ -1376,6 +1440,47 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path.join("argument.txt")).expect("argument side effect"),
             "agent argument"
+        );
+    }
+
+    /// A program *path* containing spaces must reach the child intact. The
+    /// cmd tail is one raw argument in an outer quote pair, so `/S` strips
+    /// only that pair and the path keeps its own quotes; an `arg()`-built
+    /// tail lost them and split the path at its first space.
+    #[cfg(windows)]
+    #[test]
+    fn external_agent_program_path_with_spaces_runs() {
+        let dir = TempDir::new("ext-space-path");
+        let nested = dir.path.join("space dir");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+        let shim = nested.join("baton-test-agent.cmd");
+        std::fs::write(
+            &shim,
+            "@echo off\r\nmore > request.txt\r\n> argument.txt <nul set /p =%~1\r\necho space path response\r\n",
+        )
+        .expect("write cmd shim");
+        let participant = ExternalAgentParticipant::new(
+            &shim,
+            ["argument with space"],
+            std::iter::empty::<(String, String)>(),
+            &dir.path,
+            OutputAdapter::Raw,
+            Duration::from_secs(5),
+        );
+
+        let response = participant.respond(&request_with_body("m-req-1", "space request"));
+
+        assert_eq!(response.kind, MessageKind::Response);
+        assert_eq!(response.body.trim(), "space path response");
+        assert_eq!(
+            std::fs::read_to_string(dir.path.join("request.txt"))
+                .expect("stdin side effect")
+                .trim_end(),
+            "space request"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path.join("argument.txt")).expect("argument side effect"),
+            "argument with space"
         );
     }
 
