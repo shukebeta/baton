@@ -2241,12 +2241,22 @@ mod imp {
         clock: &dyn Clock,
     ) -> Result<TaskTick> {
         let previous = running.record.clone();
-        running.record.state = state;
-        running.record.exit_code = exit_code;
-        running.record.elapsed_ms = Some(elapsed_ms);
-        if let Err(err) = write_task_record(control, &running.record) {
-            running.record = previous;
-            return Err(err);
+        {
+            // External Stop/Teardown may remove a durable task while this
+            // supervisor still has its in-memory tracker. Serialize the
+            // existence check and terminal write with that cleanup so a
+            // concurrent tick cannot resurrect the removed record.
+            let _admission = acquire_admission_lock(control)?;
+            if read_task_record(control, &running.record.id)?.is_none() {
+                return Ok(TaskTick::Finished);
+            }
+            running.record.state = state;
+            running.record.exit_code = exit_code;
+            running.record.elapsed_ms = Some(elapsed_ms);
+            if let Err(err) = write_task_record(control, &running.record) {
+                running.record = previous;
+                return Err(err);
+            }
         }
         deliver_terminal_event(running, clock)
     }
@@ -5718,6 +5728,31 @@ mod imp {
             assert!(
                 callback_inbox.is_file(),
                 "failed callback remains unavailable"
+            );
+        }
+
+        /// A supervisor tick that races external cleanup must not recreate a
+        /// durable task record after the cleanup has removed it.
+        #[test]
+        fn finalize_task_does_not_resurrect_removed_record() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("finalize-removed-task");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let mut running =
+                terminal_running_task(&dir.path, "task-finalize-removed", &callback_inbox, &clock);
+            remove_task_record(&dir.path, "task-finalize-removed").expect("remove task record");
+
+            assert!(matches!(
+                finalize_task(&dir.path, &mut running, TaskState::Failed, None, 10, &clock,)
+                    .expect("finalize removed task"),
+                TaskTick::Finished
+            ));
+            assert!(
+                read_task_record(&dir.path, "task-finalize-removed")
+                    .expect("read removed task")
+                    .is_none(),
+                "finalizing an externally removed task does not resurrect its record"
             );
         }
 
