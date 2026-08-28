@@ -17,6 +17,7 @@ use crate::task::{
 use windows_sys::Win32::Foundation::{
     CloseHandle, FALSE, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
@@ -67,11 +68,23 @@ fn fresh_job_name(kind: &str) -> String {
     )
 }
 
-fn create_job(name: &str) -> Result<JobHandle> {
+fn create_job(name: &str, inheritable: bool) -> Result<JobHandle> {
     let name = wide_null(name);
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: if inheritable { 1 } else { 0 },
+    };
+    let attributes_ptr = if inheritable {
+        &mut attributes
+    } else {
+        std::ptr::null_mut()
+    };
     // SAFETY: `name` is a valid, NUL-terminated UTF-16 string and a null
-    // security descriptor requests the default, non-inheritable handle.
-    let handle = unsafe { CreateJobObjectW(std::ptr::null(), name.as_ptr()) };
+    // security descriptor requests the default security. When requested,
+    // the handle is inheritable so a task process can keep the named job
+    // alive across a supervisor restart and descendant drain.
+    let handle = unsafe { CreateJobObjectW(attributes_ptr, name.as_ptr()) };
     if handle == 0 {
         return Err(BatonError::Io(format!(
             "could not create Windows Job Object {name:?}: {}",
@@ -804,7 +817,7 @@ fn handle_start_request(
         BatonError::Decode(format!("malformed session spec {spec_path:?}: {err}"))
     })?;
     let job_name = fresh_job_name("session");
-    let job = match create_job(&job_name) {
+    let job = match create_job(&job_name, false) {
         Ok(job) => job,
         Err(err) => {
             return reject_start_request(control, request_id, admission_error_text(&err));
@@ -1553,13 +1566,13 @@ fn abort_task_admission(control: &Path, record: &TaskRecord) -> Result<bool> {
             return Ok(false);
         }
         if liveness == Liveness::Live {
-            let _ = terminate_record_job(record.job.as_deref(), record.pid, "-TERM");
+            let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-TERM");
             wait_while_task_alive(&record, KILL_GRACE_MS);
-            liveness = is_task_alive(&record);
+            liveness = cleanup_liveness_after_pid_signal(is_task_alive(&record), record.pid);
             if liveness == Liveness::Live {
-                let _ = terminate_record_job(record.job.as_deref(), record.pid, "-KILL");
+                let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-KILL");
                 wait_while_task_alive(&record, KILL_GRACE_MS);
-                liveness = is_task_alive(&record);
+                liveness = cleanup_liveness_after_pid_signal(is_task_alive(&record), record.pid);
             }
         }
         if liveness != Liveness::Dead {
@@ -1620,8 +1633,9 @@ struct RunningTask {
     /// init, so it is represented by `None` and polled by corroborated
     /// PID liveness instead of `Child::try_wait`.
     child: Option<Child>,
-    /// Handle-only Job Object re-adoption. A missing handle remains an
-    /// unresolved identity and is never replaced by a PID tree walk.
+    /// Best-effort Job Object re-adoption. A missing handle does not change
+    /// a corroborated PID's identity; signaling falls back to that PID and
+    /// makes no descendant-reachability claim.
     job: Option<JobHandle>,
     started_ms: u64,
     /// Set once this task's max duration has been exceeded and a first Job
@@ -2043,15 +2057,17 @@ fn resume_initial_thread(pid: u32) -> Result<()> {
     result
 }
 
-/// Spawns `spec` suspended, assigns it to a private Job Object before any
-/// user code can run, then resumes its one initial thread.
+/// Spawns `spec` suspended, assigns it to a private inheritable Job Object
+/// before any user code can run, then resumes its one initial thread. The
+/// inherited handle keeps the named Job Object available to a restarted
+/// supervisor while the task process tree is still draining.
 fn spawn_task_child(
     spec: &TaskSpec,
     stdout_path: &Path,
     stderr_path: &Path,
 ) -> Result<(Child, JobHandle, String)> {
     let job_name = fresh_job_name("task");
-    let job = create_job(&job_name)?;
+    let job = create_job(&job_name, true)?;
     let mut command = Command::new(&spec.command);
     command.args(&spec.args);
     if let Some(cwd) = &spec.cwd {
@@ -2135,6 +2151,11 @@ fn tick_one_task(
                 return finalize_task(control, running, state, exit_code, elapsed_ms);
             }
             Liveness::Live => {}
+            Liveness::Unresolved if controlled_task_pid_is_gone(control, id, running)? => {
+                let cancelled = consume_task_cancel_sentinel(control, id)?;
+                let (state, exit_code) = parked_terminal(running, cancelled);
+                return finalize_task(control, running, state, exit_code, elapsed_ms);
+            }
             Liveness::Unresolved => return Ok(TaskTick::StillRunning),
         }
     }
@@ -2156,6 +2177,11 @@ fn tick_one_task(
                     return finalize_task(control, running, state, exit_code, elapsed_ms);
                 }
                 Liveness::Live => {}
+                Liveness::Unresolved if controlled_task_pid_is_gone(control, id, running)? => {
+                    let cancelled = consume_task_cancel_sentinel(control, id)?;
+                    let (state, exit_code) = parked_terminal(running, cancelled);
+                    return finalize_task(control, running, state, exit_code, elapsed_ms);
+                }
                 Liveness::Unresolved => return Ok(TaskTick::StillRunning),
             }
         }
@@ -2165,7 +2191,13 @@ fn tick_one_task(
 
     match running.child.as_mut() {
         None => match is_task_alive(&running.record) {
-            Liveness::Live | Liveness::Unresolved => Ok(TaskTick::StillRunning),
+            Liveness::Live => Ok(TaskTick::StillRunning),
+            Liveness::Unresolved if controlled_task_pid_is_gone(control, id, running)? => {
+                let cancelled = consume_task_cancel_sentinel(control, id)?;
+                let (state, exit_code) = parked_terminal(running, cancelled);
+                finalize_task(control, running, state, exit_code, elapsed_ms)
+            }
+            Liveness::Unresolved => Ok(TaskTick::StillRunning),
             Liveness::Dead => {
                 let cancelled = consume_task_cancel_sentinel(control, id)?;
                 let (state, exit_code) = parked_terminal(running, cancelled);
@@ -2464,22 +2496,22 @@ fn reap_session_tasks_with_wait(
         }
         let mut term_sent = false;
         if liveness == Liveness::Live {
-            let _ = terminate_record_job(record.job.as_deref(), record.pid, "-TERM");
+            let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-TERM");
             term_sent = true;
         }
         if liveness != Liveness::Dead {
             wait(&record, KILL_GRACE_MS);
-            liveness = is_task_alive(&record);
+            liveness = cleanup_liveness_after_pid_signal(is_task_alive(&record), record.pid);
         }
         if liveness == Liveness::Live && !term_sent {
-            let _ = terminate_record_job(record.job.as_deref(), record.pid, "-TERM");
+            let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-TERM");
             wait(&record, KILL_GRACE_MS);
-            liveness = is_task_alive(&record);
+            liveness = cleanup_liveness_after_pid_signal(is_task_alive(&record), record.pid);
         }
         if liveness == Liveness::Live {
-            let _ = terminate_record_job(record.job.as_deref(), record.pid, "-KILL");
+            let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-KILL");
             wait(&record, KILL_GRACE_MS);
-            liveness = is_task_alive(&record);
+            liveness = cleanup_liveness_after_pid_signal(is_task_alive(&record), record.pid);
         }
         if liveness == Liveness::Dead {
             remove_task_start_transaction(control, &record)?;
@@ -2636,11 +2668,8 @@ fn session_liveness(record: &SessionRecord) -> (Liveness, Option<i64>) {
         ),
         ProbeResult::Unreadable => (Liveness::Unresolved, None),
         ProbeResult::Present(current) => match &record.started_at {
-            Some(expected) if expected == &current && job_name_resolves(record.job.as_deref()) => {
-                (Liveness::Live, None)
-            }
-            Some(expected) if expected == &current => (Liveness::Unresolved, None),
-            Some(_) => (Liveness::Dead, None),
+            Some(expected) if expected == &current => (Liveness::Live, None),
+            Some(_) => (Liveness::Unresolved, None),
             None => (Liveness::Unresolved, None),
         },
     }
@@ -2658,11 +2687,8 @@ fn task_liveness(record: &TaskRecord) -> (Liveness, Option<i64>) {
         ),
         ProbeResult::Unreadable => (Liveness::Unresolved, None),
         ProbeResult::Present(current) => match &record.started_at {
-            Some(expected) if expected == &current && job_name_resolves(record.job.as_deref()) => {
-                (Liveness::Live, None)
-            }
-            Some(expected) if expected == &current => (Liveness::Unresolved, None),
-            Some(_) => (Liveness::Dead, None),
+            Some(expected) if expected == &current => (Liveness::Live, None),
+            Some(_) => (Liveness::Unresolved, None),
             None => (Liveness::Unresolved, None),
         },
     }
@@ -2680,9 +2706,9 @@ fn upgrade_legacy_task_record(_control: &Path, _record: &mut TaskRecord) -> Resu
     Ok(())
 }
 
-/// Terminates only the recorded PID. This is the explicit force fallback
-/// after a named Job Object can no longer be resolved; it makes no claim
-/// about descendants.
+/// Terminates only the recorded PID after its identity has been corroborated.
+/// This is the fallback when a named Job Object cannot be resolved; it makes
+/// no claim about descendants.
 fn terminate_record_pid(pid: u32, phase: &str) -> Result<()> {
     if pid <= 1 {
         return Ok(());
@@ -2717,6 +2743,27 @@ fn terminate_record_job(job_name: Option<&str>, _pid: u32, _phase: &str) -> Resu
     Ok(false)
 }
 
+/// Terminates a corroborated record through its Job Object when possible,
+/// otherwise falls back to the recorded PID. The fallback is safe for the
+/// identity-confirmed process but cannot promise descendant termination.
+fn terminate_record_job_or_pid(job_name: Option<&str>, pid: u32, phase: &str) -> Result<()> {
+    match terminate_record_job(job_name, pid, phase) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            eprintln!(
+                "warning: Windows Job Object unavailable during {phase}; terminating only recorded pid {pid}; descendants may survive"
+            );
+            terminate_record_pid(pid, phase)
+        }
+        Err(err) => {
+            eprintln!(
+                "warning: Windows Job Object termination during {phase} failed ({err}); terminating only recorded pid {pid}; descendants may survive"
+            );
+            terminate_record_pid(pid, phase)
+        }
+    }
+}
+
 fn force_terminate_record_job(job_name: Option<&str>, pid: u32, phase: &str) -> Result<()> {
     match terminate_record_job(job_name, pid, phase) {
         Ok(true) => Ok(()),
@@ -2729,20 +2776,60 @@ fn terminate_running_task(running: &RunningTask, phase: &str) -> Result<()> {
     if let Some(job) = running.job.as_ref() {
         terminate_job(job)
     } else {
+        eprintln!(
+            "warning: Windows Job Object unavailable for task {}; terminating only recorded pid {}; descendants may survive",
+            running.record.id, running.record.pid
+        );
         terminate_record_pid(running.record.pid, phase)
+    }
+}
+
+/// A PID-only cancel/timeout may leave an unknown descendant after the
+/// supervisor's Job Object handle was lost. Once the corroborated recorded
+/// PID is gone, a controlled outcome can still be finalized without claiming
+/// that an unresolvable descendant tree is gone.
+fn controlled_task_pid_is_gone(control: &Path, id: &str, running: &RunningTask) -> Result<bool> {
+    let controlled =
+        running.term_sent_at_ms.is_some() || task_cancel_sentinel_path(control, id).is_file();
+    Ok(controlled && recorded_pid_is_gone(running.record.pid))
+}
+
+fn recorded_pid_is_gone(pid: u32) -> bool {
+    matches!(process_probe(pid), ProbeResult::Gone)
+}
+
+/// A PID-only cleanup has no tree evidence after the Job Object name is
+/// lost. Once the corroborated recorded PID is gone, cleanup may remove its
+/// record while the signal path has already warned that descendants may
+/// survive.
+fn cleanup_liveness_after_pid_signal(liveness: Liveness, pid: u32) -> Liveness {
+    if liveness == Liveness::Unresolved && recorded_pid_is_gone(pid) {
+        Liveness::Dead
+    } else {
+        liveness
     }
 }
 
 fn wait_while_alive(record: &SessionRecord, grace_ms: u64) {
     let deadline = Instant::now() + Duration::from_millis(grace_ms);
-    while is_session_alive(record) != Liveness::Dead && Instant::now() < deadline {
+    while {
+        let liveness = is_session_alive(record);
+        liveness != Liveness::Dead
+            && !(liveness == Liveness::Unresolved && recorded_pid_is_gone(record.pid))
+            && Instant::now() < deadline
+    } {
         std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
     }
 }
 
 fn wait_while_task_alive(record: &TaskRecord, grace_ms: u64) {
     let deadline = Instant::now() + Duration::from_millis(grace_ms);
-    while is_task_alive(record) != Liveness::Dead && Instant::now() < deadline {
+    while {
+        let liveness = is_task_alive(record);
+        liveness != Liveness::Dead
+            && !(liveness == Liveness::Unresolved && recorded_pid_is_gone(record.pid))
+            && Instant::now() < deadline
+    } {
         std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
     }
 }
@@ -2780,13 +2867,13 @@ fn stop_session_record(
         wait_while_alive(&record, STOP_GRACE_MS);
         liveness = is_session_alive(&record);
         if liveness == Liveness::Live {
-            let _ = terminate_record_job(record.job.as_deref(), record.pid, "-TERM");
+            let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-TERM");
             wait_while_alive(&record, KILL_GRACE_MS);
-            liveness = is_session_alive(&record);
+            liveness = cleanup_liveness_after_pid_signal(is_session_alive(&record), record.pid);
             if liveness == Liveness::Live {
-                let _ = terminate_record_job(record.job.as_deref(), record.pid, "-KILL");
+                let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-KILL");
                 wait_while_alive(&record, KILL_GRACE_MS);
-                liveness = is_session_alive(&record);
+                liveness = cleanup_liveness_after_pid_signal(is_session_alive(&record), record.pid);
             }
         }
     }
@@ -3022,10 +3109,10 @@ fn cancel_task_record(control: &Path, record: &TaskRecord) -> Result<()> {
     }
     request_task_cancel_sentinel(control, &record.id)?;
     if is_task_alive(record) == Liveness::Live {
-        let _ = terminate_record_job(record.job.as_deref(), record.pid, "-TERM");
+        let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-TERM");
         wait_while_task_alive(record, KILL_GRACE_MS);
         if is_task_alive(record) == Liveness::Live {
-            let _ = terminate_record_job(record.job.as_deref(), record.pid, "-KILL");
+            let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-KILL");
             wait_while_task_alive(record, KILL_GRACE_MS);
         }
     }
@@ -3189,7 +3276,7 @@ mod tests {
         assert!(!spawn_start_key_ok(&None, &None));
 
         let job_name = fresh_job_name("liveness");
-        let job = create_job(&job_name).expect("create liveness job");
+        let job = create_job(&job_name, false).expect("create liveness job");
         let mut session = session_record(
             std::process::id(),
             Some(start_key.clone()),
@@ -3198,11 +3285,11 @@ mod tests {
         assert_eq!(session_liveness(&session).0, Liveness::Live);
 
         session.started_at = Some("different-process".to_string());
-        assert_eq!(session_liveness(&session).0, Liveness::Dead);
+        assert_eq!(session_liveness(&session).0, Liveness::Unresolved);
 
         session.started_at = Some(start_key.clone());
         session.job = Some(fresh_job_name("missing"));
-        assert_eq!(session_liveness(&session).0, Liveness::Unresolved);
+        assert_eq!(session_liveness(&session).0, Liveness::Live);
 
         let mut task = task_record(
             "svc-test",
@@ -3212,10 +3299,10 @@ mod tests {
         );
         assert_eq!(task_liveness(&task).0, Liveness::Live);
         task.started_at = Some("different-process".to_string());
-        assert_eq!(task_liveness(&task).0, Liveness::Dead);
+        assert_eq!(task_liveness(&task).0, Liveness::Unresolved);
         task.started_at = Some(start_key);
         task.job = Some(fresh_job_name("missing-task"));
-        assert_eq!(task_liveness(&task).0, Liveness::Unresolved);
+        assert_eq!(task_liveness(&task).0, Liveness::Live);
 
         assert_eq!(job_tree_liveness(Some(&job_name)), Some(Liveness::Dead));
         assert_eq!(
@@ -3233,12 +3320,47 @@ mod tests {
     }
 
     #[test]
+    fn corroborated_pid_fallback_terminates_when_job_name_is_gone() {
+        let job_name = fresh_job_name("pid-fallback");
+        let job = create_job(&job_name, false).expect("create non-inheritable job");
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/C", "ping -n 60 127.0.0.1 > NUL"]);
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::null());
+        command.stderr(Stdio::null());
+        command.creation_flags(CREATE_SUSPENDED);
+        let mut child = command.spawn().expect("spawn fallback task");
+        assign_job_to_child(&job, &child).expect("assign fallback task");
+        resume_initial_thread(child.id()).expect("resume fallback task");
+        let pid = child.id();
+        let started_at = recorded_start_identity(pid)
+            .0
+            .expect("fallback task has a creation key");
+        drop(job);
+
+        let record = task_record("svc-test", pid, Some(started_at), Some(job_name.clone()));
+        assert_eq!(task_liveness(&record).0, Liveness::Live);
+        terminate_record_job_or_pid(Some(&job_name), pid, "-TERM")
+            .expect("terminate corroborated pid fallback");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !recorded_pid_is_gone(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            recorded_pid_is_gone(pid),
+            "PID fallback did not terminate task"
+        );
+        let _ = child.wait();
+    }
+
+    #[test]
     fn rehydrate_reopens_recorded_job_handles() {
         let control = temp_control("rehydrate");
         let session_job_name = fresh_job_name("rehydrate-session");
         let task_job_name = fresh_job_name("rehydrate-task");
-        let session_job = create_job(&session_job_name).expect("create session job");
-        let task_job = create_job(&task_job_name).expect("create task job");
+        let session_job = create_job(&session_job_name, false).expect("create session job");
+        let task_job = create_job(&task_job_name, true).expect("create task job");
         let start_key = recorded_start_identity(std::process::id())
             .0
             .expect("current test process has a Windows creation key");
