@@ -170,13 +170,16 @@ The resolution ladder is platform-specific:
   when the durable instant is unavailable and never condemns a mismatch.
 
 - On Windows, `GetProcessTimes` supplies the creation-time start key. A live
-  PID with a matching key is `live` only while its recorded Job Object name
-  resolves; a missing or inaccessible key/job is `unresolved`, and a matching
-  PID with a different start key is `dead`. Startup re-adoption opens the
-  recorded name when the Job Object still exists. The probe recorded for #170
-  shows that a name does not survive the last handle closing while members
-  remain, so a crashed supervisor cannot safely reconstruct a missing handle.
-  The unresolved `--force` path therefore terminates only the recorded PID.
+  PID with a matching key is `live` regardless of whether its recorded Job
+  Object name resolves; a missing, inaccessible, or mismatched key is
+  `unresolved`. The Job Object is a
+  signaling and descendant-reachability preference, not part of process
+  identity. Task Job Object handles are inherited by the task process so the
+  named object normally remains available for startup re-adoption while the
+  task tree drains. If a name still cannot be opened after a restart, normal
+  cancellation, timeout, stop, and cleanup signal only the corroborated
+  recorded PID and warn that descendants may survive. A PID whose identity
+  cannot be corroborated remains fail-closed and is never signalled.
 
 New macOS records retain `started_at` as the operator-readable UTC string and
 also persist `start_epoch_secs`; the field's presence is the format-version
@@ -187,16 +190,22 @@ rewrite records, so an unresolved legacy task remains safe to retry until a
 cleanup path can upgrade it.
 
 `service stop` and `service teardown` always try the identity-free cooperative
-mailbox stop first. They then signal only `live` records. Dead records are
+mailbox stop first. They then signal only `live` records. On Windows, a live
+record uses `TerminateJobObject` when its name resolves and otherwise falls
+back to the corroborated recorded PID with a descendants-may-survive warning.
+Dead records are
 removed, terminal task records are removed without probing or signalling their
 recorded PID, and initially unresolved records are retained immediately
 without a per-task grace delay. A retained record's id, PID, liveness, and
 recorded argv are printed to stderr and the command exits non-zero. `--force`
 is the explicit operator assertion of identity: Unix sends process-group
-signals; Windows uses `TerminateJobObject` when its name resolves, otherwise
-terminates only the recorded PID and warns that descendants may survive.
+signals; Windows follows the same Job Object/PID fallback and removes the
+record even when identity remains unresolved.
 `task cancel` has no force flag; it leaves its cooperative cancel sentinel for
-the supervisor and never escalates an unresolved identity.
+the supervisor, signals a corroborated live PID even when its Job Object name
+is gone, and never escalates an unresolved identity. If that controlled PID
+has exited, the supervisor can finalize the cancellation even when an
+unresolvable descendant might still exist.
 
 `TaskRecord.started_ms` and `Clock::now_ms()` are Unix epoch milliseconds.
 `TaskRecord.start_epoch_secs`, when present on macOS, is the canonical
@@ -296,16 +305,18 @@ finalized as failed.
 The restarted supervisor cannot recover a `std::process::Child` handle for a
 task reparented to init. It therefore tracks a corroborated PID directly:
 milestones and timeout signals continue while the PID is `live`, and the task
-is finalized when that PID is `dead`. An `unresolved` task remains tracked and
-is not signalled or finalized as failed until a later probe resolves it. No
-exit status can be recovered through this path, so a rehydrated task that is
-already gone or later finishes is recorded as `failed` with `exit_code: null`;
-a timeout or cancellation remains `timeout` or `cancelled` when the supervisor
-initiated that outcome. State is persisted before the deterministic terminal
-callback is delivered, and a delivery failure leaves the tracker in place to
-retry the same event id. A terminal record is replayed once on the next
-startup for the same reason; the mailbox's done ledger drops it if delivery
-already completed.
+is finalized when that PID is `dead`. A missing Job Object no longer changes a
+matching PID to `unresolved`; it only changes termination from tree-wide to
+PID-only, with a descendants-may-survive warning. An `unresolved` task remains
+tracked and is not signalled or finalized as failed until a later probe
+resolves its identity. No exit status can be recovered through this path, so
+a rehydrated task that is already gone or later finishes is recorded as
+`failed` with `exit_code: null`; a timeout or cancellation remains `timeout`
+or `cancelled` when the supervisor initiated that outcome. State is persisted
+before the deterministic terminal callback is delivered, and a delivery
+failure leaves the tracker in place to retry the same event id. A terminal
+record is replayed once on the next startup for the same reason; the mailbox's
+done ledger drops it if delivery already completed.
 
 Prepared admissions are not active tasks: startup reconciliation owns their
 cleanup, and `rehydrate_tasks` excludes them from the in-memory tracker. If a

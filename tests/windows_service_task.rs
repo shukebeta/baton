@@ -218,6 +218,223 @@ fn windows_task_job_owns_and_terminates_command_tree() {
     panic!("Windows Job Object did not terminate the task command tree");
 }
 
+/// A restarted supervisor must retain control of a task whose process
+/// creation key still matches even though the original supervisor no longer
+/// owns its Job Object handle. Cancellation uses the re-adopted Job Object
+/// when the inherited task handle kept it named; timeout remains effective
+/// through the same rehydrated PID tracker.
+#[test]
+fn windows_rehydrated_tasks_remain_live_and_controllable() {
+    let mut guard = start_service();
+    let session = start_session(&guard);
+    let control = guard.control.to_string_lossy().into_owned();
+    let callback = guard.root.join("callback");
+    let command = "cmd.exe";
+
+    let cancel_task = baton(&[
+        "task",
+        "start",
+        "--control",
+        &control,
+        "--session",
+        &session,
+        "--command",
+        command,
+        "--arg",
+        "/D",
+        "--arg",
+        "/C",
+        "--arg",
+        "ping -n 60 127.0.0.1 > NUL",
+        "--max-duration-ms",
+        "60000",
+        "--callback-inbox",
+        callback.to_str().unwrap(),
+    ]);
+    assert!(
+        cancel_task.status.success(),
+        "cancel task start failed: {}",
+        String::from_utf8_lossy(&cancel_task.stderr)
+    );
+    let cancel_task_id = String::from_utf8_lossy(&cancel_task.stdout)
+        .trim()
+        .to_string();
+    assert!(!cancel_task_id.is_empty(), "cancel task returned an id");
+
+    let timeout_task = baton(&[
+        "task",
+        "start",
+        "--control",
+        &control,
+        "--session",
+        &session,
+        "--command",
+        command,
+        "--arg",
+        "/D",
+        "--arg",
+        "/C",
+        "--arg",
+        "ping -n 60 127.0.0.1 > NUL",
+        "--max-duration-ms",
+        "1000",
+        "--callback-inbox",
+        callback.to_str().unwrap(),
+    ]);
+    assert!(
+        timeout_task.status.success(),
+        "timeout task start failed: {}",
+        String::from_utf8_lossy(&timeout_task.stderr)
+    );
+    let timeout_task_id = String::from_utf8_lossy(&timeout_task.stdout)
+        .trim()
+        .to_string();
+    assert!(!timeout_task_id.is_empty(), "timeout task returned an id");
+
+    for task_id in [&cancel_task_id, &timeout_task_id] {
+        let mut running = false;
+        for _ in 0..100 {
+            let status = baton(&["task", "status", "--control", &control, "--task", task_id]);
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&status.stdout)
+                && json["tasks"][0]["state"] == "running"
+            {
+                running = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(running, "task {task_id} was not running before restart");
+    }
+
+    let mut old_run = guard.run.take().expect("initial service supervisor");
+    old_run.kill().expect("kill initial service supervisor");
+    let old_status = old_run.wait().expect("initial service supervisor exits");
+    assert!(!old_status.success(), "initial supervisor was interrupted");
+
+    let mut restarted = Command::new(env!("CARGO_BIN_EXE_baton"));
+    restarted.args(["service", "run", "--control", &control]);
+    restarted.stdout(Stdio::null());
+    restarted.stderr(Stdio::null());
+    guard.run = Some(
+        restarted
+            .spawn()
+            .expect("spawn restarted service supervisor"),
+    );
+    wait_for_service(&control);
+
+    let status = baton(&[
+        "task",
+        "status",
+        "--control",
+        &control,
+        "--task",
+        &cancel_task_id,
+    ]);
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("rehydrated task status is JSON");
+    assert_eq!(status_json["tasks"][0]["state"], "running");
+    assert_eq!(status_json["tasks"][0]["live"], true);
+    assert_eq!(status_json["tasks"][0]["liveness"], "live");
+
+    let cancel = baton(&[
+        "task",
+        "cancel",
+        "--control",
+        &control,
+        "--task",
+        &cancel_task_id,
+    ]);
+    assert!(
+        cancel.status.success(),
+        "rehydrated task cancel failed: {}",
+        String::from_utf8_lossy(&cancel.stderr)
+    );
+    let (state, _, _) = wait_for_terminal_task(&control, &cancel_task_id);
+    assert_eq!(state, "cancelled");
+
+    let (state, _, _) = wait_for_terminal_task(&control, &timeout_task_id);
+    assert_eq!(state, "timeout");
+}
+
+/// A direct task child may have exited and left a descendant in its Job
+/// Object when the supervisor stops. The inherited Job Object handle lets a
+/// restarted supervisor continue the descendant drain and reach a terminal
+/// result instead of leaving the task permanently unresolved. The direct
+/// child's exit code is intentionally unavailable after restart.
+#[test]
+fn windows_rehydrated_descendant_drain_reaches_terminal_state() {
+    let mut guard = start_service();
+    let session = start_session(&guard);
+    let control = guard.control.to_string_lossy().into_owned();
+    let callback = guard.root.join("callback");
+    let task = baton(&[
+        "task",
+        "start",
+        "--control",
+        &control,
+        "--session",
+        &session,
+        "--command",
+        env!("CARGO_BIN_EXE_windows_job_probe_child"),
+        "--arg",
+        "--spawn-descendant",
+        "--arg",
+        "3000",
+        "--arg",
+        "0",
+        "--max-duration-ms",
+        "60000",
+        "--callback-inbox",
+        callback.to_str().unwrap(),
+    ]);
+    assert!(
+        task.status.success(),
+        "descendant task start failed: {}",
+        String::from_utf8_lossy(&task.stderr)
+    );
+    let task_id = String::from_utf8_lossy(&task.stdout).trim().to_string();
+    assert!(!task_id.is_empty(), "descendant task returned an id");
+
+    let mut descendant_started = false;
+    for _ in 0..100 {
+        let status = baton(&["task", "status", "--control", &control, "--task", &task_id]);
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&status.stdout)
+            && let Some(stdout_path) = json["tasks"][0]["stdout_path"].as_str()
+            && std::fs::read_to_string(stdout_path)
+                .map(|stdout| !stdout.trim().is_empty())
+                .unwrap_or(false)
+        {
+            descendant_started = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(descendant_started, "task descendant did not start in time");
+    // Allow the service tick to reap the direct child and park on the
+    // descendant before the supervisor is interrupted.
+    thread::sleep(Duration::from_millis(250));
+
+    let mut old_run = guard.run.take().expect("initial service supervisor");
+    old_run.kill().expect("kill initial service supervisor");
+    let old_status = old_run.wait().expect("initial service supervisor exits");
+    assert!(!old_status.success(), "initial supervisor was interrupted");
+
+    let mut restarted = Command::new(env!("CARGO_BIN_EXE_baton"));
+    restarted.args(["service", "run", "--control", &control]);
+    restarted.stdout(Stdio::null());
+    restarted.stderr(Stdio::null());
+    guard.run = Some(
+        restarted
+            .spawn()
+            .expect("spawn restarted service supervisor"),
+    );
+    wait_for_service(&control);
+
+    let (state, exit_code, _) = wait_for_terminal_task(&control, &task_id);
+    assert_eq!(state, "failed");
+    assert_eq!(exit_code, None);
+}
+
 /// Starts a task whose direct command spawns a short-lived descendant and
 /// then exits `0`. The descendant outlives the parent inside the shared Job
 /// Object, so the service must park the reap until the tree drains — and must
