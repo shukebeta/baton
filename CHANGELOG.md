@@ -10,7 +10,7 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.3.18 … v0.3.9 (2026-08-28)
+## v0.3.19 … v0.3.9 (2026-08-28)
 
 ### Fixes
 - fix(service/windows): keep direct child's exit outcome across descendant drain (#210) (#211)
@@ -24,6 +24,7 @@ _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
 ### Docs
 - docs(service): clarify start flag scope (#225)
+- docs(protocol): complete exchange event table (#226)
 
 ### Other Changes
 - test(service/windows): cover task admission recovery (#220)
