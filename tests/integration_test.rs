@@ -17,7 +17,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -6576,9 +6576,9 @@ fn service_tasks_reconcile_after_run_restart() {
     );
 }
 
-/// Issue #123 regression: task admission rejects both an absent owner record
-/// and a record whose session process is already dead, before it creates a
-/// child or durable task record.
+/// Issue #191 regression: a task command the service cannot spawn is answered
+/// through the task-start response with its real reason, rather than leaving
+/// the client to wait out the ten-second await bound and report a timeout.
 #[cfg(unix)]
 #[test]
 fn service_task_start_spawn_failure_reports_the_reason_before_the_await_bound() {
@@ -6650,7 +6650,7 @@ fn service_task_start_spawn_failure_reports_the_reason_before_the_await_bound() 
     assert!(!session_id.is_empty(), "service start prints a session id");
 
     let unspawnable = root.path.join("no-such-binary");
-    let began = Instant::now();
+    let began = std::time::Instant::now();
     let task_start = Command::new(env!("CARGO_BIN_EXE_baton"))
         .args([
             "task",
@@ -6720,6 +6720,10 @@ fn service_task_start_spawn_failure_reports_the_reason_before_the_await_bound() 
     assert!(run_status.success(), "service run exits 0 on teardown");
 }
 
+/// Issue #123 regression: task admission rejects both an absent owner record
+/// and a record whose session process is already dead, before it creates a
+/// child or durable task record.
+#[cfg(unix)]
 #[test]
 fn service_task_rejects_missing_and_stale_owners_before_spawn() {
     let root = TempMailbox::new("task-owner-rejection");
