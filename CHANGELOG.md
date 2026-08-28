@@ -10,10 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.3.9 (2026-08-28)
+## v0.3.10 … v0.3.9 (2026-08-28)
 
 ### Fixes
 - fix(service/windows): keep direct child's exit outcome across descendant drain (#210) (#211)
+- fix(service/windows): recover tasks after supervisor restart (#212)
 
 ## v0.3.8 (2026-08-27)
 
