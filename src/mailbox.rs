@@ -322,15 +322,6 @@ pub enum StopRequest {
 /// A root that does not exist yet (so the lockfile's parent is missing) likewise
 /// means no daemon has ever run there, and so resolves to [`StopRequest::NoDaemon`]
 /// rather than an error — `--stop` never creates the mailbox it is stopping.
-/// Whether a cooperative stop has been requested here and not yet observed.
-///
-/// The sentinel [`request_stop`] drops lives exactly as long as the daemon
-/// serving `root` has been asked to stop but has not yet acted on it, so this
-/// is the "committed to stopping" probe: `poll_stop` consumes it atomically.
-pub fn stop_pending(root: impl AsRef<Path>) -> bool {
-    root.as_ref().join(STOP_FILE).is_file()
-}
-
 pub fn request_stop(root: impl AsRef<Path>) -> Result<StopRequest> {
     let root = root.as_ref();
     let lock_path = root.join(LOCK_FILE);

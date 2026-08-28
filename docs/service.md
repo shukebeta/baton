@@ -136,10 +136,15 @@ baton service teardown --control <dir> [--force]
   final rescan taken under the same uninterrupted lock hold that decides
   whether the session record may be removed — it is reaped, or reported as
   residue with the session record retained, never silently dropped. A session
-  that has been asked to stop is not an admissible task owner even while its
-  process is still live, so a start racing a released grace window fails fast
-  with the owner rejection instead of being handed a task id for a process the
-  stop is about to kill.
+  whose cleanup a live stop owns is not an admissible task owner even while
+  its process is still live, so a start racing a released grace window fails
+  fast with the owner rejection instead of being handed a task id for a
+  process the stop is about to kill. That state is a durable marker held for
+  the whole cleanup, not the cooperative `serve.stop` sentinel — the daemon
+  consumes that sentinel as soon as it observes it, long before the process
+  exits. The marker records the stopping process's identity, so one orphaned
+  by a killed `service stop` is discarded by the next reader rather than
+  wedging admission.
   Idempotent — stopping an already-gone session is a no-op success.
 - **`service teardown`** first requests `run`'s cooperative stop, then waits
   for `run` to release the control lock before taking its session snapshot and
