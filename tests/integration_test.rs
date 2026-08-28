@@ -4116,16 +4116,19 @@ fn service_task_start_claim_ack_cleanup_survives_client_loss() {
 
     let request_path = {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Ok(entries) = std::fs::read_dir(control.join("task-requests"))
-                && let Some(path) = entries
-                    .filter_map(Result::ok)
-                    .map(|entry| entry.path())
-                    .find(|path| {
-                        path.extension().and_then(|extension| extension.to_str()) == Some("json")
-                    })
-            {
-                break path;
+        'request: loop {
+            for directory in ["task-requests", "task-processing"] {
+                if let Ok(entries) = std::fs::read_dir(control.join(directory))
+                    && let Some(path) = entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .find(|path| {
+                            path.extension().and_then(|extension| extension.to_str())
+                                == Some("json")
+                        })
+                {
+                    break 'request path;
+                }
             }
             assert!(
                 std::time::Instant::now() < deadline,
