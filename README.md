@@ -51,8 +51,8 @@ page for what you are doing.
   conversation: `ask`, `session` (and `--resume`), `exchange`, `converse`, and
   `converse-ring`.
 - [docs/mailbox.md](docs/mailbox.md) — read this when agents talk asynchronously:
-  `serve`, `send`, `status`, the delivery/at-least-once contract, and the routing
-  registry.
+  `serve`, `send`, `status`, `mailbox prune`, the delivery/at-least-once contract,
+  and the routing registry.
 - [docs/external-agent.md](docs/external-agent.md) — read this when a mailbox seat
   should be a full-tooled agent CLI rather than one provider call
   (`serve --agent-cmd`).

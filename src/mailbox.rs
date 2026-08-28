@@ -18,6 +18,9 @@
 //!   claimant racing for the same file loses with `ENOENT` and moves on.
 //! - **complete** — `rename(claimed → done)`; `done/` doubles as the dedup
 //!   ledger, so a redelivered id already in `done/` is dropped, not reprocessed.
+//!   Nothing prunes it on its own: the ledger is bounded only by an operator's
+//!   [`prune_done`] (`baton mailbox prune`), which trades ledger size for the
+//!   length of the redelivery-dedup window.
 //! - **reclaim** — on startup the sole live instance moves any `claimed/` entry
 //!   a prior crash abandoned back to `pending/`, so no in-flight message is lost.
 //!
@@ -398,6 +401,82 @@ pub fn status(root: impl AsRef<Path>, max_runtime: Duration) -> Result<MailboxSt
     })
 }
 
+/// Deletes the `done/` ledger entries at `root` whose mtime is at least
+/// `older_than` old, returning how many were removed.
+///
+/// The operator-invoked bound on the dedup ledger: `done/` grows by one file per
+/// completed message and nothing else ever removes them, so a long-lived daemon
+/// accumulates one permanent file per message. Pruning is **never automatic** —
+/// it shortens the redelivery-dedup window, and only an operator can decide that
+/// a duplicate arriving after the cutoff may be reprocessed.
+///
+/// Scoped to `done/`: `pending/` and `claimed/` are never touched, so a prune can
+/// neither drop an unanswered request nor abandon an in-flight one. Like
+/// [`status`] it is **lock-free**, so it can prune a mailbox a live `baton serve`
+/// owns; a file another process removes between the listing and the stat/unlink
+/// is skipped rather than surfaced as an error, and only `<key>.json` entries are
+/// considered so a stray file survives.
+///
+/// `older_than` **must be strictly positive**, and a zero duration is rejected
+/// here as well as in argument parsing rather than being read as "prune
+/// everything": the cutoff is `age >= older_than`, so a zero window matches every
+/// entry — including a future-dated one, whose age clamps to zero — and would
+/// wipe the ledger. Clearing it outright stays an explicit `rm` an operator
+/// types.
+pub fn prune_done(root: impl AsRef<Path>, older_than: Duration) -> Result<usize> {
+    if older_than.is_zero() {
+        return Err(BatonError::Io(
+            "mailbox prune window must be greater than zero".to_string(),
+        ));
+    }
+    let dir = root.as_ref().join("done");
+    let rd = match fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        // No `done/` ⇒ nothing was ever completed here; nothing to prune.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => {
+            return Err(BatonError::Io(format!(
+                "could not read mailbox directory {dir:?}: {err}"
+            )));
+        }
+    };
+    let now = SystemTime::now();
+    let mut removed = 0;
+    for entry in rd {
+        let path = dir_entry(entry, &dir)?.path();
+        if json_key(&path).is_none() {
+            continue;
+        }
+        let modified = match fs::metadata(&path).and_then(|meta| meta.modified()) {
+            Ok(modified) => modified,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(BatonError::Io(format!(
+                    "could not stat ledger entry {path:?}: {err}"
+                )));
+            }
+        };
+        // A clock skew that dates the file in the future clamps to zero age, and
+        // a zero age never reaches a strictly-positive cutoff — so a future-dated
+        // entry always survives.
+        let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+        if age < older_than {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            // Someone else removed it first — the desired end state either way.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(BatonError::Io(format!(
+                    "could not prune ledger entry {path:?}: {err}"
+                )));
+            }
+        }
+    }
+    Ok(removed)
+}
+
 /// Counts the `<key>.json` envelopes in `dir`, treating an absent directory as
 /// empty (a mailbox never opened has no `pending/`).
 fn count_envelopes(dir: &Path) -> Result<usize> {
@@ -692,6 +771,137 @@ mod tests {
         let dir = TempDir::new("empty");
         let mailbox = Mailbox::open(&dir.path).expect("open");
         assert!(mailbox.claim_next().expect("claim").is_none());
+    }
+
+    /// Completes a message, then backdates its ledger entry by `age_secs` —
+    /// the shared setup for the prune tests.
+    fn completed_and_aged(dir: &TempDir, mailbox: &Mailbox, id: &str, age_secs: u64) {
+        mailbox.deliver(&request(id)).expect("deliver");
+        let claimed = mailbox.claim_next().expect("claim").expect("some");
+        mailbox.complete(claimed).expect("complete");
+        backdate(&dir.path.join("done").join(file_name(id)), age_secs);
+    }
+
+    /// A ledger entry older than the window is pruned, and the count reports it.
+    #[test]
+    fn prune_removes_entries_past_the_window() {
+        let dir = TempDir::new("prune-old");
+        let mailbox = Mailbox::open(&dir.path).expect("open");
+        completed_and_aged(&dir, &mailbox, "m-old", 3_600);
+
+        let removed = prune_done(&dir.path, Duration::from_secs(60)).expect("prune");
+        assert_eq!(removed, 1);
+        assert_eq!(count_files(&dir.path.join("done")), 0);
+    }
+
+    /// An entry inside the window survives, and still deduplicates a redelivery —
+    /// pruning shortens the dedup window, it does not disable dedup.
+    #[test]
+    fn prune_within_window_keeps_dedup() {
+        let dir = TempDir::new("prune-young");
+        let mailbox = Mailbox::open(&dir.path).expect("open");
+        completed_and_aged(&dir, &mailbox, "m-young", 10);
+
+        let removed = prune_done(&dir.path, Duration::from_secs(3_600)).expect("prune");
+        assert_eq!(removed, 0);
+        assert_eq!(count_files(&dir.path.join("done")), 1);
+
+        // The redelivered duplicate is still dropped, not reprocessed.
+        mailbox.deliver(&request("m-young")).expect("redeliver");
+        assert!(mailbox.claim_next().expect("claim").is_none());
+        assert_eq!(count_files(&dir.path.join("pending")), 0);
+    }
+
+    /// Once the entry is pruned, the same id is no longer deduplicated — the
+    /// documented trade-off, pinned so it cannot regress silently.
+    #[test]
+    fn prune_past_window_reopens_the_id() {
+        let dir = TempDir::new("prune-reopen");
+        let mailbox = Mailbox::open(&dir.path).expect("open");
+        completed_and_aged(&dir, &mailbox, "m-gone", 3_600);
+
+        assert_eq!(
+            prune_done(&dir.path, Duration::from_secs(60)).expect("prune"),
+            1
+        );
+
+        mailbox.deliver(&request("m-gone")).expect("redeliver");
+        let reclaimed = mailbox.claim_next().expect("claim").expect("some");
+        assert_eq!(reclaimed.key, "m-gone");
+    }
+
+    /// Pruning is scoped to `done/`: an old `pending/` or `claimed/` entry is
+    /// never removed, so a prune can neither drop an unanswered request nor
+    /// abandon an in-flight one.
+    #[test]
+    fn prune_never_touches_pending_or_claimed() {
+        let dir = TempDir::new("prune-scope");
+        let mailbox = Mailbox::open(&dir.path).expect("open");
+
+        // One waiting in pending, one held in claimed, both aged well past the
+        // window.
+        mailbox.deliver(&request("m-claimed")).expect("deliver");
+        let _held = mailbox.claim_next().expect("claim").expect("some");
+        mailbox.deliver(&request("m-pending")).expect("deliver");
+        backdate(
+            &dir.path.join("claimed").join(file_name("m-claimed")),
+            3_600,
+        );
+        backdate(
+            &dir.path.join("pending").join(file_name("m-pending")),
+            3_600,
+        );
+
+        assert_eq!(
+            prune_done(&dir.path, Duration::from_secs(60)).expect("prune"),
+            0
+        );
+        assert_eq!(count_files(&dir.path.join("pending")), 1);
+        assert_eq!(count_files(&dir.path.join("claimed")), 1);
+    }
+
+    /// A future-dated entry (clock skew) clamps to zero age, and a zero age never
+    /// reaches a strictly-positive window — so it survives every prune.
+    #[test]
+    fn prune_keeps_future_dated_entries() {
+        let dir = TempDir::new("prune-future");
+        let mailbox = Mailbox::open(&dir.path).expect("open");
+        mailbox.deliver(&request("m-future")).expect("deliver");
+        let claimed = mailbox.claim_next().expect("claim").expect("some");
+        mailbox.complete(claimed).expect("complete");
+        let entry = dir.path.join("done").join(file_name("m-future"));
+        let file = OpenOptions::new().write(true).open(&entry).expect("open");
+        file.set_modified(SystemTime::now() + Duration::from_secs(3_600))
+            .expect("post-date");
+
+        assert_eq!(
+            prune_done(&dir.path, Duration::from_millis(1)).expect("prune"),
+            0
+        );
+        assert_eq!(count_files(&dir.path.join("done")), 1);
+    }
+
+    /// A zero window is refused at the API boundary, not just in argument
+    /// parsing: `age >= 0` matches every entry, so it would wipe the ledger.
+    #[test]
+    fn prune_rejects_a_zero_window() {
+        let dir = TempDir::new("prune-zero");
+        let mailbox = Mailbox::open(&dir.path).expect("open");
+        completed_and_aged(&dir, &mailbox, "m-any", 3_600);
+
+        assert!(prune_done(&dir.path, Duration::ZERO).is_err());
+        assert_eq!(count_files(&dir.path.join("done")), 1);
+    }
+
+    /// A mailbox that never completed anything has no `done/` — pruning it is a
+    /// no-op, not an error.
+    #[test]
+    fn prune_absent_ledger_is_a_no_op() {
+        let dir = TempDir::new("prune-absent");
+        assert_eq!(
+            prune_done(&dir.path, Duration::from_secs(60)).expect("prune"),
+            0
+        );
     }
 
     /// A redelivered id already in `done/` is dropped, not re-claimed.
