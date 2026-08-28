@@ -62,10 +62,12 @@ without ever sharing a process tree with it.
   versions still parse.
 - `sessions/<id>.json` — one durable session record per session (its
   effective spec, real PID, canonical `started_at` string, and on Windows its
-  optional Job Object name). `status`/`stop`/`teardown` read
-  this directly and act on the OS process by PID — none of them need `run` to
-  be alive, so a session started by a since-crashed `run` can still be
-  inspected, stopped, or torn down.
+  optional Job Object name). On Unix, `sessions/<id>/stderr.log` is the
+  session daemon's durable stderr log; warnings from mailbox parsing and
+  session recording are written there. `status`/`stop`/`teardown` read
+  the record directly and act on the OS process by PID — none of them need
+  `run` to be alive, so a session started by a since-crashed `run` can still
+  be inspected, stopped, or torn down.
 
 ## Lifecycle contract
 
@@ -106,7 +108,8 @@ baton service teardown --control <dir> [--force]
 - **`service status`** reports the service's own liveness plus every session's
   (or just `--session <id>`'s). Each record retains the compatibility boolean
   `live` (`true` only for `liveness: "live"`) and exposes the full
-  `liveness` state. Per-session liveness checks the recorded PID against
+  `liveness` state plus `stderr_path`, the path to the Unix session daemon's
+  captured stderr log (`sessions/<id>/stderr.log`). Per-session liveness checks the recorded PID against
   `/proc/<pid>` on Linux — alive, not a zombie, and its start time still
   matches the record — so a PID recycled after a restart is `dead`. On macOS,
   records with `start_epoch_secs` compare that canonical epoch directly and

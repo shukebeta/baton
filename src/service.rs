@@ -39,10 +39,11 @@
 //!   it claims a response, allowing restart reconciliation to distinguish a
 //!   consumed response from one that was never published.
 //! - `sessions/<id>.json` — one durable [`SessionRecord`] per session, holding
-//!   its effective spec and real PID. `Status`/`Stop`/`Teardown` read this
-//!   directly and act on the OS process by PID; none of them need the `Run`
-//!   loop to be alive, so a session started by a since-crashed `Run` can still
-//!   be inspected, stopped, or torn down.
+//!   its effective spec, real PID, and (on Unix) its stderr log path. The
+//!   corresponding `sessions/<id>/stderr.log` keeps daemon warnings durable.
+//!   `Status`/`Stop`/`Teardown` read this directly and act on the OS process by
+//!   PID; none of them need the `Run` loop to be alive, so a session started by
+//!   a since-crashed `Run` can still be inspected, stopped, or torn down.
 //!
 //! ## Ownership boundary
 //!
@@ -294,6 +295,10 @@ mod imp {
         /// path.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         start_epoch_secs: Option<i64>,
+        /// Path to the session daemon's durable stderr log. Empty for a
+        /// legacy record written before session stderr capture was added.
+        #[serde(default)]
+        stderr_path: String,
     }
 
     /// The `Start` response body, keyed by request id in `responses/`.
@@ -834,9 +839,20 @@ mod imp {
         let spec: SessionSpec = serde_json::from_str(&data).map_err(|err| {
             BatonError::Decode(format!("malformed session spec {spec_path:?}: {err}"))
         })?;
-        let mut child = match spawn_serve_child(&spec) {
+        let session_id = fresh_session_id();
+        let log_dir = session_logs_dir(control, &session_id);
+        if let Err(err) = fs::create_dir_all(&log_dir) {
+            return reject_start_request(
+                control,
+                request_id,
+                format!("could not create {log_dir:?}: {err}"),
+            );
+        }
+        let stderr_path = log_dir.join("stderr.log");
+        let mut child = match spawn_serve_child(&spec, &stderr_path) {
             Ok(child) => child,
             Err(err) => {
+                let _ = fs::remove_dir_all(&log_dir);
                 return reject_start_request(control, request_id, admission_error_text(&err));
             }
         };
@@ -850,6 +866,7 @@ mod imp {
         if !spawn_start_key_ok(&started_at, &start_epoch_secs) {
             let _ = signal_group(pid, "-KILL");
             let _ = child.wait();
+            let _ = fs::remove_dir_all(&log_dir);
             return reject_start_request(
                 control,
                 request_id,
@@ -859,15 +876,17 @@ mod imp {
             );
         }
         let record = SessionRecord {
-            id: fresh_session_id(),
+            id: session_id,
             spec,
             pid,
             started_at,
             start_epoch_secs,
+            stderr_path: stderr_path.display().to_string(),
         };
         if let Err(err) = write_session_record(control, &record) {
             let _ = signal_group(pid, "-KILL");
             let _ = child.wait();
+            let _ = fs::remove_dir_all(&log_dir);
             return reject_start_request(control, request_id, admission_error_text(&err));
         }
         let respond = write_start_response(
@@ -882,6 +901,7 @@ mod imp {
             let _ = signal_group(pid, "-KILL");
             let _ = child.wait();
             let _ = remove_session_record(control, &record.id);
+            let _ = fs::remove_dir_all(&log_dir);
             return Err(err);
         }
         Ok(Some((record, child)))
@@ -942,15 +962,18 @@ mod imp {
     }
 
     /// Spawns `baton serve` for `spec` as its own process-group leader
-    /// (`pgid == pid`), detached from this process's stdio, and returns the
-    /// live [`Child`] without waiting on it — `Run`'s loop reaps it later.
-    fn spawn_serve_child(spec: &SessionSpec) -> Result<Child> {
+    /// (`pgid == pid`), detached from this process's stdio except for durable
+    /// stderr capture, and returns the live [`Child`] without waiting on it —
+    /// `Run`'s loop reaps it later.
+    fn spawn_serve_child(spec: &SessionSpec, stderr_path: &Path) -> Result<Child> {
         let exe = current_baton_exe()?;
         let mut command = Command::new(&exe);
         command.args(serve_argv(spec));
         command.stdin(Stdio::null());
         command.stdout(Stdio::null());
-        command.stderr(Stdio::null());
+        let stderr_file = File::create(stderr_path)
+            .map_err(|err| BatonError::Io(format!("could not create {stderr_path:?}: {err}")))?;
+        command.stderr(Stdio::from(stderr_file));
         // A fresh process group (not this service's own) so a later
         // `kill -- -<pid>` escalation reaches exactly this session's `serve`
         // process and its `agent-cmd` grandchild, nothing else this service
@@ -3402,6 +3425,10 @@ mod imp {
         control.join("sessions")
     }
 
+    fn session_logs_dir(control: &Path, session_id: &str) -> std::path::PathBuf {
+        sessions_dir(control).join(session_id)
+    }
+
     fn session_record_path(control: &Path, id: &str) -> Result<std::path::PathBuf> {
         if !mailbox::is_safe_key(id) {
             return Err(BatonError::Io(format!(
@@ -3469,6 +3496,7 @@ mod imp {
         live: bool,
         liveness: Liveness,
         inbox: &'a str,
+        stderr_path: &'a str,
     }
 
     #[derive(Serialize)]
@@ -3494,6 +3522,7 @@ mod imp {
                     live: liveness.is_live(),
                     liveness,
                     inbox: &record.spec.inbox,
+                    stderr_path: &record.stderr_path,
                 }
             })
             .collect();
@@ -3919,12 +3948,44 @@ mod imp {
                 pid: 4242,
                 started_at: Some("123456".to_string()),
                 start_epoch_secs: Some(123456),
+                stderr_path: "/tmp/stderr.log".to_string(),
             };
             write_session_record(&dir.path, &record).expect("write");
             let read = read_session_record(&dir.path, "svc-1")
                 .expect("read")
                 .expect("present");
             assert_eq!(read, record);
+        }
+
+        /// A record written before session stderr capture was added remains
+        /// readable and reports an empty path rather than failing status or
+        /// cleanup.
+        #[test]
+        fn legacy_session_record_defaults_stderr_path() {
+            let dir = TempDir::new("legacy-record");
+            let record = SessionRecord {
+                id: "svc-legacy".to_string(),
+                spec: spec("/tmp/in", "/tmp/out"),
+                pid: 4242,
+                started_at: None,
+                start_epoch_secs: None,
+                stderr_path: String::new(),
+            };
+            let mut json = serde_json::to_value(record).expect("serialize record");
+            json.as_object_mut()
+                .expect("record object")
+                .remove("stderr_path");
+            fs::create_dir_all(sessions_dir(&dir.path)).expect("create sessions dir");
+            fs::write(
+                session_record_path(&dir.path, "svc-legacy").expect("record path"),
+                serde_json::to_vec(&json).expect("serialize legacy record"),
+            )
+            .expect("write legacy record");
+
+            let read = read_session_record(&dir.path, "svc-legacy")
+                .expect("read legacy record")
+                .expect("legacy record exists");
+            assert!(read.stderr_path.is_empty());
         }
 
         /// A legacy macOS task rescued by its spawn instant is upgraded once
@@ -4017,6 +4078,7 @@ mod imp {
                         pid: u32::MAX - 1,
                         started_at: Some("not-current".to_string()),
                         start_epoch_secs: None,
+                        stderr_path: String::new(),
                     }),
                 ),
             ] {
@@ -4080,6 +4142,7 @@ mod imp {
                     pid,
                     started_at,
                     start_epoch_secs,
+                    stderr_path: String::new(),
                 },
             )
             .expect("write live session record");
@@ -4242,6 +4305,7 @@ mod imp {
                     pid: 1000 + i,
                     started_at: None,
                     start_epoch_secs: None,
+                    stderr_path: String::new(),
                 };
                 write_session_record(&dir.path, &record).expect("write");
             }
@@ -4265,6 +4329,7 @@ mod imp {
                 pid: 1,
                 started_at: None,
                 start_epoch_secs: None,
+                stderr_path: String::new(),
             };
             write_session_record(&dir.path, &record).expect("write");
             remove_session_record(&dir.path, "svc-1").expect("remove");
@@ -4487,6 +4552,7 @@ mod imp {
                 pid: u32::MAX - 1,
                 started_at: None,
                 start_epoch_secs: None,
+                stderr_path: String::new(),
             };
             write_session_record(&dir.path, &record).expect("write");
 
@@ -4525,6 +4591,7 @@ mod imp {
                 pid: u32::MAX - 1,
                 started_at: None,
                 start_epoch_secs: None,
+                stderr_path: String::new(),
             };
             write_session_record(&dir.path, &record).expect("write");
 
@@ -4605,6 +4672,7 @@ mod imp {
                 pid: u32::MAX - 1,
                 started_at: None,
                 start_epoch_secs: None,
+                stderr_path: String::new(),
             };
             write_session_record(&dir.path, &session_record).expect("write session record");
 
@@ -6106,6 +6174,7 @@ mod imp {
                 pid: u32::MAX - 1,
                 started_at: None,
                 start_epoch_secs: None,
+                stderr_path: String::new(),
             };
             write_session_record(&dir.path, &session_record).expect("write session");
             let task_record = TaskRecord {
@@ -6278,6 +6347,7 @@ mod imp {
                 pid: u32::MAX - 1,
                 started_at: None,
                 start_epoch_secs: None,
+                stderr_path: String::new(),
             };
             let task_record = TaskRecord {
                 id: "task-unresolved".to_string(),
