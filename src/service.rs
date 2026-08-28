@@ -5923,6 +5923,9 @@ mod imp {
                 started_ms: owned.started_ms,
                 term_sent_at_ms: None,
                 kill_sent: false,
+                terminal_delivery_attempts: 0,
+                next_terminal_retry_ms: None,
+                terminal_retry_delay_ms: 0,
             };
 
             let tick = tick_one_task(&dir.path, "task-rehydrated-group", &mut rehydrated, &clock)
