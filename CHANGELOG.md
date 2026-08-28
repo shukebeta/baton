@@ -10,7 +10,7 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.3.16 … v0.3.9 (2026-08-28)
+## v0.3.17 … v0.3.9 (2026-08-28)
 
 ### Fixes
 - fix(service/windows): keep direct child's exit outcome across descendant drain (#210) (#211)
@@ -20,6 +20,7 @@ _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 - fix(service): back off stuck terminal callback delivery (#218)
 - fix(mailbox): bound the done/ dedup ledger with an operator prune (#217)
 - fix(service): drain Unix task process groups (#214)
+- fix(windows): preserve backslashes in agent args (#223)
 
 ### Other Changes
 - test(service/windows): cover task admission recovery (#220)
