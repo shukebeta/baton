@@ -242,6 +242,13 @@ mod imp {
     /// Interval between `Run`'s request-directory scans, and between polls of
     /// a pending await (start response, stop/kill grace).
     const POLL_INTERVAL_MS: u64 = 100;
+    /// Initial delay before retrying a failed terminal callback delivery.
+    const TERMINAL_RETRY_INITIAL_DELAY_MS: u64 = 1_000;
+    /// Longest delay between terminal callback delivery attempts.
+    const TERMINAL_RETRY_MAX_DELAY_MS: u64 = 60_000;
+    /// Total terminal callback delivery attempts before the task is dropped
+    /// from the in-memory tracker.
+    const MAX_TERMINAL_DELIVERY_ATTEMPTS: u32 = 10;
     /// Bound on how long `Start` waits for a live `Run` to answer.
     const START_AWAIT_MS: u64 = 10_000;
     /// Bound on the cooperative `serve --stop` grace before escalating to
@@ -1630,6 +1637,16 @@ mod imp {
         term_sent_at_ms: Option<u64>,
         /// Set once `SIGKILL` has been sent, so it is only ever sent once.
         kill_sent: bool,
+        /// Number of failed terminal callback delivery attempts. These are
+        /// deliberately in-memory: a terminal record is replayed once after
+        /// restart, then follows the same bounded retry policy.
+        terminal_delivery_attempts: u32,
+        /// Clock deadline at which the next terminal callback delivery may be
+        /// attempted.
+        next_terminal_retry_ms: Option<u64>,
+        /// Delay used for the most recent failed terminal delivery, so the
+        /// next failure can double it without a wall-clock dependency.
+        terminal_retry_delay_ms: u64,
     }
 
     /// Restores every durable task before the request loop accepts new work.
@@ -1671,6 +1688,9 @@ mod imp {
                     started_ms,
                     term_sent_at_ms: None,
                     kill_sent: false,
+                    terminal_delivery_attempts: 0,
+                    next_terminal_retry_ms: None,
+                    terminal_retry_delay_ms: 0,
                 },
             );
         }
@@ -1678,9 +1698,19 @@ mod imp {
     }
 
     /// Outcome of one [`tick_one_task`] call.
+    #[derive(Debug)]
     enum TaskTick {
         StillRunning,
         Finished,
+        TerminalDeliveryRetry {
+            error: String,
+            attempt: u32,
+            delay_ms: u64,
+        },
+        TerminalDeliveryDropped {
+            error: String,
+            attempts: u32,
+        },
     }
 
     /// Claims and handles the next pending task-start request, if any.
@@ -1735,6 +1765,9 @@ mod imp {
                         started_ms,
                         term_sent_at_ms: None,
                         kill_sent: false,
+                        terminal_delivery_attempts: 0,
+                        next_terminal_retry_ms: None,
+                        terminal_retry_delay_ms: 0,
                     };
                     return Ok(Some((id, running)));
                 }
@@ -2031,8 +2064,7 @@ mod imp {
             return Ok(TaskTick::Finished);
         }
         if running.record.state != TaskState::Running {
-            deliver_task_event(&running.record, TaskEventKind::Terminal)?;
-            return Ok(TaskTick::Finished);
+            return deliver_terminal_event(running, clock);
         }
 
         let elapsed_ms = clock.now_ms().saturating_sub(running.started_ms);
@@ -2065,7 +2097,7 @@ mod imp {
                     } else {
                         TaskState::Failed
                     };
-                    return finalize_task(control, running, state, None, elapsed_ms);
+                    return finalize_task(control, running, state, None, elapsed_ms, clock);
                 }
                 Liveness::Live => {}
                 Liveness::Unresolved => return Ok(TaskTick::StillRunning),
@@ -2090,7 +2122,7 @@ mod imp {
                         } else {
                             TaskState::Timeout
                         };
-                        return finalize_task(control, running, state, None, elapsed_ms);
+                        return finalize_task(control, running, state, None, elapsed_ms, clock);
                     }
                     Liveness::Live => {}
                     Liveness::Unresolved => return Ok(TaskTick::StillRunning),
@@ -2112,7 +2144,7 @@ mod imp {
                     } else {
                         TaskState::Failed
                     };
-                    finalize_task(control, running, state, None, elapsed_ms)
+                    finalize_task(control, running, state, None, elapsed_ms, clock)
                 }
             },
             Some(child) => match child.try_wait() {
@@ -2136,11 +2168,53 @@ mod imp {
                     } else {
                         TaskState::Failed
                     };
-                    finalize_task(control, running, state, status.code(), elapsed_ms)
+                    finalize_task(control, running, state, status.code(), elapsed_ms, clock)
                 }
                 Ok(None) => Ok(TaskTick::StillRunning),
                 Err(err) => Err(BatonError::Io(format!("could not poll task {id}: {err}"))),
             },
+        }
+    }
+
+    /// Delivers a terminal event, applying bounded exponential backoff when
+    /// the callback inbox is unavailable.
+    fn deliver_terminal_event(running: &mut RunningTask, clock: &dyn Clock) -> Result<TaskTick> {
+        let now_ms = clock.now_ms();
+        if let Some(next_retry_ms) = running.next_terminal_retry_ms
+            && now_ms < next_retry_ms
+        {
+            return Ok(TaskTick::StillRunning);
+        }
+
+        match deliver_task_event(&running.record, TaskEventKind::Terminal) {
+            Ok(()) => Ok(TaskTick::Finished),
+            Err(err) => {
+                let attempt = running.terminal_delivery_attempts.saturating_add(1);
+                running.terminal_delivery_attempts = attempt;
+                let error = err.to_string();
+                if attempt >= MAX_TERMINAL_DELIVERY_ATTEMPTS {
+                    return Ok(TaskTick::TerminalDeliveryDropped {
+                        error,
+                        attempts: attempt,
+                    });
+                }
+
+                let delay_ms = if attempt == 1 {
+                    TERMINAL_RETRY_INITIAL_DELAY_MS
+                } else {
+                    running
+                        .terminal_retry_delay_ms
+                        .saturating_mul(2)
+                        .min(TERMINAL_RETRY_MAX_DELAY_MS)
+                };
+                running.terminal_retry_delay_ms = delay_ms;
+                running.next_terminal_retry_ms = Some(now_ms.saturating_add(delay_ms));
+                Ok(TaskTick::TerminalDeliveryRetry {
+                    error,
+                    attempt,
+                    delay_ms,
+                })
+            }
         }
     }
 
@@ -2153,6 +2227,7 @@ mod imp {
         state: TaskState,
         exit_code: Option<i32>,
         elapsed_ms: u64,
+        clock: &dyn Clock,
     ) -> Result<TaskTick> {
         let previous = running.record.clone();
         running.record.state = state;
@@ -2162,8 +2237,7 @@ mod imp {
             running.record = previous;
             return Err(err);
         }
-        deliver_task_event(&running.record, TaskEventKind::Terminal)?;
-        Ok(TaskTick::Finished)
+        deliver_terminal_event(running, clock)
     }
 
     /// Ticks every tracked task once, dropping any that finished. One task's
@@ -2176,6 +2250,23 @@ mod imp {
             match tick_one_task(control, id, running, clock) {
                 Ok(TaskTick::Finished) => finished.push(id.clone()),
                 Ok(TaskTick::StillRunning) => {}
+                Ok(TaskTick::TerminalDeliveryRetry {
+                    error,
+                    attempt,
+                    delay_ms,
+                }) => {
+                    eprintln!(
+                        "warning: baton service failed to deliver terminal event for task {id} to callback inbox {:?} (attempt {attempt}/{MAX_TERMINAL_DELIVERY_ATTEMPTS}; retrying in {delay_ms} ms): {error}",
+                        running.record.spec.callback.inbox
+                    );
+                }
+                Ok(TaskTick::TerminalDeliveryDropped { error, attempts }) => {
+                    eprintln!(
+                        "warning: baton service dropped task {id} after {attempts} failed terminal-event deliveries to callback inbox {:?}: {error}",
+                        running.record.spec.callback.inbox
+                    );
+                    finished.push(id.clone());
+                }
                 Err(err) => {
                     eprintln!("warning: baton service failed to tick task {id}: {err}");
                 }
@@ -3416,6 +3507,55 @@ mod imp {
                 started_ms,
                 term_sent_at_ms: None,
                 kill_sent: false,
+                terminal_delivery_attempts: 0,
+                next_terminal_retry_ms: None,
+                terminal_retry_delay_ms: 0,
+            }
+        }
+
+        /// Builds a terminal task without a live child so callback delivery
+        /// retry behavior can be driven entirely by [`FakeClock`].
+        fn terminal_running_task(
+            dir: &Path,
+            id: &str,
+            callback_inbox: &Path,
+            clock: &dyn Clock,
+        ) -> RunningTask {
+            let spec = task_spec(
+                "svc-1",
+                "true",
+                vec![],
+                vec![],
+                10_000,
+                &callback_inbox.display().to_string(),
+            );
+            let record = TaskRecord {
+                id: id.to_string(),
+                request_id: None,
+                admission: TaskAdmissionPhase::Committed,
+                spec,
+                pid: 0,
+                started_at: None,
+                start_epoch_secs: None,
+                job: None,
+                started_ms: Some(clock.now_ms()),
+                state: TaskState::Completed,
+                exit_code: Some(0),
+                elapsed_ms: Some(10),
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                delivered_milestones: 0,
+            };
+            write_task_record(dir, &record).expect("write terminal task record");
+            RunningTask {
+                record,
+                child: None,
+                started_ms: clock.now_ms(),
+                term_sent_at_ms: None,
+                kill_sent: false,
+                terminal_delivery_attempts: 0,
+                next_terminal_retry_ms: None,
+                terminal_retry_delay_ms: 0,
             }
         }
 
@@ -5047,6 +5187,105 @@ mod imp {
             assert_eq!(claimed.key, format!("{task_id}-terminal"));
         }
 
+        /// Failed terminal callback delivery backs off from one second and
+        /// still redelivers the deterministic event when the inbox recovers.
+        #[test]
+        fn terminal_delivery_uses_fake_clock_backoff_and_recovers() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("terminal-delivery-retry");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            fs::write(&callback_inbox, "callback unavailable").expect("make callback a file");
+            let mut running =
+                terminal_running_task(&dir.path, "task-terminal-retry", &callback_inbox, &clock);
+
+            match tick_one_task(&dir.path, "task-terminal-retry", &mut running, &clock)
+                .expect("first terminal delivery attempt")
+            {
+                TaskTick::TerminalDeliveryRetry {
+                    attempt, delay_ms, ..
+                } => {
+                    assert_eq!(attempt, 1);
+                    assert_eq!(delay_ms, TERMINAL_RETRY_INITIAL_DELAY_MS);
+                }
+                other => panic!("expected a scheduled retry, got {other:?}"),
+            }
+            assert_eq!(running.terminal_delivery_attempts, 1);
+            assert_eq!(running.next_terminal_retry_ms, Some(1_000));
+
+            clock.advance(TERMINAL_RETRY_INITIAL_DELAY_MS - 1);
+            assert!(matches!(
+                tick_one_task(&dir.path, "task-terminal-retry", &mut running, &clock)
+                    .expect("early terminal retry tick"),
+                TaskTick::StillRunning
+            ));
+            fs::remove_file(&callback_inbox).expect("remove unavailable callback marker");
+
+            clock.advance(1);
+            assert!(matches!(
+                tick_one_task(&dir.path, "task-terminal-retry", &mut running, &clock)
+                    .expect("recovered terminal delivery"),
+                TaskTick::Finished
+            ));
+            assert_terminal_task_event(&callback_inbox, "task-terminal-retry");
+        }
+
+        /// Persistent terminal callback failure is retried at most the
+        /// configured bound, with no delay growing beyond one minute, then
+        /// returns `Finished` so `tick_tasks` drops the tracker entry.
+        #[test]
+        fn terminal_delivery_drops_after_bounded_backoff_attempts() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("terminal-delivery-drop");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            fs::write(&callback_inbox, "callback unavailable").expect("make callback a file");
+            let mut running =
+                terminal_running_task(&dir.path, "task-terminal-drop", &callback_inbox, &clock);
+            let mut expected_delay = TERMINAL_RETRY_INITIAL_DELAY_MS;
+
+            for attempt in 1..=MAX_TERMINAL_DELIVERY_ATTEMPTS {
+                if attempt > 1 {
+                    clock.advance(running.terminal_retry_delay_ms);
+                }
+                let tick = tick_one_task(&dir.path, "task-terminal-drop", &mut running, &clock)
+                    .expect("terminal delivery attempt");
+                if attempt < MAX_TERMINAL_DELIVERY_ATTEMPTS {
+                    match tick {
+                        TaskTick::TerminalDeliveryRetry {
+                            attempt: reported_attempt,
+                            delay_ms,
+                            ..
+                        } => {
+                            assert_eq!(reported_attempt, attempt);
+                            assert_eq!(delay_ms, expected_delay);
+                            assert!(delay_ms <= TERMINAL_RETRY_MAX_DELAY_MS);
+                            expected_delay = expected_delay
+                                .saturating_mul(2)
+                                .min(TERMINAL_RETRY_MAX_DELAY_MS);
+                        }
+                        other => panic!("expected another retry, got {other:?}"),
+                    }
+                } else {
+                    assert!(matches!(
+                        tick,
+                        TaskTick::TerminalDeliveryDropped {
+                            attempts: MAX_TERMINAL_DELIVERY_ATTEMPTS,
+                            ..
+                        }
+                    ));
+                }
+            }
+            assert_eq!(
+                running.terminal_delivery_attempts,
+                MAX_TERMINAL_DELIVERY_ATTEMPTS
+            );
+            assert!(
+                callback_inbox.is_file(),
+                "failed callback remains unavailable"
+            );
+        }
+
         /// A task that exits zero on its own, before any max-duration
         /// breach, is reaped as `completed`.
         #[test]
@@ -5073,6 +5312,7 @@ mod imp {
                         assert!(Instant::now() < deadline, "task did not exit in time");
                         std::thread::sleep(Duration::from_millis(20));
                     }
+                    other => panic!("unexpected terminal delivery outcome: {other:?}"),
                 }
             }
             assert_eq!(running.record.state, TaskState::Completed);
@@ -5500,6 +5740,7 @@ mod imp {
                         assert!(Instant::now() < deadline, "task did not exit in time");
                         std::thread::sleep(Duration::from_millis(20));
                     }
+                    other => panic!("unexpected terminal delivery outcome: {other:?}"),
                 }
             }
             assert_eq!(running.record.state, TaskState::Cancelled);
