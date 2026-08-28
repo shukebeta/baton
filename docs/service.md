@@ -86,11 +86,16 @@ baton service teardown --control <dir> [--force]
   response to the waiting client, and any remaining failure — a malformed
   spec, an unexpected fault, a response it could not deliver — logs a warning
   and never crashes the loop for the sessions it already owns.
-- **`service start`** takes exactly the flags `baton serve` itself takes (they
-  become the session's `SessionSpec`, reconstructed into an equivalent
-  `baton serve` argv by `run`). It submits the spec and returns a session id
-  as soon as `run` has spawned the child and persisted its record — it never
-  waits on a served turn. Fails fast, with a clear error, if no `service run`
+- **`service start`** accepts the session-shaping subset of `baton serve`'s
+  flags shown in the synopsis above (`--poll-ms`, `--agent-*`, and `--role`),
+  alongside its required `--control`, `--inbox`, and `--outbox` options. The
+  session-shaping flags become the session's `SessionSpec`, reconstructed into
+  an equivalent `baton serve` argv by `run`. Direct `baton serve` lifecycle
+  flags such as `--once` and `--stop` are not accepted; service-managed
+  lifecycle is handled by `service run`, `service stop`, and `service teardown`.
+  It submits the spec and returns a session id as soon as `run` has spawned the
+  child and persisted its record — it never waits on a served turn.
+  Fails fast, with a clear error, if no `service run`
   is currently live on `--control`, rather than hanging on a request no one
   will ever answer. Relative `--inbox`, `--outbox`, and `--agent-cwd` values
   are resolved against the submitting client's current working directory and
