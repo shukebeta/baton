@@ -2107,29 +2107,26 @@ mod imp {
         if running.term_sent_at_ms.is_none()
             && max_duration_exceeded(elapsed_ms, running.record.spec.max_duration_ms)
         {
-            let _ = signal_group(running.record.pid, "-TERM");
-            running.term_sent_at_ms = Some(clock.now_ms());
+            match task_execution_liveness(&running.record) {
+                Liveness::Unresolved => return Ok(TaskTick::StillRunning),
+                Liveness::Live => {
+                    let _ = signal_group(running.record.pid, "-TERM");
+                    running.term_sent_at_ms = Some(clock.now_ms());
+                }
+                Liveness::Dead => {}
+            }
         } else if let Some(term_at) = running.term_sent_at_ms
             && !running.kill_sent
             && clock.now_ms().saturating_sub(term_at) >= KILL_GRACE_MS
         {
-            if running.child.is_none() {
-                match task_execution_liveness(&running.record) {
-                    Liveness::Dead => {
-                        let cancelled = consume_task_cancel_sentinel(control, id)?;
-                        let state = if cancelled {
-                            TaskState::Cancelled
-                        } else {
-                            TaskState::Timeout
-                        };
-                        return finalize_task(control, running, state, None, elapsed_ms, clock);
-                    }
-                    Liveness::Live => {}
-                    Liveness::Unresolved => return Ok(TaskTick::StillRunning),
+            match task_execution_liveness(&running.record) {
+                Liveness::Unresolved => return Ok(TaskTick::StillRunning),
+                Liveness::Live => {
+                    let _ = signal_group(running.record.pid, "-KILL");
+                    running.kill_sent = true;
                 }
+                Liveness::Dead => {}
             }
-            let _ = signal_group(running.record.pid, "-KILL");
-            running.kill_sent = true;
         }
 
         match running.child.as_mut() {
@@ -3237,8 +3234,8 @@ mod imp {
                 TaskLeaderExit::Gone | TaskLeaderExit::MatchingZombie => {
                     task_group_liveness(record.pid)
                 }
-                TaskLeaderExit::Mismatched | TaskLeaderExit::NotExited => Liveness::Dead,
-                TaskLeaderExit::Unresolved => Liveness::Unresolved,
+                TaskLeaderExit::Mismatched | TaskLeaderExit::Unresolved => Liveness::Unresolved,
+                TaskLeaderExit::NotExited => Liveness::Dead,
             },
             liveness => liveness,
         }
@@ -5120,8 +5117,8 @@ mod imp {
 
         /// A reused PID can still be a zombie while the original task's
         /// descendant keeps the old process group alive. The zombie's
-        /// mismatched identity must not make that unrelated group look like
-        /// this task; a legacy record with no identity remains unresolved.
+        /// mismatched identity must remain unresolved rather than making that
+        /// unrelated group look like this task.
         #[cfg(target_os = "linux")]
         #[test]
         fn task_rejects_reused_zombie_pid_with_live_group() {
@@ -5164,10 +5161,20 @@ mod imp {
             };
 
             wait_for_zombie_group_descendant(&child);
+            write_task_record(&dir.path, &record).expect("write zombie task record");
             assert_eq!(
                 task_execution_liveness(&record),
-                Liveness::Dead,
-                "a mismatched zombie cannot authorize a group probe"
+                Liveness::Unresolved,
+                "a mismatched zombie remains unresolved"
+            );
+            let residue = reap_session_tasks(&dir.path, "svc-1", false).expect("retain task");
+            assert_eq!(residue.len(), 1);
+            assert_eq!(residue[0].liveness, Liveness::Unresolved);
+            assert!(
+                read_task_record(&dir.path, &record.id)
+                    .expect("read retained zombie task")
+                    .is_some(),
+                "unresolved zombie task record is retained"
             );
             let mut legacy = record.clone();
             legacy.started_at = None;
@@ -5866,6 +5873,49 @@ mod imp {
             assert_durable_task_state(&dir.path, "task-cancel-group", TaskState::Cancelled);
             assert_eq!(task_group_liveness(running.record.pid), Liveness::Dead);
             assert_terminal_task_event(&callback_inbox, "task-cancel-group");
+        }
+
+        /// Timeout escalation never signals an owned task while its process
+        /// identity is unresolved, even when the duration has elapsed.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn task_timeout_does_not_signal_unresolved_owned_task() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("timeout-unresolved-owned");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let spec = task_spec(
+                "svc-1",
+                "sleep",
+                vec!["30".to_string()],
+                vec![],
+                100,
+                &callback_inbox.display().to_string(),
+            );
+            let mut running =
+                spawn_running_task(&dir.path, "task-timeout-unresolved", spec, &clock);
+            running.record.started_at = None;
+            running.record.spec.command = "not-the-running-command".to_string();
+
+            clock.advance(100);
+            let first_tick =
+                tick_one_task(&dir.path, "task-timeout-unresolved", &mut running, &clock)
+                    .expect("unresolved timeout tick");
+            assert!(matches!(first_tick, TaskTick::StillRunning));
+            assert_eq!(running.term_sent_at_ms, None);
+            assert!(!running.kill_sent);
+
+            running.term_sent_at_ms = Some(clock.now_ms().saturating_sub(KILL_GRACE_MS));
+            let second_tick =
+                tick_one_task(&dir.path, "task-timeout-unresolved", &mut running, &clock)
+                    .expect("unresolved timeout escalation tick");
+            assert!(matches!(second_tick, TaskTick::StillRunning));
+            assert!(!running.kill_sent);
+
+            let mut child = running.child.take().expect("unresolved task child");
+            assert!(child.try_wait().expect("poll unresolved task").is_none());
+            signal_group(running.record.pid, "-KILL").expect("clean up unresolved task");
+            child.wait().expect("wait for unresolved task");
         }
 
         /// Max-duration escalation after the direct leader exits still
