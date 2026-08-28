@@ -2411,25 +2411,36 @@ mod imp {
     fn parse_process_state(state: &str) -> Option<bool> {
         let bytes = state.as_bytes();
         let first = *bytes.first()?;
-        if !matches!(
-            first,
-            b'R' | b'S'
-                | b'D'
-                | b'T'
-                | b't'
-                | b'Z'
-                | b'X'
-                | b'x'
-                | b'K'
-                | b'W'
-                | b'P'
-                | b'I'
-                | b'U'
-        ) {
-            return None;
+        #[cfg(target_os = "linux")]
+        {
+            if !matches!(
+                first,
+                b'R' | b'S'
+                    | b'D'
+                    | b'T'
+                    | b't'
+                    | b'Z'
+                    | b'X'
+                    | b'x'
+                    | b'K'
+                    | b'W'
+                    | b'P'
+                    | b'I'
+                    | b'U'
+            ) || bytes.len() != 1
+            {
+                return None;
+            }
         }
-        if bytes[1..].iter().any(|byte| *byte != b'+') {
-            return None;
+        #[cfg(not(target_os = "linux"))]
+        {
+            if !matches!(first, b'R' | b'S' | b'I' | b'U' | b'T' | b'W' | b'Z')
+                || bytes[1..]
+                    .iter()
+                    .any(|byte| !matches!(byte, b'<' | b'>' | b'N' | b'L' | b's' | b'l' | b'+'))
+            {
+                return None;
+            }
         }
         Some(first == b'Z')
     }
@@ -4868,6 +4879,17 @@ mod imp {
             let (started_at, start_epoch_secs) = start_identity_from_probe(&probe);
             assert!(started_at.is_none());
             assert!(start_epoch_secs.is_none());
+        }
+
+        /// macOS/BSD `ps` appends metadata flags to the leading process
+        /// state; those flags do not change whether the process is a zombie.
+        #[cfg(not(target_os = "linux"))]
+        #[test]
+        fn process_state_accepts_bsd_ps_flags() {
+            assert_eq!(parse_process_state("Ssl+"), Some(false));
+            assert_eq!(parse_process_state("Zs+"), Some(true));
+            assert_eq!(parse_process_state("Q"), None);
+            assert_eq!(parse_process_state("S?"), None);
         }
 
         /// Removing an already-absent task record is a no-op success
