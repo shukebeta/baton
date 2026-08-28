@@ -1493,18 +1493,18 @@ mod imp {
         if record.state == TaskState::Running {
             let mut record = record.clone();
             upgrade_legacy_task_record(control, &mut record)?;
-            let mut liveness = is_task_alive(&record);
+            let mut liveness = task_execution_liveness(&record);
             if liveness == Liveness::Unresolved {
                 return Ok(false);
             }
             if liveness == Liveness::Live {
                 let _ = signal_group(record.pid, "-TERM");
                 wait_while_task_alive(&record, KILL_GRACE_MS);
-                liveness = is_task_alive(&record);
+                liveness = task_execution_liveness(&record);
                 if liveness == Liveness::Live {
                     let _ = signal_group(record.pid, "-KILL");
                     wait_while_task_alive(&record, KILL_GRACE_MS);
-                    liveness = is_task_alive(&record);
+                    liveness = task_execution_liveness(&record);
                 }
             }
             if liveness != Liveness::Dead {
@@ -1952,7 +1952,7 @@ mod imp {
         // accidentally signalled as this task. An unresolved identity is
         // retained and retried on a later tick.
         if running.child.is_none() {
-            match is_task_alive(&running.record) {
+            match task_execution_liveness(&running.record) {
                 Liveness::Dead => {
                     let cancelled = consume_task_cancel_sentinel(control, id)?;
                     let state = if cancelled {
@@ -1979,7 +1979,7 @@ mod imp {
             && clock.now_ms().saturating_sub(term_at) >= KILL_GRACE_MS
         {
             if running.child.is_none() {
-                match is_task_alive(&running.record) {
+                match task_execution_liveness(&running.record) {
                     Liveness::Dead => {
                         let cancelled = consume_task_cancel_sentinel(control, id)?;
                         let state = if cancelled {
@@ -1998,7 +1998,7 @@ mod imp {
         }
 
         match running.child.as_mut() {
-            None => match is_task_alive(&running.record) {
+            None => match task_execution_liveness(&running.record) {
                 Liveness::Live | Liveness::Unresolved => Ok(TaskTick::StillRunning),
                 Liveness::Dead => {
                     let cancelled = consume_task_cancel_sentinel(control, id)?;
@@ -2014,6 +2014,17 @@ mod imp {
             },
             Some(child) => match child.try_wait() {
                 Ok(Some(status)) => {
+                    // Reaping the direct leader does not end a Unix task while a
+                    // descendant still occupies its process group. Keep the
+                    // Child handle so its exit status remains available for
+                    // finalization after the group drains. A mismatched PID is
+                    // never treated as this task's group.
+                    match task_execution_liveness(&running.record) {
+                        Liveness::Live | Liveness::Unresolved => {
+                            return Ok(TaskTick::StillRunning);
+                        }
+                        Liveness::Dead => {}
+                    }
                     // An external `Stop`/`Teardown`/`Cancel` may already have
                     // finalized and removed this task's record (they act
                     // directly on the durable PID, independent of this `Run`
@@ -2233,7 +2244,7 @@ mod imp {
             }
             let mut record = record;
             upgrade_legacy_task_record(control, &mut record)?;
-            let mut liveness = is_task_alive(&record);
+            let mut liveness = task_execution_liveness(&record);
             if force {
                 if liveness != Liveness::Dead {
                     let _ = signal_group(record.pid, "-TERM");
@@ -2261,17 +2272,17 @@ mod imp {
             }
             if liveness != Liveness::Dead {
                 wait(&record, KILL_GRACE_MS);
-                liveness = is_task_alive(&record);
+                liveness = task_execution_liveness(&record);
             }
             if liveness == Liveness::Live && !term_sent {
                 let _ = signal_group(record.pid, "-TERM");
                 wait(&record, KILL_GRACE_MS);
-                liveness = is_task_alive(&record);
+                liveness = task_execution_liveness(&record);
             }
             if liveness == Liveness::Live {
                 let _ = signal_group(record.pid, "-KILL");
                 wait(&record, KILL_GRACE_MS);
-                liveness = is_task_alive(&record);
+                liveness = task_execution_liveness(&record);
             }
             if liveness == Liveness::Dead {
                 remove_task_start_transaction(control, &record)?;
@@ -2760,6 +2771,133 @@ mod imp {
         task_liveness(record).0
     }
 
+    /// Probes whether the task's process group still has any members. The
+    /// group is the Unix ownership boundary, so a reaped leader does not mean
+    /// the task is gone while a descendant remains in that group. `EPERM`
+    /// still proves that a member exists; every other unexpected probe error
+    /// is unresolved and therefore fails closed.
+    fn task_group_liveness(pid: u32) -> Liveness {
+        if pid <= 1 || pid > i32::MAX as u32 {
+            return Liveness::Dead;
+        }
+        let result = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
+        match result {
+            0 => process_group_member_liveness(pid),
+            _ => match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ESRCH) => Liveness::Dead,
+                Some(libc::EPERM) => process_group_member_liveness(pid),
+                _ => Liveness::Unresolved,
+            },
+        }
+    }
+
+    /// Confirms whether a process-group probe that succeeded with `kill(0)`
+    /// has a non-zombie member. `kill(0)` also succeeds for zombie-only groups,
+    /// which otherwise leaves an already-reaped direct child looking live
+    /// forever during cleanup.
+    #[cfg(target_os = "linux")]
+    fn process_group_member_liveness(pgid: u32) -> Liveness {
+        let entries = match fs::read_dir("/proc") {
+            Ok(entries) => entries,
+            Err(_) => return Liveness::Unresolved,
+        };
+        let mut found_member = false;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.parse::<u32>().is_err() {
+                continue;
+            }
+            let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+                continue;
+            };
+            let fields: Vec<&str> = after_comm.split_whitespace().collect();
+            let Some(state) = fields.first() else {
+                continue;
+            };
+            let Some(current_pgid) = fields.get(2).and_then(|value| value.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if current_pgid != pgid {
+                continue;
+            }
+            found_member = true;
+            if !state.starts_with('Z') {
+                return Liveness::Live;
+            }
+        }
+        if found_member {
+            Liveness::Dead
+        } else {
+            // The group existed for the kill(0) sample but no member was
+            // observable in the scan; retry rather than finalizing on a race.
+            Liveness::Unresolved
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn process_group_member_liveness(pgid: u32) -> Liveness {
+        let output = match Command::new("ps")
+            .args(["-ww", "-axo", "pid=,pgid=,state="])
+            .env("LC_ALL", "C")
+            .env("LC_TIME", "C")
+            .env("TZ", "UTC")
+            .output()
+        {
+            Ok(output) if output.status.success() => output,
+            _ => return Liveness::Unresolved,
+        };
+        let Ok(output) = std::str::from_utf8(&output.stdout) else {
+            return Liveness::Unresolved;
+        };
+        let mut found_member = false;
+        for line in output.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 3 || fields[1].parse::<u32>().ok() != Some(pgid) {
+                continue;
+            }
+            found_member = true;
+            if !fields[2].starts_with('Z') {
+                return Liveness::Live;
+            }
+        }
+        if found_member {
+            Liveness::Dead
+        } else {
+            Liveness::Unresolved
+        }
+    }
+
+    /// Returns whether the recorded direct PID is definitely gone (or is a
+    /// zombie that cannot be the live task). A mismatched live PID is not
+    /// allowed to fall through to a process-group probe: its numeric group
+    /// id may now belong to an unrelated process.
+    fn task_leader_exited(pid: u32) -> bool {
+        match process_probe(pid) {
+            ProbeResult::Gone => true,
+            ProbeResult::Present(probe) => probe.is_zombie(),
+            ProbeResult::Unreadable => false,
+        }
+    }
+
+    /// Combines the direct-PID identity with the Unix process-group boundary.
+    /// A rehydrated task has no `Child` handle and its direct leader may have
+    /// exited while descendants remain; that group is still live work. An
+    /// unresolved group probe is retained rather than finalized or signalled.
+    fn task_execution_liveness(record: &TaskRecord) -> Liveness {
+        match is_task_alive(record) {
+            Liveness::Dead if task_leader_exited(record.pid) => task_group_liveness(record.pid),
+            Liveness::Dead => Liveness::Dead,
+            liveness => liveness,
+        }
+    }
+
     /// Persists the canonical epoch after a legacy macOS record is rescued by
     /// the fallback ladder. Callers must hold the admission lock; status and
     /// supervisor tick paths intentionally remain read-only.
@@ -2843,7 +2981,7 @@ mod imp {
 
     fn wait_while_task_alive(record: &TaskRecord, grace_ms: u64) {
         let deadline = Instant::now() + Duration::from_millis(grace_ms);
-        while is_task_alive(record) != Liveness::Dead && Instant::now() < deadline {
+        while task_execution_liveness(record) != Liveness::Dead && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         }
     }
@@ -3077,7 +3215,7 @@ mod imp {
             .iter()
             .map(|record| {
                 let liveness = if record.state == TaskState::Running {
-                    is_task_alive(record)
+                    task_execution_liveness(record)
                 } else {
                     Liveness::Dead
                 };
@@ -3116,10 +3254,10 @@ mod imp {
             return Ok(());
         }
         request_task_cancel_sentinel(control, &record.id)?;
-        if is_task_alive(record) == Liveness::Live {
+        if task_execution_liveness(record) == Liveness::Live {
             let _ = signal_group(record.pid, "-TERM");
             wait_while_task_alive(record, KILL_GRACE_MS);
-            if is_task_alive(record) == Liveness::Live {
+            if task_execution_liveness(record) == Liveness::Live {
                 let _ = signal_group(record.pid, "-KILL");
                 wait_while_task_alive(record, KILL_GRACE_MS);
             }
@@ -4793,6 +4931,38 @@ mod imp {
             assert_eq!(claimed.key, format!("{task_id}-terminal"));
         }
 
+        /// Waits until the direct shell exits while its background child
+        /// keeps the task's process group alive. The bounded wait avoids
+        /// making the process-group regressions depend on scheduler timing.
+        fn wait_for_group_descendant(running: &mut RunningTask) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let direct_exited = running
+                    .child
+                    .as_mut()
+                    .expect("owned task child")
+                    .try_wait()
+                    .expect("poll task child")
+                    .is_some();
+                if direct_exited && task_group_liveness(running.record.pid) == Liveness::Live {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "task direct child did not exit with a live group descendant"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn assert_durable_task_state(control: &Path, id: &str, state: TaskState) -> TaskRecord {
+            let record = read_task_record(control, id)
+                .expect("read durable task")
+                .expect("durable task record");
+            assert_eq!(record.state, state);
+            record
+        }
+
         /// A task that exits zero on its own, before any max-duration
         /// breach, is reaped as `completed`.
         #[test]
@@ -4823,6 +4993,186 @@ mod imp {
             }
             assert_eq!(running.record.state, TaskState::Completed);
             assert_eq!(running.record.exit_code, Some(0));
+        }
+
+        /// A direct shell exit does not finalize a task while its same-group
+        /// background descendant remains alive. The retained Child handle
+        /// keeps the direct exit status available for completion after drain.
+        #[test]
+        fn tick_one_task_waits_for_same_group_descendant_before_completion() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("tick-group-drain");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let spec = task_spec(
+                "svc-1",
+                "sh",
+                vec!["-c".to_string(), "sleep 30 & exit 0".to_string()],
+                vec![],
+                10_000,
+                &callback_inbox.display().to_string(),
+            );
+            let mut running = spawn_running_task(&dir.path, "task-group-drain", spec, &clock);
+
+            wait_for_group_descendant(&mut running);
+            let tick = tick_one_task(&dir.path, "task-group-drain", &mut running, &clock)
+                .expect("tick while group remains");
+            assert!(matches!(tick, TaskTick::StillRunning));
+            assert_durable_task_state(&dir.path, "task-group-drain", TaskState::Running);
+
+            let mut status = Vec::new();
+            execute_task_status(&dir.path, Some("task-group-drain"), &mut status)
+                .expect("status while group remains");
+            let status: serde_json::Value = serde_json::from_slice(&status).expect("status JSON");
+            assert_eq!(status["tasks"][0]["state"], "running");
+            assert_eq!(status["tasks"][0]["liveness"], "live");
+
+            signal_group(running.record.pid, "-KILL").expect("kill group descendant");
+            reap_task_until_finished(&dir.path, "task-group-drain", &mut running, &clock, tick);
+            let record =
+                assert_durable_task_state(&dir.path, "task-group-drain", TaskState::Completed);
+            assert_eq!(record.exit_code, Some(0));
+            assert_terminal_task_event(&callback_inbox, "task-group-drain");
+        }
+
+        /// Cancellation after the direct leader exits still reaches a live
+        /// same-group descendant and records `cancelled` only after drain.
+        #[test]
+        fn task_cancel_reaches_same_group_descendant_after_leader_exit() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("cancel-group-drain");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let spec = task_spec(
+                "svc-1",
+                "sh",
+                vec!["-c".to_string(), "sleep 30 & exit 0".to_string()],
+                vec![],
+                10_000,
+                &callback_inbox.display().to_string(),
+            );
+            let mut running = spawn_running_task(&dir.path, "task-cancel-group", spec, &clock);
+
+            wait_for_group_descendant(&mut running);
+            let tick = tick_one_task(&dir.path, "task-cancel-group", &mut running, &clock)
+                .expect("tick while group remains");
+            assert!(matches!(tick, TaskTick::StillRunning));
+            assert_durable_task_state(&dir.path, "task-cancel-group", TaskState::Running);
+
+            execute_task_cancel(&dir.path, "task-cancel-group", &mut Vec::new())
+                .expect("cancel task");
+            reap_task_until_finished(&dir.path, "task-cancel-group", &mut running, &clock, tick);
+            assert_eq!(running.record.state, TaskState::Cancelled);
+            assert_durable_task_state(&dir.path, "task-cancel-group", TaskState::Cancelled);
+            assert_eq!(task_group_liveness(running.record.pid), Liveness::Dead);
+            assert_terminal_task_event(&callback_inbox, "task-cancel-group");
+        }
+
+        /// Max-duration escalation after the direct leader exits still
+        /// reaches a TERM-ignoring same-group descendant, then records
+        /// `timeout` after SIGKILL drains the group.
+        #[test]
+        fn task_timeout_reaches_same_group_descendant_after_leader_exit() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("timeout-group-drain");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let spec = task_spec(
+                "svc-1",
+                "sh",
+                vec![
+                    "-c".to_string(),
+                    "trap '' TERM; sleep 30 & exit 0".to_string(),
+                ],
+                vec![],
+                100,
+                &callback_inbox.display().to_string(),
+            );
+            let mut running = spawn_running_task(&dir.path, "task-timeout-group", spec, &clock);
+
+            wait_for_group_descendant(&mut running);
+            let first_tick = tick_one_task(&dir.path, "task-timeout-group", &mut running, &clock)
+                .expect("tick while group remains");
+            assert!(matches!(first_tick, TaskTick::StillRunning));
+            assert_durable_task_state(&dir.path, "task-timeout-group", TaskState::Running);
+
+            clock.advance(100);
+            let term_tick = tick_one_task(&dir.path, "task-timeout-group", &mut running, &clock)
+                .expect("timeout TERM tick");
+            assert!(matches!(term_tick, TaskTick::StillRunning));
+            assert!(running.term_sent_at_ms.is_some());
+            assert_durable_task_state(&dir.path, "task-timeout-group", TaskState::Running);
+            assert_eq!(task_group_liveness(running.record.pid), Liveness::Live);
+
+            clock.advance(KILL_GRACE_MS);
+            let kill_tick = tick_one_task(&dir.path, "task-timeout-group", &mut running, &clock)
+                .expect("timeout KILL tick");
+            assert!(running.kill_sent);
+            reap_task_until_finished(
+                &dir.path,
+                "task-timeout-group",
+                &mut running,
+                &clock,
+                kill_tick,
+            );
+            assert_eq!(running.record.state, TaskState::Timeout);
+            assert_durable_task_state(&dir.path, "task-timeout-group", TaskState::Timeout);
+            assert_eq!(task_group_liveness(running.record.pid), Liveness::Dead);
+            assert_terminal_task_event(&callback_inbox, "task-timeout-group");
+        }
+
+        /// A restarted supervisor has no Child handle, but still waits for a
+        /// same-group descendant after the recorded direct PID disappears.
+        /// Once the group drains, the rehydrated path records failed/null
+        /// because no direct exit status can be recovered.
+        #[test]
+        fn rehydrated_task_waits_for_same_group_descendant_before_failure() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("rehydrate-group-drain");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let spec = task_spec(
+                "svc-1",
+                "sh",
+                vec!["-c".to_string(), "sleep 30 & exit 0".to_string()],
+                vec![],
+                10_000,
+                &callback_inbox.display().to_string(),
+            );
+            let mut owned = spawn_running_task(&dir.path, "task-rehydrated-group", spec, &clock);
+
+            wait_for_group_descendant(&mut owned);
+            owned
+                .child
+                .take()
+                .expect("owned task child")
+                .wait()
+                .expect("wait for direct leader");
+            let mut rehydrated = RunningTask {
+                record: owned.record.clone(),
+                child: None,
+                started_ms: owned.started_ms,
+                term_sent_at_ms: None,
+                kill_sent: false,
+            };
+
+            let tick = tick_one_task(&dir.path, "task-rehydrated-group", &mut rehydrated, &clock)
+                .expect("rehydrated tick while group remains");
+            assert!(matches!(tick, TaskTick::StillRunning));
+            assert_durable_task_state(&dir.path, "task-rehydrated-group", TaskState::Running);
+
+            signal_group(rehydrated.record.pid, "-KILL").expect("kill group descendant");
+            reap_task_until_finished(
+                &dir.path,
+                "task-rehydrated-group",
+                &mut rehydrated,
+                &clock,
+                tick,
+            );
+            let record =
+                assert_durable_task_state(&dir.path, "task-rehydrated-group", TaskState::Failed);
+            assert_eq!(record.exit_code, None);
+            assert_terminal_task_event(&callback_inbox, "task-rehydrated-group");
         }
 
         // -- Session-scoped task reaping ----------------------------------

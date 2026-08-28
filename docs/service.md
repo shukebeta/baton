@@ -280,6 +280,13 @@ baton task cancel --control <dir> --task <id>
   terminates the task's Job Object on Windows or process group on Unix, so the
   resulting terminal event reads `cancelled` rather than `failed`. It is a
   no-op success if the task is already gone.
+- **Unix task draining** treats the task's process group as the ownership and
+  reaping boundary. If the direct command exits while a same-group descendant
+  remains, the durable task record stays `running`; status, cancellation, and
+  max-duration enforcement continue to track and signal that group. The task
+  becomes terminal only after the group drains, matching Windows' Job Object
+  active-process-count behavior. A descendant that detaches into another
+  process group is outside this boundary.
 
 ### Supervisor restart reconciliation
 
@@ -294,18 +301,20 @@ described above, so a live exec-replaced task remains tracked instead of being
 finalized as failed.
 
 The restarted supervisor cannot recover a `std::process::Child` handle for a
-task reparented to init. It therefore tracks a corroborated PID directly:
-milestones and timeout signals continue while the PID is `live`, and the task
-is finalized when that PID is `dead`. An `unresolved` task remains tracked and
-is not signalled or finalized as failed until a later probe resolves it. No
-exit status can be recovered through this path, so a rehydrated task that is
-already gone or later finishes is recorded as `failed` with `exit_code: null`;
-a timeout or cancellation remains `timeout` or `cancelled` when the supervisor
-initiated that outcome. State is persisted before the deterministic terminal
-callback is delivered, and a delivery failure leaves the tracker in place to
-retry the same event id. A terminal record is replayed once on the next
-startup for the same reason; the mailbox's done ledger drops it if delivery
-already completed.
+task reparented to init. It therefore tracks a corroborated PID directly and,
+on Unix, the recorded process group as well: milestones and timeout signals
+continue while either the direct PID or a same-group descendant is live. A
+rehydrated Unix task whose direct PID is gone but whose group still has a
+member remains `running`; an unresolved group probe is retained and never
+treated as drained. Once the group is drained, no exit status can be
+recovered through this path, so the task is recorded as `failed` with
+`exit_code: null`; a timeout or cancellation remains `timeout` or `cancelled`
+when the supervisor initiated that outcome. On Windows, the equivalent Job
+Object active-process count continues to define the drain boundary. State is
+persisted before the deterministic terminal callback is delivered, and a
+delivery failure leaves the tracker in place to retry the same event id. A
+terminal record is replayed once on the next startup for the same reason; the
+mailbox's done ledger drops it if delivery already completed.
 
 Prepared admissions are not active tasks: startup reconciliation owns their
 cleanup, and `rehydrate_tasks` excludes them from the in-memory tracker. If a
