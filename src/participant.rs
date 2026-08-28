@@ -595,7 +595,7 @@ fn append_windows_arg(line: &mut String, token: &str) {
         match ch {
             '\\' => backslashes += 1,
             '"' => {
-                for _ in 0..=backslashes {
+                for _ in 0..(backslashes * 2 + 1) {
                     line.push('\\');
                 }
                 line.push('"');
@@ -610,7 +610,7 @@ fn append_windows_arg(line: &mut String, token: &str) {
             }
         }
     }
-    for _ in 0..backslashes {
+    for _ in 0..(backslashes * 2) {
         line.push('\\');
     }
     line.push('"');
@@ -1482,6 +1482,25 @@ mod tests {
             std::fs::read_to_string(dir.path.join("argument.txt")).expect("argument side effect"),
             "argument with space"
         );
+    }
+
+    /// The raw command tail must use the MSVC doubling rule so the child's
+    /// CRT reconstructs backslashes before embedded and closing quotes.
+    #[cfg(windows)]
+    #[test]
+    fn append_windows_arg_matches_msvc_quoting() {
+        let cases = [
+            ("plain", "plain"),
+            ("with space", r#""with space""#),
+            (r#"C:\My Dir\"#, r#""C:\My Dir\\""#),
+            (r#"a\"b"#, r#""a\\\"b""#),
+        ];
+
+        for (token, expected) in cases {
+            let mut line = String::new();
+            append_windows_arg(&mut line, token);
+            assert_eq!(line, expected, "token {token:?}");
+        }
     }
 
     /// Two sequential runs over the *same cwd*: the second run observes the
