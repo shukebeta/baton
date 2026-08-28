@@ -57,6 +57,37 @@ fn main() {
                 .expect("spawn grandchild");
             println!("{}", child.id());
         }
+        Some("--sleep-ms") => {
+            let ms = args
+                .next()
+                .expect("sleep milliseconds argument")
+                .parse::<u64>()
+                .expect("numeric sleep milliseconds");
+            thread::sleep(Duration::from_millis(ms));
+        }
+        Some("--spawn-descendant") => {
+            // Spawns a short-lived descendant, prints its pid, then exits
+            // with the requested code while the descendant still holds the
+            // Job Object — the surviving-descendant shape of a task whose
+            // direct child has already exited.
+            let sleep_ms = args
+                .next()
+                .expect("descendant sleep milliseconds argument")
+                .parse::<u64>()
+                .expect("numeric descendant sleep milliseconds");
+            let exit_code = args
+                .next()
+                .expect("exit code argument")
+                .parse::<i32>()
+                .expect("numeric exit code");
+            let child = std::process::Command::new(env::current_exe().expect("current exe"))
+                .arg("--sleep-ms")
+                .arg(sleep_ms.to_string())
+                .spawn()
+                .expect("spawn descendant");
+            println!("{}", child.id());
+            std::process::exit(exit_code);
+        }
         other => panic!("unknown probe child mode: {other:?}"),
     }
 }

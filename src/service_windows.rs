@@ -1532,6 +1532,17 @@ fn reclaim_stale_task_requests(control: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Exit outcome of a task's direct child, retained across the descendant
+/// drain so the eventual terminal state reflects the command's own result
+/// instead of defaulting to a code-less failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChildExit {
+    /// `ExitStatus::success()` of the direct child.
+    succeeded: bool,
+    /// `ExitStatus::code()` of the direct child.
+    code: Option<i32>,
+}
+
 /// One task the `Run` loop is currently tracking: its durable
 /// [`TaskRecord`] (kept in sync as milestones fire and it goes terminal),
 /// either the live [`Child`] handle owned by this supervisor or a
@@ -1556,6 +1567,11 @@ struct RunningTask {
     /// Set once the second Job Object termination has been sent, so it is
     /// only ever sent once.
     kill_sent: bool,
+    /// Exit outcome of the direct child, stashed when the task parks to
+    /// drain surviving Job Object descendants (which clears `child`).
+    /// `None` for a task that never owned a child handle (rehydrated after
+    /// a supervisor restart) or whose child has not exited yet.
+    child_exit: Option<ChildExit>,
 }
 
 /// Restores every durable task before the request loop accepts new work.
@@ -1599,6 +1615,7 @@ fn rehydrate_tasks(control: &Path, clock: &dyn Clock) -> Result<HashMap<String, 
                 started_ms,
                 term_sent_at_ms: None,
                 kill_sent: false,
+                child_exit: None,
             },
         );
     }
@@ -1664,6 +1681,7 @@ fn process_one_task_request(
                     started_ms,
                     term_sent_at_ms: None,
                     kill_sent: false,
+                    child_exit: None,
                 };
                 return Ok(Some((id, running)));
             }
@@ -2014,14 +2032,8 @@ fn tick_one_task(
         match is_task_alive(&running.record) {
             Liveness::Dead => {
                 let cancelled = consume_task_cancel_sentinel(control, id)?;
-                let state = if cancelled {
-                    TaskState::Cancelled
-                } else if running.term_sent_at_ms.is_some() {
-                    TaskState::Timeout
-                } else {
-                    TaskState::Failed
-                };
-                return finalize_task(control, running, state, None, elapsed_ms);
+                let (state, exit_code) = parked_terminal(running, cancelled);
+                return finalize_task(control, running, state, exit_code, elapsed_ms);
             }
             Liveness::Live => {}
             Liveness::Unresolved => return Ok(TaskTick::StillRunning),
@@ -2041,12 +2053,8 @@ fn tick_one_task(
             match is_task_alive(&running.record) {
                 Liveness::Dead => {
                     let cancelled = consume_task_cancel_sentinel(control, id)?;
-                    let state = if cancelled {
-                        TaskState::Cancelled
-                    } else {
-                        TaskState::Timeout
-                    };
-                    return finalize_task(control, running, state, None, elapsed_ms);
+                    let (state, exit_code) = parked_terminal(running, cancelled);
+                    return finalize_task(control, running, state, exit_code, elapsed_ms);
                 }
                 Liveness::Live => {}
                 Liveness::Unresolved => return Ok(TaskTick::StillRunning),
@@ -2061,14 +2069,8 @@ fn tick_one_task(
             Liveness::Live | Liveness::Unresolved => Ok(TaskTick::StillRunning),
             Liveness::Dead => {
                 let cancelled = consume_task_cancel_sentinel(control, id)?;
-                let state = if cancelled {
-                    TaskState::Cancelled
-                } else if running.term_sent_at_ms.is_some() {
-                    TaskState::Timeout
-                } else {
-                    TaskState::Failed
-                };
-                finalize_task(control, running, state, None, elapsed_ms)
+                let (state, exit_code) = parked_terminal(running, cancelled);
+                finalize_task(control, running, state, exit_code, elapsed_ms)
             }
         },
         Some(child) => match child.try_wait() {
@@ -2079,7 +2081,14 @@ fn tick_one_task(
                         Ok(_) | Err(_) => {
                             // The direct command may have exited while a
                             // descendant remains. Keep the Job Object handle
-                            // and continue tracking the tree until it drains.
+                            // and continue tracking the tree until it drains,
+                            // stashing the direct child's outcome so the
+                            // eventual terminal state reflects the command's
+                            // own result instead of a code-less failure.
+                            running.child_exit = Some(ChildExit {
+                                succeeded: status.success(),
+                                code: status.code(),
+                            });
                             running.child = None;
                             return Ok(TaskTick::StillRunning);
                         }
@@ -2109,6 +2118,29 @@ fn tick_one_task(
             Ok(None) => Ok(TaskTick::StillRunning),
             Err(err) => Err(BatonError::Io(format!("could not poll task {id}: {err}"))),
         },
+    }
+}
+
+/// Resolves the terminal state and exit code for a task whose `Child`
+/// handle is gone. Cancel and timeout sentinels win over the direct
+/// child's stashed exit outcome (which is `None` for a rehydrated task
+/// that never owned a child handle); otherwise the stashed outcome
+/// decides `completed`/`failed` and supplies the real exit code.
+fn parked_terminal(running: &RunningTask, cancelled: bool) -> (TaskState, Option<i32>) {
+    if cancelled {
+        (TaskState::Cancelled, None)
+    } else if running.term_sent_at_ms.is_some() {
+        (TaskState::Timeout, None)
+    } else if running.child_exit.is_some_and(|exit| exit.succeeded) {
+        (
+            TaskState::Completed,
+            running.child_exit.and_then(|exit| exit.code),
+        )
+    } else {
+        (
+            TaskState::Failed,
+            running.child_exit.and_then(|exit| exit.code),
+        )
     }
 }
 
