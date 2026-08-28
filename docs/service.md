@@ -82,8 +82,10 @@ baton service teardown --control <dir> [--force]
 
 - **`service run`** acquires the control lock and blocks, spawning and
   reaping sessions until it observes a cooperative stop. It exits cleanly on
-  `teardown`; a single malformed or failing start request logs a warning and
-  never crashes the loop for the sessions it already owns.
+  `teardown`; an admission failure it can name is answered as an `error`
+  response to the waiting client, and any remaining failure — a malformed
+  spec, an unexpected fault, a response it could not deliver — logs a warning
+  and never crashes the loop for the sessions it already owns.
 - **`service start`** takes exactly the flags `baton serve` itself takes (they
   become the session's `SessionSpec`, reconstructed into an equivalent
   `baton serve` argv by `run`). It submits the spec and returns a session id
