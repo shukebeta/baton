@@ -1493,18 +1493,18 @@ mod imp {
         if record.state == TaskState::Running {
             let mut record = record.clone();
             upgrade_legacy_task_record(control, &mut record)?;
-            let mut liveness = task_execution_liveness(&record);
+            let mut liveness = task_execution_liveness_after_retry(&record, KILL_GRACE_MS);
             if liveness == Liveness::Unresolved {
                 return Ok(false);
             }
             if liveness == Liveness::Live {
                 let _ = signal_group(record.pid, "-TERM");
                 wait_while_task_alive(&record, KILL_GRACE_MS);
-                liveness = task_execution_liveness(&record);
+                liveness = task_execution_liveness_after_retry(&record, KILL_GRACE_MS);
                 if liveness == Liveness::Live {
                     let _ = signal_group(record.pid, "-KILL");
                     wait_while_task_alive(&record, KILL_GRACE_MS);
-                    liveness = task_execution_liveness(&record);
+                    liveness = task_execution_liveness_after_retry(&record, KILL_GRACE_MS);
                 }
             }
             if liveness != Liveness::Dead {
@@ -2272,17 +2272,17 @@ mod imp {
             }
             if liveness != Liveness::Dead {
                 wait(&record, KILL_GRACE_MS);
-                liveness = task_execution_liveness(&record);
+                liveness = task_execution_liveness_after_retry(&record, KILL_GRACE_MS);
             }
             if liveness == Liveness::Live && !term_sent {
                 let _ = signal_group(record.pid, "-TERM");
                 wait(&record, KILL_GRACE_MS);
-                liveness = task_execution_liveness(&record);
+                liveness = task_execution_liveness_after_retry(&record, KILL_GRACE_MS);
             }
             if liveness == Liveness::Live {
                 let _ = signal_group(record.pid, "-KILL");
                 wait(&record, KILL_GRACE_MS);
-                liveness = task_execution_liveness(&record);
+                liveness = task_execution_liveness_after_retry(&record, KILL_GRACE_MS);
             }
             if liveness == Liveness::Dead {
                 remove_task_start_transaction(control, &record)?;
@@ -2405,6 +2405,35 @@ mod imp {
         Some(era * 146_097 + day_of_era - 719_468)
     }
 
+    /// Parses the platform process-state token used by both the Linux
+    /// `/proc` and macOS `ps` probes. Unknown states are incomplete evidence,
+    /// not proof that a process is live or drained.
+    fn parse_process_state(state: &str) -> Option<bool> {
+        let bytes = state.as_bytes();
+        let first = *bytes.first()?;
+        if !matches!(
+            first,
+            b'R' | b'S'
+                | b'D'
+                | b'T'
+                | b't'
+                | b'Z'
+                | b'X'
+                | b'x'
+                | b'K'
+                | b'W'
+                | b'P'
+                | b'I'
+                | b'U'
+        ) {
+            return None;
+        }
+        if bytes[1..].iter().any(|byte| *byte != b'+') {
+            return None;
+        }
+        Some(first == b'Z')
+    }
+
     #[cfg(target_os = "linux")]
     #[derive(Debug, PartialEq, Eq)]
     struct ProcessProbe {
@@ -2428,8 +2457,10 @@ mod imp {
         let fields: Vec<&str> = after_comm.split_whitespace().collect();
         // `fields[0]` is field 3 (state) overall; starttime is field 22
         // overall, i.e. `fields[19]`.
+        let state = fields.first()?;
+        parse_process_state(state)?;
         Some(ProcessProbe {
-            state: fields.first()?.to_string(),
+            state: state.to_string(),
             start_key: fields.get(19)?.to_string(),
         })
     }
@@ -2588,6 +2619,7 @@ mod imp {
             return None;
         }
         let state = fields[0].to_string();
+        parse_process_state(&state)?;
         let start_key = fields[1..6].join(" ");
         Some(ProcessProbe {
             state,
@@ -2782,13 +2814,29 @@ mod imp {
         }
         let result = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
         match result {
-            0 => process_group_member_liveness(pid),
+            0 => group_scan_with_absence_recheck(pid),
             _ => match std::io::Error::last_os_error().raw_os_error() {
                 Some(libc::ESRCH) => Liveness::Dead,
-                Some(libc::EPERM) => process_group_member_liveness(pid),
+                Some(libc::EPERM) => group_scan_with_absence_recheck(pid),
                 _ => Liveness::Unresolved,
             },
         }
+    }
+
+    /// A process can disappear while a strict group scan is reading the
+    /// system process table. If a second kernel-level probe now proves that
+    /// the group itself is gone, that is complete absence evidence; otherwise
+    /// preserve `Unresolved` rather than turning an incomplete scan into
+    /// `Dead`.
+    fn group_scan_with_absence_recheck(pgid: u32) -> Liveness {
+        let liveness = process_group_member_liveness(pgid);
+        if liveness == Liveness::Unresolved {
+            let result = unsafe { libc::kill(-(pgid as libc::pid_t), 0) };
+            if result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return Liveness::Dead;
+            }
+        }
+        liveness
     }
 
     /// Confirms whether a process-group probe that succeeded with `kill(0)`
@@ -2802,37 +2850,43 @@ mod imp {
             Err(_) => return Liveness::Unresolved,
         };
         let mut found_member = false;
-        for entry in entries.flatten() {
+        let mut found_live_member = false;
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return Liveness::Unresolved;
+            };
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
-                continue;
+                return Liveness::Unresolved;
             };
-            if name.parse::<u32>().is_err() {
+            if !name.bytes().all(|byte| byte.is_ascii_digit()) {
                 continue;
             }
-            let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
-                continue;
+            let Ok(pid) = name.parse::<u32>() else {
+                return Liveness::Unresolved;
             };
-            let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
-                continue;
+            let stat = match fs::read_to_string(entry.path().join("stat")) {
+                Ok(stat) => stat,
+                Err(_) => return Liveness::Unresolved,
             };
-            let fields: Vec<&str> = after_comm.split_whitespace().collect();
-            let Some(state) = fields.first() else {
-                continue;
-            };
-            let Some(current_pgid) = fields.get(2).and_then(|value| value.parse::<u32>().ok())
+            let Some((stat_pid, is_zombie, current_pgid)) = parse_linux_process_group_member(&stat)
             else {
-                continue;
+                return Liveness::Unresolved;
             };
+            if stat_pid != pid {
+                return Liveness::Unresolved;
+            }
             if current_pgid != pgid {
                 continue;
             }
             found_member = true;
-            if !state.starts_with('Z') {
-                return Liveness::Live;
+            if !is_zombie {
+                found_live_member = true;
             }
         }
-        if found_member {
+        if found_live_member {
+            Liveness::Live
+        } else if found_member {
             Liveness::Dead
         } else {
             // The group existed for the kill(0) sample but no member was
@@ -2853,36 +2907,108 @@ mod imp {
             Ok(output) if output.status.success() => output,
             _ => return Liveness::Unresolved,
         };
+        if !output.stderr.is_empty() {
+            return Liveness::Unresolved;
+        }
         let Ok(output) = std::str::from_utf8(&output.stdout) else {
             return Liveness::Unresolved;
         };
         let mut found_member = false;
+        let mut found_live_member = false;
         for line in output.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
             let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 3 || fields[1].parse::<u32>().ok() != Some(pgid) {
+            if fields.len() != 3 {
+                return Liveness::Unresolved;
+            }
+            let Some(pid) = fields[0].parse::<u32>().ok() else {
+                return Liveness::Unresolved;
+            };
+            let Some(current_pgid) = fields[1].parse::<u32>().ok() else {
+                return Liveness::Unresolved;
+            };
+            if pid == 0 || current_pgid == 0 || fields[2].is_empty() {
+                return Liveness::Unresolved;
+            }
+            let Some(is_zombie) = parse_process_state(fields[2]) else {
+                return Liveness::Unresolved;
+            };
+            if current_pgid != pgid {
                 continue;
             }
             found_member = true;
-            if !fields[2].starts_with('Z') {
-                return Liveness::Live;
+            if !is_zombie {
+                found_live_member = true;
             }
         }
-        if found_member {
+        if found_live_member {
+            Liveness::Live
+        } else if found_member {
             Liveness::Dead
         } else {
             Liveness::Unresolved
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn parse_linux_process_group_member(stat: &str) -> Option<(u32, bool, u32)> {
+        let pid = stat.split_once(' ')?.0.parse::<u32>().ok()?;
+        let after_comm = stat.rsplit_once(')')?.1;
+        let fields: Vec<&str> = after_comm.split_whitespace().collect();
+        let state = fields.first()?;
+        let is_zombie = parse_process_state(state)?;
+        let pgid = fields.get(2)?.parse::<u32>().ok()?;
+        Some((pid, is_zombie, pgid))
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TaskLeaderExit {
+        Gone,
+        MatchingZombie,
+        Mismatched,
+        NotExited,
+        Unresolved,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn zombie_identity_matches(record: &TaskRecord, probe: &ProcessProbe) -> Option<bool> {
+        record
+            .started_at
+            .as_deref()
+            .map(|recorded| recorded == probe.start_key)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn zombie_identity_matches(record: &TaskRecord, probe: &ProcessProbe) -> Option<bool> {
+        if let Some(recorded) = record.start_epoch_secs {
+            probe.start_epoch_secs.map(|current| current == recorded)
+        } else {
+            record
+                .started_at
+                .as_deref()
+                .map(|recorded| recorded == probe.start_key)
+        }
+    }
+
     /// Returns whether the recorded direct PID is definitely gone (or is a
-    /// zombie that cannot be the live task). A mismatched live PID is not
-    /// allowed to fall through to a process-group probe: its numeric group
-    /// id may now belong to an unrelated process.
-    fn task_leader_exited(pid: u32) -> bool {
-        match process_probe(pid) {
-            ProbeResult::Gone => true,
-            ProbeResult::Present(probe) => probe.is_zombie(),
-            ProbeResult::Unreadable => false,
+    /// zombie that cannot be the live task). A zombie may fall through to a
+    /// process-group probe only after its start identity matches the durable
+    /// record. A mismatched or legacy identity is never allowed to use the
+    /// numeric PID as a group id.
+    fn task_leader_exited(record: &TaskRecord) -> TaskLeaderExit {
+        match process_probe(record.pid) {
+            ProbeResult::Gone => TaskLeaderExit::Gone,
+            ProbeResult::Present(probe) if probe.is_zombie() => {
+                match zombie_identity_matches(record, &probe) {
+                    Some(true) => TaskLeaderExit::MatchingZombie,
+                    Some(false) => TaskLeaderExit::Mismatched,
+                    None => TaskLeaderExit::Unresolved,
+                }
+            }
+            ProbeResult::Present(_) => TaskLeaderExit::NotExited,
+            ProbeResult::Unreadable => TaskLeaderExit::Unresolved,
         }
     }
 
@@ -2892,8 +3018,13 @@ mod imp {
     /// unresolved group probe is retained rather than finalized or signalled.
     fn task_execution_liveness(record: &TaskRecord) -> Liveness {
         match is_task_alive(record) {
-            Liveness::Dead if task_leader_exited(record.pid) => task_group_liveness(record.pid),
-            Liveness::Dead => Liveness::Dead,
+            Liveness::Dead => match task_leader_exited(record) {
+                TaskLeaderExit::Gone | TaskLeaderExit::MatchingZombie => {
+                    task_group_liveness(record.pid)
+                }
+                TaskLeaderExit::Mismatched | TaskLeaderExit::NotExited => Liveness::Dead,
+                TaskLeaderExit::Unresolved => Liveness::Unresolved,
+            },
             liveness => liveness,
         }
     }
@@ -2982,6 +3113,21 @@ mod imp {
     fn wait_while_task_alive(record: &TaskRecord, grace_ms: u64) {
         let deadline = Instant::now() + Duration::from_millis(grace_ms);
         while task_execution_liveness(record) != Liveness::Dead && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        }
+    }
+
+    /// Retries an incomplete Unix process-group scan for one bounded grace
+    /// period. An unresolved result is never treated as permission to signal;
+    /// this only gives a transient `/proc` or `ps` snapshot a chance to become
+    /// complete before a cancellation or escalation decision is made.
+    fn task_execution_liveness_after_retry(record: &TaskRecord, grace_ms: u64) -> Liveness {
+        let deadline = Instant::now() + Duration::from_millis(grace_ms);
+        loop {
+            let liveness = task_execution_liveness(record);
+            if liveness != Liveness::Unresolved || Instant::now() >= deadline {
+                return liveness;
+            }
             std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         }
     }
@@ -3254,10 +3400,12 @@ mod imp {
             return Ok(());
         }
         request_task_cancel_sentinel(control, &record.id)?;
-        if task_execution_liveness(record) == Liveness::Live {
+        let mut liveness = task_execution_liveness_after_retry(record, KILL_GRACE_MS);
+        if liveness == Liveness::Live {
             let _ = signal_group(record.pid, "-TERM");
             wait_while_task_alive(record, KILL_GRACE_MS);
-            if task_execution_liveness(record) == Liveness::Live {
+            liveness = task_execution_liveness_after_retry(record, KILL_GRACE_MS);
+            if liveness == Liveness::Live {
                 let _ = signal_group(record.pid, "-KILL");
                 wait_while_task_alive(record, KILL_GRACE_MS);
             }
@@ -4547,6 +4695,74 @@ mod imp {
             let _ = child.wait();
         }
 
+        /// A reused PID can still be a zombie while the original task's
+        /// descendant keeps the old process group alive. The zombie's
+        /// mismatched identity must not make that unrelated group look like
+        /// this task; a legacy record with no identity remains unresolved.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn task_rejects_reused_zombie_pid_with_live_group() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("task-zombie-pid-reuse");
+            let callback_inbox = dir.path.join("callback");
+            let spec = task_spec(
+                "svc-1",
+                "sh",
+                vec!["-c".to_string(), "sleep 30 & exit 0".to_string()],
+                vec![],
+                10_000,
+                &callback_inbox.display().to_string(),
+            );
+            let log_dir = task_logs_dir(&dir.path, "task-zombie-pid-reuse");
+            fs::create_dir_all(&log_dir).expect("create log dir");
+            let stdout_path = log_dir.join("stdout.log");
+            let stderr_path = log_dir.join("stderr.log");
+            let mut child = spawn_task_child(&spec, &stdout_path, &stderr_path)
+                .expect("spawn task with descendant");
+            let pid = child.id();
+            let (started_at, start_epoch_secs) = recorded_start_identity(pid);
+            assert!(started_at.is_some(), "fixture has a start identity");
+            let record = TaskRecord {
+                id: "task-zombie-pid-reuse".to_string(),
+                request_id: None,
+                admission: TaskAdmissionPhase::Committed,
+                spec,
+                pid,
+                started_at: Some("not-the-zombie-start-key".to_string()),
+                start_epoch_secs,
+                job: None,
+                started_ms: None,
+                state: TaskState::Running,
+                exit_code: None,
+                elapsed_ms: None,
+                stdout_path: stdout_path.display().to_string(),
+                stderr_path: stderr_path.display().to_string(),
+                delivered_milestones: 0,
+            };
+
+            wait_for_zombie_group_descendant(&child);
+            assert_eq!(
+                task_execution_liveness(&record),
+                Liveness::Dead,
+                "a mismatched zombie cannot authorize a group probe"
+            );
+            let mut legacy = record.clone();
+            legacy.started_at = None;
+            assert_eq!(
+                task_execution_liveness(&legacy),
+                Liveness::Unresolved,
+                "a zombie without durable identity remains unresolved"
+            );
+            assert_eq!(
+                unsafe { libc::kill(-(pid as libc::pid_t), 0) },
+                0,
+                "the descendant's process group remains alive after the rejected probes"
+            );
+
+            signal_group(pid, "-KILL").expect("kill fixture group");
+            let _ = child.wait();
+        }
+
         /// The lstart parser accepts a leap-day in a divisible-by-four year.
         #[test]
         fn lstart_parser_leap_year_case() {
@@ -4931,6 +5147,25 @@ mod imp {
             assert_eq!(claimed.key, format!("{task_id}-terminal"));
         }
 
+        #[cfg(target_os = "linux")]
+        fn wait_for_zombie_group_descendant(child: &Child) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let zombie = matches!(
+                    process_probe(child.id()),
+                    ProbeResult::Present(probe) if probe.is_zombie()
+                );
+                if zombie && task_group_liveness(child.id()) == Liveness::Live {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "task leader did not become a zombie with a live group descendant"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
         /// Waits until the direct shell exits while its background child
         /// keeps the task's process group alive. The bounded wait avoids
         /// making the process-group regressions depend on scheduler timing.
@@ -5025,7 +5260,13 @@ mod imp {
                 .expect("status while group remains");
             let status: serde_json::Value = serde_json::from_slice(&status).expect("status JSON");
             assert_eq!(status["tasks"][0]["state"], "running");
-            assert_eq!(status["tasks"][0]["liveness"], "live");
+            assert!(
+                matches!(
+                    status["tasks"][0]["liveness"].as_str(),
+                    Some("live") | Some("unresolved")
+                ),
+                "an incomplete group scan remains safe: {status}"
+            );
 
             signal_group(running.record.pid, "-KILL").expect("kill group descendant");
             reap_task_until_finished(&dir.path, "task-group-drain", &mut running, &clock, tick);
@@ -5102,7 +5343,11 @@ mod imp {
             assert!(matches!(term_tick, TaskTick::StillRunning));
             assert!(running.term_sent_at_ms.is_some());
             assert_durable_task_state(&dir.path, "task-timeout-group", TaskState::Running);
-            assert_eq!(task_group_liveness(running.record.pid), Liveness::Live);
+            assert_eq!(
+                unsafe { libc::kill(-(running.record.pid as libc::pid_t), 0) },
+                0,
+                "the TERM-ignoring descendant keeps the process group alive"
+            );
 
             clock.advance(KILL_GRACE_MS);
             let kill_tick = tick_one_task(&dir.path, "task-timeout-group", &mut running, &clock)
