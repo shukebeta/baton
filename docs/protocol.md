@@ -10,8 +10,9 @@ stand on its own.
 
 Two schemas and their trail:
 
-- `baton.exchange/v1` — one provider *call* (request + outcome), recorded as a
-  JSONL trail.
+- `baton.exchange/v1` — provider-call and mailbox-delivery events, recorded as
+  a JSONL trail. Provider calls use request/outcome pairs; `baton send` uses
+  standalone delivery events.
 - `baton.message/v1` — one agent-to-agent *peer message* envelope, which nests
   a `baton.exchange/v1` record.
 
@@ -81,10 +82,12 @@ can be skipped; `baton log` itself does this (emitting a stderr warning naming
 the line), so an unclean shutdown never bricks the whole trail. The event trail
 is auxiliary observability — it is written to the configured file
 only, never to stdout, and a failed log write degrades to a stderr warning
-rather than failing the command. The schema is per-exchange: each line is one
-request or one outcome, and a session turn's `request` carries that turn's user
-input as `prompt` (the full accumulated history is not aggregated into a single
-schema object).
+rather than failing the command. Provider-call records are per-exchange: each
+provider call has one request and one outcome, and a session turn's `request`
+carries that turn's user input as `prompt` (the full accumulated history is not
+aggregated into a single schema object). Standalone `message_sent` /
+`reply_consumed` lines record mailbox delivery and reply consumption; they have
+no provider-call request/outcome pair.
 
 ### Session trail
 
