@@ -2,7 +2,8 @@
 
 The asynchronous, file-backed transport: a long-lived responder, the client that
 posts to it and consumes the correlated reply, the liveness probe over the same
-mailbox, and the routing registry that resolves a role name to a mailbox pair.
+mailbox, the operator prune that bounds its dedup ledger, and the routing registry
+that resolves a role name to a mailbox pair.
 
 ## Serving a mailbox (`baton serve`)
 
@@ -255,6 +256,57 @@ A registry entry may carry an optional `max_runtime_ms`, used by `status
 
 The field is optional and back-compatible: existing registries without it parse
 unchanged and fall back to the `status` default.
+
+## Pruning the dedup ledger (`baton mailbox prune`)
+
+`done/` is not just an archive — it **is** the redelivery-dedup ledger
+([at-least-once semantics](#at-least-once-semantics)): `claim_next` drops a
+redelivered id because a file for it is sitting in `done/`. Nothing removes those
+files on their own, so a long-lived `serve` daemon accumulates one permanent file
+per processed message. `baton mailbox prune` is the operator's bound on that
+growth.
+
+```
+baton mailbox prune --mailbox <root> --older-than <duration>
+```
+
+- `--mailbox <root>` — the mailbox root to prune, the same root `serve --inbox`
+  and `status --mailbox` name.
+- `--older-than <duration>` — the retention window. Every `done/` entry whose
+  mtime is at least this old is deleted. An integer with an optional unit
+  suffix — `ms`, `s`, `m`, `h`, `d` — and a bare integer is milliseconds, as
+  everywhere else in the CLI: `7d`, `48h`, `900000`.
+
+It prints one JSON line and exits 0:
+
+```json
+{"removed":12,"older_than_ms":604800000}
+```
+
+**The trade-off: pruning shortens the dedup window.** A duplicate is suppressed
+only while its `done/` entry survives. Prune with `--older-than 7d` and a message
+redelivered eight days later is treated as new and reprocessed — a repeat provider
+call, and for an `--agent-cmd` worker a repeat agent run. Size the window above
+the longest delay after which a sender could plausibly redeliver, not merely above
+the time the reply took.
+
+This is why pruning is **never automatic**: only an operator can decide that a
+duplicate arriving after the cutoff may be reprocessed. Two consequences of the
+same rule:
+
+- **The window must be strictly positive.** `--older-than 0` is a usage error, not
+  a shorthand for "prune everything" — the cutoff is `age >= window`, so a zero
+  window matches every entry and one typo would wipe the ledger. Clearing it
+  outright stays an explicit `rm` you type yourself, with dedup disabled for every
+  id you removed.
+- **A future-dated entry always survives.** A clock skew that stamps an entry in
+  the future clamps its age to zero, and zero never reaches a positive window.
+
+Pruning is scoped to `done/`: `pending/` and `claimed/` are never touched, so it
+can neither drop an unanswered request nor abandon an in-flight one. Like
+[`status`](#mailbox-liveness-baton-status) it is **lock-free**, so it can prune a
+mailbox a live `serve` daemon owns — an entry the daemon writes while the scan
+runs is simply seen by the next prune.
 
 ## Routing registry (name → mailbox)
 
