@@ -54,7 +54,7 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session [--role <name>] [--resume <file> [--session <id>]] | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton serve --stop --inbox <dir> | baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]] | baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>... | baton roles | baton role show <name> | baton service run --control <dir> | baton service start --control <dir> --inbox <dir> --outbox <dir> [--poll-ms <n>] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton service status --control <dir> [--session <id>] | baton service stop --control <dir> --session <id> [--force] | baton service teardown --control <dir> [--force] | baton task start --control <dir> --session <id> --command <program> [--arg <arg>]... [--cwd <dir>] [--env KEY=VALUE]... [--milestone-ms <n>]... --max-duration-ms <n> --callback-inbox <dir> [--callback-role <name>] | baton task status --control <dir> [--task <id>] | baton task cancel --control <dir> --task <id>";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session [--role <name>] [--resume <file> [--session <id>]] | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton serve --stop --inbox <dir> | baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]] | baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>] | baton log show [--file <path>] | baton log replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>... | baton roles | baton role show <name> | baton service run --control <dir> | baton service start --control <dir> --inbox <dir> --outbox <dir> [--poll-ms <n>] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton service status --control <dir> [--session <id>] | baton service stop --control <dir> --session <id> [--force] | baton service teardown --control <dir> [--force] | baton task start --control <dir> --session <id> --command <program> [--arg <arg>]... [--cwd <dir>] [--env KEY=VALUE]... [--milestone-ms <n>]... --max-duration-ms <n> --callback-inbox <dir> [--callback-role <name>] | baton task status --control <dir> [--task <id>] | baton task cancel --control <dir> --task <id>";
 
 /// Default `baton serve` inbox poll interval, in milliseconds, when `--poll-ms`
 /// is unset.
@@ -3324,6 +3324,22 @@ mod tests {
             parse_args(&argv(&["ask", "--help"])).unwrap_err(),
             BatonError::Usage(_)
         ));
+    }
+
+    #[test]
+    fn usage_scopes_log_index_to_replay() {
+        // Regression: the synopsis once fused the two log subcommands as
+        // `log show|replay [--file <path>] [--index <N>]`, advertising an
+        // `--index` that `show` rejects (see `index_flag_on_show_is_usage_error`).
+        assert!(
+            USAGE.contains("baton log show [--file <path>] |"),
+            "{USAGE}"
+        );
+        assert!(
+            USAGE.contains("baton log replay [--file <path>] [--index <N>]"),
+            "{USAGE}"
+        );
+        assert!(!USAGE.contains("log show|replay"), "{USAGE}");
     }
 
     #[test]
