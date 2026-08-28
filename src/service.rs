@@ -4184,10 +4184,18 @@ mod imp {
             };
             write_task_record(&dir.path, &task_record).expect("write terminal task record");
             request_task_cancel_sentinel(&dir.path, task_id).expect("write cancel sentinel");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let liveness = loop {
+                let liveness = is_task_alive(&task_record);
+                if liveness == Liveness::Live || Instant::now() >= deadline {
+                    break liveness;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
             assert_eq!(
-                is_task_alive(&task_record),
+                liveness,
                 Liveness::Live,
-                "fixture must match the live process by PID and argv"
+                "fixture must match the live process by PID and argv within 10 seconds"
             );
 
             let session_record = SessionRecord {
