@@ -114,7 +114,8 @@ baton service teardown --control <dir> [--force]
   (or just `--session <id>`'s). Each record retains the compatibility boolean
   `live` (`true` only for `liveness: "live"`) and exposes the full
   `liveness` state plus `stderr_path`, the path to the Unix session daemon's
-  captured stderr log (`sessions/<id>/stderr.log`). Per-session liveness checks the recorded PID against
+  captured stderr log (`sessions/<id>/stderr.log`). Per-session liveness
+  checks the recorded PID against
   `/proc/<pid>` on Linux — alive, not a zombie, and its start time still
   matches the record — so a PID recycled after a restart is `dead`. On macOS,
   records with `start_epoch_secs` compare that canonical epoch directly and
