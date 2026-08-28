@@ -136,7 +136,8 @@ baton service teardown --control <dir> [--force]
 
 ### Liveness resolution and safe cleanup
 
-Status exposes three identity outcomes for a running record:
+For a session record, and for the directly recorded PID portion of a task,
+status exposes three identity outcomes:
 
 - `live` means the process is present and its PID identity is corroborated.
 - `dead` means the PID is absent, a zombie, or positively belongs to a
@@ -144,6 +145,15 @@ Status exposes three identity outcomes for a running record:
 - `unresolved` means the PID exists but the available identity evidence is
   unreadable or insufficient. It is fail-closed: no signal, removal, or failed
   terminal state is inferred from it.
+
+Unix tasks add process-group execution liveness on top of that direct-PID
+identity. A task remains `live` while its corroborated direct PID or a
+non-zombie member of its recorded process group is live. Therefore a task
+whose direct PID is gone or zombie can still report `live` while a same-group
+descendant remains. An incomplete `/proc` or `ps` group scan reports
+`unresolved`; only a complete scan showing no live member, or a confirming
+group-absence probe, reports the task as drained/dead. A PID-reuse or missing
+zombie identity never authorizes a process-group probe.
 
 The resolution ladder is platform-specific:
 
