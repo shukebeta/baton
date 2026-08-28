@@ -56,7 +56,10 @@ without ever sharing a process tree with it.
   request is delivered into `requests/`, claimed into `processing/` by `run`,
   and answered into `responses/` keyed by the request id. This is the only
   operation that must execute *inside* the long-lived process, since spawning
-  the child there is the entire point.
+  the child there is the entire point. A response body carries either a
+  `session_id` (the request was admitted) or an `error` (an admission failure
+  `run` can name), never both; the `session_id`-only bodies written by older
+  versions still parse.
 - `sessions/<id>.json` — one durable session record per session (its
   effective spec, real PID, canonical `started_at` string, and on Windows its
   optional Job Object name). `status`/`stop`/`teardown` read
@@ -79,8 +82,10 @@ baton service teardown --control <dir> [--force]
 
 - **`service run`** acquires the control lock and blocks, spawning and
   reaping sessions until it observes a cooperative stop. It exits cleanly on
-  `teardown`; a single malformed or failing start request logs a warning and
-  never crashes the loop for the sessions it already owns.
+  `teardown`; an admission failure it can name is answered as an `error`
+  response to the waiting client, and any remaining failure — a malformed
+  spec, an unexpected fault, a response it could not deliver — logs a warning
+  and never crashes the loop for the sessions it already owns.
 - **`service start`** takes exactly the flags `baton serve` itself takes (they
   become the session's `SessionSpec`, reconstructed into an equivalent
   `baton serve` argv by `run`). It submits the spec and returns a session id
@@ -91,7 +96,13 @@ baton service teardown --control <dir> [--force]
   are resolved against the submitting client's current working directory and
   persisted as absolute paths before the request is sent; resolution is
   lexical and does not canonicalize or require the target to exist at
-  submission time. Absolute values are preserved unchanged.
+  submission time. Absolute values are preserved unchanged. An admission
+  failure `run` can name once it has claimed the request — the `baton serve`
+  child could not be spawned or corroborated, or its session record could not
+  be written — comes back as an `error` response, so the client exits non-zero
+  with that reason instead of waiting out the ten-second await bound. Only a
+  failure to deliver a response at all leaves the request unanswered; `run`
+  warns and keeps polling, and the client falls back to the await timeout.
 - **`service status`** reports the service's own liveness plus every session's
   (or just `--session <id>`'s). Each record retains the compatibility boolean
   `live` (`true` only for `liveness: "live"`) and exposes the full
@@ -253,6 +264,13 @@ baton task cancel --control <dir> --task <id>
   and whose recorded process is currently live. A missing record or a stale
   record whose process is no longer live is rejected with a non-zero owner
   error before any task process, log directory, or `TaskRecord` is created.
+  Every later admission failure `run` can name — the log directory could not
+  be created, the command could not be spawned or corroborated, the
+  `TaskRecord` could not be written — is answered the same way, as a
+  task-start response carrying `error` instead of a task id, so a command that
+  cannot spawn fails immediately with its real reason rather than as a
+  ten-second await timeout. No durable task record survives such a failure,
+  and a command that never started leaves no log directory behind either.
   While waiting for the response, the submitting client probes the control
   lock. If `run` releases that lock before answering, the client takes the
   short-lived admission lock, re-checks for a response, writes a durable

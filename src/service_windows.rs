@@ -212,6 +212,13 @@ const CONTROL_STOP_FILE: &str = "service.stop";
 /// Interval between `Run`'s request-directory scans, and between polls of
 /// a pending await (start response, stop/kill grace).
 const POLL_INTERVAL_MS: u64 = 100;
+/// Initial delay before retrying a failed terminal callback delivery.
+const TERMINAL_RETRY_INITIAL_DELAY_MS: u64 = 1_000;
+/// Longest delay between terminal callback delivery attempts.
+const TERMINAL_RETRY_MAX_DELAY_MS: u64 = 60_000;
+/// Total terminal callback delivery attempts before the task is dropped
+/// from the in-memory tracker.
+const MAX_TERMINAL_DELIVERY_ATTEMPTS: u32 = 10;
 /// Bound on how long `Start` waits for a live `Run` to answer.
 const START_AWAIT_MS: u64 = 10_000;
 /// Bound on the cooperative `serve --stop` grace before escalating to
@@ -254,9 +261,15 @@ struct SessionRecord {
 }
 
 /// The `Start` response body, keyed by request id in `responses/`.
+/// An admitted request carries `session_id`; an admission failure the
+/// supervisor can name carries `error` and no session id. Both fields
+/// default, so a response persisted before `error` existed still parses.
 #[derive(Debug, Serialize, Deserialize)]
 struct StartResponse {
-    session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 /// Whether a live `Run` holds the control lock.
@@ -664,7 +677,14 @@ fn await_start_response(control: &Path, request_id: &str) -> Result<String> {
             let resp: StartResponse = serde_json::from_str(&data).map_err(|err| {
                 BatonError::Decode(format!("malformed service response {path:?}: {err}"))
             })?;
-            return Ok(resp.session_id);
+            if let Some(error) = resp.error {
+                return Err(BatonError::Io(error));
+            }
+            return resp.session_id.ok_or_else(|| {
+                BatonError::Decode(format!(
+                    "service response {path:?} contained neither a session id nor an error"
+                ))
+            });
         }
         if probe_control(control)? == ControlLiveness::NotRunning {
             return Err(BatonError::Io(format!(
@@ -732,7 +752,9 @@ fn process_one_request(control: &Path) -> Result<Option<(String, RunningSession)
             Ok(()) => {
                 let outcome = handle_start_request(control, &key, &claimed_path);
                 let _ = fs::remove_file(&claimed_path);
-                let (record, running) = outcome?;
+                let Some((record, running)) = outcome? else {
+                    return Ok(None);
+                };
                 return Ok(Some((record.id, running)));
             }
             // Lost a claim race (shouldn't happen — `Run` is the sole
@@ -744,25 +766,75 @@ fn process_one_request(control: &Path) -> Result<Option<(String, RunningSession)
     Ok(None)
 }
 
+/// Renders `err` for a start-response `error` field. The client re-wraps
+/// that text in [`BatonError::Io`], so the rendered form must not repeat
+/// the kind prefix `Display` already adds.
+fn admission_error_text(err: &BatonError) -> String {
+    match err {
+        BatonError::Io(msg) => msg.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Writes a start response body keyed by `request_id`.
+fn write_start_response(control: &Path, request_id: &str, response: &StartResponse) -> Result<()> {
+    let json = serde_json::to_string(response)
+        .map_err(|err| BatonError::Io(format!("could not serialize start response: {err}")))?;
+    let responses = responses_dir(control);
+    fs::create_dir_all(&responses)
+        .map_err(|err| BatonError::Io(format!("could not create {responses:?}: {err}")))?;
+    mailbox::atomic_write(&responses, &mailbox::file_name(request_id), &json)
+}
+
+/// Answers a claimed start request with an admission failure the supervisor
+/// can name, so the client fails immediately with the real reason instead of
+/// waiting out [`START_AWAIT_MS`]. Only the response write itself can still
+/// fail the request loop.
+fn reject_start_request(
+    control: &Path,
+    request_id: &str,
+    error: String,
+) -> Result<Option<(SessionRecord, RunningSession)>> {
+    write_start_response(
+        control,
+        request_id,
+        &StartResponse {
+            session_id: None,
+            error: Some(error),
+        },
+    )?;
+    Ok(None)
+}
+
 /// Spawns the requested session, persists its [`SessionRecord`], and
 /// answers the request with its session id.
+///
+/// An admission failure after the request is claimed — a job/spawn failure, a
+/// post-spawn corroboration failure, a record-write failure — is answered as
+/// an error response and reported as `Ok(None)`; only a failure to deliver a
+/// response at all is propagated as `Err`.
 fn handle_start_request(
     control: &Path,
     request_id: &str,
     spec_path: &Path,
-) -> Result<(SessionRecord, RunningSession)> {
+) -> Result<Option<(SessionRecord, RunningSession)>> {
     let data = fs::read_to_string(spec_path)
         .map_err(|err| BatonError::Io(format!("could not read {spec_path:?}: {err}")))?;
     let spec: SessionSpec = serde_json::from_str(&data).map_err(|err| {
         BatonError::Decode(format!("malformed session spec {spec_path:?}: {err}"))
     })?;
     let job_name = fresh_job_name("session");
-    let job = create_job(&job_name, false)?;
+    let job = match create_job(&job_name, false) {
+        Ok(job) => job,
+        Err(err) => {
+            return reject_start_request(control, request_id, admission_error_text(&err));
+        }
+    };
     let mut child = match spawn_serve_child(&spec, &job_name) {
         Ok(child) => child,
         Err(err) => {
             drop(job);
-            return Err(err);
+            return reject_start_request(control, request_id, admission_error_text(&err));
         }
     };
     if let Err(err) =
@@ -770,22 +842,25 @@ fn handle_start_request(
     {
         let _ = terminate_job(&job);
         let _ = child.wait();
-        return Err(err);
+        return reject_start_request(control, request_id, admission_error_text(&err));
     }
     let pid = child.id();
     let (started_at, start_epoch_secs) = recorded_start_identity(pid);
     // Everything below this point must kill+reap `child` before
-    // returning `Err`: once this function returns an error, nothing else
-    // ever tracks this `Child` (it isn't inserted into `Run`'s
-    // `children` map, and `Drop` for `std::process::Child` does not
-    // kill), so leaving it running here would leak a live, unrecorded,
-    // unreapable `serve` process.
+    // returning: once this function stops tracking it, nothing else ever
+    // does (it isn't inserted into `Run`'s `children` map, and `Drop` for
+    // `std::process::Child` does not kill), so leaving it running here
+    // would leak a live, unrecorded, unreapable `serve` process.
     if !spawn_start_key_ok(&started_at, &start_epoch_secs) {
         let _ = terminate_job(&job);
         let _ = child.wait();
-        return Err(BatonError::Io(format!(
-            "baton serve (pid {pid}) could not be corroborated right after spawn; treating as a spawn failure"
-        )));
+        return reject_start_request(
+            control,
+            request_id,
+            format!(
+                "baton serve (pid {pid}) could not be corroborated right after spawn; treating as a spawn failure"
+            ),
+        );
     }
     let record = SessionRecord {
         id: fresh_session_id(),
@@ -798,32 +873,29 @@ fn handle_start_request(
     if let Err(err) = write_session_record(control, &record) {
         let _ = terminate_job(&job);
         let _ = child.wait();
-        return Err(err);
+        return reject_start_request(control, request_id, admission_error_text(&err));
     }
-    let response = StartResponse {
-        session_id: record.id.clone(),
-    };
-    let respond = serde_json::to_string(&response)
-        .map_err(|err| BatonError::Io(format!("could not serialize start response: {err}")))
-        .and_then(|json| {
-            let responses = responses_dir(control);
-            fs::create_dir_all(&responses)
-                .map_err(|err| BatonError::Io(format!("could not create {responses:?}: {err}")))?;
-            mailbox::atomic_write(&responses, &mailbox::file_name(request_id), &json)
-        });
+    let respond = write_start_response(
+        control,
+        request_id,
+        &StartResponse {
+            session_id: Some(record.id.clone()),
+            error: None,
+        },
+    );
     if let Err(err) = respond {
         let _ = terminate_job(&job);
         let _ = child.wait();
         let _ = remove_session_record(control, &record.id);
         return Err(err);
     }
-    Ok((
+    Ok(Some((
         record,
         RunningSession {
             child: Some(child),
             job: Some(job),
         },
-    ))
+    )))
 }
 
 /// Resolves the currently-running `baton` binary, so `Run` spawns
@@ -1581,6 +1653,16 @@ struct RunningTask {
     /// Set once the second Job Object termination has been sent, so it is
     /// only ever sent once.
     kill_sent: bool,
+    /// Number of failed terminal callback delivery attempts. These are
+    /// deliberately in-memory: a terminal record is replayed once after
+    /// restart, then follows the same bounded retry policy.
+    terminal_delivery_attempts: u32,
+    /// Clock deadline at which the next terminal callback delivery may be
+    /// attempted.
+    next_terminal_retry_ms: Option<u64>,
+    /// Delay used for the most recent failed terminal delivery, so the next
+    /// failure can double it without a wall-clock dependency.
+    terminal_retry_delay_ms: u64,
     /// Exit outcome of the direct child, stashed when the task parks to
     /// drain surviving Job Object descendants (which clears `child`).
     /// `None` for a task that never owned a child handle (rehydrated after
@@ -1629,6 +1711,9 @@ fn rehydrate_tasks(control: &Path, clock: &dyn Clock) -> Result<HashMap<String, 
                 started_ms,
                 term_sent_at_ms: None,
                 kill_sent: false,
+                terminal_delivery_attempts: 0,
+                next_terminal_retry_ms: None,
+                terminal_retry_delay_ms: 0,
                 child_exit: None,
             },
         );
@@ -1637,9 +1722,19 @@ fn rehydrate_tasks(control: &Path, clock: &dyn Clock) -> Result<HashMap<String, 
 }
 
 /// Outcome of one [`tick_one_task`] call.
+#[derive(Debug)]
 enum TaskTick {
     StillRunning,
     Finished,
+    TerminalDeliveryRetry {
+        error: String,
+        attempt: u32,
+        delay_ms: u64,
+    },
+    TerminalDeliveryDropped {
+        error: String,
+        attempts: u32,
+    },
 }
 
 /// Claims and handles the next pending task-start request, if any.
@@ -1695,6 +1790,9 @@ fn process_one_task_request(
                     started_ms,
                     term_sent_at_ms: None,
                     kill_sent: false,
+                    terminal_delivery_attempts: 0,
+                    next_terminal_retry_ms: None,
+                    terminal_retry_delay_ms: 0,
                     child_exit: None,
                 };
                 return Ok(Some((id, running)));
@@ -1706,6 +1804,24 @@ fn process_one_task_request(
     Ok(None)
 }
 
+/// Answers a claimed task-start request with an admission failure the
+/// supervisor can name, mirroring [`reject_start_request`].
+fn reject_task_start_request(
+    control: &Path,
+    request_id: &str,
+    error: String,
+) -> Result<Option<(TaskRecord, Child, JobHandle, u64)>> {
+    write_task_start_response(
+        control,
+        request_id,
+        &TaskStartResponse {
+            task_id: None,
+            error: Some(error),
+        },
+    )?;
+    Ok(None)
+}
+
 /// Validates the requested owner, then spawns the task, persists its
 /// [`TaskRecord`], and answers the request with its task id. Mirrors
 /// [`handle_start_request`]'s
@@ -1713,6 +1829,12 @@ fn process_one_task_request(
 /// record is durable. After that point the task remains tracked when
 /// response delivery or phase persistence fails, so restart reconciliation
 /// can retry the response boundary without spawning again.
+///
+/// Every admission failure before that point — owner rejection, log-dir
+/// creation, spawn, post-spawn corroboration, record write — is answered as an
+/// error response and reported as `Ok(None)`, so the client fails immediately
+/// with the real reason instead of waiting out [`START_AWAIT_MS`]. Only a
+/// failure to deliver a response at all is propagated as `Err`.
 fn handle_task_start_request(
     control: &Path,
     request_id: &str,
@@ -1735,31 +1857,41 @@ fn handle_task_start_request(
             "task start rejected: --session {:?} does not name a live managed session on {:?} (the session record is absent or its process is no longer live)",
             spec.session, control
         );
-        write_task_start_response(
-            control,
-            request_id,
-            &TaskStartResponse {
-                task_id: None,
-                error: Some(error),
-            },
-        )?;
-        return Ok(None);
+        return reject_task_start_request(control, request_id, error);
     }
     let task_id = fresh_task_id();
     let log_dir = task_logs_dir(control, &task_id);
-    fs::create_dir_all(&log_dir)
-        .map_err(|err| BatonError::Io(format!("could not create {log_dir:?}: {err}")))?;
+    if let Err(err) = fs::create_dir_all(&log_dir) {
+        return reject_task_start_request(
+            control,
+            request_id,
+            format!("could not create {log_dir:?}: {err}"),
+        );
+    }
     let stdout_path = log_dir.join("stdout.log");
     let stderr_path = log_dir.join("stderr.log");
-    let (mut child, job, job_name) = spawn_task_child(&spec, &stdout_path, &stderr_path)?;
+    let (mut child, job, job_name) = match spawn_task_child(&spec, &stdout_path, &stderr_path) {
+        Ok(spawned) => spawned,
+        Err(err) => {
+            // Nothing ever ran under this id, so its just-created log
+            // directory holds two empty files and no record refers to
+            // it: drop it rather than leaking one per failed start.
+            let _ = fs::remove_dir_all(&log_dir);
+            return reject_task_start_request(control, request_id, admission_error_text(&err));
+        }
+    };
     let pid = child.id();
     let (started_at, start_epoch_secs) = recorded_start_identity(pid);
     if !spawn_start_key_ok(&started_at, &start_epoch_secs) {
         let _ = terminate_job(&job);
         let _ = child.wait();
-        return Err(BatonError::Io(format!(
-            "task command (pid {pid}) could not be corroborated right after spawn; treating as a spawn failure"
-        )));
+        return reject_task_start_request(
+            control,
+            request_id,
+            format!(
+                "task command (pid {pid}) could not be corroborated right after spawn; treating as a spawn failure"
+            ),
+        );
     }
     let started_ms = clock.now_ms();
     let mut record = TaskRecord {
@@ -1782,7 +1914,7 @@ fn handle_task_start_request(
     if let Err(err) = write_task_record(control, &record) {
         let _ = terminate_job(&job);
         let _ = child.wait();
-        return Err(err);
+        return reject_task_start_request(control, request_id, admission_error_text(&err));
     }
     wait_for_test_task_admission_barrier();
     record.admission = TaskAdmissionPhase::Committed;
@@ -1790,7 +1922,7 @@ fn handle_task_start_request(
         let _ = terminate_job(&job);
         let _ = child.wait();
         let _ = remove_task_record(control, &record.id);
-        return Err(err);
+        return reject_task_start_request(control, request_id, admission_error_text(&err));
     }
     let respond = write_task_start_response(
         control,
@@ -2021,8 +2153,7 @@ fn tick_one_task(
         return Ok(TaskTick::Finished);
     }
     if running.record.state != TaskState::Running {
-        deliver_task_event(&running.record, TaskEventKind::Terminal)?;
-        return Ok(TaskTick::Finished);
+        return deliver_terminal_event(running, clock);
     }
 
     let elapsed_ms = clock.now_ms().saturating_sub(running.started_ms);
@@ -2049,13 +2180,13 @@ fn tick_one_task(
             Liveness::Dead => {
                 let cancelled = consume_task_cancel_sentinel(control, id)?;
                 let (state, exit_code) = parked_terminal(running, cancelled);
-                return finalize_task(control, running, state, exit_code, elapsed_ms);
+                return finalize_task(control, running, state, exit_code, elapsed_ms, clock);
             }
             Liveness::Live => {}
             Liveness::Unresolved if controlled_task_pid_is_gone(control, id, running)? => {
                 let cancelled = consume_task_cancel_sentinel(control, id)?;
                 let (state, exit_code) = parked_terminal(running, cancelled);
-                return finalize_task(control, running, state, exit_code, elapsed_ms);
+                return finalize_task(control, running, state, exit_code, elapsed_ms, clock);
             }
             Liveness::Unresolved => return Ok(TaskTick::StillRunning),
         }
@@ -2075,13 +2206,13 @@ fn tick_one_task(
                 Liveness::Dead => {
                     let cancelled = consume_task_cancel_sentinel(control, id)?;
                     let (state, exit_code) = parked_terminal(running, cancelled);
-                    return finalize_task(control, running, state, exit_code, elapsed_ms);
+                    return finalize_task(control, running, state, exit_code, elapsed_ms, clock);
                 }
                 Liveness::Live => {}
                 Liveness::Unresolved if controlled_task_pid_is_gone(control, id, running)? => {
                     let cancelled = consume_task_cancel_sentinel(control, id)?;
                     let (state, exit_code) = parked_terminal(running, cancelled);
-                    return finalize_task(control, running, state, exit_code, elapsed_ms);
+                    return finalize_task(control, running, state, exit_code, elapsed_ms, clock);
                 }
                 Liveness::Unresolved => return Ok(TaskTick::StillRunning),
             }
@@ -2096,13 +2227,13 @@ fn tick_one_task(
             Liveness::Unresolved if controlled_task_pid_is_gone(control, id, running)? => {
                 let cancelled = consume_task_cancel_sentinel(control, id)?;
                 let (state, exit_code) = parked_terminal(running, cancelled);
-                finalize_task(control, running, state, exit_code, elapsed_ms)
+                finalize_task(control, running, state, exit_code, elapsed_ms, clock)
             }
             Liveness::Unresolved => Ok(TaskTick::StillRunning),
             Liveness::Dead => {
                 let cancelled = consume_task_cancel_sentinel(control, id)?;
                 let (state, exit_code) = parked_terminal(running, cancelled);
-                finalize_task(control, running, state, exit_code, elapsed_ms)
+                finalize_task(control, running, state, exit_code, elapsed_ms, clock)
             }
         },
         Some(child) => match child.try_wait() {
@@ -2145,7 +2276,7 @@ fn tick_one_task(
                 } else {
                     TaskState::Failed
                 };
-                finalize_task(control, running, state, status.code(), elapsed_ms)
+                finalize_task(control, running, state, status.code(), elapsed_ms, clock)
             }
             Ok(None) => Ok(TaskTick::StillRunning),
             Err(err) => Err(BatonError::Io(format!("could not poll task {id}: {err}"))),
@@ -2176,6 +2307,48 @@ fn parked_terminal(running: &RunningTask, cancelled: bool) -> (TaskState, Option
     }
 }
 
+/// Delivers a terminal event, applying bounded exponential backoff when the
+/// callback inbox is unavailable.
+fn deliver_terminal_event(running: &mut RunningTask, clock: &dyn Clock) -> Result<TaskTick> {
+    let now_ms = clock.now_ms();
+    if let Some(next_retry_ms) = running.next_terminal_retry_ms
+        && now_ms < next_retry_ms
+    {
+        return Ok(TaskTick::StillRunning);
+    }
+
+    match deliver_task_event(&running.record, TaskEventKind::Terminal) {
+        Ok(()) => Ok(TaskTick::Finished),
+        Err(err) => {
+            let attempt = running.terminal_delivery_attempts.saturating_add(1);
+            running.terminal_delivery_attempts = attempt;
+            let error = err.to_string();
+            if attempt >= MAX_TERMINAL_DELIVERY_ATTEMPTS {
+                return Ok(TaskTick::TerminalDeliveryDropped {
+                    error,
+                    attempts: attempt,
+                });
+            }
+
+            let delay_ms = if attempt == 1 {
+                TERMINAL_RETRY_INITIAL_DELAY_MS
+            } else {
+                running
+                    .terminal_retry_delay_ms
+                    .saturating_mul(2)
+                    .min(TERMINAL_RETRY_MAX_DELAY_MS)
+            };
+            running.terminal_retry_delay_ms = delay_ms;
+            running.next_terminal_retry_ms = Some(now_ms.saturating_add(delay_ms));
+            Ok(TaskTick::TerminalDeliveryRetry {
+                error,
+                attempt,
+                delay_ms,
+            })
+        }
+    }
+}
+
 /// Persists a terminal task state before delivering its deterministic
 /// terminal event. If delivery fails, the terminal record remains in the
 /// tracker and the next tick retries the same event id.
@@ -2185,6 +2358,7 @@ fn finalize_task(
     state: TaskState,
     exit_code: Option<i32>,
     elapsed_ms: u64,
+    clock: &dyn Clock,
 ) -> Result<TaskTick> {
     let previous = running.record.clone();
     running.record.state = state;
@@ -2194,8 +2368,7 @@ fn finalize_task(
         running.record = previous;
         return Err(err);
     }
-    deliver_task_event(&running.record, TaskEventKind::Terminal)?;
-    Ok(TaskTick::Finished)
+    deliver_terminal_event(running, clock)
 }
 
 /// Ticks every tracked task once, dropping any that finished. One task's
@@ -2208,6 +2381,23 @@ fn tick_tasks(control: &Path, tasks: &mut HashMap<String, RunningTask>, clock: &
         match tick_one_task(control, id, running, clock) {
             Ok(TaskTick::Finished) => finished.push(id.clone()),
             Ok(TaskTick::StillRunning) => {}
+            Ok(TaskTick::TerminalDeliveryRetry {
+                error,
+                attempt,
+                delay_ms,
+            }) => {
+                eprintln!(
+                    "warning: baton service failed to deliver terminal event for task {id} to callback inbox {:?} (attempt {attempt}/{MAX_TERMINAL_DELIVERY_ATTEMPTS}; retrying in {delay_ms} ms): {error}",
+                    running.record.spec.callback.inbox
+                );
+            }
+            Ok(TaskTick::TerminalDeliveryDropped { error, attempts }) => {
+                eprintln!(
+                    "warning: baton service dropped task {id} after {attempts} failed terminal-event deliveries to callback inbox {:?}: {error}",
+                    running.record.spec.callback.inbox
+                );
+                finished.push(id.clone());
+            }
             Err(err) => {
                 eprintln!("warning: baton service failed to tick task {id}: {err}");
             }
@@ -3082,7 +3272,7 @@ fn wait_for_control_release(control: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task::{TASK_SPEC_SCHEMA, TaskCallback};
+    use crate::task::{FakeClock, TASK_SPEC_SCHEMA, TaskCallback};
     use std::path::PathBuf;
 
     fn session_spec() -> SessionSpec {
@@ -3166,6 +3356,142 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("create test control directory");
         path
+    }
+
+    fn terminal_running_task(
+        control: &Path,
+        id: &str,
+        callback_inbox: &Path,
+        clock: &FakeClock,
+    ) -> RunningTask {
+        let mut record = task_record(
+            "svc-test",
+            std::process::id(),
+            recorded_start_identity(std::process::id()).0,
+            None,
+        );
+        record.id = id.to_string();
+        record.spec.callback.inbox = callback_inbox.display().to_string();
+        record.started_ms = Some(clock.now_ms());
+        record.state = TaskState::Completed;
+        record.exit_code = Some(0);
+        record.elapsed_ms = Some(10);
+        write_task_record(control, &record).expect("write terminal task record");
+        RunningTask {
+            record,
+            child: None,
+            job: None,
+            started_ms: clock.now_ms(),
+            term_sent_at_ms: None,
+            kill_sent: false,
+            terminal_delivery_attempts: 0,
+            next_terminal_retry_ms: None,
+            terminal_retry_delay_ms: 0,
+            child_exit: None,
+        }
+    }
+
+    #[test]
+    fn terminal_delivery_uses_fake_clock_backoff_and_recovers() {
+        let control = temp_control("terminal-delivery-retry");
+        let clock = FakeClock::new();
+        let callback_inbox = control.join("callback");
+        fs::write(&callback_inbox, "callback unavailable").expect("make callback a file");
+        let mut running =
+            terminal_running_task(&control, "task-terminal-retry", &callback_inbox, &clock);
+
+        match tick_one_task(&control, "task-terminal-retry", &mut running, &clock)
+            .expect("first terminal delivery attempt")
+        {
+            TaskTick::TerminalDeliveryRetry {
+                attempt, delay_ms, ..
+            } => {
+                assert_eq!(attempt, 1);
+                assert_eq!(delay_ms, TERMINAL_RETRY_INITIAL_DELAY_MS);
+            }
+            other => panic!("expected a scheduled retry, got {other:?}"),
+        }
+        assert_eq!(running.terminal_delivery_attempts, 1);
+        assert_eq!(running.next_terminal_retry_ms, Some(1_000));
+
+        clock.advance(TERMINAL_RETRY_INITIAL_DELAY_MS - 1);
+        assert!(matches!(
+            tick_one_task(&control, "task-terminal-retry", &mut running, &clock)
+                .expect("early terminal retry tick"),
+            TaskTick::StillRunning
+        ));
+        fs::remove_file(&callback_inbox).expect("remove unavailable callback marker");
+
+        clock.advance(1);
+        assert!(matches!(
+            tick_one_task(&control, "task-terminal-retry", &mut running, &clock)
+                .expect("recovered terminal delivery"),
+            TaskTick::Finished
+        ));
+        let mailbox = mailbox::Mailbox::open(&callback_inbox).expect("open callback mailbox");
+        assert_eq!(
+            mailbox
+                .claim_next()
+                .expect("claim terminal event")
+                .expect("terminal event present")
+                .key,
+            "task-terminal-retry-terminal"
+        );
+        drop(mailbox);
+        let _ = fs::remove_dir_all(control);
+    }
+
+    #[test]
+    fn terminal_delivery_drops_after_bounded_backoff_attempts() {
+        let control = temp_control("terminal-delivery-drop");
+        let clock = FakeClock::new();
+        let callback_inbox = control.join("callback");
+        fs::write(&callback_inbox, "callback unavailable").expect("make callback a file");
+        let mut running =
+            terminal_running_task(&control, "task-terminal-drop", &callback_inbox, &clock);
+        let mut expected_delay = TERMINAL_RETRY_INITIAL_DELAY_MS;
+
+        for attempt in 1..=MAX_TERMINAL_DELIVERY_ATTEMPTS {
+            if attempt > 1 {
+                clock.advance(running.terminal_retry_delay_ms);
+            }
+            let tick = tick_one_task(&control, "task-terminal-drop", &mut running, &clock)
+                .expect("terminal delivery attempt");
+            if attempt < MAX_TERMINAL_DELIVERY_ATTEMPTS {
+                match tick {
+                    TaskTick::TerminalDeliveryRetry {
+                        attempt: reported_attempt,
+                        delay_ms,
+                        ..
+                    } => {
+                        assert_eq!(reported_attempt, attempt);
+                        assert_eq!(delay_ms, expected_delay);
+                        assert!(delay_ms <= TERMINAL_RETRY_MAX_DELAY_MS);
+                        expected_delay = expected_delay
+                            .saturating_mul(2)
+                            .min(TERMINAL_RETRY_MAX_DELAY_MS);
+                    }
+                    other => panic!("expected another retry, got {other:?}"),
+                }
+            } else {
+                assert!(matches!(
+                    tick,
+                    TaskTick::TerminalDeliveryDropped {
+                        attempts: MAX_TERMINAL_DELIVERY_ATTEMPTS,
+                        ..
+                    }
+                ));
+            }
+        }
+        assert_eq!(
+            running.terminal_delivery_attempts,
+            MAX_TERMINAL_DELIVERY_ATTEMPTS
+        );
+        assert!(
+            callback_inbox.is_file(),
+            "failed callback remains unavailable"
+        );
+        let _ = fs::remove_dir_all(control);
     }
 
     #[test]

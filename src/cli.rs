@@ -54,7 +54,7 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session [--role <name>] [--resume <file> [--session <id>]] | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton serve --stop --inbox <dir> | baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]] | baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>] | baton log show|replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>... | baton roles | baton role show <name> | baton service run --control <dir> | baton service start --control <dir> --inbox <dir> --outbox <dir> [--poll-ms <n>] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton service status --control <dir> [--session <id>] | baton service stop --control <dir> --session <id> [--force] | baton service teardown --control <dir> [--force] | baton task start --control <dir> --session <id> --command <program> [--arg <arg>]... [--cwd <dir>] [--env KEY=VALUE]... [--milestone-ms <n>]... --max-duration-ms <n> --callback-inbox <dir> [--callback-role <name>] | baton task status --control <dir> [--task <id>] | baton task cancel --control <dir> --task <id>";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session [--role <name>] [--resume <file> [--session <id>]] | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton serve --stop --inbox <dir> | baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]] | baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>] | baton mailbox prune --mailbox <root> --older-than <duration> | baton log show [--file <path>] | baton log replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>... | baton roles | baton role show <name> | baton service run --control <dir> | baton service start --control <dir> --inbox <dir> --outbox <dir> [--poll-ms <n>] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton service status --control <dir> [--session <id>] | baton service stop --control <dir> --session <id> [--force] | baton service teardown --control <dir> [--force] | baton task start --control <dir> --session <id> --command <program> [--arg <arg>]... [--cwd <dir>] [--env KEY=VALUE]... [--milestone-ms <n>]... --max-duration-ms <n> --callback-inbox <dir> [--callback-role <name>] | baton task status --control <dir> [--task <id>] | baton task cancel --control <dir> --task <id>";
 
 /// Default `baton serve` inbox poll interval, in milliseconds, when `--poll-ms`
 /// is unset.
@@ -227,6 +227,11 @@ enum Command {
         /// registry value and the default.
         max_runtime_ms: Option<u64>,
     },
+    /// Prune the `done/` dedup ledger of the mailbox at `mailbox`, removing
+    /// every entry at least `older_than_ms` old. Operator-invoked and never
+    /// automatic: it bounds the ledger at the cost of shortening the
+    /// redelivery-dedup window.
+    MailboxPrune { mailbox: String, older_than_ms: u64 },
     /// Pretty-print the recorded exchange trail.
     LogShow { file: Option<String> },
     /// Re-run a recorded exchange. `index` is 1-based; `None` ⇒ the last one.
@@ -717,6 +722,14 @@ pub fn run() -> Result<()> {
             let status = mailbox::status(&root, Duration::from_millis(threshold_ms))?;
             let stdout = std::io::stdout();
             execute_status(&status, threshold_ms, stdout.lock())
+        }
+        Command::MailboxPrune {
+            mailbox,
+            older_than_ms,
+        } => {
+            let removed = mailbox::prune_done(&mailbox, Duration::from_millis(older_than_ms))?;
+            let stdout = std::io::stdout();
+            execute_mailbox_prune(removed, older_than_ms, stdout.lock())
         }
         Command::LogShow { file } => {
             let exchanges = read_log(file.as_deref())?;
@@ -1229,6 +1242,17 @@ fn execute_status(status: &MailboxStatus, max_runtime_ms: u64, mut out: impl Wri
         out,
         "{{\"state\":\"{state}\",\"queue_depth\":{},\"claim_age_ms\":{claim_age},\"max_runtime_ms\":{max_runtime_ms}}}",
         status.queue_depth
+    )
+    .map_err(io_err)
+}
+
+/// Renders one `baton mailbox prune` result as a single JSON line: how many
+/// ledger entries were removed, and the window they were measured against
+/// (normalized to milliseconds, whatever unit the operator typed).
+fn execute_mailbox_prune(removed: usize, older_than_ms: u64, mut out: impl Write) -> Result<()> {
+    writeln!(
+        out,
+        "{{\"removed\":{removed},\"older_than_ms\":{older_than_ms}}}"
     )
     .map_err(io_err)
 }
@@ -1876,6 +1900,7 @@ fn parse_args(args: &[String]) -> Result<Command> {
         "serve" => parse_serve(iter),
         "send" => parse_send(iter),
         "status" => parse_status(iter),
+        "mailbox" => parse_mailbox(iter),
         "log" => parse_log(iter),
         "roles" => parse_roles(iter),
         "role" => parse_role(iter),
@@ -3211,6 +3236,81 @@ fn parse_status<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comman
     })
 }
 
+/// Parses `baton mailbox prune --mailbox <root> --older-than <duration>`.
+///
+/// `prune` is the only subcommand; both flags are required. The full ledger scan
+/// happens in `run`, so this stays I/O-free.
+fn parse_mailbox<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
+    let sub = iter
+        .next()
+        .ok_or_else(|| usage("mailbox requires a subcommand: prune"))?;
+    if sub.as_str() != "prune" {
+        return Err(usage(&format!("unknown mailbox subcommand {sub:?}")));
+    }
+
+    let mut mailbox: Option<String> = None;
+    let mut older_than_ms: Option<u64> = None;
+    while let Some(arg) = iter.next() {
+        let mut take = |flag: &str| -> Result<String> {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| usage(&format!("{flag} requires a value")))
+        };
+        match arg.as_str() {
+            "--mailbox" => mailbox = Some(take("--mailbox")?),
+            other if other.starts_with("--mailbox=") => {
+                mailbox = Some(other["--mailbox=".len()..].to_string());
+            }
+            "--older-than" => older_than_ms = Some(parse_duration_ms(&take("--older-than")?)?),
+            other if other.starts_with("--older-than=") => {
+                older_than_ms = Some(parse_duration_ms(&other["--older-than=".len()..])?);
+            }
+            other => return Err(usage(&format!("unexpected argument {other:?}"))),
+        }
+    }
+
+    Ok(Command::MailboxPrune {
+        mailbox: require_dir(mailbox, "--mailbox")?,
+        older_than_ms: older_than_ms
+            .ok_or_else(|| usage("mailbox prune requires --older-than <duration>"))?,
+    })
+}
+
+/// Parses `--older-than`: a **strictly positive** integer with an optional
+/// `ms`/`s`/`m`/`h`/`d` unit suffix, normalized to milliseconds. A bare integer
+/// is milliseconds, matching every other `--*-ms` flag; the suffixes exist
+/// because a retention window is naturally `7d`, not `604800000`.
+///
+/// Zero is rejected in any unit: the prune cutoff is `age >= window`, so a zero
+/// window matches every entry — including a future-dated one, whose age clamps to
+/// zero — and would silently wipe the ledger on a typo. An overflowing value is a
+/// usage error too, never a wrapped or panicking multiplication.
+fn parse_duration_ms(raw: &str) -> Result<u64> {
+    let text = raw.trim();
+    let reject = || {
+        usage(&format!(
+            "--older-than must be a positive duration such as 500ms, 30s, 15m, 6h or 7d, got {raw:?}"
+        ))
+    };
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (digits, unit) = text.split_at(split);
+    let value: u64 = digits.parse().map_err(|_| reject())?;
+    let multiplier: u64 = match unit {
+        "" | "ms" => 1,
+        "s" => 1_000,
+        "m" => 60 * 1_000,
+        "h" => 60 * 60 * 1_000,
+        "d" => 24 * 60 * 60 * 1_000,
+        _ => return Err(reject()),
+    };
+    value
+        .checked_mul(multiplier)
+        .filter(|&ms| ms > 0)
+        .ok_or_else(reject)
+}
+
 /// Parses `--max-runtime-ms`: a positive integer of milliseconds (zero is
 /// rejected — a zero threshold would flag every live claim as crashed).
 fn parse_max_runtime_ms(raw: &str) -> Result<u64> {
@@ -3324,6 +3424,22 @@ mod tests {
             parse_args(&argv(&["ask", "--help"])).unwrap_err(),
             BatonError::Usage(_)
         ));
+    }
+
+    #[test]
+    fn usage_scopes_log_index_to_replay() {
+        // Regression: the synopsis once fused the two log subcommands as
+        // `log show|replay [--file <path>] [--index <N>]`, advertising an
+        // `--index` that `show` rejects (see `index_flag_on_show_is_usage_error`).
+        assert!(
+            USAGE.contains("baton log show [--file <path>] |"),
+            "{USAGE}"
+        );
+        assert!(
+            USAGE.contains("baton log replay [--file <path>] [--index <N>]"),
+            "{USAGE}"
+        );
+        assert!(!USAGE.contains("log show|replay"), "{USAGE}");
     }
 
     #[test]
@@ -6322,6 +6438,127 @@ mod tests {
                 "expected usage error for {case:?}"
             );
         }
+    }
+
+    #[test]
+    fn mailbox_prune_parses_every_duration_unit() {
+        let cases: &[(&str, u64)] = &[
+            ("750", 750),
+            ("750ms", 750),
+            ("30s", 30_000),
+            ("15m", 900_000),
+            ("6h", 21_600_000),
+            ("7d", 604_800_000),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                parse_args(&argv(&[
+                    "mailbox",
+                    "prune",
+                    "--mailbox",
+                    "/mb",
+                    "--older-than",
+                    raw
+                ]))
+                .expect("parses"),
+                Command::MailboxPrune {
+                    mailbox: "/mb".to_string(),
+                    older_than_ms: *expected,
+                },
+                "for {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mailbox_prune_accepts_inline_flag_values() {
+        assert_eq!(
+            parse_args(&argv(&[
+                "mailbox",
+                "prune",
+                "--mailbox=/mb",
+                "--older-than=7d"
+            ]))
+            .expect("parses"),
+            Command::MailboxPrune {
+                mailbox: "/mb".to_string(),
+                older_than_ms: 604_800_000,
+            }
+        );
+    }
+
+    #[test]
+    fn mailbox_argument_rules_are_usage_errors() {
+        let cases: &[&[&str]] = &[
+            &["mailbox"],                                                    // no subcommand
+            &["mailbox", "compact", "--mailbox", "/mb"],                     // unknown subcommand
+            &["mailbox", "prune", "--older-than", "7d"],                     // no mailbox
+            &["mailbox", "prune", "--mailbox", "/mb"],                       // no window
+            &["mailbox", "prune", "--mailbox", "/mb", "--older-than", "0"],  // zero window
+            &["mailbox", "prune", "--mailbox", "/mb", "--older-than", "0d"], // zero, suffixed
+            &["mailbox", "prune", "--mailbox", "/mb", "--older-than", "-5"], // negative
+            &["mailbox", "prune", "--mailbox", "/mb", "--older-than", "7w"], // unknown unit
+            &[
+                "mailbox",
+                "prune",
+                "--mailbox",
+                "/mb",
+                "--older-than",
+                "7 d",
+            ], // embedded space
+            &[
+                "mailbox",
+                "prune",
+                "--mailbox",
+                "/mb",
+                "--older-than",
+                "soon",
+            ], // not a number
+            &["mailbox", "prune", "--mailbox", "/mb", "--older-than"],       // dangling flag
+            // Syntactically valid but unrepresentable: the suffix multiplication
+            // must fail as a usage error, never wrap or panic.
+            &[
+                "mailbox",
+                "prune",
+                "--mailbox",
+                "/mb",
+                "--older-than",
+                "999999999999999999d",
+            ],
+            &[
+                "mailbox",
+                "prune",
+                "--mailbox",
+                "/mb",
+                "--older-than",
+                "7d",
+                "--force",
+            ], // unknown flag
+        ];
+        for case in cases {
+            assert!(
+                matches!(parse_args(&argv(case)).unwrap_err(), BatonError::Usage(_)),
+                "expected usage error for {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn execute_mailbox_prune_renders_one_json_line() {
+        let mut out = Vec::new();
+        execute_mailbox_prune(12, 604_800_000, &mut out).expect("render");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "{\"removed\":12,\"older_than_ms\":604800000}\n"
+        );
+
+        // Nothing pruned still reports the window it was measured against.
+        let mut out = Vec::new();
+        execute_mailbox_prune(0, 900_000, &mut out).expect("render");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "{\"removed\":0,\"older_than_ms\":900000}\n"
+        );
     }
 
     #[test]
