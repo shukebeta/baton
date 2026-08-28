@@ -10,7 +10,7 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.3.14 … v0.3.9 (2026-08-28)
+## v0.3.15 … v0.3.9 (2026-08-28)
 
 ### Fixes
 - fix(service/windows): keep direct child's exit outcome across descendant drain (#210) (#211)
@@ -19,6 +19,9 @@ _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 - fix(cli): scope --index to log replay in the help synopsis (#216)
 - fix(service): back off stuck terminal callback delivery (#218)
 - fix(mailbox): bound the done/ dedup ledger with an operator prune (#217)
+
+### Other Changes
+- test(service/windows): cover task admission recovery (#220)
 
 ## v0.3.8 (2026-08-27)
 
