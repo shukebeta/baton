@@ -3261,6 +3261,12 @@ fn service_session_captures_daemon_stderr_in_status_path() {
             outbox.to_str().unwrap(),
             "--poll-ms",
             "20",
+            "--agent-cmd",
+            "sh",
+            "--agent-arg",
+            "-c",
+            "--agent-arg",
+            "cat >/dev/null",
         ])
         .output()
         .expect("run baton service start");
