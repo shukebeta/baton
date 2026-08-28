@@ -290,9 +290,15 @@ mod imp {
     }
 
     /// The `Start` response body, keyed by request id in `responses/`.
+    /// An admitted request carries `session_id`; an admission failure the
+    /// supervisor can name carries `error` and no session id. Both fields
+    /// default, so a response persisted before `error` existed still parses.
     #[derive(Debug, Serialize, Deserialize)]
     struct StartResponse {
-        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     }
 
     /// Whether a live `Run` holds the control lock.
@@ -671,7 +677,14 @@ mod imp {
                 let resp: StartResponse = serde_json::from_str(&data).map_err(|err| {
                     BatonError::Decode(format!("malformed service response {path:?}: {err}"))
                 })?;
-                return Ok(resp.session_id);
+                if let Some(error) = resp.error {
+                    return Err(BatonError::Io(error));
+                }
+                return resp.session_id.ok_or_else(|| {
+                    BatonError::Decode(format!(
+                        "service response {path:?} contained neither a session id nor an error"
+                    ))
+                });
             }
             if probe_control(control)? == ControlLiveness::NotRunning {
                 return Err(BatonError::Io(format!(
@@ -739,7 +752,9 @@ mod imp {
                 Ok(()) => {
                     let outcome = handle_start_request(control, &key, &claimed_path);
                     let _ = fs::remove_file(&claimed_path);
-                    let (record, child) = outcome?;
+                    let Some((record, child)) = outcome? else {
+                        return Ok(None);
+                    };
                     return Ok(Some((record.id, child)));
                 }
                 // Lost a claim race (shouldn't happen — `Run` is the sole
@@ -751,33 +766,90 @@ mod imp {
         Ok(None)
     }
 
+    /// Renders `err` for a start-response `error` field. The client re-wraps
+    /// that text in [`BatonError::Io`], so the rendered form must not repeat
+    /// the kind prefix `Display` already adds.
+    fn admission_error_text(err: &BatonError) -> String {
+        match err {
+            BatonError::Io(msg) => msg.clone(),
+            other => other.to_string(),
+        }
+    }
+
+    /// Writes a start response body keyed by `request_id`.
+    fn write_start_response(
+        control: &Path,
+        request_id: &str,
+        response: &StartResponse,
+    ) -> Result<()> {
+        let json = serde_json::to_string(response)
+            .map_err(|err| BatonError::Io(format!("could not serialize start response: {err}")))?;
+        let responses = responses_dir(control);
+        fs::create_dir_all(&responses)
+            .map_err(|err| BatonError::Io(format!("could not create {responses:?}: {err}")))?;
+        mailbox::atomic_write(&responses, &mailbox::file_name(request_id), &json)
+    }
+
+    /// Answers a claimed start request with an admission failure the
+    /// supervisor can name, so the client fails immediately with the real
+    /// reason instead of waiting out [`START_AWAIT_MS`]. Only the response
+    /// write itself can still fail the request loop.
+    fn reject_start_request(
+        control: &Path,
+        request_id: &str,
+        error: String,
+    ) -> Result<Option<(SessionRecord, Child)>> {
+        write_start_response(
+            control,
+            request_id,
+            &StartResponse {
+                session_id: None,
+                error: Some(error),
+            },
+        )?;
+        Ok(None)
+    }
+
     /// Spawns the requested session, persists its [`SessionRecord`], and
     /// answers the request with its session id.
+    ///
+    /// An admission failure after the request is claimed — a spawn failure, a
+    /// post-spawn corroboration failure, a record-write failure — is answered
+    /// as an error response and reported as `Ok(None)`; only a failure to
+    /// deliver a response at all is propagated as `Err`.
     fn handle_start_request(
         control: &Path,
         request_id: &str,
         spec_path: &Path,
-    ) -> Result<(SessionRecord, Child)> {
+    ) -> Result<Option<(SessionRecord, Child)>> {
         let data = fs::read_to_string(spec_path)
             .map_err(|err| BatonError::Io(format!("could not read {spec_path:?}: {err}")))?;
         let spec: SessionSpec = serde_json::from_str(&data).map_err(|err| {
             BatonError::Decode(format!("malformed session spec {spec_path:?}: {err}"))
         })?;
-        let mut child = spawn_serve_child(&spec)?;
+        let mut child = match spawn_serve_child(&spec) {
+            Ok(child) => child,
+            Err(err) => {
+                return reject_start_request(control, request_id, admission_error_text(&err));
+            }
+        };
         let pid = child.id();
         let (started_at, start_epoch_secs) = recorded_start_identity(pid);
         // Everything below this point must kill+reap `child` before
-        // returning `Err`: once this function returns an error, nothing else
-        // ever tracks this `Child` (it isn't inserted into `Run`'s
-        // `children` map, and `Drop` for `std::process::Child` does not
-        // kill), so leaving it running here would leak a live, unrecorded,
-        // unreapable `serve` process.
+        // returning: once this function stops tracking it, nothing else ever
+        // does (it isn't inserted into `Run`'s `children` map, and `Drop` for
+        // `std::process::Child` does not kill), so leaving it running here
+        // would leak a live, unrecorded, unreapable `serve` process.
         if !spawn_start_key_ok(&started_at, &start_epoch_secs) {
             let _ = signal_group(pid, "-KILL");
             let _ = child.wait();
-            return Err(BatonError::Io(format!(
-                "baton serve (pid {pid}) could not be corroborated right after spawn; treating as a spawn failure"
-            )));
+            return reject_start_request(
+                control,
+                request_id,
+                format!(
+                    "baton serve (pid {pid}) could not be corroborated right after spawn; treating as a spawn failure"
+                ),
+            );
         }
         let record = SessionRecord {
             id: fresh_session_id(),
@@ -789,27 +861,23 @@ mod imp {
         if let Err(err) = write_session_record(control, &record) {
             let _ = signal_group(pid, "-KILL");
             let _ = child.wait();
-            return Err(err);
+            return reject_start_request(control, request_id, admission_error_text(&err));
         }
-        let response = StartResponse {
-            session_id: record.id.clone(),
-        };
-        let respond = serde_json::to_string(&response)
-            .map_err(|err| BatonError::Io(format!("could not serialize start response: {err}")))
-            .and_then(|json| {
-                let responses = responses_dir(control);
-                fs::create_dir_all(&responses).map_err(|err| {
-                    BatonError::Io(format!("could not create {responses:?}: {err}"))
-                })?;
-                mailbox::atomic_write(&responses, &mailbox::file_name(request_id), &json)
-            });
+        let respond = write_start_response(
+            control,
+            request_id,
+            &StartResponse {
+                session_id: Some(record.id.clone()),
+                error: None,
+            },
+        );
         if let Err(err) = respond {
             let _ = signal_group(pid, "-KILL");
             let _ = child.wait();
             let _ = remove_session_record(control, &record.id);
             return Err(err);
         }
-        Ok((record, child))
+        Ok(Some((record, child)))
     }
 
     /// Resolves the currently-running `baton` binary, so `Run` spawns
@@ -1677,6 +1745,24 @@ mod imp {
         Ok(None)
     }
 
+    /// Answers a claimed task-start request with an admission failure the
+    /// supervisor can name, mirroring [`reject_start_request`].
+    fn reject_task_start_request(
+        control: &Path,
+        request_id: &str,
+        error: String,
+    ) -> Result<Option<(TaskRecord, Child, u64)>> {
+        write_task_start_response(
+            control,
+            request_id,
+            &TaskStartResponse {
+                task_id: None,
+                error: Some(error),
+            },
+        )?;
+        Ok(None)
+    }
+
     /// Validates the requested owner, then spawns the task, persists its
     /// [`TaskRecord`], and answers the request with its task id. Mirrors
     /// [`handle_start_request`]'s
@@ -1684,6 +1770,13 @@ mod imp {
     /// record is durable. After that point the task remains tracked when
     /// response delivery or phase persistence fails, so restart reconciliation
     /// can retry the response boundary without spawning again.
+    ///
+    /// Every admission failure before that point — owner rejection, log-dir
+    /// creation, spawn, post-spawn corroboration, record write — is answered
+    /// as an error response and reported as `Ok(None)`, so the client fails
+    /// immediately with the real reason instead of waiting out
+    /// [`START_AWAIT_MS`]. Only a failure to deliver a response at all is
+    /// propagated as `Err`.
     fn handle_task_start_request(
         control: &Path,
         request_id: &str,
@@ -1707,31 +1800,41 @@ mod imp {
                 "task start rejected: --session {:?} does not name a live managed session on {:?} (the session record is absent or its process is no longer live)",
                 spec.session, control
             );
-            write_task_start_response(
-                control,
-                request_id,
-                &TaskStartResponse {
-                    task_id: None,
-                    error: Some(error),
-                },
-            )?;
-            return Ok(None);
+            return reject_task_start_request(control, request_id, error);
         }
         let task_id = fresh_task_id();
         let log_dir = task_logs_dir(control, &task_id);
-        fs::create_dir_all(&log_dir)
-            .map_err(|err| BatonError::Io(format!("could not create {log_dir:?}: {err}")))?;
+        if let Err(err) = fs::create_dir_all(&log_dir) {
+            return reject_task_start_request(
+                control,
+                request_id,
+                format!("could not create {log_dir:?}: {err}"),
+            );
+        }
         let stdout_path = log_dir.join("stdout.log");
         let stderr_path = log_dir.join("stderr.log");
-        let mut child = spawn_task_child(&spec, &stdout_path, &stderr_path)?;
+        let mut child = match spawn_task_child(&spec, &stdout_path, &stderr_path) {
+            Ok(child) => child,
+            Err(err) => {
+                // Nothing ever ran under this id, so its just-created log
+                // directory holds two empty files and no record refers to
+                // it: drop it rather than leaking one per failed start.
+                let _ = fs::remove_dir_all(&log_dir);
+                return reject_task_start_request(control, request_id, admission_error_text(&err));
+            }
+        };
         let pid = child.id();
         let (started_at, start_epoch_secs) = recorded_start_identity(pid);
         if !spawn_start_key_ok(&started_at, &start_epoch_secs) {
             let _ = signal_group(pid, "-KILL");
             let _ = child.wait();
-            return Err(BatonError::Io(format!(
-                "task command (pid {pid}) could not be corroborated right after spawn; treating as a spawn failure"
-            )));
+            return reject_task_start_request(
+                control,
+                request_id,
+                format!(
+                    "task command (pid {pid}) could not be corroborated right after spawn; treating as a spawn failure"
+                ),
+            );
         }
         let started_ms = clock.now_ms();
         let mut record = TaskRecord {
@@ -1754,7 +1857,7 @@ mod imp {
         if let Err(err) = write_task_record(control, &record) {
             let _ = signal_group(pid, "-KILL");
             let _ = child.wait();
-            return Err(err);
+            return reject_task_start_request(control, request_id, admission_error_text(&err));
         }
         wait_for_test_task_admission_barrier();
         record.admission = TaskAdmissionPhase::Committed;
@@ -1762,7 +1865,7 @@ mod imp {
             let _ = signal_group(pid, "-KILL");
             let _ = child.wait();
             let _ = remove_task_record(control, &record.id);
-            return Err(err);
+            return reject_task_start_request(control, request_id, admission_error_text(&err));
         }
         let respond = write_task_start_response(
             control,
@@ -3514,6 +3617,157 @@ mod imp {
                     .as_deref()
                     .is_some_and(|error| error.contains("does not name a live managed session")));
             }
+        }
+
+        /// A task command that cannot be spawned is answered through the
+        /// task-start response, so the submitting client fails with the
+        /// spawn reason instead of waiting out `START_AWAIT_MS`.
+        #[test]
+        fn task_start_spawn_failure_answers_with_error_response() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("task-spawn-failure");
+            let pid = std::process::id();
+            let (started_at, start_epoch_secs) = recorded_start_identity(pid);
+            write_session_record(
+                &dir.path,
+                &SessionRecord {
+                    id: "svc-live".to_string(),
+                    spec: spec("/tmp/in", "/tmp/out"),
+                    pid,
+                    started_at,
+                    start_epoch_secs,
+                },
+            )
+            .expect("write live session record");
+
+            let unspawnable = dir.path.join("no-such-binary").display().to_string();
+            let spec_path = dir.path.join("task-request.json");
+            let task_spec = task_spec(
+                "svc-live",
+                &unspawnable,
+                vec![],
+                vec![],
+                1_000,
+                "/tmp/callback",
+            );
+            fs::write(
+                &spec_path,
+                serde_json::to_string(&task_spec).expect("serialize task spec"),
+            )
+            .expect("write task spec");
+
+            let outcome =
+                handle_task_start_request(&dir.path, "spawn-fail", &spec_path, &FakeClock::new())
+                    .expect("spawn failure is a handled response, not a request-loop error");
+            assert!(outcome.is_none(), "a failed spawn returns no task");
+            assert!(
+                !dir.path.join("tasks").exists(),
+                "a failed spawn leaves no task record"
+            );
+            assert!(
+                fs::read_dir(dir.path.join("task-logs"))
+                    .map(|entries| entries.count() == 0)
+                    .unwrap_or(true),
+                "a failed spawn leaves no orphan task log directory"
+            );
+
+            let response_path =
+                task_responses_dir(&dir.path).join(mailbox::file_name("spawn-fail"));
+            let response: TaskStartResponse =
+                serde_json::from_str(&fs::read_to_string(response_path).expect("spawn response"))
+                    .expect("decode spawn response");
+            assert!(response.task_id.is_none());
+            let error = response.error.expect("spawn failure carries an error");
+            assert!(
+                error.contains("could not spawn task command") && error.contains(&unspawnable),
+                "the response names the spawn failure: {error}"
+            );
+        }
+
+        /// A session admission failure after the request is claimed is
+        /// answered through the start response rather than propagated to the
+        /// request loop, where it would strand the client on the await bound.
+        #[test]
+        fn start_request_admission_failure_answers_with_error_response() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("session-admission-failure");
+            // A file where `sessions/` must be a directory, so the record
+            // write fails — the last admission step before the success
+            // response. Which named failure the handler reaches first is
+            // platform-dependent: where the post-spawn corroborator cannot
+            // read a just-spawned child's start key (observed on macOS), the
+            // earlier corroboration step rejects instead. Both are named
+            // post-claim admission failures, and the contract under test is
+            // the same for either — an error response, not a propagated
+            // `Err` the client would only see as a timeout.
+            fs::write(sessions_dir(&dir.path), b"not a directory").expect("block sessions dir");
+
+            let spec_path = dir.path.join("session-request.json");
+            fs::write(
+                &spec_path,
+                serde_json::to_string(&spec(
+                    &dir.path.join("in").display().to_string(),
+                    &dir.path.join("out").display().to_string(),
+                ))
+                .expect("serialize session spec"),
+            )
+            .expect("write session spec");
+
+            let outcome = handle_start_request(&dir.path, "session-fail", &spec_path)
+                .expect("admission failure is a handled response, not a request-loop error");
+            assert!(outcome.is_none(), "a failed admission returns no session");
+
+            let response_path = responses_dir(&dir.path).join(mailbox::file_name("session-fail"));
+            let response: StartResponse =
+                serde_json::from_str(&fs::read_to_string(response_path).expect("start response"))
+                    .expect("decode start response");
+            assert!(response.session_id.is_none());
+            let error = response.error.expect("the response carries an error");
+            assert!(
+                error.contains("sessions") || error.contains("could not be corroborated"),
+                "the response names a post-claim admission failure: {error}"
+            );
+            assert!(
+                list_session_records(&dir.path)
+                    .unwrap_or_default()
+                    .is_empty(),
+                "a failed admission persists no session record"
+            );
+        }
+
+        /// The start-response client surfaces an error response immediately,
+        /// and still reads a response persisted before `error` existed.
+        #[test]
+        fn await_start_response_surfaces_error_and_legacy_bodies() {
+            let dir = TempDir::new("start-response-shapes");
+            let responses = responses_dir(&dir.path);
+            fs::create_dir_all(&responses).expect("create responses dir");
+
+            fs::write(
+                responses.join(mailbox::file_name("failed")),
+                serde_json::to_string(&StartResponse {
+                    session_id: None,
+                    error: Some("could not spawn baton serve: nope".to_string()),
+                })
+                .expect("serialize error response"),
+            )
+            .expect("write error response");
+            let err = await_start_response(&dir.path, "failed").expect_err("error response fails");
+            assert!(
+                err.to_string()
+                    .contains("could not spawn baton serve: nope"),
+                "the client error names the admission failure: {err}"
+            );
+
+            fs::write(
+                responses.join(mailbox::file_name("legacy")),
+                r#"{"session_id":"svc-legacy"}"#,
+            )
+            .expect("write legacy response");
+            assert_eq!(
+                await_start_response(&dir.path, "legacy").expect("legacy response parses"),
+                "svc-legacy"
+            );
         }
 
         /// An unsafe session id is rejected rather than escaping the control

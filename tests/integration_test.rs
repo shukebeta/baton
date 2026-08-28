@@ -6576,6 +6576,150 @@ fn service_tasks_reconcile_after_run_restart() {
     );
 }
 
+/// Issue #191 regression: a task command the service cannot spawn is answered
+/// through the task-start response with its real reason, rather than leaving
+/// the client to wait out the ten-second await bound and report a timeout.
+#[cfg(unix)]
+#[test]
+fn service_task_start_spawn_failure_reports_the_reason_before_the_await_bound() {
+    let root = TempMailbox::new("task-spawn-failure");
+    let control = root.path.join("control");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+    let callback_inbox = root.path.join("callback");
+
+    let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    run.args(["service", "run", "--control", control.to_str().unwrap()]);
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::piped());
+    let mut run_child = run.spawn().expect("spawn baton service run");
+    let control_str = control.to_str().unwrap();
+
+    let mut live = false;
+    for _ in 0..100 {
+        if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(["service", "status", "--control", control_str])
+            .output()
+            && out.status.success()
+            && String::from_utf8_lossy(&out.stdout).contains("\"service_running\":true")
+        {
+            live = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !live {
+        let _ = run_child.kill();
+        let output = run_child
+            .wait_with_output()
+            .expect("collect failed service run stderr");
+        panic!(
+            "baton service run did not report live in time; status={:?}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str,
+            "--inbox",
+            inbox.to_str().unwrap(),
+            "--outbox",
+            outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+            "--agent-cmd",
+            "sh",
+            "--agent-arg",
+            "-c",
+            "--agent-arg",
+            "cat >/dev/null; printf ready",
+        ])
+        .output()
+        .expect("run baton service start");
+    assert!(
+        start.status.success(),
+        "service start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let session_id = String::from_utf8_lossy(&start.stdout).trim().to_string();
+    assert!(!session_id.is_empty(), "service start prints a session id");
+
+    let unspawnable = root.path.join("no-such-binary");
+    let began = std::time::Instant::now();
+    let task_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "task",
+            "start",
+            "--control",
+            control_str,
+            "--session",
+            &session_id,
+            "--command",
+            unspawnable.to_str().unwrap(),
+            "--max-duration-ms",
+            "60000",
+            "--callback-inbox",
+            callback_inbox.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run baton task start with an unspawnable command");
+    let elapsed = began.elapsed();
+
+    assert!(
+        !task_start.status.success(),
+        "an unspawnable command must fail the start; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&task_start.stdout),
+        String::from_utf8_lossy(&task_start.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&task_start.stderr);
+    assert!(
+        stderr.contains("could not spawn task command")
+            && stderr.contains(unspawnable.to_str().unwrap()),
+        "the client error names the spawn failure: {stderr}"
+    );
+    assert!(
+        !stderr.contains("timed out waiting"),
+        "the spawn failure must not surface as the generic await timeout: {stderr}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the spawn failure must be reported well inside the 10s await bound, took {elapsed:?}"
+    );
+    assert!(
+        task_start.stdout.is_empty(),
+        "a failed task start prints no task id"
+    );
+
+    let task_status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["task", "status", "--control", control_str])
+        .output()
+        .expect("read task status after the spawn failure");
+    let task_json: serde_json::Value =
+        serde_json::from_slice(&task_status.stdout).expect("task status is JSON");
+    assert_eq!(
+        task_json["tasks"].as_array().unwrap().len(),
+        0,
+        "a failed spawn leaves no durable task record"
+    );
+
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str])
+        .output()
+        .expect("run baton service teardown");
+    assert!(
+        teardown.status.success(),
+        "teardown should exit 0; stderr: {}",
+        String::from_utf8_lossy(&teardown.stderr)
+    );
+    let run_status = run_child.wait().expect("baton service run exits");
+    assert!(run_status.success(), "service run exits 0 on teardown");
+}
+
 /// Issue #123 regression: task admission rejects both an absent owner record
 /// and a record whose session process is already dead, before it creates a
 /// child or durable task record.
