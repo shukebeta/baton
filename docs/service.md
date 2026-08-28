@@ -127,7 +127,8 @@ baton service teardown --control <dir> [--force]
   only the recorded PID, removes the record, and warns that descendants may
   survive; it never claims tree reach in that case.
   It serializes that cleanup with task admission, so a task is either
-  admitted before the stop and reaped with the session or rejected after the
+  admitted before the stop began and reaped with the session, or rejected —
+  once the stop owns the session's cleanup, and thereafter because the
   session is no longer a live owner. The admission lock covers the record
   reads, signals, and record mutations only: each grace wait releases it and
   re-acquires it afterwards, re-probing liveness, so a stop never freezes the
