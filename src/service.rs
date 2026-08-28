@@ -3691,9 +3691,15 @@ mod imp {
         fn start_request_admission_failure_answers_with_error_response() {
             let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("session-admission-failure");
-            // A file where `sessions/` must be a directory: the record write
-            // fails after the child is spawned and corroborated, which is the
-            // last admission step before the success response.
+            // A file where `sessions/` must be a directory, so the record
+            // write fails — the last admission step before the success
+            // response. Which named failure the handler reaches first is
+            // platform-dependent: where the post-spawn corroborator cannot
+            // read a just-spawned child's start key (observed on macOS), the
+            // earlier corroboration step rejects instead. Both are named
+            // post-claim admission failures, and the contract under test is
+            // the same for either — an error response, not a propagated
+            // `Err` the client would only see as a timeout.
             fs::write(sessions_dir(&dir.path), b"not a directory").expect("block sessions dir");
 
             let spec_path = dir.path.join("session-request.json");
@@ -3716,13 +3722,16 @@ mod imp {
                 serde_json::from_str(&fs::read_to_string(response_path).expect("start response"))
                     .expect("decode start response");
             assert!(response.session_id.is_none());
+            let error = response.error.expect("the response carries an error");
             assert!(
-                response
-                    .error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("sessions")),
-                "the response names the admission failure: {:?}",
-                response.error
+                error.contains("sessions") || error.contains("could not be corroborated"),
+                "the response names a post-claim admission failure: {error}"
+            );
+            assert!(
+                list_session_records(&dir.path)
+                    .unwrap_or_default()
+                    .is_empty(),
+                "a failed admission persists no session record"
             );
         }
 
