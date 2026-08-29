@@ -702,8 +702,8 @@ fn capture_child_output(
     let mut stdout_pipe = child.stdout.take().expect("child stdout is piped");
     let (stdout_tx, stdout_rx) = mpsc::channel();
     thread::spawn(move || {
-        let mut buf = String::new();
-        let result = stdout_pipe.read_to_string(&mut buf).map(|_| buf);
+        let mut buf = Vec::new();
+        let result = stdout_pipe.read_to_end(&mut buf).map(|_| buf);
         let _ = stdout_tx.send(result);
     });
 
@@ -737,14 +737,6 @@ fn capture_child_output(
         let _ = stderr_tx.send(s);
     });
 
-    // Write the payload, then drop stdin so the child sees EOF.
-    {
-        let mut stdin = child.stdin.take().expect("child stdin is piped");
-        stdin
-            .write_all(payload)
-            .map_err(|err| BatonError::Io(format!("could not write to child stdin: {err}")))?;
-    }
-
     // Collect stderr best-effort. The child is reaped before this runs on the
     // success path, so the pipe is at EOF; the timeout is a safety net against
     // a leaked descriptor from a descendant process.
@@ -754,22 +746,56 @@ fn capture_child_output(
             .unwrap_or_default()
     };
 
+    // An I/O error means the child may still be running (for example, it can
+    // close stdin before the payload is written). Always reap it before
+    // returning, and retain any diagnostic it emitted on stderr.
+    let kill_and_reap = |child: &mut std::process::Child| {
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let stderr_detail = |stderr: &str| {
+        if stderr.trim().is_empty() {
+            String::new()
+        } else {
+            format!(": {}", stderr.trim())
+        }
+    };
+
+    // Write the payload, then drop stdin so the child sees EOF.
+    let write_result = {
+        let mut stdin = child.stdin.take().expect("child stdin is piped");
+        stdin.write_all(payload)
+    };
+    if let Err(err) = write_result {
+        kill_and_reap(&mut child);
+        let stderr = collect_stderr();
+        return Err(BatonError::Io(format!(
+            "could not write to child stdin: {err}{}",
+            stderr_detail(&stderr)
+        )));
+    }
+
     match stdout_rx.recv_timeout(read_timeout) {
         Ok(read_result) => {
-            let stdout = read_result
-                .map_err(|err| BatonError::Io(format!("could not read child stdout: {err}")))?;
+            let stdout = match read_result {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(err) => {
+                    kill_and_reap(&mut child);
+                    let stderr = collect_stderr();
+                    return Err(BatonError::Io(format!(
+                        "could not read child stdout: {err}{}",
+                        stderr_detail(&stderr)
+                    )));
+                }
+            };
             let status = child
                 .wait()
                 .map_err(|err| BatonError::Io(format!("could not reap child process: {err}")))?;
             if !status.success() {
                 let stderr = collect_stderr();
-                let detail = if stderr.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(": {}", stderr.trim())
-                };
                 return Err(BatonError::Transport(format!(
-                    "child process exited with {status}{detail}"
+                    "child process exited with {status}{}",
+                    stderr_detail(&stderr)
                 )));
             }
             Ok((stdout, collect_stderr()))
@@ -1398,6 +1424,24 @@ mod tests {
         // The request body was delivered on the agent's stdin...
         let stdin_seen = std::fs::read_to_string(dir.path.join("round1.txt")).expect("side effect");
         assert_eq!(stdin_seen, "please edit round1.txt");
+    }
+
+    /// A successful external-agent turn may contain non-UTF-8 bytes; those
+    /// bytes are lossily decoded and delivered instead of becoming a machinery
+    /// error.
+    #[test]
+    fn external_agent_delivers_lossy_stdout_on_invalid_utf8() {
+        let dir = TempDir::new("ext-invalid-utf8");
+        let participant = external_agent(
+            "cat >/dev/null; printf '\\377'",
+            &dir.path,
+            Duration::from_secs(5),
+        );
+
+        let response = participant.respond(&request_with_body("m-req-1", "go"));
+
+        assert_eq!(response.kind, MessageKind::Response);
+        assert_eq!(response.body, "\u{fffd}");
     }
 
     /// On Windows, an installed agent CLI commonly has a `.cmd` shim. `cmd`
