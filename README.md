@@ -8,7 +8,7 @@ center of the design.
 
 ## Status
 
-The current blessed release is `v0.3.19`.
+The current blessed release is `v0.3.20`.
 
 Early scaffolding. The crate establishes the module layout and typed runtime
 shape around a non-streaming Claude-compatible Messages client
@@ -107,7 +107,7 @@ Put the extracted executable on your `PATH`. On macOS, use
 If a Rust toolchain (≥ 1.89) is available, the from-source alternative is:
 
 ```bash
-cargo install --git https://github.com/shukebeta/baton --tag v0.3.19 --locked
+cargo install --git https://github.com/shukebeta/baton --tag v0.3.20 --locked
 ```
 
 This puts `baton` on your PATH. The `--locked` flag is **required**: without it
