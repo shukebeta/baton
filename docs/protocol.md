@@ -48,9 +48,9 @@ emits a `reply_consumed` line when it consumes the correlated reply:
 
 | `event`          | Fields beyond `schema` / `ts_ms`                            | Meaning                                              |
 | ---------------- | ----------------------------------------------------------- | ---------------------------------------------------- |
-| `request`        | `model`, `base_url`, `prompt`, `session_id?`, `turn_index?`, `from?`, `to?`, `conversation_id?`, `message_id?`, `in_reply_to?` | Emitted before the call; carries enough to replay it. `session_id` / `turn_index` are present on a `session` turn (see below). A `serve --role` seat request also carries the optional A2A addressing and correlation fields; its `session_id` equals `conversation_id` and its `turn_index` is omitted. |
-| `response_ok`    | `duration_ms`, `reply`, `input_tokens`, `output_tokens`, `session_id?`, `turn_index?` | The call succeeded.                                  |
-| `response_error` | `duration_ms`, `kind`, `message`, `session_id?`, `turn_index?`                            | The call failed; `kind` is the stable machine class. |
+| `request`        | `model`, `base_url`, `prompt`, `session_id?`, `turn_index?`, `from?`, `to?`, `conversation_id?`, `message_id?`, `in_reply_to?` | Emitted before the call; carries enough to replay it. `session_id` / `turn_index` are present on a `session` turn (see below). An `ask` request carries a generated `message_id`, and a `serve`/`exchange` request the request envelope's `message_id` + `conversation_id`, so its outcome pairs unambiguously on a shared trail. A `serve --role` seat request also carries the optional A2A addressing and correlation fields; its `session_id` equals `conversation_id` and its `turn_index` is omitted. |
+| `response_ok`    | `duration_ms`, `reply`, `input_tokens`, `output_tokens`, `session_id?`, `turn_index?`, `message_id?` | The call succeeded. `message_id` echoes the `ask`/`serve` request it answers. |
+| `response_error` | `duration_ms`, `kind`, `message`, `session_id?`, `turn_index?`, `message_id?`             | The call failed; `kind` is the stable machine class. `message_id` echoes the `ask`/`serve` request it answers. |
 | `message_sent`   | `message_id`, `conversation_id`, `from`, `to`              | Emitted when `baton send` delivers a request into a mailbox. |
 | `reply_consumed` | `message_id`, `in_reply_to?`, `conversation_id`             | Emitted by `baton send --await` when it consumes a correlated reply; `in_reply_to` is present when the reply carries the request id it answers. |
 | `session_start`  | `session_id`, `role?`, `identity?`                          | Emitted once at the start of a `baton session` run. When present, `identity` is an array of `{key, value?, source}` fields describing the effective role identity. |
@@ -88,6 +88,17 @@ carries that turn's user input as `prompt` (the full accumulated history is not
 aggregated into a single schema object). Standalone `message_sent` /
 `reply_consumed` lines record mailbox delivery and reply consumption; they have
 no provider-call request/outcome pair.
+
+**Pairing on a shared log.** `baton log show` / `replay` pair each `request` with
+its outcome by correlation, so a log that several processes append to
+concurrently (a `serve` daemon plus a `baton ask`, say) never loses an exchange
+to interleaving. A `request`/outcome pair carrying a `message_id` (or a session
+turn's `session_id` + `turn_index`) is matched by that key; a pair carrying
+neither — a legacy trail written before these fields existed — is matched in file
+order through a single pending slot, exactly as before. On such a legacy trail,
+two interleaved exchanges cannot be reconstructed: the reader emits a stderr
+warning naming the overwritten request and the resulting dangling outcome rather
+than dropping either silently.
 
 ### Session trail
 
