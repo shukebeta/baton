@@ -10,13 +10,14 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.3.24 … v0.3.20 (2026-08-29)
+## v0.3.25 … v0.3.20 (2026-08-29)
 
 ### Fixes
 - fix(service): persist Unix session daemon stderr (#227)
 - fix(service): gate task test seams from releases (#228)
 - fix(session): announce fresh REPL banner (#231)
 - fix(service): release the admission lock across stop/teardown grace waits (#221)
+- fix(log): pair exchanges by correlation in parse_jsonl (#203) (#232)
 
 ### Docs
 - docs(service): add service.probe.lock and undocumented task directories to inventory (#229)
