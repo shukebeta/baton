@@ -135,6 +135,13 @@ pub enum ExchangeEvent {
         /// `session_id` is omitted.
         #[serde(skip_serializing_if = "Option::is_none")]
         turn_index: Option<u64>,
+        /// Correlation id linking this outcome to its `request` on the ask/serve
+        /// provider-call path (unique per exchange), so a shared trail with
+        /// interleaved writers pairs unambiguously. Omitted on the session path
+        /// (which correlates via `session_id` + `turn_index`) and on legacy
+        /// single-writer trails.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
     /// Emitted by `baton send` when a request is delivered into a mailbox.
     ///
@@ -197,6 +204,13 @@ pub enum ExchangeEvent {
         /// `session_id` is omitted.
         #[serde(skip_serializing_if = "Option::is_none")]
         turn_index: Option<u64>,
+        /// Correlation id linking this outcome to its `request` on the ask/serve
+        /// provider-call path (unique per exchange), so a shared trail with
+        /// interleaved writers pairs unambiguously. Omitted on the session path
+        /// (which correlates via `session_id` + `turn_index`) and on legacy
+        /// single-writer trails.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
     },
     /// Emitted once by `baton session` at the start of a run, before any turn.
     ///
@@ -258,6 +272,38 @@ impl ExchangeEvent {
             to: None,
             conversation_id: None,
             message_id: None,
+            in_reply_to: None,
+        }
+    }
+
+    /// Builds a provider-call request event carrying a `message_id` correlation
+    /// id (and an optional `conversation_id`) that links it to its outcome on a
+    /// shared trail.
+    ///
+    /// Used by the single-turn `ask` path (a generated per-exchange id,
+    /// `conversation_id = None`) and by the `serve`/`exchange` path (the request
+    /// envelope's ids). Unlike the session path this stamps no `session_id`, so
+    /// [`crate::log::parse_sessions`] still treats the line as sessionless while
+    /// [`crate::log::parse_jsonl`] pairs it by `message_id`.
+    pub fn correlated_request(
+        ts_ms: u64,
+        meta: &ExchangeMeta,
+        prompt: &str,
+        conversation_id: Option<&str>,
+        message_id: &str,
+    ) -> Self {
+        ExchangeEvent::Request {
+            schema: SCHEMA,
+            ts_ms,
+            model: meta.model.clone(),
+            base_url: meta.base_url.clone(),
+            prompt: prompt.to_string(),
+            session_id: None,
+            turn_index: None,
+            from: None,
+            to: None,
+            conversation_id: conversation_id.map(str::to_string),
+            message_id: Some(message_id.to_string()),
             in_reply_to: None,
         }
     }
@@ -364,7 +410,7 @@ impl ExchangeEvent {
 
     /// Builds the success outcome event, carrying any reported token usage.
     pub fn response_ok(ts_ms: u64, duration_ms: u64, reply: &str, usage: &TokenUsage) -> Self {
-        Self::response_ok_with_correlation(ts_ms, duration_ms, reply, usage, None)
+        Self::response_ok_with_correlation(ts_ms, duration_ms, reply, usage, None, None)
     }
 
     /// Builds a success outcome for a human↔agent session turn, carrying the
@@ -383,7 +429,20 @@ impl ExchangeEvent {
             reply,
             usage,
             Some((session_id, turn_index)),
+            None,
         )
+    }
+
+    /// Builds a success outcome for an `ask`/`serve` provider call, carrying the
+    /// `message_id` that links it to its `request` on a shared trail.
+    pub fn correlated_response_ok(
+        ts_ms: u64,
+        duration_ms: u64,
+        reply: &str,
+        usage: &TokenUsage,
+        message_id: &str,
+    ) -> Self {
+        Self::response_ok_with_correlation(ts_ms, duration_ms, reply, usage, None, Some(message_id))
     }
 
     fn response_ok_with_correlation(
@@ -392,6 +451,7 @@ impl ExchangeEvent {
         reply: &str,
         usage: &TokenUsage,
         correlation: Option<(&str, u64)>,
+        message_id: Option<&str>,
     ) -> Self {
         ExchangeEvent::ResponseOk {
             schema: SCHEMA,
@@ -402,6 +462,7 @@ impl ExchangeEvent {
             output_tokens: usage.output_tokens,
             session_id: correlation.map(|(session_id, _)| session_id.to_string()),
             turn_index: correlation.map(|(_, turn_index)| turn_index),
+            message_id: message_id.map(str::to_string),
         }
     }
 
@@ -430,7 +491,7 @@ impl ExchangeEvent {
 
     /// Builds the failure outcome event from a [`BatonError`].
     pub fn response_error(ts_ms: u64, duration_ms: u64, err: &BatonError) -> Self {
-        Self::response_error_with_correlation(ts_ms, duration_ms, err, None)
+        Self::response_error_with_correlation(ts_ms, duration_ms, err, None, None)
     }
 
     /// Builds a failure outcome for a human↔agent session turn, carrying the
@@ -447,7 +508,19 @@ impl ExchangeEvent {
             duration_ms,
             err,
             Some((session_id, turn_index)),
+            None,
         )
+    }
+
+    /// Builds a failure outcome for an `ask`/`serve` provider call, carrying the
+    /// `message_id` that links it to its `request` on a shared trail.
+    pub fn correlated_response_error(
+        ts_ms: u64,
+        duration_ms: u64,
+        err: &BatonError,
+        message_id: &str,
+    ) -> Self {
+        Self::response_error_with_correlation(ts_ms, duration_ms, err, None, Some(message_id))
     }
 
     fn response_error_with_correlation(
@@ -455,6 +528,7 @@ impl ExchangeEvent {
         duration_ms: u64,
         err: &BatonError,
         correlation: Option<(&str, u64)>,
+        message_id: Option<&str>,
     ) -> Self {
         ExchangeEvent::ResponseError {
             schema: SCHEMA,
@@ -464,6 +538,7 @@ impl ExchangeEvent {
             message: err.to_string(),
             session_id: correlation.map(|(session_id, _)| session_id.to_string()),
             turn_index: correlation.map(|(_, turn_index)| turn_index),
+            message_id: message_id.map(str::to_string),
         }
     }
 
@@ -475,6 +550,21 @@ impl ExchangeEvent {
     /// event trail without re-timing or re-deriving the call, so the trail and
     /// the in-band record stay one source of truth.
     pub fn from_outcome(outcome: &crate::log::Outcome) -> Self {
+        Self::from_outcome_with_message_id(outcome, None)
+    }
+
+    /// Like [`ExchangeEvent::from_outcome`], but stamps the `message_id` that
+    /// links this outcome to its `request` on the `serve`/`exchange` shared
+    /// trail (the request envelope's id), so [`crate::log::parse_jsonl`] pairs
+    /// interleaved exchanges unambiguously.
+    pub fn from_outcome_correlated(outcome: &crate::log::Outcome, message_id: &str) -> Self {
+        Self::from_outcome_with_message_id(outcome, Some(message_id))
+    }
+
+    fn from_outcome_with_message_id(
+        outcome: &crate::log::Outcome,
+        message_id: Option<&str>,
+    ) -> Self {
         match outcome {
             crate::log::Outcome::Ok {
                 ts_ms,
@@ -491,6 +581,7 @@ impl ExchangeEvent {
                 output_tokens: *output_tokens,
                 session_id: None,
                 turn_index: None,
+                message_id: message_id.map(str::to_string),
             },
             crate::log::Outcome::Error {
                 ts_ms,
@@ -505,6 +596,7 @@ impl ExchangeEvent {
                 message: message.clone(),
                 session_id: None,
                 turn_index: None,
+                message_id: message_id.map(str::to_string),
             },
         }
     }
@@ -654,6 +746,83 @@ mod tests {
         assert_eq!(value["event"], "response_error");
         assert_eq!(value["session_id"], "sess-B");
         assert_eq!(value["turn_index"], 4);
+    }
+
+    #[test]
+    fn correlated_request_carries_message_id_and_optional_conversation() {
+        // ask path: a message_id but no conversation (there is none) and no
+        // session framing.
+        let ask = ExchangeEvent::correlated_request(1, &meta(), "q", None, "m-1");
+        let v: Value = serde_json::to_value(&ask).expect("serializes");
+        assert_eq!(v["event"], "request");
+        assert_eq!(v["message_id"], "m-1");
+        assert!(
+            v.get("conversation_id").is_none(),
+            "ask has no conversation: {v}"
+        );
+        assert!(
+            v.get("session_id").is_none() && v.get("turn_index").is_none(),
+            "correlated request carries no session framing: {v}"
+        );
+        // serve path: conversation_id present alongside message_id.
+        let serve = ExchangeEvent::correlated_request(1, &meta(), "q", Some("c-1"), "m-1");
+        let v: Value = serde_json::to_value(&serve).expect("serializes");
+        assert_eq!(v["conversation_id"], "c-1");
+        assert_eq!(v["message_id"], "m-1");
+    }
+
+    #[test]
+    fn correlated_outcome_events_carry_message_id() {
+        let ok = ExchangeEvent::correlated_response_ok(2, 3, "hi", &TokenUsage::default(), "m-1");
+        let v: Value = serde_json::to_value(&ok).expect("serializes");
+        assert_eq!(v["event"], "response_ok");
+        assert_eq!(v["message_id"], "m-1");
+
+        let err = BatonError::Auth("bad".to_string());
+        let e = ExchangeEvent::correlated_response_error(2, 3, &err, "m-1");
+        let v: Value = serde_json::to_value(&e).expect("serializes");
+        assert_eq!(v["event"], "response_error");
+        assert_eq!(v["message_id"], "m-1");
+    }
+
+    #[test]
+    fn from_outcome_stamps_message_id_only_when_correlated() {
+        let outcome = crate::log::Outcome::Ok {
+            ts_ms: 1,
+            duration_ms: 2,
+            reply: "r".to_string(),
+            input_tokens: None,
+            output_tokens: None,
+        };
+        let bare: Value = serde_json::to_value(ExchangeEvent::from_outcome(&outcome)).unwrap();
+        assert!(
+            bare.get("message_id").is_none(),
+            "bare from_outcome omits message_id (legacy byte shape): {bare}"
+        );
+        let corr: Value =
+            serde_json::to_value(ExchangeEvent::from_outcome_correlated(&outcome, "m-9")).unwrap();
+        assert_eq!(corr["message_id"], "m-9");
+    }
+
+    #[test]
+    fn bare_outcome_events_omit_message_id() {
+        // The `ask`/session builders that predate #203 stay byte-identical: no
+        // message_id on the wire.
+        let ok: Value = serde_json::to_value(ExchangeEvent::response_ok(
+            1,
+            2,
+            "r",
+            &TokenUsage::default(),
+        ))
+        .unwrap();
+        assert!(ok.get("message_id").is_none(), "{ok}");
+        let err: Value = serde_json::to_value(ExchangeEvent::response_error(
+            1,
+            2,
+            &BatonError::Auth("x".to_string()),
+        ))
+        .unwrap();
+        assert!(err.get("message_id").is_none(), "{err}");
     }
 
     #[test]

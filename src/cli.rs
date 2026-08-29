@@ -1010,12 +1010,21 @@ fn execute_exchange(
     meta: &ExchangeMeta,
     request: &MessageEnvelope,
 ) -> MessageEnvelope {
-    emit(sink, &ExchangeEvent::request(now_ms(), meta, &request.body));
+    emit(
+        sink,
+        &ExchangeEvent::correlated_request(
+            now_ms(),
+            meta,
+            &request.body,
+            Some(&request.conversation_id),
+            &request.message_id,
+        ),
+    );
     let response = participant.respond(request);
     if let Some(wrapped) = &response.exchange {
         emit(
             sink,
-            &ExchangeEvent::from_outcome(&wrapped.exchange.outcome),
+            &ExchangeEvent::from_outcome_correlated(&wrapped.exchange.outcome, &request.message_id),
         );
     }
     response
@@ -1099,6 +1108,7 @@ impl RoleSessionRecorder {
                 message: response.body.clone(),
                 session_id: None,
                 turn_index: None,
+                message_id: None,
             },
             (None, kind) => {
                 return Err(io::Error::new(
@@ -1742,6 +1752,17 @@ fn new_session_id() -> String {
     format!("sess-{}-{}", std::process::id(), now_ms())
 }
 
+/// Mints a per-exchange `message_id` for the single-turn `ask` path.
+///
+/// The `ask` path has no envelope to correlate against, so this supplies the id
+/// that pairs its `request` with its outcome when several processes append to one
+/// `BATON_EVENT_LOG` (#203). Derived from the process id and timestamp — like
+/// [`new_session_id`], dependency-free and unique across concurrent writers (a
+/// distinct `pid` per process; one `ask` exchange per invocation).
+fn new_ask_message_id() -> String {
+    format!("ask-{}-{}", std::process::id(), now_ms())
+}
+
 /// Records the request event, times `call`, records the matching outcome event,
 /// and returns the call's result.
 ///
@@ -1761,11 +1782,28 @@ fn timed_exchange(
     session: Option<(&str, u64)>,
     call: impl FnOnce() -> Result<AssistantReply>,
 ) -> Result<AssistantReply> {
+    // On the single-turn `ask` path there is no envelope to correlate against, so
+    // mint a per-exchange `message_id` that links this request to its outcome when
+    // several processes share one `BATON_EVENT_LOG` (#203). The session path
+    // already correlates via `session_id` + `turn_index`, so it needs no id here.
+    let ask_message_id: Option<String> = match session {
+        Some(_) => None,
+        None => Some(new_ask_message_id()),
+    };
+
     let request = match session {
         Some((session_id, turn_index)) => {
             ExchangeEvent::session_request(now_ms(), meta, event_prompt, session_id, turn_index)
         }
-        None => ExchangeEvent::request(now_ms(), meta, event_prompt),
+        None => ExchangeEvent::correlated_request(
+            now_ms(),
+            meta,
+            event_prompt,
+            None,
+            ask_message_id
+                .as_deref()
+                .expect("ask path mints a message_id"),
+        ),
     };
     emit(sink, &request);
 
@@ -1782,9 +1820,15 @@ fn timed_exchange(
             session_id,
             turn_index,
         ),
-        (Ok(reply), None) => {
-            ExchangeEvent::response_ok(now_ms(), duration_ms, &reply.text, &reply.usage)
-        }
+        (Ok(reply), None) => ExchangeEvent::correlated_response_ok(
+            now_ms(),
+            duration_ms,
+            &reply.text,
+            &reply.usage,
+            ask_message_id
+                .as_deref()
+                .expect("ask path mints a message_id"),
+        ),
         (Err(err), Some((session_id, turn_index))) => ExchangeEvent::session_response_error(
             now_ms(),
             duration_ms,
@@ -1792,7 +1836,14 @@ fn timed_exchange(
             session_id,
             turn_index,
         ),
-        (Err(err), None) => ExchangeEvent::response_error(now_ms(), duration_ms, err),
+        (Err(err), None) => ExchangeEvent::correlated_response_error(
+            now_ms(),
+            duration_ms,
+            err,
+            ask_message_id
+                .as_deref()
+                .expect("ask path mints a message_id"),
+        ),
     };
     emit(sink, &event);
 
@@ -3668,6 +3719,34 @@ mod tests {
     }
 
     #[test]
+    fn execute_ask_stamps_matching_message_id_on_request_and_outcome() {
+        // #203: the `ask` path has no envelope, so it mints a per-exchange
+        // `message_id` and stamps it on both the request and its outcome — the id
+        // that pairs them when several processes share one `BATON_EVENT_LOG`.
+        let transport = OkTransport::new("a");
+        let mut sink = RecordingSink::new();
+        execute_ask(&transport, &mut sink, &test_meta(), "q").expect("succeeds");
+
+        let req_id = match &sink.events[0] {
+            ExchangeEvent::Request { message_id, .. } => message_id
+                .clone()
+                .expect("ask request carries a message_id"),
+            other => panic!("expected Request, got {other:?}"),
+        };
+        let out_id = match &sink.events[1] {
+            ExchangeEvent::ResponseOk { message_id, .. } => message_id
+                .clone()
+                .expect("ask outcome carries a message_id"),
+            other => panic!("expected ResponseOk, got {other:?}"),
+        };
+        assert_eq!(
+            req_id, out_id,
+            "request and outcome share the correlation id"
+        );
+        assert!(req_id.starts_with("ask-"), "ask id shape: {req_id}");
+    }
+
+    #[test]
     fn execute_ask_records_token_usage_from_reply() {
         use crate::model::TokenUsage;
 
@@ -4957,6 +5036,39 @@ mod tests {
         assert_eq!(sink.events.len(), 2, "request + outcome");
         assert!(matches!(sink.events[0], ExchangeEvent::Request { .. }));
         assert!(matches!(sink.events[1], ExchangeEvent::ResponseOk { .. }));
+    }
+
+    #[test]
+    fn execute_exchange_stamps_envelope_correlation_on_request_and_outcome() {
+        // #203: the serve/exchange path stamps the request envelope's
+        // `message_id` (+ `conversation_id`) on the emitted request and the
+        // `message_id` on the derived outcome, so `parse_jsonl` pairs interleaved
+        // exchanges on a shared trail.
+        let mut sink = RecordingSink::new();
+        execute_exchange(
+            &participant_over(OkTransport::new("four")),
+            &mut sink,
+            &test_meta(),
+            &request_envelope(),
+        );
+
+        match &sink.events[0] {
+            ExchangeEvent::Request {
+                message_id,
+                conversation_id,
+                ..
+            } => {
+                assert_eq!(message_id.as_deref(), Some("m-req-1"));
+                assert_eq!(conversation_id.as_deref(), Some("conv-42"));
+            }
+            other => panic!("expected Request, got {other:?}"),
+        }
+        match &sink.events[1] {
+            ExchangeEvent::ResponseOk { message_id, .. } => {
+                assert_eq!(message_id.as_deref(), Some("m-req-1"), "outcome links back");
+            }
+            other => panic!("expected ResponseOk, got {other:?}"),
+        }
     }
 
     #[test]
