@@ -7370,6 +7370,29 @@ fn spawn_recording_provider() -> (String, std::sync::Arc<std::sync::Mutex<Vec<St
     (base_url, captured)
 }
 
+/// Strips every provider setting Baton reads from the environment, so a
+/// `serve --role` run resolves them from the role layer alone and can only reach
+/// the loopback mock. A full `env_clear()` is not usable here: on Windows a
+/// process without `SystemRoot` cannot initialise networking, so the host
+/// environment is kept and only the variables under test are removed. The caller
+/// sets whatever it wants back afterwards (later `env` calls win).
+fn strip_provider_env(cmd: &mut Command) -> &mut Command {
+    for var in [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "BATON_MODEL",
+        "BATON_SYSTEM_PROMPT",
+        "BATON_TIMEOUT_SECS",
+        "BATON_MAX_TOKENS",
+        "BATON_EVENT_LOG",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 /// Writes an executable `/bin/sh` stub that records its working directory, then
 /// answers with a fixed body — the `--agent-cmd` under test.
 #[cfg(unix)]
@@ -7564,11 +7587,10 @@ fn serve_role_local_provider_uses_role_model_from_config() {
         "--poll-ms",
         "10",
     ]);
-    // Hermetic: the credential is the only provider setting from the
-    // environment, so the role config is the sole source of model and base_url
-    // and the provider stays loopback-only.
-    serve
-        .env_clear()
+    // Hermetic: every provider setting is stripped and only the credential put
+    // back, so the role config is the sole source of model and base_url and the
+    // provider stays loopback-only.
+    strip_provider_env(&mut serve)
         .env("BATON_HOME", &home.path)
         .env("ANTHROPIC_API_KEY", "test-key")
         .stdout(Stdio::null())
@@ -7715,8 +7737,7 @@ fn serve_role_env_model_overrides_role_config_model() {
         "--poll-ms",
         "10",
     ]);
-    serve
-        .env_clear()
+    strip_provider_env(&mut serve)
         .env("BATON_HOME", &home.path)
         .env("ANTHROPIC_API_KEY", "test-key")
         .env("BATON_MODEL", "env-model")
