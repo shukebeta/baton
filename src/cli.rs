@@ -1490,6 +1490,10 @@ fn execute_session(
     session_id: String,
     opening: Option<(&str, Vec<IdentityField>)>,
 ) -> Result<()> {
+    eprintln!(
+        "baton session — type a message and press enter; Ctrl-D or {SESSION_EXIT_COMMAND} to quit"
+    );
+
     // Open the session boundary on the trail. Every turn's `request` carries this
     // id; the matching `session_end` closes it on a clean exit. A `--role` session
     // stamps the role name + effective identity on the marker (#80/#82); a plain

@@ -143,9 +143,26 @@ baton service teardown --control <dir> [--force]
   only the recorded PID, removes the record, and warns that descendants may
   survive; it never claims tree reach in that case.
   It serializes that cleanup with task admission, so a task is either
-  admitted before the stop and reaped with the session or rejected after the
-  session is no longer a live owner. Idempotent — stopping an already-gone
-  session is a no-op success.
+  admitted before the stop began and reaped with the session, or rejected —
+  once the stop owns the session's cleanup, and thereafter because the
+  session is no longer a live owner. The admission lock covers the record
+  reads, signals, and record mutations only: each grace wait releases it and
+  re-acquires it afterwards, re-probing liveness, so a stop never freezes the
+  supervisor's request admission or a task-start client for the length of its
+  grace windows. A task admitted while the lock was released is caught by a
+  final rescan taken under the same uninterrupted lock hold that decides
+  whether the session record may be removed — it is reaped, or reported as
+  residue with the session record retained, never silently dropped. A session
+  whose cleanup a live stop owns is not an admissible task owner even while
+  its process is still live, so a start racing a released grace window fails
+  fast with the owner rejection instead of being handed a task id for a
+  process the stop is about to kill. That state is a durable marker held for
+  the whole cleanup, not the cooperative `serve.stop` sentinel — the daemon
+  consumes that sentinel as soon as it observes it, long before the process
+  exits. The marker records the stopping process's identity, so one orphaned
+  by a killed `service stop` is discarded by the next reader rather than
+  wedging admission.
+  Idempotent — stopping an already-gone session is a no-op success.
 - **`service teardown`** first requests `run`'s cooperative stop, then waits
   for `run` to release the control lock before taking its session snapshot and
   applying `stop` to every record. The released lock is the admission barrier:
@@ -153,7 +170,8 @@ baton service teardown --control <dir> [--force]
   the snapshot, or fails because no live service remains (an already-written
   request may remain unprocessed); it cannot spawn a session outside the
   snapshot. Teardown also takes the short-lived admission lock while it
-  drains the snapshot, covering task cleanup as well. Without `--force`, it
+  drains the snapshot, covering task cleanup as well, under the same
+  release-during-grace discipline `stop` uses. Without `--force`, it
   keeps unresolved records, prints their identity details to stderr, and exits
   non-zero; an initially unresolved task is retained immediately without a
   per-task grace delay. `--force` applies the same platform-specific rule and
@@ -445,8 +463,14 @@ removed without signalling their recorded PID.
 This applies even if a task's `--callback-inbox` points somewhere entirely
 outside the owning session's own mailbox. Task admission and those cleanup
 paths share the short-lived `service.admission.lock`, so cleanup cannot leave a
-task admitted after its owner record has been removed. The callback is a
-delivery target only.
+task admitted after its owner record has been removed. Cleanup releases that
+lock while it waits out a grace window and re-acquires it before mutating
+anything further; the boundary still holds, because admission is gated on a
+*live* owner and the whole request runs inside one hold of the lock, and
+because the session's escalation ladder runs before task reaping — so once
+cleanup has observed the session dead under the lock, nothing further can be
+admitted for it. The final rescan and the session-record removal share one
+uninterrupted hold. The callback is a delivery target only.
 
 ### Injectable clock
 
