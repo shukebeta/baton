@@ -10,7 +10,7 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.3.30 … v0.3.20 (2026-08-29)
+## v0.3.34 … v0.3.20 (2026-08-29)
 
 ### Fixes
 - fix(service): persist Unix session daemon stderr (#227)
@@ -20,14 +20,18 @@ _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 - fix(log): pair exchanges by correlation in parse_jsonl (#203) (#232)
 - fix(participant): make synthesized reply message_ids unique per emission (#234)
 - fix: preserve invalid child output (#238)
+- fix(service): skip vanished /proc entries in the group scan (#242)
+- fix(service): bounded backoff for milestone delivery, decoupled from supervision (#240)
 
 ### Docs
 - docs(service): add service.probe.lock and undocumented task directories to inventory (#229)
+- docs(service): name the session-stopping/ stop-ownership marker (#244)
 
 ### Other Changes
 - test(log): cover `log merge` trail discovery and warning glue (#208) (#235)
 - fix/issue 204 rehydrated probe rate (#233)
 - test(serve): cover the `serve --role` composition end-to-end (#239)
+- test: make integration deadlines configurable (#241)
 
 ## v0.3.19 … v0.3.9 (2026-08-28)
 

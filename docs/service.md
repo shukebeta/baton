@@ -75,6 +75,15 @@ without ever sharing a process tree with it.
   the record directly and act on the OS process by PID — none of them need
   `run` to be alive, so a session started by a since-crashed `run` can still
   be inspected, stopped, or torn down.
+- `session-stopping/<id>.json` — the durable "a stop owns this session's
+  cleanup" marker. `service stop`/`teardown` writes it under
+  `service.admission.lock` before the first grace wait releases that lock, and
+  holds it for the whole cleanup; the stop removes it when it finishes. It
+  records the stopping process's identity (its PID and that process's recorded
+  start identity), so a marker orphaned by a killed stop — or one that is
+  malformed — is discarded by the next reader instead of wedging admission for
+  good. While it is present and live, the session is not an admissible task
+  owner even if its process still is.
 
 ## Lifecycle contract
 
@@ -156,12 +165,13 @@ baton service teardown --control <dir> [--force]
   whose cleanup a live stop owns is not an admissible task owner even while
   its process is still live, so a start racing a released grace window fails
   fast with the owner rejection instead of being handed a task id for a
-  process the stop is about to kill. That state is a durable marker held for
-  the whole cleanup, not the cooperative `serve.stop` sentinel — the daemon
-  consumes that sentinel as soon as it observes it, long before the process
-  exits. The marker records the stopping process's identity, so one orphaned
-  by a killed `service stop` is discarded by the next reader rather than
-  wedging admission.
+  process the stop is about to kill. That state is
+  `session-stopping/<id>.json`, a durable marker held for the whole cleanup,
+  not the cooperative `serve.stop` sentinel — the daemon consumes that
+  sentinel as soon as it observes it, long before the process exits. The marker
+  records the stopping process's identity, so one orphaned by a killed
+  `service stop` is discarded by the next reader rather than wedging
+  admission.
   Idempotent — stopping an already-gone session is a no-op success.
 - **`service teardown`** first requests `run`'s cooperative stop, then waits
   for `run` to release the control lock before taking its session snapshot and
@@ -197,16 +207,21 @@ non-zombie member of its recorded process group is live. Therefore a task
 whose direct PID is gone or zombie can still report `live` while a same-group
 descendant remains. An incomplete `/proc` or `ps` group scan reports
 `unresolved`; only a complete scan showing no live member, or a confirming
-group-absence probe, reports the task as drained/dead. A PID-reuse or missing
-zombie identity never authorizes a process-group probe.
+group-absence probe, reports the task as drained/dead. A `/proc` entry that
+disappears between the directory listing and its `stat` read does not make the
+scan incomplete: a pid that no longer exists cannot be a live member, so it is
+skipped, and unrelated host process churn therefore cannot force every scan to
+`unresolved`. An entry that is present but unreadable or unparseable still
+reports `unresolved`. A PID-reuse or missing zombie identity never authorizes
+a process-group probe.
 
 The resolution ladder is platform-specific:
 
-- On Linux, an unreadable `/proc/<pid>/stat` is `unresolved`; a missing PID or
-  zombie is `dead`; a matching start-time tick is `live`; and a mismatched
-  recorded tick is `dead`. A legacy session with no start key may use the
-  exact NUL-separated `/proc/<pid>/cmdline` argv as a corroborator. A legacy
-  task may use matching argv to confirm `live`, but a mismatch is only
+- On Linux, a present but unreadable `/proc/<pid>/stat` is `unresolved`; a
+  missing PID or zombie is `dead`; a matching start-time tick is `live`; and a
+  mismatched recorded tick is `dead`. A legacy session with no start key may
+  use the exact NUL-separated `/proc/<pid>/cmdline` argv as a corroborator. A
+  legacy task may use matching argv to confirm `live`, but a mismatch is only
   `unresolved`, because a task such as `bash -c ...` can exec-replace its argv
   while retaining the same PID. Linux has no epoch instant leg: `/proc` start
   ticks are relative to boot, and `/proc/<pid>` directory mtime is not a safe
@@ -390,9 +405,18 @@ Job Object no longer changes a matching PID to `unresolved`; it only changes
 termination from tree-wide to PID-only, with a descendants-may-survive
 warning. State is persisted before the deterministic terminal callback is
 delivered, and a delivery failure leaves the tracker in place to retry the
-same event id. A terminal record is replayed once on the next startup for the
-same reason; the mailbox's done ledger drops it if delivery already
+same event id under the bounded backoff described in "Event delivery and
+dedup contract" below. A terminal record is replayed once on the next startup
+for the same reason; the mailbox's done ledger drops it if delivery already
 completed.
+
+Milestone delivery is decoupled from supervision: a milestone whose callback
+inbox is unavailable is retried on the same bounded backoff, but its failure
+never aborts the tick. The child-exit reap, the `max_duration_ms`
+`SIGTERM`/`SIGKILL` escalation, and the cancel-sentinel consumption all still
+run on a tick whose milestone delivery is failing or backed off, so an
+unreachable inbox can neither keep a task un-reapable nor re-fire the same
+milestone at the loop rate.
 
 Prepared admissions are not active tasks: startup reconciliation owns their
 cleanup, and `rehydrate_tasks` excludes them from the in-memory tracker. If a
@@ -450,6 +474,21 @@ at-least-once, matching every other `baton` mailbox path; a consumer dedups a
 redelivered event for free via the mailbox's own `done/`-membership check
 (`Mailbox::claim_next` drops an id it has already claimed-and-completed) — no
 resident store or polling loop needed between turns.
+
+When a callback inbox is unavailable, both milestone and terminal delivery
+follow the same **bounded exponential backoff**: the first failure waits one
+second, each subsequent failure doubles the delay up to a one-minute cap, and
+after ten failed attempts the event is dropped with a single summary warning
+rather than retried forever. Between attempts the delivery is simply skipped —
+there is no per-tick write or warning, so a persistently stuck inbox cannot
+flood the log at the loop rate. The backoff clock is the injectable `Clock`,
+so the schedule is deterministic in tests. The two event kinds differ only in
+what a drop means: dropping a terminal event drops the task from the in-memory
+tracker, while dropping a milestone advances past it (persisted, so a restart
+does not re-enter it) and leaves the task supervised. A milestone that
+succeeds on retry is still delivered exactly once — `delivered_milestones`
+only advances on a delivered or dropped index, never regressing, so an earlier
+delivered milestone is never redelivered when a later one recovers.
 
 ### Ownership vs. callback
 

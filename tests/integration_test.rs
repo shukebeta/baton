@@ -39,6 +39,67 @@ const SUCCESS_BODY: &str = r#"{
     "usage": {"input_tokens": 9, "output_tokens": 3}
 }"#;
 
+#[cfg(unix)]
+const INTEGRATION_TEST_DEADLINE_SCALE_ENV: &str = "BATON_INTEGRATION_TEST_DEADLINE_SCALE";
+const INTEGRATION_TEST_DEADLINE_BASE_SECS: u64 = 5;
+const INTEGRATION_TEST_DEADLINE_DEFAULT_SCALE: u64 = 1;
+const INTEGRATION_TEST_DEADLINE_MAX_SCALE: u64 = 60;
+
+/// Returns a deadline using a five-second base multiplied by the optional
+/// `BATON_INTEGRATION_TEST_DEADLINE_SCALE` integer. Values from 1 through 60
+/// are accepted; unset, malformed, non-positive, and out-of-range values all
+/// fall back to 1.
+#[cfg(unix)]
+fn integration_test_deadline() -> std::time::Instant {
+    let raw_scale = std::env::var(INTEGRATION_TEST_DEADLINE_SCALE_ENV).ok();
+    std::time::Instant::now() + integration_test_deadline_duration(raw_scale.as_deref())
+}
+
+fn integration_test_deadline_duration(raw_scale: Option<&str>) -> Duration {
+    Duration::from_secs(
+        INTEGRATION_TEST_DEADLINE_BASE_SECS * integration_test_deadline_scale(raw_scale),
+    )
+}
+
+fn integration_test_deadline_scale(raw_scale: Option<&str>) -> u64 {
+    raw_scale
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|scale| {
+            (INTEGRATION_TEST_DEADLINE_DEFAULT_SCALE..=INTEGRATION_TEST_DEADLINE_MAX_SCALE)
+                .contains(scale)
+        })
+        .unwrap_or(INTEGRATION_TEST_DEADLINE_DEFAULT_SCALE)
+}
+
+#[test]
+fn integration_test_deadline_scale_uses_documented_base_and_domain() {
+    assert_eq!(
+        integration_test_deadline_duration(None),
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        integration_test_deadline_duration(Some("3")),
+        Duration::from_secs(15)
+    );
+
+    for invalid in [
+        "",
+        "0",
+        "-1",
+        "0.5",
+        "61",
+        "NaN",
+        "inf",
+        "18446744073709551616",
+    ] {
+        assert_eq!(
+            integration_test_deadline_scale(Some(invalid)),
+            1,
+            "invalid scale should use the default: {invalid:?}"
+        );
+    }
+}
+
 /// Reads a complete HTTP request before the mock writes a response. Closing a
 /// socket with unread request body bytes can cause Windows to reset the
 /// connection instead of delivering that response.
@@ -2627,7 +2688,7 @@ fn service_upgrades_legacy_macos_start_epoch_records() {
     ];
     let mut session_pid = None;
     let mut task_pid = None;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = integration_test_deadline();
     while std::time::Instant::now() < deadline && (session_pid.is_none() || task_pid.is_none()) {
         let session_status = run_cli(&session_status_args);
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&session_status.stdout) {
@@ -2767,7 +2828,7 @@ fn service_upgrades_legacy_macos_start_epoch_records() {
     wait_for_service();
 
     let mut rehydrated_live = false;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = integration_test_deadline();
     while std::time::Instant::now() < deadline {
         let task_status = run_cli(&task_status_args);
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&task_status.stdout)
@@ -2802,7 +2863,7 @@ fn service_upgrades_legacy_macos_start_epoch_records() {
         "legacy service stop succeeds; stderr: {}",
         String::from_utf8_lossy(&stop.stderr)
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = integration_test_deadline();
     while (process_is_live(session_pid) || process_is_live(task_pid))
         && std::time::Instant::now() < deadline
     {
@@ -2957,7 +3018,7 @@ fn service_rehydrated_exec_replaced_task_without_start_key_is_unresolved() {
         task_id.as_str(),
     ];
     let mut task_pid = None;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = integration_test_deadline();
     let mut observed_argv = None;
     while std::time::Instant::now() < deadline {
         if let Some(argv) = read_proc_cmdline(task_pid.unwrap_or(0))
@@ -3011,7 +3072,7 @@ fn service_rehydrated_exec_replaced_task_without_start_key_is_unresolved() {
     wait_for_service();
 
     let mut unresolved_status = None;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = integration_test_deadline();
     while std::time::Instant::now() < deadline {
         let status = Command::new(env!("CARGO_BIN_EXE_baton"))
             .args(task_status_args)
@@ -3070,7 +3131,7 @@ fn service_rehydrated_exec_replaced_task_without_start_key_is_unresolved() {
         !task_record_path.is_file(),
         "forced teardown removes the unresolved task record"
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = integration_test_deadline();
     while process_is_live(task_pid) && std::time::Instant::now() < deadline {
         thread::sleep(Duration::from_millis(50));
     }
@@ -3701,7 +3762,7 @@ fn service_task_start_discards_unadmitted_request_after_run_loss() {
     assert_eq!(final_tasks.len(), 1, "restart must not duplicate the task");
     assert_eq!(final_tasks[0]["id"], successful_task_id);
     let final_record = {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = integration_test_deadline();
         loop {
             let record: serde_json::Value = serde_json::from_slice(
                 &std::fs::read(&task_record_path).expect("read finalized task record"),
@@ -3762,7 +3823,7 @@ fn service_task_start_discards_unadmitted_request_after_run_loss() {
     assert_eq!(second_tasks.len(), 1, "second restart retains one task");
     assert_eq!(second_tasks[0]["id"], successful_task_id);
     let second_record = {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = integration_test_deadline();
         loop {
             let record: serde_json::Value = serde_json::from_slice(
                 &std::fs::read(&task_record_path).expect("read second finalized task record"),
@@ -3917,7 +3978,7 @@ fn service_task_start_response_write_failure_retries_committed_record() {
     .expect("write task request");
 
     let task_record_path = {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = integration_test_deadline();
         loop {
             if let Ok(entries) = std::fs::read_dir(control.join("tasks"))
                 && let Some(path) = entries
@@ -3971,7 +4032,7 @@ fn service_task_start_response_write_failure_retries_committed_record() {
     let mut restarted_child = restarted.spawn().expect("spawn restarted service run");
     wait_for_live();
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = integration_test_deadline();
     loop {
         let record: serde_json::Value = serde_json::from_slice(
             &std::fs::read(&task_record_path).expect("read restored task record"),
@@ -4086,7 +4147,7 @@ fn service_task_start_restoration_failure_retries_committed_record() {
     run.stderr(Stdio::null());
     let mut run_child = run.spawn().expect("spawn service run");
     wait_for_live();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = integration_test_deadline();
     while failure_marker.exists() {
         assert!(
             std::time::Instant::now() < deadline,
@@ -4123,7 +4184,7 @@ fn service_task_start_restoration_failure_retries_committed_record() {
     restarted.stderr(Stdio::null());
     let mut restarted_child = restarted.spawn().expect("spawn retry service run");
     wait_for_live();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = integration_test_deadline();
     loop {
         let record: serde_json::Value = serde_json::from_slice(
             &std::fs::read(tasks_dir.join(format!("{task_id}.json")))
@@ -4266,7 +4327,7 @@ fn service_task_start_claim_ack_cleanup_survives_client_loss() {
     let mut client = client.spawn().expect("spawn task-start client");
 
     let request_path = {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = integration_test_deadline();
         'request: loop {
             for directory in ["task-requests", "task-processing"] {
                 if let Ok(entries) = std::fs::read_dir(control.join(directory))
@@ -4299,7 +4360,7 @@ fn service_task_start_claim_ack_cleanup_survives_client_loss() {
     let claim_path = control
         .join("task-responses")
         .join(format!(".{}.claimed", request_name.to_string_lossy()));
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = integration_test_deadline();
     loop {
         if ack_path.is_file() && claim_path.is_file() {
             break;
@@ -4472,7 +4533,7 @@ fn service_task_start_rolls_back_prepared_record_after_run_loss() {
         .expect("spawn task start that loses its supervisor");
 
     let task_record_path = {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = integration_test_deadline();
         loop {
             if let Ok(entries) = std::fs::read_dir(control.join("tasks"))
                 && let Some(path) = entries
@@ -4519,7 +4580,7 @@ fn service_task_start_rolls_back_prepared_record_after_run_loss() {
         "failure should explain the admission loss: {}",
         failed_message
     );
-    let task_started_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let task_started_deadline = integration_test_deadline();
     while !task_started.exists() && std::time::Instant::now() < task_started_deadline {
         thread::sleep(Duration::from_millis(10));
     }
@@ -4534,7 +4595,7 @@ fn service_task_start_rolls_back_prepared_record_after_run_loss() {
         .expect("spawn restarted baton service run");
     wait_for_live();
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = integration_test_deadline();
     loop {
         let status = Command::new(env!("CARGO_BIN_EXE_baton"))
             .args(["task", "status", "--control", control_str])
@@ -4560,7 +4621,7 @@ fn service_task_start_rolls_back_prepared_record_after_run_loss() {
         "rollback removes the prepared task record"
     );
     let process_path = std::path::PathBuf::from(format!("/proc/{task_pid}"));
-    let process_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let process_deadline = integration_test_deadline();
     while process_path.exists() && std::time::Instant::now() < process_deadline {
         thread::sleep(Duration::from_millis(20));
     }
@@ -4686,7 +4747,7 @@ fn service_prepared_unresolved_admission_is_not_rehydrated_or_finalized() {
         .expect("spawn task start that loses its supervisor");
 
     let task_record_path = {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = integration_test_deadline();
         loop {
             if let Ok(entries) = std::fs::read_dir(control.join("tasks"))
                 && let Some(path) = entries
@@ -4740,13 +4801,13 @@ fn service_prepared_unresolved_admission_is_not_rehydrated_or_finalized() {
         "failure should explain the admission loss: {}",
         failed_message
     );
-    let task_started_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let task_started_deadline = integration_test_deadline();
     while !task_started.exists() && std::time::Instant::now() < task_started_deadline {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(task_started.exists(), "the prepared task must have spawned");
 
-    let argv_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let argv_deadline = integration_test_deadline();
     while !read_proc_cmdline(task_pid).is_some_and(|argv| argv.iter().any(|arg| arg == "sleep"))
         && std::time::Instant::now() < argv_deadline
     {
@@ -4810,7 +4871,7 @@ fn service_prepared_unresolved_admission_is_not_rehydrated_or_finalized() {
         .args(["-KILL", "--", &format!("-{task_pid}")])
         .status()
         .expect("kill unresolved prepared task");
-    let task_exit_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let task_exit_deadline = integration_test_deadline();
     while process_is_live(task_pid) && std::time::Instant::now() < task_exit_deadline {
         thread::sleep(Duration::from_millis(20));
     }
@@ -4938,7 +4999,7 @@ fn service_task_start_reconcile_keeps_rollback_marker_until_cleanup() {
     run.stderr(Stdio::null());
     let mut run_child = run.spawn().expect("spawn service run");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = integration_test_deadline();
     loop {
         assert!(
             std::time::Instant::now() < deadline,
@@ -4967,7 +5028,7 @@ fn service_task_start_reconcile_keeps_rollback_marker_until_cleanup() {
     restarted.stderr(Stdio::null());
     let mut restarted_child = restarted.spawn().expect("spawn restarted service run");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = integration_test_deadline();
     while rollback_file.exists() {
         assert!(
             std::time::Instant::now() < deadline,
@@ -5064,7 +5125,7 @@ fn service_task_start_request_loop_keeps_rollback_marker_until_cleanup() {
     std::fs::write(&request_file, serde_json::to_vec(&task_request).unwrap())
         .expect("write task request");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = integration_test_deadline();
     loop {
         assert!(
             std::time::Instant::now() < deadline,
@@ -5089,7 +5150,7 @@ fn service_task_start_request_loop_keeps_rollback_marker_until_cleanup() {
     restarted.stderr(Stdio::null());
     let mut restarted_child = restarted.spawn().expect("spawn restarted service run");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = integration_test_deadline();
     while rollback_file.exists() {
         assert!(
             std::time::Instant::now() < deadline,
