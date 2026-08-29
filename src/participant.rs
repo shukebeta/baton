@@ -574,18 +574,89 @@ impl Participant for ExternalAgentParticipant {
 /// truncated and a marker appended so the reader knows output was lost.
 const MAX_STDERR_BYTES: usize = 1024 * 1024;
 
-/// Appends `token` to `line` with the quoting `Command::arg()` would apply on
-/// Windows: a token containing whitespace or a quote is wrapped in quotes,
-/// with embedded quotes backslash-escaped and backslashes preceding them
-/// doubled (the MSVC convention the child's C runtime reverses). Replicated
-/// here because the `cmd /D /S /C` tail must be assembled as one raw string
-/// with an outer quote pair — `arg()` cannot produce that shape.
+/// Appends `token` to the raw `cmd /D /S /C` tail while preserving the token
+/// through both parsers involved in a Windows `.cmd` launch. MSVC-style
+/// quoting is needed by the child CRT, while cmd metacharacters must be
+/// caret-escaped for the cmd parser; in particular, `%` expands even inside
+/// ordinary double quotes. The tail is assembled as one raw string with an
+/// outer quote pair because `arg()` cannot produce that shape.
 #[cfg(windows)]
 fn append_windows_arg(line: &mut String, token: &str) {
     if token.is_empty() {
         line.push_str("\"\"");
         return;
     }
+
+    // Ordinary tokens can keep the exact compact representation used before
+    // the cmd-layer protection was needed. This also keeps the MSVC quoting
+    // cases easy to compare with Command::arg() semantics.
+    if !token.chars().any(is_windows_cmd_metachar) {
+        append_windows_msvc_arg(line, token);
+        return;
+    }
+
+    // Keep every protected token in a quoted CRT argument. The quote pair is
+    // itself caret-escaped so cmd treats it as a literal quote in the command
+    // line passed to the child; this is distinct from a normal cmd quote and
+    // lets every metacharacter use the same caret escape. This is necessary
+    // for `%`, whose expansion is not disabled by ordinary double quotes.
+    line.push('^');
+    line.push('"');
+    let mut backslashes = 0usize;
+    for ch in token.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                // The caret keeps cmd from interpreting this quote while the
+                // MSVC backslash run makes it a literal quote for the child.
+                for _ in 0..(backslashes * 2 + 1) {
+                    line.push('\\');
+                }
+                line.push('^');
+                line.push('"');
+                backslashes = 0;
+            }
+            ch if is_windows_cmd_metachar(ch) => {
+                // The token quote is cmd-opaque, so escape the metacharacter
+                // explicitly; the caret is consumed before the child sees
+                // the command line.
+                for _ in 0..backslashes {
+                    line.push('\\');
+                }
+                line.push('^');
+                if ch == '^' {
+                    line.push('^');
+                } else {
+                    line.push(ch);
+                }
+                backslashes = 0;
+            }
+            other => {
+                for _ in 0..backslashes {
+                    line.push('\\');
+                }
+                backslashes = 0;
+                line.push(other);
+            }
+        }
+    }
+    for _ in 0..(backslashes * 2) {
+        line.push('\\');
+    }
+    line.push('^');
+    line.push('"');
+}
+
+#[cfg(windows)]
+fn is_windows_cmd_metachar(ch: char) -> bool {
+    matches!(ch, '&' | '|' | '<' | '>' | '^' | '%' | '(' | ')' | '!')
+}
+
+/// Appends a token using the MSVC command-line quoting convention. This is
+/// kept separate from [`append_windows_arg`] so cmd-layer escapes never leak
+/// into the ordinary path/space/quote cases.
+#[cfg(windows)]
+fn append_windows_msvc_arg(line: &mut String, token: &str) {
     if !token.contains([' ', '\t', '"']) {
         line.push_str(token);
         return;
@@ -645,9 +716,9 @@ fn capture_child_output(
     // `cmd /C` performs that resolution for both participant implementations.
     //
     // The program+args tail is assembled here as one raw argument wrapped in
-    // an extra outer quote pair, with each token quoted the way `arg()` would
-    // quote it (spaces force quotes, embedded quotes backslash-escaped):
-    // `/S` strips exactly that outer pair, so the token quoting survives.
+    // an extra outer quote pair. `append_windows_arg` applies the MSVC CRT
+    // quoting and cmd metacharacter escaping needed by each token; `/S` strips
+    // exactly that outer pair, so the token quoting survives.
     // Letting `arg()` build the tail instead exposes the same `/S` strip to
     // the program's own quotes, which splits any program path containing a
     // space at its first space (`C:\Users\Jane Doe\...` — the integration
@@ -1501,6 +1572,43 @@ mod tests {
             std::fs::read_to_string(dir.path.join("argument.txt")).expect("argument side effect"),
             "agent argument"
         );
+    }
+
+    /// Cmd metacharacters in an agent argument remain one intact CRT argv
+    /// entry. The environment-variable-shaped percent sequence specifically
+    /// proves that quoting alone did not merely hide a cmd expansion.
+    #[cfg(windows)]
+    #[test]
+    fn external_agent_cmd_shim_preserves_metacharacters() {
+        let dir = TempDir::new("ext-cmd-metacharacters");
+        let shim = dir.path.join("baton-test-agent.cmd");
+        std::fs::write(
+            &shim,
+            "@echo off\r\nmore >nul\r\nset \"BATON_ARG=%~1\"\r\nset BATON_ARG\r\n",
+        )
+        .expect("write cmd shim");
+        let path = format!(
+            "{};{}",
+            dir.path.display(),
+            std::env::var("PATH").expect("PATH is set")
+        );
+        let argument = "meta & | ^ %BATON_EXPAND_ME% < > ( )";
+        let participant = ExternalAgentParticipant::new(
+            "baton-test-agent",
+            [argument],
+            [
+                ("PATH", path),
+                ("BATON_EXPAND_ME", "must-not-expand".to_string()),
+            ],
+            &dir.path,
+            OutputAdapter::Raw,
+            Duration::from_secs(5),
+        );
+
+        let response = participant.respond(&request_with_body("m-req-1", "metachar request"));
+
+        assert_eq!(response.kind, MessageKind::Response);
+        assert_eq!(response.body.trim(), format!("BATON_ARG={argument}"));
     }
 
     /// A program *path* containing spaces must reach the child intact. The
