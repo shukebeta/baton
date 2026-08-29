@@ -3680,6 +3680,62 @@ mod tests {
         }
     }
 
+    /// Spawns `spec` under `control` inside a private Job Object and wraps it
+    /// as a durably-recorded [`RunningTask`], mirroring what
+    /// `handle_task_start_request` does — but callable directly, so a test can
+    /// drive [`tick_one_task`] through a real reap without the request-file
+    /// dance. Used where a live child is required (max-duration termination and
+    /// reap), unlike [`milestone_running_task`] which never spawns.
+    fn spawn_running_task(
+        control: &Path,
+        id: &str,
+        spec: TaskSpec,
+        clock: &FakeClock,
+    ) -> RunningTask {
+        let log_dir = task_logs_dir(control, id);
+        fs::create_dir_all(&log_dir).expect("create log dir");
+        let stdout_path = log_dir.join("stdout.log");
+        let stderr_path = log_dir.join("stderr.log");
+        let (child, job, job_name) =
+            spawn_task_child(&spec, &stdout_path, &stderr_path).expect("spawn task");
+        let pid = child.id();
+        let started_ms = clock.now_ms();
+        let (started_at, start_epoch_secs) = recorded_start_identity(pid);
+        let record = TaskRecord {
+            id: id.to_string(),
+            request_id: None,
+            admission: TaskAdmissionPhase::Committed,
+            spec,
+            pid,
+            started_at,
+            start_epoch_secs,
+            job: Some(job_name),
+            started_ms: Some(started_ms),
+            state: TaskState::Running,
+            exit_code: None,
+            elapsed_ms: None,
+            stdout_path: stdout_path.display().to_string(),
+            stderr_path: stderr_path.display().to_string(),
+            delivered_milestones: 0,
+        };
+        write_task_record(control, &record).expect("write task record");
+        RunningTask {
+            record,
+            child: Some(child),
+            job: Some(job),
+            started_ms,
+            term_sent_at_ms: None,
+            kill_sent: false,
+            terminal_delivery_attempts: 0,
+            next_terminal_retry_ms: None,
+            terminal_retry_delay_ms: 0,
+            milestone_delivery_attempts: 0,
+            next_milestone_retry_ms: None,
+            milestone_retry_delay_ms: 0,
+            child_exit: None,
+        }
+    }
+
     /// Failed milestone callback delivery backs off from one second on the
     /// same schedule as terminal delivery, keeps the tick `StillRunning`
     /// (supervision never blocked by the stuck milestone), does not advance
@@ -3856,6 +3912,78 @@ mod tests {
         assert!(
             callback_inbox.is_file(),
             "failed callback remains unavailable"
+        );
+        let _ = fs::remove_dir_all(control);
+    }
+
+    /// A stuck milestone delivery must not block the tick's supervision: the
+    /// max-duration escalation still terminates the Job Object and the child is
+    /// still reaped to a terminal state while the milestone stays undelivered
+    /// and backed off.
+    #[test]
+    fn supervision_continues_while_milestone_delivery_is_stuck() {
+        let control = temp_control("milestone-stuck-supervision");
+        let clock = FakeClock::new();
+        let callback_inbox = control.join("callback");
+        fs::write(&callback_inbox, "callback unavailable").expect("make callback a file");
+        // A child that stays alive until the Job Object is terminated, so the
+        // max-duration breach has something live to escalate against.
+        let spec = TaskSpec {
+            schema: TASK_SPEC_SCHEMA.to_string(),
+            session: "svc-test".to_string(),
+            command: "cmd.exe".to_string(),
+            args: vec![
+                "/D".to_string(),
+                "/C".to_string(),
+                "ping".to_string(),
+                "-n".to_string(),
+                "31".to_string(),
+                "127.0.0.1".to_string(),
+            ],
+            cwd: None,
+            env: Vec::new(),
+            milestones_ms: vec![1],
+            max_duration_ms: 100,
+            callback: TaskCallback {
+                inbox: callback_inbox.display().to_string(),
+                role: None,
+            },
+        };
+        let mut running = spawn_running_task(&control, "task-m-stuck", spec, &clock);
+
+        // Past both the milestone threshold and the max duration: the milestone
+        // delivery fails, but the tick still escalates Job Object termination.
+        clock.advance(150);
+        let tick =
+            tick_one_task(&control, "task-m-stuck", &mut running, &clock).expect("stuck tick");
+        assert!(
+            running.term_sent_at_ms.is_some(),
+            "max-duration breach must terminate even while a milestone is stuck"
+        );
+        assert_eq!(running.milestone_delivery_attempts, 1);
+        assert_eq!(running.record.delivered_milestones, 0);
+
+        // The terminated child is reaped to a terminal state even though the
+        // callback inbox is still unavailable.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut tick = tick;
+        while running.record.state == TaskState::Running {
+            assert!(
+                Instant::now() < deadline,
+                "task was not reaped while its milestone delivery stayed stuck"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+            tick =
+                tick_one_task(&control, "task-m-stuck", &mut running, &clock).expect("reap tick");
+        }
+        assert_eq!(running.record.state, TaskState::Timeout);
+        assert!(
+            matches!(tick, TaskTick::TerminalDeliveryRetry { .. }),
+            "terminal delivery to the unavailable inbox follows the backoff policy"
+        );
+        assert_eq!(
+            running.record.delivered_milestones, 0,
+            "the milestone stayed undelivered throughout"
         );
         let _ = fs::remove_dir_all(control);
     }
