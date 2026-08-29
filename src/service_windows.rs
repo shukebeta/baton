@@ -212,13 +212,16 @@ const CONTROL_STOP_FILE: &str = "service.stop";
 /// Interval between `Run`'s request-directory scans, and between polls of
 /// a pending await (start response, stop/kill grace).
 const POLL_INTERVAL_MS: u64 = 100;
-/// Initial delay before retrying a failed terminal callback delivery.
-const TERMINAL_RETRY_INITIAL_DELAY_MS: u64 = 1_000;
-/// Longest delay between terminal callback delivery attempts.
-const TERMINAL_RETRY_MAX_DELAY_MS: u64 = 60_000;
-/// Total terminal callback delivery attempts before the task is dropped
-/// from the in-memory tracker.
-const MAX_TERMINAL_DELIVERY_ATTEMPTS: u32 = 10;
+/// Initial delay before retrying a failed task-event callback delivery.
+/// Governs both milestone and terminal delivery — the same bounded
+/// exponential backoff policy applies to every task event.
+const EVENT_RETRY_INITIAL_DELAY_MS: u64 = 1_000;
+/// Longest delay between task-event callback delivery attempts.
+const EVENT_RETRY_MAX_DELAY_MS: u64 = 60_000;
+/// Total callback delivery attempts for a single task event before it is
+/// dropped (a terminal event drops the tracker entry; a milestone is
+/// skipped so supervision continues).
+const MAX_EVENT_DELIVERY_ATTEMPTS: u32 = 10;
 /// Bound on how long `Start` waits for a live `Run` to answer.
 const START_AWAIT_MS: u64 = 10_000;
 /// Bound on the cooperative `serve --stop` grace before escalating to
@@ -1659,6 +1662,17 @@ struct RunningTask {
     /// Delay used for the most recent failed terminal delivery, so the next
     /// failure can double it without a wall-clock dependency.
     terminal_retry_delay_ms: u64,
+    /// Number of failed delivery attempts for the current lowest undelivered
+    /// milestone. Reset once that milestone is delivered or dropped. In-memory
+    /// only, like the terminal counters: a rehydrated task re-attempts a due
+    /// milestone with a fresh backoff.
+    milestone_delivery_attempts: u32,
+    /// Clock deadline at which the next milestone callback delivery may be
+    /// attempted; `None` when no milestone delivery is currently backed off.
+    next_milestone_retry_ms: Option<u64>,
+    /// Delay used for the most recent failed milestone delivery, so the next
+    /// failure can double it without a wall-clock dependency.
+    milestone_retry_delay_ms: u64,
     /// Exit outcome of the direct child, stashed when the task parks to
     /// drain surviving Job Object descendants (which clears `child`).
     /// `None` for a task that never owned a child handle (rehydrated after
@@ -1710,6 +1724,9 @@ fn rehydrate_tasks(control: &Path, clock: &dyn Clock) -> Result<HashMap<String, 
                 terminal_delivery_attempts: 0,
                 next_terminal_retry_ms: None,
                 terminal_retry_delay_ms: 0,
+                milestone_delivery_attempts: 0,
+                next_milestone_retry_ms: None,
+                milestone_retry_delay_ms: 0,
                 child_exit: None,
             },
         );
@@ -1789,6 +1806,9 @@ fn process_one_task_request(
                     terminal_delivery_attempts: 0,
                     next_terminal_retry_ms: None,
                     terminal_retry_delay_ms: 0,
+                    milestone_delivery_attempts: 0,
+                    next_milestone_retry_ms: None,
+                    milestone_retry_delay_ms: 0,
                     child_exit: None,
                 };
                 return Ok(Some((id, running)));
@@ -2189,18 +2209,11 @@ fn tick_one_task(
 
     let elapsed_ms = clock.now_ms().saturating_sub(running.started_ms);
 
-    for index in milestones_due(
-        elapsed_ms,
-        &running.record.spec.milestones_ms,
-        running.record.delivered_milestones,
-    ) {
-        deliver_task_event(&running.record, TaskEventKind::Milestone { index })?;
-        running.record.delivered_milestones = index + 1;
-        if let Err(err) = write_task_record(control, &running.record) {
-            running.record.delivered_milestones = index;
-            return Err(err);
-        }
-    }
+    // Deliver due milestones best-effort: a failing or backed-off callback
+    // inbox must not abort the tick before the liveness/timeout/reap handling
+    // below, or an unreachable inbox would keep a task un-reapable forever and
+    // re-fire the same milestone at loop rate.
+    deliver_due_milestones(control, id, running, elapsed_ms, clock)?;
 
     // A rehydrated task has no Child handle. Check its identity before
     // any timeout signal so a gone or PID-reused process is never
@@ -2338,6 +2351,101 @@ fn parked_terminal(running: &RunningTask, cancelled: bool) -> (TaskState, Option
     }
 }
 
+/// Delivers every milestone newly due at `elapsed_ms`, best-effort.
+///
+/// A callback inbox that is unavailable is handled by the same bounded
+/// exponential backoff [`deliver_terminal_event`] applies: the lowest
+/// undelivered milestone is retried on a doubling delay (from
+/// [`EVENT_RETRY_INITIAL_DELAY_MS`], capped at [`EVENT_RETRY_MAX_DELAY_MS`]) and
+/// dropped after [`MAX_EVENT_DELIVERY_ATTEMPTS`], so a stuck inbox never
+/// re-fires a milestone at loop rate. Unlike the terminal outcome, milestone
+/// retry/drop warnings are emitted here rather than routed up through
+/// [`TaskTick`], because the caller's tick must continue past them to reap,
+/// time out, and cancel the task regardless.
+///
+/// Only a control-dir *write* failure propagates (mirroring [`finalize_task`]);
+/// a callback-delivery failure is absorbed into the backoff so supervision is
+/// never blocked by an unreachable inbox.
+fn deliver_due_milestones(
+    control: &Path,
+    id: &str,
+    running: &mut RunningTask,
+    elapsed_ms: u64,
+    clock: &dyn Clock,
+) -> Result<()> {
+    let now_ms = clock.now_ms();
+    if let Some(next_retry_ms) = running.next_milestone_retry_ms
+        && now_ms < next_retry_ms
+    {
+        return Ok(());
+    }
+
+    for index in milestones_due(
+        elapsed_ms,
+        &running.record.spec.milestones_ms,
+        running.record.delivered_milestones,
+    ) {
+        match deliver_task_event(&running.record, TaskEventKind::Milestone { index }) {
+            Ok(()) => {
+                running.record.delivered_milestones = index + 1;
+                if let Err(err) = write_task_record(control, &running.record) {
+                    running.record.delivered_milestones = index;
+                    return Err(err);
+                }
+                // A milestone delivered clears any backoff left by an earlier
+                // failure, so the next milestone starts fresh.
+                running.milestone_delivery_attempts = 0;
+                running.next_milestone_retry_ms = None;
+                running.milestone_retry_delay_ms = 0;
+            }
+            Err(err) => {
+                let attempt = running.milestone_delivery_attempts.saturating_add(1);
+                running.milestone_delivery_attempts = attempt;
+                if attempt >= MAX_EVENT_DELIVERY_ATTEMPTS {
+                    eprintln!(
+                        "warning: baton service dropped milestone {index} for task {id} after {attempt} failed deliveries to callback inbox {:?}: {err}",
+                        running.record.spec.callback.inbox
+                    );
+                    // Advance past the dropped milestone and persist it, so a
+                    // supervisor restart does not re-enter the same stuck
+                    // milestone via `rehydrate_tasks`.
+                    running.record.delivered_milestones = index + 1;
+                    if let Err(write_err) = write_task_record(control, &running.record) {
+                        running.record.delivered_milestones = index;
+                        return Err(write_err);
+                    }
+                    running.milestone_delivery_attempts = 0;
+                    running.next_milestone_retry_ms = None;
+                    running.milestone_retry_delay_ms = 0;
+                    // Let the next tick handle any further due milestones, each
+                    // with its own fresh backoff, rather than hammering the same
+                    // unavailable inbox for the whole batch now.
+                    break;
+                }
+
+                let delay_ms = if attempt == 1 {
+                    EVENT_RETRY_INITIAL_DELAY_MS
+                } else {
+                    running
+                        .milestone_retry_delay_ms
+                        .saturating_mul(2)
+                        .min(EVENT_RETRY_MAX_DELAY_MS)
+                };
+                running.milestone_retry_delay_ms = delay_ms;
+                running.next_milestone_retry_ms = Some(now_ms.saturating_add(delay_ms));
+                eprintln!(
+                    "warning: baton service failed to deliver milestone {index} for task {id} to callback inbox {:?} (attempt {attempt}/{MAX_EVENT_DELIVERY_ATTEMPTS}; retrying in {delay_ms} ms): {err}",
+                    running.record.spec.callback.inbox
+                );
+                // Milestones are delivered in order; stop the batch until this
+                // one is delivered or dropped.
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Delivers a terminal event, applying bounded exponential backoff when the
 /// callback inbox is unavailable.
 fn deliver_terminal_event(running: &mut RunningTask, clock: &dyn Clock) -> Result<TaskTick> {
@@ -2354,7 +2462,7 @@ fn deliver_terminal_event(running: &mut RunningTask, clock: &dyn Clock) -> Resul
             let attempt = running.terminal_delivery_attempts.saturating_add(1);
             running.terminal_delivery_attempts = attempt;
             let error = err.to_string();
-            if attempt >= MAX_TERMINAL_DELIVERY_ATTEMPTS {
+            if attempt >= MAX_EVENT_DELIVERY_ATTEMPTS {
                 return Ok(TaskTick::TerminalDeliveryDropped {
                     error,
                     attempts: attempt,
@@ -2362,12 +2470,12 @@ fn deliver_terminal_event(running: &mut RunningTask, clock: &dyn Clock) -> Resul
             }
 
             let delay_ms = if attempt == 1 {
-                TERMINAL_RETRY_INITIAL_DELAY_MS
+                EVENT_RETRY_INITIAL_DELAY_MS
             } else {
                 running
                     .terminal_retry_delay_ms
                     .saturating_mul(2)
-                    .min(TERMINAL_RETRY_MAX_DELAY_MS)
+                    .min(EVENT_RETRY_MAX_DELAY_MS)
             };
             running.terminal_retry_delay_ms = delay_ms;
             running.next_terminal_retry_ms = Some(now_ms.saturating_add(delay_ms));
@@ -2418,7 +2526,7 @@ fn tick_tasks(control: &Path, tasks: &mut HashMap<String, RunningTask>, clock: &
                 delay_ms,
             }) => {
                 eprintln!(
-                    "warning: baton service failed to deliver terminal event for task {id} to callback inbox {:?} (attempt {attempt}/{MAX_TERMINAL_DELIVERY_ATTEMPTS}; retrying in {delay_ms} ms): {error}",
+                    "warning: baton service failed to deliver terminal event for task {id} to callback inbox {:?} (attempt {attempt}/{MAX_EVENT_DELIVERY_ATTEMPTS}; retrying in {delay_ms} ms): {error}",
                     running.record.spec.callback.inbox
                 );
             }
@@ -3418,6 +3526,9 @@ mod tests {
             terminal_delivery_attempts: 0,
             next_terminal_retry_ms: None,
             terminal_retry_delay_ms: 0,
+            milestone_delivery_attempts: 0,
+            next_milestone_retry_ms: None,
+            milestone_retry_delay_ms: 0,
             child_exit: None,
         }
     }
@@ -3438,14 +3549,14 @@ mod tests {
                 attempt, delay_ms, ..
             } => {
                 assert_eq!(attempt, 1);
-                assert_eq!(delay_ms, TERMINAL_RETRY_INITIAL_DELAY_MS);
+                assert_eq!(delay_ms, EVENT_RETRY_INITIAL_DELAY_MS);
             }
             other => panic!("expected a scheduled retry, got {other:?}"),
         }
         assert_eq!(running.terminal_delivery_attempts, 1);
         assert_eq!(running.next_terminal_retry_ms, Some(1_000));
 
-        clock.advance(TERMINAL_RETRY_INITIAL_DELAY_MS - 1);
+        clock.advance(EVENT_RETRY_INITIAL_DELAY_MS - 1);
         assert!(matches!(
             tick_one_task(&control, "task-terminal-retry", &mut running, &clock)
                 .expect("early terminal retry tick"),
@@ -3480,15 +3591,15 @@ mod tests {
         fs::write(&callback_inbox, "callback unavailable").expect("make callback a file");
         let mut running =
             terminal_running_task(&control, "task-terminal-drop", &callback_inbox, &clock);
-        let mut expected_delay = TERMINAL_RETRY_INITIAL_DELAY_MS;
+        let mut expected_delay = EVENT_RETRY_INITIAL_DELAY_MS;
 
-        for attempt in 1..=MAX_TERMINAL_DELIVERY_ATTEMPTS {
+        for attempt in 1..=MAX_EVENT_DELIVERY_ATTEMPTS {
             if attempt > 1 {
                 clock.advance(running.terminal_retry_delay_ms);
             }
             let tick = tick_one_task(&control, "task-terminal-drop", &mut running, &clock)
                 .expect("terminal delivery attempt");
-            if attempt < MAX_TERMINAL_DELIVERY_ATTEMPTS {
+            if attempt < MAX_EVENT_DELIVERY_ATTEMPTS {
                 match tick {
                     TaskTick::TerminalDeliveryRetry {
                         attempt: reported_attempt,
@@ -3497,10 +3608,10 @@ mod tests {
                     } => {
                         assert_eq!(reported_attempt, attempt);
                         assert_eq!(delay_ms, expected_delay);
-                        assert!(delay_ms <= TERMINAL_RETRY_MAX_DELAY_MS);
+                        assert!(delay_ms <= EVENT_RETRY_MAX_DELAY_MS);
                         expected_delay = expected_delay
                             .saturating_mul(2)
-                            .min(TERMINAL_RETRY_MAX_DELAY_MS);
+                            .min(EVENT_RETRY_MAX_DELAY_MS);
                     }
                     other => panic!("expected another retry, got {other:?}"),
                 }
@@ -3508,7 +3619,7 @@ mod tests {
                 assert!(matches!(
                     tick,
                     TaskTick::TerminalDeliveryDropped {
-                        attempts: MAX_TERMINAL_DELIVERY_ATTEMPTS,
+                        attempts: MAX_EVENT_DELIVERY_ATTEMPTS,
                         ..
                     }
                 ));
@@ -3516,11 +3627,363 @@ mod tests {
         }
         assert_eq!(
             running.terminal_delivery_attempts,
-            MAX_TERMINAL_DELIVERY_ATTEMPTS
+            MAX_EVENT_DELIVERY_ATTEMPTS
         );
         assert!(
             callback_inbox.is_file(),
             "failed callback remains unavailable"
+        );
+        let _ = fs::remove_dir_all(control);
+    }
+
+    /// A still-running task whose milestone delivery can be driven by the
+    /// [`FakeClock`]. Its recorded identity is the live test process, so the
+    /// tick's liveness check keeps it `Running` (never reaped) across ticks
+    /// while milestone backoff is exercised — no child spawn needed.
+    fn milestone_running_task(
+        control: &Path,
+        id: &str,
+        callback_inbox: &Path,
+        milestones_ms: Vec<u64>,
+        clock: &FakeClock,
+    ) -> RunningTask {
+        let mut record = task_record(
+            "svc-test",
+            std::process::id(),
+            recorded_start_identity(std::process::id()).0,
+            None,
+        );
+        record.id = id.to_string();
+        record.spec.callback.inbox = callback_inbox.display().to_string();
+        record.spec.milestones_ms = milestones_ms;
+        // Large enough that these tests never cross it: only milestone backoff
+        // is under test, not max-duration termination (which would signal the
+        // live test process's own group).
+        record.spec.max_duration_ms = 3_600_000;
+        record.started_ms = Some(clock.now_ms());
+        record.state = TaskState::Running;
+        write_task_record(control, &record).expect("write running task record");
+        RunningTask {
+            record,
+            child: None,
+            job: None,
+            started_ms: clock.now_ms(),
+            term_sent_at_ms: None,
+            kill_sent: false,
+            terminal_delivery_attempts: 0,
+            next_terminal_retry_ms: None,
+            terminal_retry_delay_ms: 0,
+            milestone_delivery_attempts: 0,
+            next_milestone_retry_ms: None,
+            milestone_retry_delay_ms: 0,
+            child_exit: None,
+        }
+    }
+
+    /// Spawns `spec` under `control` inside a private Job Object and wraps it
+    /// as a durably-recorded [`RunningTask`], mirroring what
+    /// `handle_task_start_request` does — but callable directly, so a test can
+    /// drive [`tick_one_task`] through a real reap without the request-file
+    /// dance. Used where a live child is required (max-duration termination and
+    /// reap), unlike [`milestone_running_task`] which never spawns.
+    fn spawn_running_task(
+        control: &Path,
+        id: &str,
+        spec: TaskSpec,
+        clock: &FakeClock,
+    ) -> RunningTask {
+        let log_dir = task_logs_dir(control, id);
+        fs::create_dir_all(&log_dir).expect("create log dir");
+        let stdout_path = log_dir.join("stdout.log");
+        let stderr_path = log_dir.join("stderr.log");
+        let (child, job, job_name) =
+            spawn_task_child(&spec, &stdout_path, &stderr_path).expect("spawn task");
+        let pid = child.id();
+        let started_ms = clock.now_ms();
+        let (started_at, start_epoch_secs) = recorded_start_identity(pid);
+        let record = TaskRecord {
+            id: id.to_string(),
+            request_id: None,
+            admission: TaskAdmissionPhase::Committed,
+            spec,
+            pid,
+            started_at,
+            start_epoch_secs,
+            job: Some(job_name),
+            started_ms: Some(started_ms),
+            state: TaskState::Running,
+            exit_code: None,
+            elapsed_ms: None,
+            stdout_path: stdout_path.display().to_string(),
+            stderr_path: stderr_path.display().to_string(),
+            delivered_milestones: 0,
+        };
+        write_task_record(control, &record).expect("write task record");
+        RunningTask {
+            record,
+            child: Some(child),
+            job: Some(job),
+            started_ms,
+            term_sent_at_ms: None,
+            kill_sent: false,
+            terminal_delivery_attempts: 0,
+            next_terminal_retry_ms: None,
+            terminal_retry_delay_ms: 0,
+            milestone_delivery_attempts: 0,
+            next_milestone_retry_ms: None,
+            milestone_retry_delay_ms: 0,
+            child_exit: None,
+        }
+    }
+
+    /// Failed milestone callback delivery backs off from one second on the
+    /// same schedule as terminal delivery, keeps the tick `StillRunning`
+    /// (supervision never blocked by the stuck milestone), does not advance
+    /// `delivered_milestones` while it fails, and delivers exactly once when
+    /// the inbox recovers.
+    #[test]
+    fn milestone_delivery_uses_fake_clock_backoff_and_recovers() {
+        let control = temp_control("milestone-delivery-retry");
+        let clock = FakeClock::new();
+        let callback_inbox = control.join("callback");
+        fs::write(&callback_inbox, "callback unavailable").expect("make callback a file");
+        let mut running =
+            milestone_running_task(&control, "task-m-retry", &callback_inbox, vec![50], &clock);
+
+        clock.advance(60);
+        assert!(matches!(
+            tick_one_task(&control, "task-m-retry", &mut running, &clock)
+                .expect("first milestone delivery attempt"),
+            TaskTick::StillRunning
+        ));
+        assert_eq!(running.milestone_delivery_attempts, 1);
+        assert_eq!(
+            running.next_milestone_retry_ms,
+            Some(60 + EVENT_RETRY_INITIAL_DELAY_MS)
+        );
+        assert_eq!(running.record.delivered_milestones, 0);
+
+        clock.advance(EVENT_RETRY_INITIAL_DELAY_MS - 1);
+        assert!(matches!(
+            tick_one_task(&control, "task-m-retry", &mut running, &clock)
+                .expect("early milestone retry tick"),
+            TaskTick::StillRunning
+        ));
+        assert_eq!(running.milestone_delivery_attempts, 1);
+        assert_eq!(running.record.delivered_milestones, 0);
+
+        fs::remove_file(&callback_inbox).expect("remove unavailable callback marker");
+        clock.advance(1);
+        assert!(matches!(
+            tick_one_task(&control, "task-m-retry", &mut running, &clock)
+                .expect("recovered milestone delivery"),
+            TaskTick::StillRunning
+        ));
+        assert_eq!(running.record.delivered_milestones, 1);
+        assert_eq!(running.milestone_delivery_attempts, 0);
+        assert_eq!(running.next_milestone_retry_ms, None);
+
+        let mailbox = mailbox::Mailbox::open(&callback_inbox).expect("open");
+        assert_eq!(
+            mailbox
+                .claim_next()
+                .expect("claim")
+                .expect("milestone event present")
+                .key,
+            "task-m-retry-milestone-0"
+        );
+        assert!(
+            mailbox.claim_next().expect("claim").is_none(),
+            "milestone delivered exactly once"
+        );
+        let _ = fs::remove_dir_all(control);
+    }
+
+    /// A milestone already delivered before a later milestone's delivery fails
+    /// is never redelivered when the inbox recovers: the failure backs off the
+    /// stuck index only, and `delivered_milestones` never regresses.
+    #[test]
+    fn milestone_batch_failure_does_not_redeliver_earlier_index() {
+        let control = temp_control("milestone-batch-retry");
+        let clock = FakeClock::new();
+        let callback_inbox = control.join("callback");
+        let mut running = milestone_running_task(
+            &control,
+            "task-m-batch",
+            &callback_inbox,
+            vec![10, 20],
+            &clock,
+        );
+
+        clock.advance(15);
+        assert!(matches!(
+            tick_one_task(&control, "task-m-batch", &mut running, &clock)
+                .expect("milestone 0 delivery"),
+            TaskTick::StillRunning
+        ));
+        assert_eq!(running.record.delivered_milestones, 1);
+        let mailbox = mailbox::Mailbox::open(&callback_inbox).expect("open");
+        assert_eq!(
+            mailbox
+                .claim_next()
+                .expect("claim")
+                .expect("milestone 0 present")
+                .key,
+            "task-m-batch-milestone-0"
+        );
+
+        fs::remove_dir_all(&callback_inbox).expect("drop callback inbox");
+        fs::write(&callback_inbox, "callback unavailable").expect("make callback a file");
+
+        clock.advance(10);
+        assert!(matches!(
+            tick_one_task(&control, "task-m-batch", &mut running, &clock)
+                .expect("milestone 1 delivery attempt"),
+            TaskTick::StillRunning
+        ));
+        assert_eq!(running.milestone_delivery_attempts, 1);
+        assert_eq!(running.record.delivered_milestones, 1);
+
+        fs::remove_file(&callback_inbox).expect("remove unavailable callback marker");
+        clock.advance(EVENT_RETRY_INITIAL_DELAY_MS);
+        assert!(matches!(
+            tick_one_task(&control, "task-m-batch", &mut running, &clock)
+                .expect("recovered milestone 1 delivery"),
+            TaskTick::StillRunning
+        ));
+        assert_eq!(running.record.delivered_milestones, 2);
+
+        let mailbox = mailbox::Mailbox::open(&callback_inbox).expect("open");
+        assert_eq!(
+            mailbox
+                .claim_next()
+                .expect("claim")
+                .expect("milestone 1 present")
+                .key,
+            "task-m-batch-milestone-1",
+            "recovery delivers the stuck index",
+        );
+        assert!(
+            mailbox.claim_next().expect("claim").is_none(),
+            "milestone 0 is not redelivered after recovery"
+        );
+        let _ = fs::remove_dir_all(control);
+    }
+
+    /// Persistent milestone callback failure is retried at most the configured
+    /// bound, then the milestone is dropped and the advance past it is
+    /// persisted — so a supervisor restart's `rehydrate_tasks` does not
+    /// re-enter the same stuck milestone.
+    #[test]
+    fn milestone_delivery_drops_after_bounded_backoff_and_persists_advance() {
+        let control = temp_control("milestone-delivery-drop");
+        let clock = FakeClock::new();
+        let callback_inbox = control.join("callback");
+        fs::write(&callback_inbox, "callback unavailable").expect("make callback a file");
+        let mut running =
+            milestone_running_task(&control, "task-m-drop", &callback_inbox, vec![50], &clock);
+
+        clock.advance(60);
+        for attempt in 1..=MAX_EVENT_DELIVERY_ATTEMPTS {
+            if attempt > 1 {
+                clock.advance(running.milestone_retry_delay_ms);
+            }
+            assert!(matches!(
+                tick_one_task(&control, "task-m-drop", &mut running, &clock)
+                    .expect("milestone delivery attempt"),
+                TaskTick::StillRunning
+            ));
+            if attempt < MAX_EVENT_DELIVERY_ATTEMPTS {
+                assert_eq!(running.milestone_delivery_attempts, attempt);
+                assert_eq!(running.record.delivered_milestones, 0);
+            }
+        }
+
+        assert_eq!(running.record.delivered_milestones, 1);
+        assert_eq!(running.milestone_delivery_attempts, 0);
+        assert_eq!(running.next_milestone_retry_ms, None);
+        let durable = read_task_record(&control, "task-m-drop")
+            .expect("read durable record")
+            .expect("durable record present");
+        assert_eq!(
+            durable.delivered_milestones, 1,
+            "dropped milestone advance is persisted so a restart does not re-enter it"
+        );
+        assert!(
+            callback_inbox.is_file(),
+            "failed callback remains unavailable"
+        );
+        let _ = fs::remove_dir_all(control);
+    }
+
+    /// A stuck milestone delivery must not block the tick's supervision: the
+    /// max-duration escalation still terminates the Job Object and the child is
+    /// still reaped to a terminal state while the milestone stays undelivered
+    /// and backed off.
+    #[test]
+    fn supervision_continues_while_milestone_delivery_is_stuck() {
+        let control = temp_control("milestone-stuck-supervision");
+        let clock = FakeClock::new();
+        let callback_inbox = control.join("callback");
+        fs::write(&callback_inbox, "callback unavailable").expect("make callback a file");
+        // A child that stays alive until the Job Object is terminated, so the
+        // max-duration breach has something live to escalate against.
+        let spec = TaskSpec {
+            schema: TASK_SPEC_SCHEMA.to_string(),
+            session: "svc-test".to_string(),
+            command: "cmd.exe".to_string(),
+            args: vec![
+                "/D".to_string(),
+                "/C".to_string(),
+                "ping".to_string(),
+                "-n".to_string(),
+                "31".to_string(),
+                "127.0.0.1".to_string(),
+            ],
+            cwd: None,
+            env: Vec::new(),
+            milestones_ms: vec![1],
+            max_duration_ms: 100,
+            callback: TaskCallback {
+                inbox: callback_inbox.display().to_string(),
+                role: None,
+            },
+        };
+        let mut running = spawn_running_task(&control, "task-m-stuck", spec, &clock);
+
+        // Past both the milestone threshold and the max duration: the milestone
+        // delivery fails, but the tick still escalates Job Object termination.
+        clock.advance(150);
+        let tick =
+            tick_one_task(&control, "task-m-stuck", &mut running, &clock).expect("stuck tick");
+        assert!(
+            running.term_sent_at_ms.is_some(),
+            "max-duration breach must terminate even while a milestone is stuck"
+        );
+        assert_eq!(running.milestone_delivery_attempts, 1);
+        assert_eq!(running.record.delivered_milestones, 0);
+
+        // The terminated child is reaped to a terminal state even though the
+        // callback inbox is still unavailable.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut tick = tick;
+        while running.record.state == TaskState::Running {
+            assert!(
+                Instant::now() < deadline,
+                "task was not reaped while its milestone delivery stayed stuck"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+            tick =
+                tick_one_task(&control, "task-m-stuck", &mut running, &clock).expect("reap tick");
+        }
+        assert_eq!(running.record.state, TaskState::Timeout);
+        assert!(
+            matches!(tick, TaskTick::TerminalDeliveryRetry { .. }),
+            "terminal delivery to the unavailable inbox follows the backoff policy"
+        );
+        assert_eq!(
+            running.record.delivered_milestones, 0,
+            "the milestone stayed undelivered throughout"
         );
         let _ = fs::remove_dir_all(control);
     }
