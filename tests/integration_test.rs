@@ -748,6 +748,12 @@ fn session_runs_multi_turn_and_records_a_pair_per_turn() {
         "one reply printed per turn; stdout: {stdout}"
     );
 
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "baton session — type a message and press enter; Ctrl-D or /exit to quit\n",
+        "fresh sessions announce the REPL on stderr"
+    );
+
     // The session is self-delimiting: a session_start marker, then two turns ×
     // (request + response_ok), then a session_end marker reporting the turn count.
     let lines = read_jsonl(&temp.file);
