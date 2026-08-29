@@ -10,7 +10,7 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.3.33 … v0.3.20 (2026-08-29)
+## v0.3.34 … v0.3.20 (2026-08-29)
 
 ### Fixes
 - fix(service): persist Unix session daemon stderr (#227)
@@ -31,6 +31,7 @@ _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 - test(log): cover `log merge` trail discovery and warning glue (#208) (#235)
 - fix/issue 204 rehydrated probe rate (#233)
 - test(serve): cover the `serve --role` composition end-to-end (#239)
+- test: make integration deadlines configurable (#241)
 
 ## v0.3.19 … v0.3.9 (2026-08-28)
 
