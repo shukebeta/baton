@@ -10,7 +10,7 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.3.26 … v0.3.20 (2026-08-29)
+## v0.3.27 … v0.3.20 (2026-08-29)
 
 ### Fixes
 - fix(service): persist Unix session daemon stderr (#227)
@@ -22,6 +22,9 @@ _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
 ### Docs
 - docs(service): add service.probe.lock and undocumented task directories to inventory (#229)
+
+### Other Changes
+- test(log): cover `log merge` trail discovery and warning glue (#208) (#235)
 
 ## v0.3.19 … v0.3.9 (2026-08-28)
 
