@@ -49,6 +49,13 @@ without ever sharing a process tree with it.
 - `service.admission.lock` — a short-lived advisory lock shared by task
   admission and session cleanup. It is separate from `service.lock`, which
   the long-lived `service run` holds for its entire lifetime.
+- `service.probe.lock` — a short-lived advisory lock serializing
+  `service.lock`'s acquisition against the liveness probes behind
+  `status`/`stop`/`teardown`/`start`. A probe answers "not running" by
+  *taking* `service.lock`, so without this lock a probe landing on a starting
+  `service run` would refuse it as a duplicate instance. It is distinct from
+  `service.admission.lock`, which serializes task admission and session
+  cleanup.
 - `service.stop` — the cooperative-stop sentinel `service teardown` drops for
   a live `service run` to observe between polls (mirrors `serve.stop`).
 - `requests/` / `processing/` / `responses/` — the atomic-rename request
@@ -267,7 +274,8 @@ baton task cancel --control <dir> --task <id>
 
 - **`task start`** submits a `TaskSpec` (schema `baton.task-spec/v1`) and
   returns a stable task id as soon as `run` has spawned the command and
-  persisted its record — like `service start`, it never waits on the command
+  persisted its durable record in `tasks/<id>.json` — like `service start`,
+  it never waits on the command
   to finish, and fails fast if no `service run` is live on `--control`. The
   `--session` value must name a managed session whose durable record exists
   and whose recorded process is currently live. A missing record or a stale
@@ -283,7 +291,8 @@ baton task cancel --control <dir> --task <id>
   While waiting for the response, the submitting client probes the control
   lock. If `run` releases that lock before answering, the client takes the
   short-lived admission lock, re-checks for a response, writes a durable
-  rollback marker, then removes the still-pending request from both
+  rollback marker into `task-start-rollback/`, then removes the still-pending
+  request from both
   `task-requests/` and `task-processing/` and exits non-zero with a `task start
   request was not admitted` error. Startup reconciliation or the request loop
   clears the marker only after it has removed any associated task record and
@@ -318,12 +327,14 @@ baton task cancel --control <dir> --task <id>
   elapsed milliseconds, `live` plus the distinct `liveness` identity state,
   and the following task identity/output fields:
   `command` is the effective executable identity, while `stdout_path` and
-  `stderr_path` are the paths to the captured stdout and stderr logs.
+  `stderr_path` are the paths to the captured stdout and stderr logs
+  under `task-logs/<task-id>/`.
   These fields are present for both running and terminal tasks. Reads the
   durable `TaskRecord` directly by PID, so it works whether or not `run` is
   currently alive.
-- **`task cancel`** is idempotent: after the cooperative cancel sentinel it
-  terminates the task's Job Object on Windows or process group on Unix, so the
+- **`task cancel`** is idempotent: after dropping a cooperative cancel sentinel
+  into `task-cancel/`, it terminates the task's Job Object on Windows or
+  process group on Unix, so the
   resulting terminal event reads `cancelled` rather than `failed`. It is a
   no-op success if the task is already gone.
 - **Unix task draining** treats the task's process group as the ownership and
@@ -377,11 +388,12 @@ residue whose identity remains unresolved.
 Task admission is a durable transaction keyed by the task-start request id.
 After spawning and persisting a `TaskRecord`, `run` records the `prepared`
 phase, then durably changes it to `committed` before publishing the success
-response, and finally records `responded` while holding the admission lock.
-The task-start client takes that same lock, atomically renames the response to
-a private claim, parses it, writes `task-start-ack/<request-id>.json`, and
-removes the claim only after the acknowledgement is durable. A claim without
-an acknowledgement is restored to the response on the next startup.
+response into `task-responses/`, and finally records `responded` while holding
+the admission lock. The task-start client takes that same lock, atomically
+renames the response to a private claim, parses it, writes
+`task-start-ack/<request-id>.json`, and removes the claim only after the
+acknowledgement is durable. A claim without an acknowledgement is restored to
+`task-responses/` on the next startup.
 
 Startup reconciliation removes a prepared task only after its process is
 positively dead (or its record is already terminal), including its process and
