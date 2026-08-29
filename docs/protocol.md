@@ -10,8 +10,9 @@ stand on its own.
 
 Two schemas and their trail:
 
-- `baton.exchange/v1` — one provider *call* (request + outcome), recorded as a
-  JSONL trail.
+- `baton.exchange/v1` — provider-call and mailbox-delivery events, recorded as
+  a JSONL trail. Provider calls use request/outcome pairs; `baton send` uses
+  standalone delivery events.
 - `baton.message/v1` — one agent-to-agent *peer message* envelope, which nests
   a `baton.exchange/v1` record.
 
@@ -34,9 +35,11 @@ cat baton-events.jsonl
 
 The format is [JSONL](https://jsonlines.org/): one JSON object per line. Each
 line carries a `schema` discriminator (`baton.exchange/v1`), an `event` tag, and
-a `ts_ms` wall-clock timestamp (Unix epoch milliseconds). One exchange emits a
-`request` line followed by exactly one outcome line (`response_ok` or
-`response_error`):
+a `ts_ms` wall-clock timestamp (Unix epoch milliseconds). A provider-backed
+exchange emits a `request` line followed by exactly one outcome line
+(`response_ok` or `response_error`). A `baton send` operation does not make a
+provider call: it emits a `message_sent` delivery line, and `baton send --await`
+emits a `reply_consumed` line when it consumes the correlated reply:
 
 ```jsonl
 {"event":"request","schema":"baton.exchange/v1","ts_ms":1700000000000,"model":"claude-sonnet-4-6","base_url":"https://api.anthropic.com","prompt":"hello"}
@@ -45,10 +48,12 @@ a `ts_ms` wall-clock timestamp (Unix epoch milliseconds). One exchange emits a
 
 | `event`          | Fields beyond `schema` / `ts_ms`                            | Meaning                                              |
 | ---------------- | ----------------------------------------------------------- | ---------------------------------------------------- |
-| `request`        | `model`, `base_url`, `prompt`, `session_id?`, `turn_index?` | Emitted before the call; carries enough to replay it. `session_id` / `turn_index` are present only on a `session` turn (see below). |
+| `request`        | `model`, `base_url`, `prompt`, `session_id?`, `turn_index?`, `from?`, `to?`, `conversation_id?`, `message_id?`, `in_reply_to?` | Emitted before the call; carries enough to replay it. `session_id` / `turn_index` are present on a `session` turn (see below). A `serve --role` seat request also carries the optional A2A addressing and correlation fields; its `session_id` equals `conversation_id` and its `turn_index` is omitted. |
 | `response_ok`    | `duration_ms`, `reply`, `input_tokens`, `output_tokens`, `session_id?`, `turn_index?` | The call succeeded.                                  |
 | `response_error` | `duration_ms`, `kind`, `message`, `session_id?`, `turn_index?`                            | The call failed; `kind` is the stable machine class. |
-| `session_start`  | `session_id`                                                | Emitted once at the start of a `baton session` run.  |
+| `message_sent`   | `message_id`, `conversation_id`, `from`, `to`              | Emitted when `baton send` delivers a request into a mailbox. |
+| `reply_consumed` | `message_id`, `in_reply_to?`, `conversation_id`             | Emitted by `baton send --await` when it consumes a correlated reply; `in_reply_to` is present when the reply carries the request id it answers. |
+| `session_start`  | `session_id`, `role?`, `identity?`                          | Emitted once at the start of a `baton session` run. When present, `identity` is an array of `{key, value?, source}` fields describing the effective role identity. |
 | `session_end`    | `session_id`, `turns`                                       | Emitted once on a clean session exit (EOF / `/exit`); `turns` is the turn count. |
 
 `input_tokens` / `output_tokens` are the provider-reported token counts for the
@@ -77,10 +82,12 @@ can be skipped; `baton log` itself does this (emitting a stderr warning naming
 the line), so an unclean shutdown never bricks the whole trail. The event trail
 is auxiliary observability — it is written to the configured file
 only, never to stdout, and a failed log write degrades to a stderr warning
-rather than failing the command. The schema is per-exchange: each line is one
-request or one outcome, and a session turn's `request` carries that turn's user
-input as `prompt` (the full accumulated history is not aggregated into a single
-schema object).
+rather than failing the command. Provider-call records are per-exchange: each
+provider call has one request and one outcome, and a session turn's `request`
+carries that turn's user input as `prompt` (the full accumulated history is not
+aggregated into a single schema object). Standalone `message_sent` /
+`reply_consumed` lines record mailbox delivery and reply consumption; they have
+no provider-call request/outcome pair.
 
 ### Session trail
 

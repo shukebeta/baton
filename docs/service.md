@@ -62,10 +62,12 @@ without ever sharing a process tree with it.
   versions still parse.
 - `sessions/<id>.json` — one durable session record per session (its
   effective spec, real PID, canonical `started_at` string, and on Windows its
-  optional Job Object name). `status`/`stop`/`teardown` read
-  this directly and act on the OS process by PID — none of them need `run` to
-  be alive, so a session started by a since-crashed `run` can still be
-  inspected, stopped, or torn down.
+  optional Job Object name). On Unix, `sessions/<id>/stderr.log` is the
+  session daemon's durable stderr log; warnings from mailbox parsing and
+  session recording are written there. `status`/`stop`/`teardown` read
+  the record directly and act on the OS process by PID — none of them need
+  `run` to be alive, so a session started by a since-crashed `run` can still
+  be inspected, stopped, or torn down.
 
 ## Lifecycle contract
 
@@ -86,11 +88,16 @@ baton service teardown --control <dir> [--force]
   response to the waiting client, and any remaining failure — a malformed
   spec, an unexpected fault, a response it could not deliver — logs a warning
   and never crashes the loop for the sessions it already owns.
-- **`service start`** takes exactly the flags `baton serve` itself takes (they
-  become the session's `SessionSpec`, reconstructed into an equivalent
-  `baton serve` argv by `run`). It submits the spec and returns a session id
-  as soon as `run` has spawned the child and persisted its record — it never
-  waits on a served turn. Fails fast, with a clear error, if no `service run`
+- **`service start`** accepts the session-shaping subset of `baton serve`'s
+  flags shown in the synopsis above (`--poll-ms`, `--agent-*`, and `--role`),
+  alongside its required `--control`, `--inbox`, and `--outbox` options. The
+  session-shaping flags become the session's `SessionSpec`, reconstructed into
+  an equivalent `baton serve` argv by `run`. Direct `baton serve` lifecycle
+  flags such as `--once` and `--stop` are not accepted; service-managed
+  lifecycle is handled by `service run`, `service stop`, and `service teardown`.
+  It submits the spec and returns a session id as soon as `run` has spawned the
+  child and persisted its record — it never waits on a served turn.
+  Fails fast, with a clear error, if no `service run`
   is currently live on `--control`, rather than hanging on a request no one
   will ever answer. Relative `--inbox`, `--outbox`, and `--agent-cwd` values
   are resolved against the submitting client's current working directory and
@@ -106,7 +113,9 @@ baton service teardown --control <dir> [--force]
 - **`service status`** reports the service's own liveness plus every session's
   (or just `--session <id>`'s). Each record retains the compatibility boolean
   `live` (`true` only for `liveness: "live"`) and exposes the full
-  `liveness` state. Per-session liveness checks the recorded PID against
+  `liveness` state plus `stderr_path`, the path to the Unix session daemon's
+  captured stderr log (`sessions/<id>/stderr.log`). Per-session liveness
+  checks the recorded PID against
   `/proc/<pid>` on Linux — alive, not a zombie, and its start time still
   matches the record — so a PID recycled after a restart is `dead`. On macOS,
   records with `start_epoch_secs` compare that canonical epoch directly and
@@ -165,7 +174,8 @@ baton service teardown --control <dir> [--force]
 
 ### Liveness resolution and safe cleanup
 
-Status exposes three identity outcomes for a running record:
+For a session record, and for the directly recorded PID portion of a task,
+status exposes three identity outcomes:
 
 - `live` means the process is present and its PID identity is corroborated.
 - `dead` means the PID is absent, a zombie, or positively belongs to a
@@ -173,6 +183,15 @@ Status exposes three identity outcomes for a running record:
 - `unresolved` means the PID exists but the available identity evidence is
   unreadable or insufficient. It is fail-closed: no signal, removal, or failed
   terminal state is inferred from it.
+
+Unix tasks add process-group execution liveness on top of that direct-PID
+identity. A task remains `live` while its corroborated direct PID or a
+non-zombie member of its recorded process group is live. Therefore a task
+whose direct PID is gone or zombie can still report `live` while a same-group
+descendant remains. An incomplete `/proc` or `ps` group scan reports
+`unresolved`; only a complete scan showing no live member, or a confirming
+group-absence probe, reports the task as drained/dead. A PID-reuse or missing
+zombie identity never authorizes a process-group probe.
 
 The resolution ladder is platform-specific:
 
@@ -325,6 +344,13 @@ baton task cancel --control <dir> --task <id>
   terminates the task's Job Object on Windows or process group on Unix, so the
   resulting terminal event reads `cancelled` rather than `failed`. It is a
   no-op success if the task is already gone.
+- **Unix task draining** treats the task's process group as the ownership and
+  reaping boundary. If the direct command exits while a same-group descendant
+  remains, the durable task record stays `running`; status, cancellation, and
+  max-duration enforcement continue to track and signal that group. The task
+  becomes terminal only after the group drains, matching Windows' Job Object
+  active-process-count behavior. A descendant that detaches into another
+  process group is outside this boundary.
 
 ### Supervisor restart reconciliation
 
@@ -339,20 +365,23 @@ described above, so a live exec-replaced task remains tracked instead of being
 finalized as failed.
 
 The restarted supervisor cannot recover a `std::process::Child` handle for a
-task reparented to init. It therefore tracks a corroborated PID directly:
-milestones and timeout signals continue while the PID is `live`, and the task
-is finalized when that PID is `dead`. A missing Job Object no longer changes a
-matching PID to `unresolved`; it only changes termination from tree-wide to
-PID-only, with a descendants-may-survive warning. An `unresolved` task remains
-tracked and is not signalled or finalized as failed until a later probe
-resolves its identity. No exit status can be recovered through this path, so
-a rehydrated task that is already gone or later finishes is recorded as
-`failed` with `exit_code: null`; a timeout or cancellation remains `timeout`
-or `cancelled` when the supervisor initiated that outcome. State is persisted
-before the deterministic terminal callback is delivered, and a delivery
-failure leaves the tracker in place to retry the same event id. A terminal
-record is replayed once on the next startup for the same reason; the mailbox's
-done ledger drops it if delivery already completed.
+task reparented to init. It therefore tracks a corroborated PID directly and,
+on Unix, the recorded process group as well: milestones and timeout signals
+continue while either the direct PID or a same-group descendant is live. A
+rehydrated Unix task whose direct PID is gone but whose group still has a
+member remains `running`; an unresolved group probe is retained and never
+treated as drained. Once the group is drained, no exit status can be
+recovered through this path, so the task is recorded as `failed` with
+`exit_code: null`; a timeout or cancellation remains `timeout` or `cancelled`
+when the supervisor initiated that outcome. On Windows, the equivalent Job
+Object active-process count continues to define the drain boundary. A missing
+Job Object no longer changes a matching PID to `unresolved`; it only changes
+termination from tree-wide to PID-only, with a descendants-may-survive
+warning. State is persisted before the deterministic terminal callback is
+delivered, and a delivery failure leaves the tracker in place to retry the
+same event id. A terminal record is replayed once on the next startup for the
+same reason; the mailbox's done ledger drops it if delivery already
+completed.
 
 Prepared admissions are not active tasks: startup reconciliation owns their
 cleanup, and `rehydrate_tasks` excludes them from the in-memory tracker. If a
