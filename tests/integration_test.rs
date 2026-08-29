@@ -39,6 +39,7 @@ const SUCCESS_BODY: &str = r#"{
     "usage": {"input_tokens": 9, "output_tokens": 3}
 }"#;
 
+#[cfg(unix)]
 const INTEGRATION_TEST_DEADLINE_SCALE_ENV: &str = "BATON_INTEGRATION_TEST_DEADLINE_SCALE";
 const INTEGRATION_TEST_DEADLINE_BASE_SECS: u64 = 5;
 const INTEGRATION_TEST_DEADLINE_DEFAULT_SCALE: u64 = 1;
@@ -48,6 +49,7 @@ const INTEGRATION_TEST_DEADLINE_MAX_SCALE: u64 = 60;
 /// `BATON_INTEGRATION_TEST_DEADLINE_SCALE` integer. Values from 1 through 60
 /// are accepted; unset, malformed, non-positive, and out-of-range values all
 /// fall back to 1.
+#[cfg(unix)]
 fn integration_test_deadline() -> std::time::Instant {
     let raw_scale = std::env::var(INTEGRATION_TEST_DEADLINE_SCALE_ENV).ok();
     std::time::Instant::now() + integration_test_deadline_duration(raw_scale.as_deref())
