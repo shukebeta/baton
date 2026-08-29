@@ -342,11 +342,14 @@ baton task cancel --control <dir> --task <id>
   directory; an absolute path is preserved unchanged. The resolved path is
   persisted in the task record before the service spawns the command. If the
   flag is omitted, the command inherits the service's working directory.
-- **`--milestone-ms <n>` is opaque to baton.** The core carries no default
-  duration set and no cadence semantics; a caller supplies whichever
-  durations (elapsed ms since spawn) it wants an event at, or none. The same
-  timer that enforces `--max-duration-ms` also fires milestones, so there is
-  no separate scheduler subsystem and no consumer-side polling requirement.
+- **`--milestone-ms <n>` is opaque to baton except for ordering validation.**
+  Supplied durations (elapsed ms since spawn) must be strictly ascending; zero
+  or more values are allowed, but duplicates and decreases are rejected as a
+  usage error. The core carries no default duration set and no cadence
+  semantics; a caller supplies whichever durations it wants an event at, or
+  none. The same timer that enforces `--max-duration-ms` also fires milestones,
+  so there is no separate scheduler subsystem and no consumer-side polling
+  requirement.
 - **`--callback-inbox <dir>` / `--callback-role <name>`** address a mailbox
   root exactly like every other `baton` surface (`SessionSpec.inbox`,
   `send --to`, …): `inbox` is where events land, `role` is an optional
