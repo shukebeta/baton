@@ -7313,7 +7313,9 @@ impl TempHome {
         std::fs::write(dir.join("config.json"), config).expect("write role config");
     }
 
-    /// The `roles/<role>/sessions/<conversation>.jsonl` seat trail.
+    /// The `roles/<role>/sessions/<conversation>.jsonl` seat trail. Only the
+    /// Unix-gated external-agent test reads a recorded seat session.
+    #[cfg(unix)]
     fn session_path(&self, role: &str, conversation: &str) -> PathBuf {
         self.path
             .join("roles")
