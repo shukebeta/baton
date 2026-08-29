@@ -2485,7 +2485,14 @@ fn service_liveness_keys_ignore_supervisor_and_client_environment() {
         "cross-environment teardown removes every session record"
     );
     let session_records = std::fs::read_dir(control.join("sessions"))
-        .map(|entries| entries.filter_map(|entry| entry.ok()).count())
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry.path().extension().and_then(|ext| ext.to_str()) == Some("json")
+                })
+                .count()
+        })
         .unwrap_or(0);
     assert_eq!(session_records, 0, "teardown removes every session record");
 }
@@ -3196,6 +3203,143 @@ fn service_session_survives_submitting_client_and_is_owned_by_run() {
     assert_eq!(reply.body, "hello from the mock server");
 
     // Teardown reaps the session and stops `Run` cooperatively; wait it out.
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str])
+        .output()
+        .expect("run baton service teardown");
+    assert!(
+        teardown.status.success(),
+        "teardown should exit 0; stderr: {}",
+        String::from_utf8_lossy(&teardown.stderr)
+    );
+    let run_status = run_child.wait().expect("baton service run exits");
+    assert!(run_status.success(), "service run exits 0 on teardown");
+}
+
+/// Issue #196 regression: a service-owned session keeps a durable stderr log
+/// and exposes its path through `service status`, so warnings from malformed
+/// mailbox messages remain inspectable after the message is moved to `done/`.
+#[cfg(unix)]
+#[test]
+fn service_session_captures_daemon_stderr_in_status_path() {
+    let root = TempMailbox::new("service-session-stderr");
+    let control = root.path.join("control");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+    let control_str = control.to_str().unwrap();
+
+    let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
+    run.args(["service", "run", "--control", control_str]);
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::null());
+    let mut run_child = run.spawn().expect("spawn baton service run");
+
+    let mut live = false;
+    for _ in 0..100 {
+        if let Ok(status) = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(["service", "status", "--control", control_str])
+            .output()
+            && status.status.success()
+            && String::from_utf8_lossy(&status.stdout).contains("\"service_running\":true")
+        {
+            live = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(live, "baton service run did not report live in time");
+
+    let start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str,
+            "--inbox",
+            inbox.to_str().unwrap(),
+            "--outbox",
+            outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+            "--agent-cmd",
+            "sh",
+            "--agent-arg",
+            "-c",
+            "--agent-arg",
+            "cat >/dev/null",
+        ])
+        .output()
+        .expect("run baton service start");
+    assert!(
+        start.status.success(),
+        "service start should exit 0; stderr: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let session_id = String::from_utf8_lossy(&start.stdout).trim().to_string();
+    assert!(!session_id.is_empty(), "service start prints a session id");
+
+    let pending = inbox.join("pending");
+    let mut inbox_ready = false;
+    for _ in 0..100 {
+        if pending.is_dir() {
+            inbox_ready = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(inbox_ready, "the session creates its mailbox");
+
+    let malformed = pending.join("malformed.json");
+    std::fs::write(&malformed, b"not a message envelope").expect("write malformed mailbox message");
+    let done = inbox.join("done").join("malformed.json");
+    let mut dropped = false;
+    for _ in 0..100 {
+        if done.is_file() {
+            dropped = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(dropped, "the daemon moves the malformed message to done");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "status",
+            "--control",
+            control_str,
+            "--session",
+            &session_id,
+        ])
+        .output()
+        .expect("run baton service status");
+    assert!(
+        status.status.success(),
+        "service status should exit 0; stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status is JSON");
+    let session = &status_json["sessions"][0];
+    let stderr_path = session["stderr_path"]
+        .as_str()
+        .expect("status exposes the session stderr path");
+    let expected_stderr = control
+        .join("sessions")
+        .join(&session_id)
+        .join("stderr.log");
+    assert_eq!(
+        Path::new(stderr_path),
+        expected_stderr.as_path(),
+        "status exposes the per-session stderr log"
+    );
+    let stderr = std::fs::read_to_string(stderr_path).expect("read session stderr log");
+    assert!(
+        stderr.contains("warning: dropping unparseable mailbox message")
+            && stderr.contains("malformed"),
+        "the malformed-message warning is durable: {stderr:?}"
+    );
+
     let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
         .args(["service", "teardown", "--control", control_str])
         .output()
@@ -5681,7 +5825,14 @@ fn service_teardown_closes_admission_before_draining_sessions() {
         "teardown leaves no managed sessions"
     );
     let session_records = std::fs::read_dir(control.join("sessions"))
-        .map(|entries| entries.filter_map(|entry| entry.ok()).count())
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry.path().extension().and_then(|ext| ext.to_str()) == Some("json")
+                })
+                .count()
+        })
         .unwrap_or(0);
     assert_eq!(session_records, 0, "teardown removes every session record");
 }
