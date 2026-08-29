@@ -24,6 +24,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use baton::config::{BatonConfig, Credential, DEFAULT_MAX_TOKENS};
 use baton::error::BatonError;
+use baton::message::{MessageEnvelope, MessageKind};
 use baton::model::Prompt;
 use baton::transport::Transport;
 use baton::transport::claude::ANTHROPIC_VERSION;
@@ -7090,4 +7091,193 @@ fn service_task_rejects_missing_and_stale_owners_before_spawn() {
     );
     let run_status = run_child.wait().expect("baton service run exits");
     assert!(run_status.success(), "service run exits 0 on teardown");
+}
+
+// -----------------------------------------------------------------------------
+// `baton log merge` end-to-end (issue #208)
+//
+// The merge command's glue — trail discovery (`trail_files_at` directory
+// expansion + stat errors) and the stderr-warning surfacing in
+// `read_message_trails` — has no coverage: `merge_conversation` and the CLI
+// parser are each tested in isolation, but nothing drives the binary across the
+// seam. These tests do, each against temp `baton.message/v1` trail files.
+// -----------------------------------------------------------------------------
+
+/// A temp directory for trail-file fixtures, removed on drop. Named by pid + a
+/// per-test tag so concurrent tests never collide (mirrors `TempEventLog`).
+struct TempTrailDir {
+    dir: PathBuf,
+}
+
+impl TempTrailDir {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("baton-merge-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp trail dir");
+        Self { dir }
+    }
+
+    /// Writes `lines` as a newline-terminated trail file and returns its path.
+    fn write(&self, name: &str, lines: &[String]) -> PathBuf {
+        let path = self.dir.join(name);
+        let mut content = lines.join("\n");
+        content.push('\n');
+        std::fs::write(&path, content).expect("write trail file");
+        path
+    }
+
+    /// Creates (empty) a fresh subdirectory and returns its path.
+    fn subdir(&self, name: &str) -> PathBuf {
+        let path = self.dir.join(name);
+        std::fs::create_dir_all(&path).expect("create trail subdir");
+        path
+    }
+}
+
+impl Drop for TempTrailDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Serializes one `baton.message/v1` envelope line for a trail fixture.
+fn trail_line(id: &str, convo: &str, reply_to: Option<&str>, ts_ms: u64, body: &str) -> String {
+    let mut envelope =
+        MessageEnvelope::new(id, convo, "alice", "bob", MessageKind::Request, body, ts_ms);
+    envelope.in_reply_to = reply_to.map(String::from);
+    serde_json::to_string(&envelope).expect("serialize envelope")
+}
+
+/// Runs `baton log merge --conversation <convo> <paths>...`.
+fn run_log_merge(convo: &str, paths: &[&Path]) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_baton"));
+    cmd.args(["log", "merge", "--conversation", convo]);
+    for path in paths {
+        cmd.arg(path);
+    }
+    cmd.output().expect("run baton log merge")
+}
+
+/// Two trails hold one conversation's envelopes out of causal order; the merge
+/// emits them in reply-chain order (m1 → m2 → m3), not file/concatenation order.
+#[test]
+fn log_merge_orders_by_reply_chain_across_files() {
+    let tmp = TempTrailDir::new("causal");
+    let convo = "c-208-causal";
+    let m1 = trail_line("m1", convo, None, 1000, "first");
+    let m2 = trail_line("m2", convo, Some("m1"), 2000, "second");
+    let m3 = trail_line("m3", convo, Some("m2"), 3000, "third");
+    // File a.jsonl concatenates as [m3, m1]; b.jsonl holds [m2]. Read order is
+    // therefore m3, m1, m2 — deliberately not the causal order.
+    let a = tmp.write("a.jsonl", &[m3, m1]);
+    let b = tmp.write("b.jsonl", &[m2]);
+
+    let out = run_log_merge(convo, &[&a, &b]);
+    assert!(
+        out.status.success(),
+        "merge exits 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+
+    let p_first = stdout.find("body: first").expect("m1 body present");
+    let p_second = stdout.find("body: second").expect("m2 body present");
+    let p_third = stdout.find("body: third").expect("m3 body present");
+    assert!(
+        p_first < p_second && p_second < p_third,
+        "reply-chain order (first < second < third), not file order; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("#1  "),
+        "blocks are numbered from #1; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("in_reply_to: —"),
+        "root envelope renders an em-dash reply link; stdout:\n{stdout}"
+    );
+}
+
+/// A directory argument expands to its sorted file entries, so envelopes split
+/// across files inside it all appear in the merged output.
+#[test]
+fn log_merge_expands_directory_argument() {
+    let tmp = TempTrailDir::new("dir");
+    let convo = "c-208-dir";
+    let dir = tmp.subdir("trails");
+    let m1 = trail_line("d1", convo, None, 1000, "alpha");
+    let m2 = trail_line("d2", convo, Some("d1"), 2000, "beta");
+    std::fs::write(dir.join("a.jsonl"), format!("{m1}\n")).expect("write a.jsonl");
+    std::fs::write(dir.join("b.jsonl"), format!("{m2}\n")).expect("write b.jsonl");
+
+    let out = run_log_merge(convo, &[&dir]);
+    assert!(
+        out.status.success(),
+        "merge exits 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    assert!(
+        stdout.contains("body: alpha"),
+        "envelope from a.jsonl present; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("body: beta"),
+        "envelope from b.jsonl present; stdout:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("in_reply_to:").count(),
+        2,
+        "both directory envelopes rendered; stdout:\n{stdout}"
+    );
+}
+
+/// A malformed line in one trail surfaces a `warning:` on stderr naming that
+/// file, while the merge still succeeds and prints the good envelopes.
+#[test]
+fn log_merge_warns_on_malformed_line_but_still_merges() {
+    let tmp = TempTrailDir::new("malformed");
+    let convo = "c-208-malformed";
+    let good1 = trail_line("g1", convo, None, 1000, "good-one");
+    let good2 = trail_line("g2", convo, Some("g1"), 2000, "good-two");
+    // a.jsonl holds a valid envelope followed by a line that is not JSON.
+    let a = tmp.write("a.jsonl", &[good1, "this is not json".to_string()]);
+    let b = tmp.write("b.jsonl", &[good2]);
+
+    let out = run_log_merge(convo, &[&a, &b]);
+    assert!(
+        out.status.success(),
+        "a malformed line is non-fatal; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+    assert!(
+        stdout.contains("body: good-one") && stdout.contains("body: good-two"),
+        "good envelopes still merged; stdout:\n{stdout}"
+    );
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    assert!(
+        stderr.contains("warning:"),
+        "warning surfaced; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("a.jsonl"),
+        "warning names the offending file; stderr:\n{stderr}"
+    );
+}
+
+/// A nonexistent merge argument exits non-zero with the `failed to stat`
+/// message.
+#[test]
+fn log_merge_nonexistent_path_is_stat_error() {
+    let tmp = TempTrailDir::new("missing");
+    let convo = "c-208-missing";
+    let missing = tmp.dir.join("does-not-exist.jsonl");
+
+    let out = run_log_merge(convo, &[&missing]);
+    assert!(!out.status.success(), "a missing path exits non-zero");
+    let stderr = String::from_utf8(out.stderr).expect("utf8 stderr");
+    assert!(
+        stderr.contains("failed to stat"),
+        "stat error surfaced; stderr:\n{stderr}"
+    );
 }
