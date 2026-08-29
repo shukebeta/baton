@@ -1,6 +1,6 @@
 [package]
 name = "baton"
-version = "0.3.32"
+version = "0.3.33"
 edition = "2024"
 # The file-lock API (`File::try_lock`/`unlock`) used by the serve mailbox
 # stabilized in std at 1.89.0. `edition = "2024"` already floors the toolchain
