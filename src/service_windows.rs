@@ -1445,7 +1445,7 @@ fn reconcile_task_admissions(control: &Path) -> Result<()> {
                 remove_task_start_ack(control, request_id)?;
                 if rollback {
                     wait_for_test_task_rollback_cleanup_barrier(
-                        "BATON_TEST_TASK_ROLLBACK_RECONCILE_BARRIER",
+                        TEST_TASK_ROLLBACK_RECONCILE_BARRIER,
                     );
                 }
                 remove_task_start_rollback(control, request_id)?;
@@ -1471,9 +1471,7 @@ fn reconcile_task_admissions(control: &Path) -> Result<()> {
             discard_pending_task_start_request(control, request_id)?;
             remove_task_start_response_files(control, request_id)?;
             remove_task_start_ack(control, request_id)?;
-            wait_for_test_task_rollback_cleanup_barrier(
-                "BATON_TEST_TASK_ROLLBACK_RECONCILE_BARRIER",
-            );
+            wait_for_test_task_rollback_cleanup_barrier(TEST_TASK_ROLLBACK_RECONCILE_BARRIER);
             remove_task_start_rollback(control, request_id)?;
             continue;
         }
@@ -1553,9 +1551,7 @@ fn reconcile_task_admissions(control: &Path) -> Result<()> {
             discard_pending_task_start_request(control, &request_id)?;
             remove_task_start_response_files(control, &request_id)?;
             remove_task_start_ack(control, &request_id)?;
-            wait_for_test_task_rollback_cleanup_barrier(
-                "BATON_TEST_TASK_ROLLBACK_RECONCILE_BARRIER",
-            );
+            wait_for_test_task_rollback_cleanup_barrier(TEST_TASK_ROLLBACK_RECONCILE_BARRIER);
         }
         if !retained_rollbacks.contains(&request_id) {
             remove_task_start_rollback(control, &request_id)?;
@@ -1771,7 +1767,7 @@ fn process_one_task_request(
                     if task_start_rollback_exists(control, &key)? {
                         discard_pending_task_start_request(control, &key)?;
                         wait_for_test_task_rollback_cleanup_barrier(
-                            "BATON_TEST_TASK_ROLLBACK_REQUEST_BARRIER",
+                            TEST_TASK_ROLLBACK_REQUEST_BARRIER,
                         );
                         remove_task_start_rollback(control, &key)?;
                         return Ok(None);
@@ -1954,7 +1950,10 @@ fn handle_task_start_request(
 /// Test-only synchronization seam for the post-record/pre-response crash
 /// regression. A service launched with this environment variable waits
 /// after persisting the prepared record until the named path disappears;
-/// production callers never set it.
+/// production callers never set it. This helper is compiled only with debug
+/// assertions; release builds use the no-op fallback below so the test seam
+/// cannot affect a shipped service.
+#[cfg(debug_assertions)]
 fn wait_for_test_task_admission_barrier() {
     let Some(path) = std::env::var_os("BATON_TEST_TASK_ADMISSION_BARRIER") else {
         return;
@@ -1965,10 +1964,15 @@ fn wait_for_test_task_admission_barrier() {
     }
 }
 
+#[cfg(not(debug_assertions))]
+fn wait_for_test_task_admission_barrier() {}
+
 /// Test-only synchronization seam for the response/phase boundary. A
 /// service launched with this environment variable waits after publishing
 /// the response while still holding the admission lock; production callers
-/// never set it.
+/// never set it. This helper is compiled only with debug assertions; the
+/// release fallback is a no-op.
+#[cfg(debug_assertions)]
 fn wait_for_test_task_response_phase_barrier() {
     let Some(path) = std::env::var_os("BATON_TEST_TASK_RESPONSE_PHASE_BARRIER") else {
         return;
@@ -1979,9 +1983,14 @@ fn wait_for_test_task_response_phase_barrier() {
     }
 }
 
+#[cfg(not(debug_assertions))]
+fn wait_for_test_task_response_phase_barrier() {}
+
 /// Test-only synchronization seam for the response claim/ack boundary. A
 /// task-start client waits after persisting its acknowledgement and before
-/// removing the private claim; production callers never set it.
+/// removing the private claim; production callers never set it. This helper
+/// is compiled only with debug assertions; the release fallback is a no-op.
+#[cfg(debug_assertions)]
 fn wait_for_test_task_start_ack_barrier() {
     let Some(path) = std::env::var_os("BATON_TEST_TASK_START_ACK_BARRIER") else {
         return;
@@ -1992,10 +2001,25 @@ fn wait_for_test_task_start_ack_barrier() {
     }
 }
 
+#[cfg(not(debug_assertions))]
+fn wait_for_test_task_start_ack_barrier() {}
+
+#[cfg(debug_assertions)]
+const TEST_TASK_ROLLBACK_RECONCILE_BARRIER: &str = "BATON_TEST_TASK_ROLLBACK_RECONCILE_BARRIER";
+#[cfg(not(debug_assertions))]
+const TEST_TASK_ROLLBACK_RECONCILE_BARRIER: &str = "";
+
+#[cfg(debug_assertions)]
+const TEST_TASK_ROLLBACK_REQUEST_BARRIER: &str = "BATON_TEST_TASK_ROLLBACK_REQUEST_BARRIER";
+#[cfg(not(debug_assertions))]
+const TEST_TASK_ROLLBACK_REQUEST_BARRIER: &str = "";
+
 /// Test-only synchronization seam for rollback cleanup ordering. A
 /// service launched with one of the named environment variables waits
 /// after request/record cleanup and before removing the rollback marker;
-/// production callers never set it.
+/// production callers never set it. This helper is compiled only with debug
+/// assertions; the release fallback is a no-op.
+#[cfg(debug_assertions)]
 fn wait_for_test_task_rollback_cleanup_barrier(variable: &str) {
     let Some(path) = std::env::var_os(variable) else {
         return;
@@ -2006,11 +2030,18 @@ fn wait_for_test_task_rollback_cleanup_barrier(variable: &str) {
     }
 }
 
+#[cfg(not(debug_assertions))]
+fn wait_for_test_task_rollback_cleanup_barrier(_variable: &str) {}
+
 fn write_task_start_response(
     control: &Path,
     request_id: &str,
     response: &TaskStartResponse,
 ) -> Result<()> {
+    // This failure injection is needed by integration tests, whose
+    // test-built binary has debug assertions enabled. Keep the release
+    // binary free of the test environment seam.
+    #[cfg(debug_assertions)]
     if let Some(path) = std::env::var_os("BATON_TEST_TASK_START_RESPONSE_WRITE_FAILURE") {
         let path = std::path::PathBuf::from(path);
         match fs::remove_file(&path) {
