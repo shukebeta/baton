@@ -139,7 +139,10 @@ struct ErrRecord {
 /// here rather than printing them, leaving stderr emission to the caller.
 #[derive(Debug, Default)]
 pub struct ParseReport {
-    /// Complete request/outcome pairs, in file order.
+    /// Complete request/outcome pairs, in outcome-completion order — the order
+    /// each pair's outcome line was read. For a single-writer trail this is file
+    /// order; when concurrent writers interleave, a correlated pair is yielded
+    /// when its outcome lands, which may differ from its request's position.
     pub exchanges: Vec<Exchange>,
     /// Non-fatal diagnostics, in the order they were encountered.
     pub warnings: Vec<String>,
@@ -149,8 +152,14 @@ pub struct ParseReport {
 /// values plus any non-fatal warnings.
 ///
 /// Each non-blank line is parsed as a standalone JSON object and dispatched on
-/// its `event` tag. A `request` opens a pending exchange; the next outcome line
-/// (`response_ok` / `response_error`) closes it. Behaviour at the edges:
+/// its `event` tag. A `request` opens a pending exchange; the next matching
+/// outcome line (`response_ok` / `response_error`) closes it. Pairing mirrors
+/// [`parse_sessions`]: a `request`/outcome carrying a correlation key
+/// (`message_id`, or a session turn's `session_id` + `turn_index`) pairs through
+/// that key, so several exchanges can be in flight at once when processes share
+/// one trail (#203); a line with neither field pairs by file order through a
+/// single fallback slot, preserving legacy single-writer trails. Behaviour at
+/// the edges:
 ///
 /// - **Unknown `event` tag** (or a line with no `event`): skipped without error,
 ///   so a log written by a newer Baton still parses.
@@ -165,8 +174,14 @@ pub struct ParseReport {
 ///   caller can surface it, and the exchanges already parsed are still yielded.
 ///   The same failure on any newline-terminated line is genuine corruption and
 ///   stays a hard error.
-/// - **Dangling outcome** (no preceding request) or a **trailing request** with
-///   no outcome: not yielded — only complete pairs become an [`Exchange`].
+/// - **Overwritten uncorrelated request**: a second request carrying no
+///   correlation fields, arriving before the previous uncorrelated request's
+///   outcome, records a [`ParseReport::warnings`] entry (the older bug silently
+///   dropped it) — the sign of concurrent writers on a legacy trail.
+/// - **Dangling outcome** (no matching pending request): not yielded, and records
+///   a [`ParseReport::warnings`] entry rather than dropping silently.
+/// - **Trailing request** with no outcome (a torn tail or an in-flight call): not
+///   yielded and not warned — only complete pairs become an [`Exchange`].
 ///
 /// The function is pure over its [`Read`] argument: warnings are returned in the
 /// [`ParseReport`] rather than printed, so callers (and unit tests) decide how
@@ -174,7 +189,15 @@ pub struct ParseReport {
 pub fn parse_jsonl<R: Read>(reader: R) -> Result<ParseReport> {
     let mut buffered = BufReader::new(reader);
     let mut report = ParseReport::default();
-    let mut pending: Option<RequestRecord> = None;
+    // Correlated exchanges (an ask/serve `message_id`, or a session turn's
+    // `session_id` + `turn_index`) pair through this map; several can be pending
+    // at once when processes share one trail (#203, mirroring `parse_sessions`).
+    let mut pending_by_correlation: HashMap<String, RequestRecord> = HashMap::new();
+    // Legacy single-writer trails carry no correlation fields; keep the old
+    // file-order single slot for them. Only one such request can be safely
+    // pending at a time — a second overwriting it is exactly the interleaving
+    // data-loss bug, now reported instead of dropped.
+    let mut pending_uncorrelated: Option<RequestRecord> = None;
     let mut buf: Vec<u8> = Vec::new();
     let mut line_no = 0usize;
 
@@ -214,13 +237,32 @@ pub fn parse_jsonl<R: Read>(reader: R) -> Result<ParseReport> {
 
         match value.get("event").and_then(Value::as_str) {
             Some("request") => {
+                // The key must be read before `value` is consumed by `from_value`.
+                let key = correlation_key(&value);
                 let record: RequestRecord = from_value(value, line_no, "request")?;
-                pending = Some(record);
+                match key {
+                    Some(key) => {
+                        pending_by_correlation.insert(key, record);
+                    }
+                    None => {
+                        if let Some(overwritten) = pending_uncorrelated.replace(record) {
+                            report.warnings.push(format!(
+                                "line {line_no}: a request with no correlation fields arrived \
+                                 before the previous uncorrelated request's outcome — the earlier \
+                                 exchange (prompt {:?}, ts_ms {}) cannot be reconstructed; \
+                                 concurrent writers to one event log need correlation fields",
+                                excerpt(&overwritten.prompt, 60),
+                                overwritten.ts_ms
+                            ));
+                        }
+                    }
+                }
             }
             Some("response_ok") => {
+                let key = correlation_key(&value);
                 let ok: OkRecord = from_value(value, line_no, "response_ok")?;
-                if let Some(request) = pending.take() {
-                    report.exchanges.push(Exchange {
+                match take_pending(&mut pending_by_correlation, &mut pending_uncorrelated, key) {
+                    Some(request) => report.exchanges.push(Exchange {
                         request,
                         outcome: Outcome::Ok {
                             ts_ms: ok.ts_ms,
@@ -229,13 +271,17 @@ pub fn parse_jsonl<R: Read>(reader: R) -> Result<ParseReport> {
                             input_tokens: ok.input_tokens,
                             output_tokens: ok.output_tokens,
                         },
-                    });
+                    }),
+                    None => report
+                        .warnings
+                        .push(dangling_outcome_warning(line_no, "response_ok")),
                 }
             }
             Some("response_error") => {
+                let key = correlation_key(&value);
                 let err: ErrRecord = from_value(value, line_no, "response_error")?;
-                if let Some(request) = pending.take() {
-                    report.exchanges.push(Exchange {
+                match take_pending(&mut pending_by_correlation, &mut pending_uncorrelated, key) {
+                    Some(request) => report.exchanges.push(Exchange {
                         request,
                         outcome: Outcome::Error {
                             ts_ms: err.ts_ms,
@@ -243,7 +289,10 @@ pub fn parse_jsonl<R: Read>(reader: R) -> Result<ParseReport> {
                             kind: err.kind,
                             message: err.message,
                         },
-                    });
+                    }),
+                    None => report
+                        .warnings
+                        .push(dangling_outcome_warning(line_no, "response_error")),
                 }
             }
             // Unknown or absent event tag: skip, staying forward-compatible.
@@ -252,6 +301,51 @@ pub fn parse_jsonl<R: Read>(reader: R) -> Result<ParseReport> {
     }
 
     Ok(report)
+}
+
+/// The pairing key for a `baton.exchange/v1` provider-call line, read from the
+/// raw JSON so the typed record mirrors stay untouched.
+///
+/// `message_id` (the ask/serve correlation id) takes precedence; failing that a
+/// session turn's `session_id` + `turn_index` pair keys it. A line carrying
+/// neither is uncorrelated — a legacy single-writer trail — and pairs by file
+/// order instead. The `m:` / `s:` prefixes keep the two key spaces disjoint.
+fn correlation_key(value: &Value) -> Option<String> {
+    if let Some(message_id) = value.get("message_id").and_then(Value::as_str) {
+        return Some(format!("m:{message_id}"));
+    }
+    match (
+        value.get("session_id").and_then(Value::as_str),
+        value.get("turn_index").and_then(Value::as_u64),
+    ) {
+        (Some(session_id), Some(turn_index)) => Some(format!("s:{session_id}:{turn_index}")),
+        _ => None,
+    }
+}
+
+/// Removes the pending request an outcome closes: its correlated entry when the
+/// outcome carries a key, else the file-order fallback slot. A correlated
+/// outcome never falls back to the uncorrelated slot — a missing keyed request
+/// is a genuine dangling outcome, not a mispairing candidate.
+fn take_pending(
+    pending_by_correlation: &mut HashMap<String, RequestRecord>,
+    pending_uncorrelated: &mut Option<RequestRecord>,
+    key: Option<String>,
+) -> Option<RequestRecord> {
+    match key {
+        Some(key) => pending_by_correlation.remove(&key),
+        None => pending_uncorrelated.take(),
+    }
+}
+
+/// Warning text for an outcome line with no matching pending request — a
+/// dangling outcome that is reported rather than dropped silently.
+fn dangling_outcome_warning(line_no: usize, event: &str) -> String {
+    format!(
+        "line {line_no}: a {event} outcome had no matching pending request (a dangling \
+         outcome) — its request may have been overwritten by a concurrent writer or lost; \
+         the outcome is not shown"
+    )
 }
 
 /// Deserializes a known event into `T`, mapping a shape mismatch onto a
@@ -1089,6 +1183,145 @@ mod tests {
             "the trailing unpaired request is dropped"
         );
         assert_eq!(exchanges[0].request.prompt, "first");
+    }
+
+    /// Two exchanges whose lines interleave (`req A / req B / ok B / ok A`) both
+    /// survive when they carry a `message_id` — the #203 fix. Before it, B's
+    /// request overwrote A's single pending slot and A's exchange vanished.
+    #[test]
+    fn parse_jsonl_pairs_interleaved_correlated_exchanges() {
+        let meta = crate::events::ExchangeMeta {
+            model: "m".to_string(),
+            base_url: "u".to_string(),
+        };
+        let trail = [
+            line(&ExchangeEvent::correlated_request(
+                1, &meta, "A", None, "m-A",
+            )),
+            line(&ExchangeEvent::correlated_request(
+                2, &meta, "B", None, "m-B",
+            )),
+            line(&ExchangeEvent::correlated_response_ok(
+                3,
+                1,
+                "rB",
+                &TokenUsage::default(),
+                "m-B",
+            )),
+            line(&ExchangeEvent::correlated_response_ok(
+                4,
+                1,
+                "rA",
+                &TokenUsage::default(),
+                "m-A",
+            )),
+        ]
+        .join("\n")
+            + "\n";
+
+        let report = parse_jsonl(Cursor::new(trail)).expect("parses");
+        assert_eq!(
+            report.exchanges.len(),
+            2,
+            "both interleaved exchanges are recovered"
+        );
+        assert!(
+            report.warnings.is_empty(),
+            "correlated pairs warn nothing: {:?}",
+            report.warnings
+        );
+        // Yielded in outcome-completion order: B closes first, then A.
+        assert_eq!(report.exchanges[0].request.prompt, "B");
+        assert_eq!(report.exchanges[1].request.prompt, "A");
+    }
+
+    /// The same interleaving with no correlation fields (a legacy trail written
+    /// by concurrent processes) cannot be reconstructed — but it is now reported
+    /// via warnings rather than dropped silently (AC #2).
+    #[test]
+    fn parse_jsonl_warns_instead_of_dropping_interleaved_uncorrelated() {
+        let meta = crate::events::ExchangeMeta {
+            model: "m".to_string(),
+            base_url: "u".to_string(),
+        };
+        let trail = [
+            line(&ExchangeEvent::request(1, &meta, "A")),
+            line(&ExchangeEvent::request(2, &meta, "B")),
+            line(&ExchangeEvent::response_ok(
+                3,
+                1,
+                "rB",
+                &TokenUsage::default(),
+            )),
+            line(&ExchangeEvent::response_ok(
+                4,
+                1,
+                "rA",
+                &TokenUsage::default(),
+            )),
+        ]
+        .join("\n")
+            + "\n";
+
+        let report = parse_jsonl(Cursor::new(trail)).expect("parses");
+        // B overwrote A's file-order slot, so only B pairs; A's request and its
+        // dangling outcome are each named in a warning.
+        assert_eq!(report.exchanges.len(), 1);
+        assert_eq!(report.exchanges[0].request.prompt, "B");
+        assert_eq!(
+            report.warnings.len(),
+            2,
+            "an overwrite warning and a dangling-outcome warning: {:?}",
+            report.warnings
+        );
+        assert!(
+            report.warnings[0].contains("line 2") && report.warnings[0].contains('A'),
+            "overwrite names the lost request: {}",
+            report.warnings[0]
+        );
+        assert!(
+            report.warnings[1].contains("line 4") && report.warnings[1].contains("dangling"),
+            "dangling outcome named: {}",
+            report.warnings[1]
+        );
+    }
+
+    /// A legacy single-writer trail (sequential, no correlation fields) parses to
+    /// the same exchanges as before, with no warnings — the backward-compat AC.
+    #[test]
+    fn parse_jsonl_legacy_sequential_trail_has_no_warnings() {
+        let meta = crate::events::ExchangeMeta {
+            model: "m".to_string(),
+            base_url: "u".to_string(),
+        };
+        let trail = [
+            line(&ExchangeEvent::request(1, &meta, "A")),
+            line(&ExchangeEvent::response_ok(
+                2,
+                1,
+                "rA",
+                &TokenUsage::default(),
+            )),
+            line(&ExchangeEvent::request(3, &meta, "B")),
+            line(&ExchangeEvent::response_ok(
+                4,
+                1,
+                "rB",
+                &TokenUsage::default(),
+            )),
+        ]
+        .join("\n")
+            + "\n";
+
+        let report = parse_jsonl(Cursor::new(trail)).expect("parses");
+        assert_eq!(report.exchanges.len(), 2);
+        assert!(
+            report.warnings.is_empty(),
+            "a sequential legacy trail warns nothing: {:?}",
+            report.warnings
+        );
+        assert_eq!(report.exchanges[0].request.prompt, "A");
+        assert_eq!(report.exchanges[1].request.prompt, "B");
     }
 
     #[test]
