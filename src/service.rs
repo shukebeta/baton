@@ -2426,11 +2426,10 @@ mod imp {
         } else if let Some(term_at) = running.term_sent_at_ms
             && !running.kill_sent
             && clock.now_ms().saturating_sub(term_at) >= KILL_GRACE_MS
+            && rehydrated_liveness != Some(Liveness::Dead)
         {
-            if rehydrated_liveness != Some(Liveness::Dead) {
-                let _ = signal_group(running.record.pid, "-KILL");
-                running.kill_sent = true;
-            }
+            let _ = signal_group(running.record.pid, "-KILL");
+            running.kill_sent = true;
         }
 
         match running.child.as_mut() {
