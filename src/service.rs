@@ -1836,11 +1836,12 @@ mod imp {
         /// init, so it is represented by `None` and polled by corroborated
         /// PID liveness instead of `Child::try_wait`.
         child: Option<Child>,
-        /// Most recent non-Linux liveness sample for a rehydrated task. The
+        /// Most recent non-Linux liveness sample for a rehydrated task, with
+        /// both injected-clock and monotonic wall-clock timestamps. The
         /// sample is intentionally in-memory: a restart must corroborate the
         /// durable PID again before making any decision about it.
         #[cfg(not(target_os = "linux"))]
-        rehydrated_liveness: Option<(u64, Liveness)>,
+        rehydrated_liveness: Option<(u64, Liveness, Instant)>,
         started_ms: u64,
         /// Set once this task's max duration has been exceeded and `SIGTERM`
         /// sent, so a later tick knows to escalate to `SIGKILL` after
@@ -2313,10 +2314,13 @@ mod imp {
         task_execution_liveness(&running.record)
     }
 
-    /// Returns one cached liveness sample for a rehydrated task. A forced
-    /// refresh is used immediately before timeout escalation so a stale live
-    /// sample can never authorize signalling a reused PID. The caller must
-    /// thread the returned value through the rest of the tick.
+    /// Returns one cached liveness sample for a rehydrated task. The injected
+    /// clock makes cadence tests deterministic; the monotonic timestamp also
+    /// expires a sample when an external process change occurs while that
+    /// clock is paused. A forced refresh is used immediately before timeout
+    /// escalation so a stale live sample can never authorize signalling a
+    /// reused PID. The caller must thread the returned value through the rest
+    /// of the tick.
     #[cfg(not(target_os = "linux"))]
     fn rehydrated_task_liveness(
         running: &mut RunningTask,
@@ -2326,12 +2330,18 @@ mod imp {
         let refresh = force_refresh
             || running
                 .rehydrated_liveness
-                .map(|(checked_ms, _)| {
+                .map(|(checked_ms, _, checked_at)| {
                     now_ms.saturating_sub(checked_ms) >= REHYDRATED_LIVENESS_CACHE_MS
+                        || checked_at.elapsed()
+                            >= Duration::from_millis(REHYDRATED_LIVENESS_CACHE_MS)
                 })
                 .unwrap_or(true);
         if refresh {
-            running.rehydrated_liveness = Some((now_ms, task_execution_liveness(&running.record)));
+            running.rehydrated_liveness = Some((
+                now_ms,
+                task_execution_liveness(&running.record),
+                Instant::now(),
+            ));
         }
         running
             .rehydrated_liveness
