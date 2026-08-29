@@ -197,16 +197,21 @@ non-zombie member of its recorded process group is live. Therefore a task
 whose direct PID is gone or zombie can still report `live` while a same-group
 descendant remains. An incomplete `/proc` or `ps` group scan reports
 `unresolved`; only a complete scan showing no live member, or a confirming
-group-absence probe, reports the task as drained/dead. A PID-reuse or missing
-zombie identity never authorizes a process-group probe.
+group-absence probe, reports the task as drained/dead. A `/proc` entry that
+disappears between the directory listing and its `stat` read does not make the
+scan incomplete: a pid that no longer exists cannot be a live member, so it is
+skipped, and unrelated host process churn therefore cannot force every scan to
+`unresolved`. An entry that is present but unreadable or unparseable still
+reports `unresolved`. A PID-reuse or missing zombie identity never authorizes
+a process-group probe.
 
 The resolution ladder is platform-specific:
 
-- On Linux, an unreadable `/proc/<pid>/stat` is `unresolved`; a missing PID or
-  zombie is `dead`; a matching start-time tick is `live`; and a mismatched
-  recorded tick is `dead`. A legacy session with no start key may use the
-  exact NUL-separated `/proc/<pid>/cmdline` argv as a corroborator. A legacy
-  task may use matching argv to confirm `live`, but a mismatch is only
+- On Linux, a present but unreadable `/proc/<pid>/stat` is `unresolved`; a
+  missing PID or zombie is `dead`; a matching start-time tick is `live`; and a
+  mismatched recorded tick is `dead`. A legacy session with no start key may
+  use the exact NUL-separated `/proc/<pid>/cmdline` argv as a corroborator. A
+  legacy task may use matching argv to confirm `live`, but a mismatch is only
   `unresolved`, because a task such as `bash -c ...` can exec-replace its argv
   while retaining the same PID. Linux has no epoch instant leg: `/proc` start
   ticks are relative to boot, and `/proc/<pid>` directory mtime is not a safe
