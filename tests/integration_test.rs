@@ -7281,3 +7281,499 @@ fn log_merge_nonexistent_path_is_stat_error() {
         "stat error surfaced; stderr:\n{stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `serve --role` end-to-end (#209)
+//
+// The role-host workflow documented in docs/mailbox.md and docs/external-agent.md
+// composes several separately-tested pieces: role-home identity resolution, the
+// role-supplied `--agent-cwd` fallback, the two participant backings, the
+// per-role seat-session recorder (#82), and the drain loop. These tests drive the
+// real binary against a temp `BATON_HOME` so a regression in the *composition*
+// fails here rather than shipping silently.
+// ---------------------------------------------------------------------------
+
+/// A unique self-cleaning temp `BATON_HOME` root, keyed by pid + tag.
+struct TempHome {
+    path: PathBuf,
+}
+
+impl TempHome {
+    fn new(tag: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("baton-home-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create temp baton home");
+        Self { path }
+    }
+
+    /// Writes `roles/<role>/config.json`, creating the role home on the way.
+    fn write_role_config(&self, role: &str, config: &str) {
+        let dir = self.path.join("roles").join(role);
+        std::fs::create_dir_all(&dir).expect("create role home");
+        std::fs::write(dir.join("config.json"), config).expect("write role config");
+    }
+
+    /// The `roles/<role>/sessions/<conversation>.jsonl` seat trail. Only the
+    /// Unix-gated external-agent test reads a recorded seat session.
+    #[cfg(unix)]
+    fn session_path(&self, role: &str, conversation: &str) -> PathBuf {
+        self.path
+            .join("roles")
+            .join(role)
+            .join("sessions")
+            .join(format!("{conversation}.jsonl"))
+    }
+}
+
+impl Drop for TempHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// A repeating loopback provider that answers every connection with
+/// `SUCCESS_BODY` and records each raw request, so a test can assert *which*
+/// model reached the provider. Returns the base URL and the shared capture.
+fn spawn_recording_provider() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::sync::{Arc, Mutex};
+
+    let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_for_thread = Arc::clone(&captured);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind recording provider");
+    let addr = listener.local_addr().expect("read local_addr");
+    let base_url = format!("http://{addr}");
+
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut stream) = conn else { break };
+            let buf = drain_request(&mut stream);
+            captured_for_thread
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&buf).into_owned());
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 content-type: application/json\r\n\
+                 content-length: {}\r\n\
+                 connection: close\r\n\
+                 \r\n\
+                 {SUCCESS_BODY}",
+                SUCCESS_BODY.len(),
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    (base_url, captured)
+}
+
+/// Strips every provider setting Baton reads from the environment, so a
+/// `serve --role` run resolves them from the role layer alone and can only reach
+/// the loopback mock. A full `env_clear()` is not usable here: on Windows a
+/// process without `SystemRoot` cannot initialise networking, so the host
+/// environment is kept and only the variables under test are removed. The caller
+/// sets whatever it wants back afterwards (later `env` calls win).
+fn strip_provider_env(cmd: &mut Command) -> &mut Command {
+    for var in [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "BATON_MODEL",
+        "BATON_SYSTEM_PROMPT",
+        "BATON_TIMEOUT_SECS",
+        "BATON_MAX_TOKENS",
+        "BATON_EVENT_LOG",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// Writes an executable `/bin/sh` stub that records its working directory, then
+/// answers with a fixed body — the `--agent-cmd` under test.
+#[cfg(unix)]
+fn write_cwd_recording_stub(path: &Path, reply: &str) {
+    std::fs::write(
+        path,
+        format!(
+            r#"#!/bin/sh
+set -eu
+cat > /dev/null
+pwd > "$BATON_TEST_CWD"
+printf '%s' '{reply}'
+"#
+        ),
+    )
+    .expect("write agent stub");
+    let mut permissions = std::fs::metadata(path)
+        .expect("stat agent stub")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).expect("make agent stub executable");
+}
+
+/// Sends one request into `inbox` and awaits its reply from `outbox`, with a
+/// hermetic (cleared) environment — `send` needs no provider configuration.
+fn send_awaiting_reply(
+    inbox: &Path,
+    outbox: &Path,
+    conversation: &str,
+    body: &str,
+) -> std::process::Output {
+    let mut send = Command::new(env!("CARGO_BIN_EXE_baton"));
+    send.args([
+        "send",
+        "--inbox",
+        inbox.to_str().unwrap(),
+        "--outbox",
+        outbox.to_str().unwrap(),
+        "--await",
+        "--timeout-ms",
+        "15000",
+        "--to",
+        "worker",
+        "--conversation",
+        conversation,
+        "--body",
+        body,
+    ]);
+    send.env_clear()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    send.output().expect("send mailbox request")
+}
+
+/// Stops a live `serve` daemon and reaps it, returning both outputs. Called
+/// before any assertion so a failure cannot leave a daemon behind.
+fn stop_and_reap(
+    inbox: &Path,
+    serve_child: std::process::Child,
+) -> (std::process::Output, std::process::Output) {
+    let stop = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["serve", "--stop", "--inbox", inbox.to_str().unwrap()])
+        .env_clear()
+        .output()
+        .expect("stop serve");
+    let served = serve_child.wait_with_output().expect("reap serve");
+    (stop, served)
+}
+
+/// The full external-agent role host: a `--role` resolves its home, the role
+/// config's `cwd` fills the unpassed `--agent-cwd`, the agent's reply is
+/// delivered to the outbox, and the exchange is recorded as this role's seat
+/// session under `roles/<r>/sessions/<conversation>.jsonl`.
+#[cfg(unix)]
+#[test]
+fn serve_role_external_agent_uses_role_cwd_and_records_seat_session() {
+    let home = TempHome::new("role-agent");
+    let root = TempMailbox::new("role-agent");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+    let stub = root.path.join("agent-stub");
+    let captured_cwd = root.path.join("agent-cwd.txt");
+    let role_cwd = root.path.join("role-workdir");
+    std::fs::create_dir_all(&role_cwd).expect("create role cwd");
+
+    write_cwd_recording_stub(&stub, "role agent reply");
+    home.write_role_config(
+        "worker",
+        &format!(r#"{{"cwd": "{}"}}"#, role_cwd.to_str().unwrap()),
+    );
+
+    let conversation = "c-209-agent";
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_baton"));
+    serve.args([
+        "serve",
+        "--role",
+        "worker",
+        "--inbox",
+        inbox.to_str().unwrap(),
+        "--outbox",
+        outbox.to_str().unwrap(),
+        "--poll-ms",
+        "10",
+        "--agent-cmd",
+        stub.to_str().unwrap(),
+    ]);
+    // Hermetic: only the home and the stub's capture path are inherited, so the
+    // role home is the only source of `cwd` and no host provider config leaks in.
+    serve
+        .env_clear()
+        .env("BATON_HOME", &home.path)
+        .env("BATON_TEST_CWD", &captured_cwd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let serve_child = serve.spawn().expect("spawn role external-agent serve");
+
+    let send_output = send_awaiting_reply(&inbox, &outbox, conversation, "hello role host");
+    let (stop, served) = stop_and_reap(&inbox, serve_child);
+
+    assert!(
+        stop.status.success(),
+        "serve stop should succeed; stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(
+        served.status.success(),
+        "role serve should exit 0; stderr: {}",
+        String::from_utf8_lossy(&served.stderr)
+    );
+    assert!(
+        send_output.status.success(),
+        "send should receive a response; stderr: {}",
+        String::from_utf8_lossy(&send_output.stderr)
+    );
+
+    let response: serde_json::Value =
+        serde_json::from_slice(&send_output.stdout).expect("awaited response is JSON");
+    assert_eq!(response["kind"], "response");
+    assert_eq!(response["body"], "role agent reply");
+
+    // The role config's `cwd` reached the agent process, with no `--agent-cwd`.
+    let observed = std::fs::read_to_string(&captured_cwd).expect("read captured agent cwd");
+    assert_eq!(
+        std::fs::canonicalize(observed.trim()).expect("canonicalize observed cwd"),
+        std::fs::canonicalize(&role_cwd).expect("canonicalize role cwd"),
+        "the agent ran in the role-supplied cwd"
+    );
+
+    // The seat session (#82) landed in the role home and parses as one session.
+    let session = home.session_path("worker", conversation);
+    let report = baton::log::parse_sessions(
+        std::fs::File::open(&session).expect("open recorded seat session"),
+    )
+    .expect("seat session parses");
+    assert_eq!(
+        report.sessions.len(),
+        1,
+        "one seat session, keyed on the conversation"
+    );
+    let recorded = &report.sessions[0];
+    assert_eq!(recorded.session_id, conversation);
+    assert!(recorded.started, "the opening identity marker was written");
+    assert_eq!(recorded.turns.len(), 1, "one answered exchange");
+    assert_eq!(recorded.turns[0].request.prompt, "hello role host");
+}
+
+/// The local-provider role host: with no `--agent-cmd`, the role's identity
+/// feeds `BatonConfig::from_lookup`, so the role's `model` and `base_url` from
+/// `config.json` are what the provider actually sees.
+#[test]
+fn serve_role_local_provider_uses_role_model_from_config() {
+    let home = TempHome::new("role-provider");
+    let root = TempMailbox::new("role-provider");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+    let (base_url, captured) = spawn_recording_provider();
+
+    home.write_role_config(
+        "worker",
+        &format!(r#"{{"model": "role-config-model", "base_url": "{base_url}"}}"#),
+    );
+
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_baton"));
+    serve.args([
+        "serve",
+        "--role",
+        "worker",
+        "--inbox",
+        inbox.to_str().unwrap(),
+        "--outbox",
+        outbox.to_str().unwrap(),
+        "--poll-ms",
+        "10",
+    ]);
+    // Hermetic: every provider setting is stripped and only the credential put
+    // back, so the role config is the sole source of model and base_url and the
+    // provider stays loopback-only.
+    strip_provider_env(&mut serve)
+        .env("BATON_HOME", &home.path)
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let serve_child = serve.spawn().expect("spawn role local-provider serve");
+
+    let send_output = send_awaiting_reply(&inbox, &outbox, "c-209-provider", "ask the provider");
+    let (stop, served) = stop_and_reap(&inbox, serve_child);
+
+    assert!(
+        stop.status.success(),
+        "serve stop should succeed; stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(
+        served.status.success(),
+        "role serve should exit 0; stderr: {}",
+        String::from_utf8_lossy(&served.stderr)
+    );
+    assert!(
+        send_output.status.success(),
+        "send should receive a response; stderr: {}",
+        String::from_utf8_lossy(&send_output.stderr)
+    );
+
+    let response: serde_json::Value =
+        serde_json::from_slice(&send_output.stdout).expect("awaited response is JSON");
+    assert_eq!(response["kind"], "response");
+    assert_eq!(response["body"], "hello from the mock server");
+
+    let requests = captured.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1, "one provider call for one message");
+    assert!(
+        requests[0].contains(r#""model":"role-config-model""#),
+        "the role's model reached the provider; request: {}",
+        requests[0]
+    );
+}
+
+/// Precedence over the role layer: an explicit `--agent-cwd` beats the role
+/// config's `cwd` (flag over role).
+#[cfg(unix)]
+#[test]
+fn serve_role_agent_cwd_flag_overrides_role_config_cwd() {
+    let home = TempHome::new("role-cwd-flag");
+    let root = TempMailbox::new("role-cwd-flag");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+    let stub = root.path.join("agent-stub");
+    let captured_cwd = root.path.join("agent-cwd.txt");
+    let role_cwd = root.path.join("role-workdir");
+    let flag_cwd = root.path.join("flag-workdir");
+    std::fs::create_dir_all(&role_cwd).expect("create role cwd");
+    std::fs::create_dir_all(&flag_cwd).expect("create flag cwd");
+
+    write_cwd_recording_stub(&stub, "flag cwd reply");
+    home.write_role_config(
+        "worker",
+        &format!(r#"{{"cwd": "{}"}}"#, role_cwd.to_str().unwrap()),
+    );
+
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_baton"));
+    serve.args([
+        "serve",
+        "--role",
+        "worker",
+        "--inbox",
+        inbox.to_str().unwrap(),
+        "--outbox",
+        outbox.to_str().unwrap(),
+        "--poll-ms",
+        "10",
+        "--agent-cwd",
+        flag_cwd.to_str().unwrap(),
+        "--agent-cmd",
+        stub.to_str().unwrap(),
+    ]);
+    serve
+        .env_clear()
+        .env("BATON_HOME", &home.path)
+        .env("BATON_TEST_CWD", &captured_cwd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let serve_child = serve.spawn().expect("spawn role serve with --agent-cwd");
+
+    let send_output = send_awaiting_reply(&inbox, &outbox, "c-209-cwd-flag", "which cwd?");
+    let (stop, served) = stop_and_reap(&inbox, serve_child);
+
+    assert!(
+        stop.status.success(),
+        "serve stop should succeed; stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(
+        served.status.success(),
+        "role serve should exit 0; stderr: {}",
+        String::from_utf8_lossy(&served.stderr)
+    );
+    assert!(
+        send_output.status.success(),
+        "send should receive a response; stderr: {}",
+        String::from_utf8_lossy(&send_output.stderr)
+    );
+
+    let observed = std::fs::read_to_string(&captured_cwd).expect("read captured agent cwd");
+    let observed = std::fs::canonicalize(observed.trim()).expect("canonicalize observed cwd");
+    assert_eq!(
+        observed,
+        std::fs::canonicalize(&flag_cwd).expect("canonicalize flag cwd"),
+        "the explicit --agent-cwd wins over the role config"
+    );
+    assert_ne!(
+        observed,
+        std::fs::canonicalize(&role_cwd).expect("canonicalize role cwd"),
+        "the role config's cwd was not used"
+    );
+}
+
+/// Precedence over the role layer: `BATON_MODEL` in the environment beats the
+/// role config's `model` (env over role), the layered lookup's own contract seen
+/// end-to-end through `serve --role`.
+#[test]
+fn serve_role_env_model_overrides_role_config_model() {
+    let home = TempHome::new("role-model-env");
+    let root = TempMailbox::new("role-model-env");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+    let (base_url, captured) = spawn_recording_provider();
+
+    home.write_role_config(
+        "worker",
+        &format!(r#"{{"model": "role-config-model", "base_url": "{base_url}"}}"#),
+    );
+
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_baton"));
+    serve.args([
+        "serve",
+        "--role",
+        "worker",
+        "--inbox",
+        inbox.to_str().unwrap(),
+        "--outbox",
+        outbox.to_str().unwrap(),
+        "--poll-ms",
+        "10",
+    ]);
+    strip_provider_env(&mut serve)
+        .env("BATON_HOME", &home.path)
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("BATON_MODEL", "env-model")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let serve_child = serve.spawn().expect("spawn role serve with BATON_MODEL");
+
+    let send_output = send_awaiting_reply(&inbox, &outbox, "c-209-model-env", "which model?");
+    let (stop, served) = stop_and_reap(&inbox, serve_child);
+
+    assert!(
+        stop.status.success(),
+        "serve stop should succeed; stderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(
+        served.status.success(),
+        "role serve should exit 0; stderr: {}",
+        String::from_utf8_lossy(&served.stderr)
+    );
+    assert!(
+        send_output.status.success(),
+        "send should receive a response; stderr: {}",
+        String::from_utf8_lossy(&send_output.stderr)
+    );
+
+    let requests = captured.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1, "one provider call for one message");
+    assert!(
+        requests[0].contains(r#""model":"env-model""#),
+        "the environment's model wins over the role config; request: {}",
+        requests[0]
+    );
+    assert!(
+        !requests[0].contains("role-config-model"),
+        "the role config's model was not used; request: {}",
+        requests[0]
+    );
+}

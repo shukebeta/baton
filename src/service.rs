@@ -201,6 +201,8 @@ pub fn execute_task(cmd: TaskCommand, _out: impl Write) -> Result<()> {
 #[cfg(unix)]
 mod imp {
     use super::*;
+    #[cfg(all(test, not(target_os = "linux")))]
+    use std::cell::Cell;
     use std::collections::HashMap;
     use std::fs::{self, File, OpenOptions, TryLockError};
     use std::os::unix::fs::OpenOptionsExt;
@@ -243,6 +245,11 @@ mod imp {
     /// Interval between `Run`'s request-directory scans, and between polls of
     /// a pending await (start response, stop/kill grace).
     const POLL_INTERVAL_MS: u64 = 100;
+    /// Minimum interval between liveness probes for one rehydrated task. The
+    /// supervisor still ticks every 100 ms, but a non-Linux `ps` probe is
+    /// allowed at most twice per second in the steady state.
+    #[cfg(not(target_os = "linux"))]
+    const REHYDRATED_LIVENESS_CACHE_MS: u64 = 500;
     /// Initial delay before retrying a failed task-event callback delivery.
     /// Governs both milestone and terminal delivery — the same bounded
     /// exponential backoff policy applies to every task event.
@@ -264,6 +271,26 @@ mod imp {
     /// Process-local sequence, making request/session ids unique even across
     /// several calls within the same millisecond.
     static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(all(test, not(target_os = "linux")))]
+    thread_local! {
+        static PROCESS_PROBE_COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    #[cfg(all(test, not(target_os = "linux")))]
+    fn note_process_probe() {
+        PROCESS_PROBE_COUNT.with(|count| count.set(count.get() + 1));
+    }
+
+    #[cfg(all(test, not(target_os = "linux")))]
+    fn reset_process_probe_count() {
+        PROCESS_PROBE_COUNT.with(|count| count.set(0));
+    }
+
+    #[cfg(all(test, not(target_os = "linux")))]
+    fn process_probe_count() -> u64 {
+        PROCESS_PROBE_COUNT.with(Cell::get)
+    }
 
     /// Opens any service lock with close-on-exec set. `Run` holds the control
     /// lock while it spawns sessions and tasks; descendants must not retain
@@ -1812,6 +1839,12 @@ mod imp {
         /// init, so it is represented by `None` and polled by corroborated
         /// PID liveness instead of `Child::try_wait`.
         child: Option<Child>,
+        /// Most recent non-Linux liveness sample for a rehydrated task, with
+        /// both injected-clock and monotonic wall-clock timestamps. The
+        /// sample is intentionally in-memory: a restart must corroborate the
+        /// durable PID again before making any decision about it.
+        #[cfg(not(target_os = "linux"))]
+        rehydrated_liveness: Option<(u64, Liveness, Instant)>,
         started_ms: u64,
         /// Set once this task's max duration has been exceeded and `SIGTERM`
         /// sent, so a later tick knows to escalate to `SIGKILL` after
@@ -1879,6 +1912,8 @@ mod imp {
                 RunningTask {
                     record,
                     child: None,
+                    #[cfg(not(target_os = "linux"))]
+                    rehydrated_liveness: None,
                     started_ms,
                     term_sent_at_ms: None,
                     kill_sent: false,
@@ -1959,6 +1994,8 @@ mod imp {
                     let running = RunningTask {
                         record,
                         child: Some(child),
+                        #[cfg(not(target_os = "linux"))]
+                        rehydrated_liveness: None,
                         started_ms,
                         term_sent_at_ms: None,
                         kill_sent: false,
@@ -2286,6 +2323,52 @@ mod imp {
         })
     }
 
+    /// Returns one liveness sample for a rehydrated task. Linux deliberately
+    /// keeps its existing `/proc` cadence; non-Linux hosts cache the sample.
+    #[cfg(target_os = "linux")]
+    fn rehydrated_task_liveness(
+        running: &mut RunningTask,
+        _now_ms: u64,
+        _force_refresh: bool,
+    ) -> Liveness {
+        task_execution_liveness(&running.record)
+    }
+
+    /// Returns one cached liveness sample for a rehydrated task. The injected
+    /// clock makes cadence tests deterministic; the monotonic timestamp also
+    /// expires a sample when an external process change occurs while that
+    /// clock is paused. A forced refresh is used immediately before timeout
+    /// escalation so a stale live sample can never authorize signalling a
+    /// reused PID. The caller must thread the returned value through the rest
+    /// of the tick.
+    #[cfg(not(target_os = "linux"))]
+    fn rehydrated_task_liveness(
+        running: &mut RunningTask,
+        now_ms: u64,
+        force_refresh: bool,
+    ) -> Liveness {
+        let refresh = force_refresh
+            || running
+                .rehydrated_liveness
+                .map(|(checked_ms, _, checked_at)| {
+                    now_ms.saturating_sub(checked_ms) >= REHYDRATED_LIVENESS_CACHE_MS
+                        || checked_at.elapsed()
+                            >= Duration::from_millis(REHYDRATED_LIVENESS_CACHE_MS)
+                })
+                .unwrap_or(true);
+        if refresh {
+            running.rehydrated_liveness = Some((
+                now_ms,
+                task_execution_liveness(&running.record),
+                Instant::now(),
+            ));
+        }
+        running
+            .rehydrated_liveness
+            .expect("rehydrated liveness cache populated")
+            .1
+    }
+
     /// Advances one tracked task by one loop tick: delivers any
     /// newly-due milestone events, escalates `SIGTERM`→`SIGKILL` past
     /// `max_duration_ms`, and — once the process has actually exited —
@@ -2310,7 +2393,8 @@ mod imp {
             return deliver_terminal_event(running, clock);
         }
 
-        let elapsed_ms = clock.now_ms().saturating_sub(running.started_ms);
+        let now_ms = clock.now_ms();
+        let elapsed_ms = now_ms.saturating_sub(running.started_ms);
 
         // Deliver due milestones best-effort: a failing or backed-off callback
         // inbox must not abort the tick before the liveness/timeout/reap
@@ -2322,8 +2406,14 @@ mod imp {
         // any timeout signal so a gone or PID-reused process is never
         // accidentally signalled as this task. An unresolved identity is
         // retained and retried on a later tick.
-        if running.child.is_none() {
-            match task_execution_liveness(&running.record) {
+        let rehydrated_liveness = if running.child.is_none() {
+            let signal_due = (running.term_sent_at_ms.is_none()
+                && max_duration_exceeded(elapsed_ms, running.record.spec.max_duration_ms))
+                || (running.term_sent_at_ms.is_some()
+                    && !running.kill_sent
+                    && now_ms.saturating_sub(running.term_sent_at_ms.unwrap()) >= KILL_GRACE_MS);
+            let liveness = rehydrated_task_liveness(running, now_ms, signal_due);
+            match liveness {
                 Liveness::Dead => {
                     let cancelled = consume_task_cancel_sentinel(control, id)?;
                     let state = if cancelled {
@@ -2338,12 +2428,17 @@ mod imp {
                 Liveness::Live => {}
                 Liveness::Unresolved => return Ok(TaskTick::StillRunning),
             }
-        }
+            Some(liveness)
+        } else {
+            None
+        };
 
         if running.term_sent_at_ms.is_none()
             && max_duration_exceeded(elapsed_ms, running.record.spec.max_duration_ms)
         {
-            match task_execution_liveness(&running.record) {
+            let liveness =
+                rehydrated_liveness.unwrap_or_else(|| task_execution_liveness(&running.record));
+            match liveness {
                 Liveness::Unresolved => return Ok(TaskTick::StillRunning),
                 Liveness::Live => {
                     let _ = signal_group(running.record.pid, "-TERM");
@@ -2355,7 +2450,9 @@ mod imp {
             && !running.kill_sent
             && clock.now_ms().saturating_sub(term_at) >= KILL_GRACE_MS
         {
-            match task_execution_liveness(&running.record) {
+            let liveness =
+                rehydrated_liveness.unwrap_or_else(|| task_execution_liveness(&running.record));
+            match liveness {
                 Liveness::Unresolved => return Ok(TaskTick::StillRunning),
                 Liveness::Live => {
                     let _ = signal_group(running.record.pid, "-KILL");
@@ -2366,7 +2463,7 @@ mod imp {
         }
 
         match running.child.as_mut() {
-            None => match task_execution_liveness(&running.record) {
+            None => match rehydrated_liveness.expect("rehydrated liveness cached above") {
                 Liveness::Live | Liveness::Unresolved => Ok(TaskTick::StillRunning),
                 Liveness::Dead => {
                     let cancelled = consume_task_cancel_sentinel(control, id)?;
@@ -3081,6 +3178,8 @@ mod imp {
         if pid <= 1 {
             return ProbeResult::Gone;
         }
+        #[cfg(all(test, not(target_os = "linux")))]
+        note_process_probe();
         match fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => parse_linux_process_probe(&stat)
                 .map(ProbeResult::Present)
@@ -3245,6 +3344,8 @@ mod imp {
         if pid <= 1 {
             return ProbeResult::Gone;
         }
+        #[cfg(all(test, not(target_os = "linux")))]
+        note_process_probe();
         let output = match Command::new("ps")
             .args([
                 "-ww",
@@ -4241,6 +4342,8 @@ mod imp {
             RunningTask {
                 record,
                 child: Some(child),
+                #[cfg(not(target_os = "linux"))]
+                rehydrated_liveness: None,
                 started_ms,
                 term_sent_at_ms: None,
                 kill_sent: false,
@@ -4290,6 +4393,8 @@ mod imp {
             RunningTask {
                 record,
                 child: None,
+                #[cfg(not(target_os = "linux"))]
+                rehydrated_liveness: None,
                 started_ms: clock.now_ms(),
                 term_sent_at_ms: None,
                 kill_sent: false,
@@ -6640,7 +6745,6 @@ mod imp {
 
         /// Timeout escalation never signals an owned task while its process
         /// identity is unresolved, even when the duration has elapsed.
-        #[cfg(target_os = "linux")]
         #[test]
         fn task_timeout_does_not_signal_unresolved_owned_task() {
             let _guard = serialize_forks_and_locks();
@@ -6658,6 +6762,8 @@ mod imp {
             let mut running =
                 spawn_running_task(&dir.path, "task-timeout-unresolved", spec, &clock);
             running.record.started_at = None;
+            running.record.start_epoch_secs = None;
+            running.record.started_ms = Some(SystemClock.now_ms().saturating_add(10_000));
             running.record.spec.command = "not-the-running-command".to_string();
 
             clock.advance(100);
@@ -6738,6 +6844,54 @@ mod imp {
             assert_terminal_task_event(&callback_inbox, "task-timeout-group");
         }
 
+        /// Rehydrated liveness is sampled once per tick and cached between
+        /// ticks. The fake clock makes the 500 ms cadence deterministic while
+        /// the process-probe seam proves that the supervisor does not repeat
+        /// the same sample at each decision point.
+        #[cfg(not(target_os = "linux"))]
+        #[test]
+        fn rehydrated_task_liveness_is_deduplicated_and_rate_limited() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("rehydrate-liveness-cache");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let spec = task_spec(
+                "svc-1",
+                "sleep",
+                vec!["30".to_string()],
+                vec![],
+                60_000,
+                &callback_inbox.display().to_string(),
+            );
+            let mut running = spawn_running_task(&dir.path, "task-rehydrated-cache", spec, &clock);
+            let mut child = running.child.take().expect("rehydrated task child");
+
+            reset_process_probe_count();
+            assert!(matches!(
+                tick_one_task(&dir.path, "task-rehydrated-cache", &mut running, &clock,),
+                Ok(TaskTick::StillRunning)
+            ));
+            assert_eq!(process_probe_count(), 1);
+
+            clock.advance(100);
+            tick_one_task(&dir.path, "task-rehydrated-cache", &mut running, &clock)
+                .expect("cached liveness tick");
+            assert_eq!(process_probe_count(), 1);
+
+            clock.advance(REHYDRATED_LIVENESS_CACHE_MS - 101);
+            tick_one_task(&dir.path, "task-rehydrated-cache", &mut running, &clock)
+                .expect("cached liveness tick before refresh");
+            assert_eq!(process_probe_count(), 1);
+
+            clock.advance(1);
+            tick_one_task(&dir.path, "task-rehydrated-cache", &mut running, &clock)
+                .expect("refresh liveness tick");
+            assert_eq!(process_probe_count(), 2);
+
+            signal_group(running.record.pid, "-KILL").expect("clean up rehydrated task");
+            child.wait().expect("wait for rehydrated task");
+        }
+
         /// A restarted supervisor has no Child handle, but still waits for a
         /// same-group descendant after the recorded direct PID disappears.
         /// Once the group drains, the rehydrated path records failed/null
@@ -6768,6 +6922,8 @@ mod imp {
             let mut rehydrated = RunningTask {
                 record: owned.record.clone(),
                 child: None,
+                #[cfg(not(target_os = "linux"))]
+                rehydrated_liveness: None,
                 started_ms: owned.started_ms,
                 term_sent_at_ms: None,
                 kill_sent: false,
