@@ -3471,6 +3471,14 @@ mod imp {
             };
             let stat = match fs::read_to_string(entry.path().join("stat")) {
                 Ok(stat) => stat,
+                // The pid vanished between the directory yield and this read.
+                // A process that no longer exists cannot be a live member, so
+                // skipping it keeps the scan complete instead of letting
+                // unrelated host churn make every scan unresolved. It can only
+                // leave `found_member` unset, and the no-member path still
+                // needs the kernel `ESRCH` recheck before reporting `Dead`.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                // Present but genuinely unreadable: fail closed.
                 Err(_) => return Liveness::Unresolved,
             };
             let Some((stat_pid, is_zombie, current_pgid)) = parse_linux_process_group_member(&stat)
@@ -6390,6 +6398,76 @@ mod imp {
             assert!(child.try_wait().expect("poll unresolved task").is_none());
             signal_group(running.record.pid, "-KILL").expect("clean up unresolved task");
             child.wait().expect("wait for unresolved task");
+        }
+
+        /// A `/proc` entry that disappears mid-scan is absence of evidence,
+        /// not evidence of absence: the group probe must keep reporting
+        /// `Live` for a leader-exited group whose descendant is alive, even
+        /// while unrelated processes exit continuously underneath the scan.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn group_liveness_survives_unrelated_process_churn_after_leader_exit() {
+            /// Terminates and reaps the churn helper on every exit path,
+            /// including a panicking assertion.
+            struct ChurnGuard(Child);
+            impl Drop for ChurnGuard {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("group-scan-churn");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let spec = task_spec(
+                "svc-1",
+                "sh",
+                vec!["-c".to_string(), "sleep 30 & exit 0".to_string()],
+                vec![],
+                10_000,
+                &callback_inbox.display().to_string(),
+            );
+            let mut running = spawn_running_task(&dir.path, "task-group-churn", spec, &clock);
+
+            wait_for_group_descendant(&mut running);
+            assert!(
+                running
+                    .child
+                    .as_mut()
+                    .expect("owned task child")
+                    .try_wait()
+                    .expect("poll task child")
+                    .is_some(),
+                "the direct leader must have exited before the group is probed"
+            );
+            assert_eq!(
+                task_group_liveness(running.record.pid),
+                Liveness::Live,
+                "a non-zombie same-group descendant must hold the group open"
+            );
+
+            let churn = ChurnGuard(
+                Command::new("sh")
+                    .args(["-c", "while :; do /bin/true; done"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("spawn churn helper"),
+            );
+            const PROBES: usize = 30;
+            for probe in 0..PROBES {
+                assert_eq!(
+                    task_group_liveness(running.record.pid),
+                    Liveness::Live,
+                    "probe {probe} of {PROBES}: a vanished unrelated process must not \
+                     make the group scan unresolved"
+                );
+            }
+
+            drop(churn);
+            signal_group(running.record.pid, "-KILL").expect("kill group descendant");
         }
 
         /// Max-duration escalation after the direct leader exits still
