@@ -390,9 +390,18 @@ Job Object no longer changes a matching PID to `unresolved`; it only changes
 termination from tree-wide to PID-only, with a descendants-may-survive
 warning. State is persisted before the deterministic terminal callback is
 delivered, and a delivery failure leaves the tracker in place to retry the
-same event id. A terminal record is replayed once on the next startup for the
-same reason; the mailbox's done ledger drops it if delivery already
+same event id under the bounded backoff described in "Event delivery and
+dedup contract" below. A terminal record is replayed once on the next startup
+for the same reason; the mailbox's done ledger drops it if delivery already
 completed.
+
+Milestone delivery is decoupled from supervision: a milestone whose callback
+inbox is unavailable is retried on the same bounded backoff, but its failure
+never aborts the tick. The child-exit reap, the `max_duration_ms`
+`SIGTERM`/`SIGKILL` escalation, and the cancel-sentinel consumption all still
+run on a tick whose milestone delivery is failing or backed off, so an
+unreachable inbox can neither keep a task un-reapable nor re-fire the same
+milestone at the loop rate.
 
 Prepared admissions are not active tasks: startup reconciliation owns their
 cleanup, and `rehydrate_tasks` excludes them from the in-memory tracker. If a
@@ -450,6 +459,21 @@ at-least-once, matching every other `baton` mailbox path; a consumer dedups a
 redelivered event for free via the mailbox's own `done/`-membership check
 (`Mailbox::claim_next` drops an id it has already claimed-and-completed) — no
 resident store or polling loop needed between turns.
+
+When a callback inbox is unavailable, both milestone and terminal delivery
+follow the same **bounded exponential backoff**: the first failure waits one
+second, each subsequent failure doubles the delay up to a one-minute cap, and
+after ten failed attempts the event is dropped with a single summary warning
+rather than retried forever. Between attempts the delivery is simply skipped —
+there is no per-tick write or warning, so a persistently stuck inbox cannot
+flood the log at the loop rate. The backoff clock is the injectable `Clock`,
+so the schedule is deterministic in tests. The two event kinds differ only in
+what a drop means: dropping a terminal event drops the task from the in-memory
+tracker, while dropping a milestone advances past it (persisted, so a restart
+does not re-enter it) and leaves the task supervised. A milestone that
+succeeds on retry is still delivered exactly once — `delivered_milestones`
+only advances on a delivered or dropped index, never regressing, so an earlier
+delivered milestone is never redelivered when a later one recovers.
 
 ### Ownership vs. callback
 
