@@ -16,6 +16,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -810,13 +811,28 @@ fn synthesize_error_response(request: &MessageEnvelope, message: &str) -> Messag
     response
 }
 
+/// A process-lifetime counter making every synthesized response id distinct.
+///
+/// Millisecond timestamps do not separate emissions: a `baton serve` daemon
+/// draining a mailbox answers requests in a tight loop, and a fast failure (an
+/// unspawnable `--agent-cmd`, say) resolves in microseconds, so several replies
+/// in one conversation can share a `ts_ms`.
+static RESPONSE_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Builds a fresh `message_id` for a response without adding a dependency.
 ///
-/// Derived from the conversation id and the response timestamp: an in-process
-/// participant emits one response per request, so a collision is impossible, and
+/// Derived from the conversation id, the response timestamp, and a draw from
+/// [`RESPONSE_SEQ`]. The counter — not the timestamp — carries uniqueness: each
+/// call takes a value no other call in this process takes, so two replies
+/// emitted in the same conversation within the same millisecond still differ.
+/// That matters because the id is the mailbox filename key
+/// ([`crate::mailbox`]'s `safe_key`, for which `-` and digits are safe) and the
+/// identity `baton log merge` collapses duplicates by: a collision would
+/// overwrite a pending reply and erase a turn from the merged transcript.
 /// `baton.message/v1` places no format constraint on the id beyond uniqueness.
 fn fresh_message_id(conversation_id: &str, ts_ms: u64) -> String {
-    format!("{conversation_id}-r-{ts_ms}")
+    let seq = RESPONSE_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{conversation_id}-r-{ts_ms}-{seq}")
 }
 
 /// Test-only participant doubles, reusable across the crate's unit tests.
@@ -1953,5 +1969,78 @@ mod tests {
             response.exchange.is_none(),
             "a mis-correlated reply is a machinery failure, nesting no record"
         );
+    }
+
+    /// Two replies synthesized in one conversation within the same millisecond
+    /// must stay distinct all the way through: distinct ids, two surviving
+    /// `pending/` files, and two surviving turns in the merged transcript.
+    ///
+    /// Deterministic by construction — `fresh_message_id` takes `ts_ms` as an
+    /// argument and reads no clock, so a single pinned `TS_MS` reproduces the
+    /// collision exactly, with no sleep or wall-clock coincidence.
+    #[test]
+    fn same_millisecond_responses_stay_distinct_end_to_end() {
+        const TS_MS: u64 = 1_787_882_604_553;
+
+        // The production construction from `respond`: fresh id, addressing
+        // swapped, one shared timestamp.
+        let reply = |body: &str| {
+            MessageEnvelope::new(
+                fresh_message_id("c", TS_MS),
+                "c".to_string(),
+                "agent".to_string(),
+                "caller".to_string(),
+                MessageKind::Error,
+                body.to_string(),
+                TS_MS,
+            )
+        };
+        let first = reply("first");
+        let second = reply("second");
+
+        assert_eq!(
+            (first.ts_ms, second.ts_ms),
+            (TS_MS, TS_MS),
+            "the pair shares a millisecond — that is the condition under test"
+        );
+        assert_ne!(
+            first.message_id, second.message_id,
+            "same-millisecond replies must not share a message_id"
+        );
+
+        // Mailbox leg: the id is the `pending/` filename key, so a collision
+        // would silently overwrite the first reply.
+        let dir = TempDir::new("same-ms");
+        mailbox::deliver_to(&dir.path, &first).expect("deliver first");
+        mailbox::deliver_to(&dir.path, &second).expect("deliver second");
+
+        let mut bodies: Vec<String> = std::fs::read_dir(dir.path.join("pending"))
+            .expect("read pending")
+            .map(|entry| entry.expect("dir entry").path())
+            .map(|path| std::fs::read_to_string(path).expect("read envelope"))
+            .map(|json| {
+                serde_json::from_str::<MessageEnvelope>(&json)
+                    .expect("envelope round-trips")
+                    .body
+            })
+            .collect();
+        bodies.sort();
+        assert_eq!(
+            bodies,
+            vec!["first".to_string(), "second".to_string()],
+            "both replies survive delivery — neither overwrote the other"
+        );
+
+        // Merge leg: `merge_conversation` collapses by `message_id`, so a
+        // collision would drop one turn from the unified transcript.
+        let merged = crate::log::merge_conversation(vec![first.clone(), second.clone()], "c");
+        let mut merged_ids: Vec<&str> = merged.iter().map(|e| e.message_id.as_str()).collect();
+        merged_ids.sort_unstable();
+        let mut expected_ids = vec![first.message_id.as_str(), second.message_id.as_str()];
+        expected_ids.sort_unstable();
+        assert_eq!(merged_ids, expected_ids, "both turns survive the merge");
+        let mut merged_bodies: Vec<&str> = merged.iter().map(|e| e.body.as_str()).collect();
+        merged_bodies.sort_unstable();
+        assert_eq!(merged_bodies, vec!["first", "second"]);
     }
 }
