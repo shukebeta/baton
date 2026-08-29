@@ -75,6 +75,15 @@ without ever sharing a process tree with it.
   the record directly and act on the OS process by PID — none of them need
   `run` to be alive, so a session started by a since-crashed `run` can still
   be inspected, stopped, or torn down.
+- `session-stopping/<id>.json` — the durable "a stop owns this session's
+  cleanup" marker. `service stop`/`teardown` writes it under
+  `service.admission.lock` before the first grace wait releases that lock, and
+  holds it for the whole cleanup; the stop removes it when it finishes. It
+  records the stopping process's identity (its PID and that process's recorded
+  start identity), so a marker orphaned by a killed stop — or one that is
+  malformed — is discarded by the next reader instead of wedging admission for
+  good. While it is present and live, the session is not an admissible task
+  owner even if its process still is.
 
 ## Lifecycle contract
 
@@ -156,12 +165,13 @@ baton service teardown --control <dir> [--force]
   whose cleanup a live stop owns is not an admissible task owner even while
   its process is still live, so a start racing a released grace window fails
   fast with the owner rejection instead of being handed a task id for a
-  process the stop is about to kill. That state is a durable marker held for
-  the whole cleanup, not the cooperative `serve.stop` sentinel — the daemon
-  consumes that sentinel as soon as it observes it, long before the process
-  exits. The marker records the stopping process's identity, so one orphaned
-  by a killed `service stop` is discarded by the next reader rather than
-  wedging admission.
+  process the stop is about to kill. That state is
+  `session-stopping/<id>.json`, a durable marker held for the whole cleanup,
+  not the cooperative `serve.stop` sentinel — the daemon consumes that
+  sentinel as soon as it observes it, long before the process exits. The marker
+  records the stopping process's identity, so one orphaned by a killed
+  `service stop` is discarded by the next reader rather than wedging
+  admission.
   Idempotent — stopping an already-gone session is a no-op success.
 - **`service teardown`** first requests `run`'s cooperative stop, then waits
   for `run` to release the control lock before taking its session snapshot and
