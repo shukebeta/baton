@@ -2436,10 +2436,17 @@ mod imp {
         } else if let Some(term_at) = running.term_sent_at_ms
             && !running.kill_sent
             && clock.now_ms().saturating_sub(term_at) >= KILL_GRACE_MS
-            && rehydrated_liveness != Some(Liveness::Dead)
         {
-            let _ = signal_group(running.record.pid, "-KILL");
-            running.kill_sent = true;
+            let liveness =
+                rehydrated_liveness.unwrap_or_else(|| task_execution_liveness(&running.record));
+            match liveness {
+                Liveness::Unresolved => return Ok(TaskTick::StillRunning),
+                Liveness::Live => {
+                    let _ = signal_group(running.record.pid, "-KILL");
+                    running.kill_sent = true;
+                }
+                Liveness::Dead => {}
+            }
         }
 
         match running.child.as_mut() {
@@ -6343,7 +6350,6 @@ mod imp {
 
         /// Timeout escalation never signals an owned task while its process
         /// identity is unresolved, even when the duration has elapsed.
-        #[cfg(target_os = "linux")]
         #[test]
         fn task_timeout_does_not_signal_unresolved_owned_task() {
             let _guard = serialize_forks_and_locks();
@@ -6361,6 +6367,8 @@ mod imp {
             let mut running =
                 spawn_running_task(&dir.path, "task-timeout-unresolved", spec, &clock);
             running.record.started_at = None;
+            running.record.start_epoch_secs = None;
+            running.record.started_ms = Some(SystemClock.now_ms().saturating_add(10_000));
             running.record.spec.command = "not-the-running-command".to_string();
 
             clock.advance(100);
