@@ -1860,11 +1860,12 @@ mod imp {
         /// init, so it is represented by `None` and polled by corroborated
         /// PID liveness instead of `Child::try_wait`.
         child: Option<Child>,
-        /// Most recent Linux process-group liveness sample for a rehydrated
-        /// task. Direct PID identity is still probed on every tick; only the
+        /// Most recent Linux process-group liveness sample. Direct PID
+        /// identity is still probed on every rehydrated tick, while an owned
+        /// task uses its Child handle to check the direct leader; only the
         /// table-wide group scan is rate-limited.
         #[cfg(target_os = "linux")]
-        rehydrated_group_liveness: Option<(u64, Liveness, Instant)>,
+        group_liveness: Option<(u64, Liveness, Instant)>,
         /// Most recent non-Linux liveness sample for a rehydrated task, with
         /// both injected-clock and monotonic wall-clock timestamps. The
         /// sample is intentionally in-memory: a restart must corroborate the
@@ -1939,7 +1940,7 @@ mod imp {
                     record,
                     child: None,
                     #[cfg(target_os = "linux")]
-                    rehydrated_group_liveness: None,
+                    group_liveness: None,
                     #[cfg(not(target_os = "linux"))]
                     rehydrated_liveness: None,
                     started_ms,
@@ -2023,7 +2024,7 @@ mod imp {
                         record,
                         child: Some(child),
                         #[cfg(target_os = "linux")]
-                        rehydrated_group_liveness: None,
+                        group_liveness: None,
                         #[cfg(not(target_os = "linux"))]
                         rehydrated_liveness: None,
                         started_ms,
@@ -2362,44 +2363,110 @@ mod imp {
         })
     }
 
-    /// Returns one liveness sample for a rehydrated task. Linux always checks
-    /// direct PID identity, but rate-limits the table-wide group scan. A
-    /// forced refresh is used immediately before timeout escalation.
+    /// Returns the cached group sample and whether it needs refreshing. The
+    /// cache is shared by owned and rehydrated tasks; callers decide whether
+    /// their direct-leader check requires a group sample at all.
     #[cfg(target_os = "linux")]
-    fn rehydrated_task_liveness(
-        running: &mut RunningTask,
+    fn group_liveness_cache(
+        running: &RunningTask,
         now_ms: u64,
         force_refresh: bool,
-    ) -> Liveness {
-        let direct_probe = process_probe(running.record.pid);
+    ) -> (Option<Liveness>, bool) {
         let refresh = force_refresh
             || running
-                .rehydrated_group_liveness
+                .group_liveness
                 .map(|(checked_ms, _, checked_at)| {
                     now_ms.saturating_sub(checked_ms) >= REHYDRATED_LIVENESS_CACHE_MS
                         || checked_at.elapsed()
                             >= Duration::from_millis(REHYDRATED_LIVENESS_CACHE_MS)
                 })
                 .unwrap_or(true);
-        let cached_group_liveness = if refresh {
+        let cached = if refresh {
             None
         } else {
             Some(
                 running
-                    .rehydrated_group_liveness
-                    .expect("rehydrated group liveness cache populated")
+                    .group_liveness
+                    .expect("group liveness cache populated")
                     .1,
             )
         };
+        (cached, refresh)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn remember_group_liveness(
+        running: &mut RunningTask,
+        now_ms: u64,
+        refresh: bool,
+        liveness: Liveness,
+    ) {
+        if refresh {
+            running.group_liveness = Some((now_ms, liveness, Instant::now()));
+        }
+    }
+
+    /// Returns one cached liveness sample for a PID-identified task. Linux
+    /// always checks direct PID identity, but rate-limits the table-wide group
+    /// scan. A forced refresh is used immediately before timeout escalation.
+    #[cfg(target_os = "linux")]
+    fn cached_task_execution_liveness(
+        running: &mut RunningTask,
+        now_ms: u64,
+        force_refresh: bool,
+    ) -> Liveness {
+        let direct_probe = process_probe(running.record.pid);
+        let (cached_group_liveness, refresh) = group_liveness_cache(running, now_ms, force_refresh);
         let (liveness, used_group_liveness) = task_execution_liveness_from_probe(
             &running.record,
             &direct_probe,
             cached_group_liveness,
         );
-        if refresh && used_group_liveness {
-            running.rehydrated_group_liveness = Some((now_ms, liveness, Instant::now()));
+        if used_group_liveness {
+            remember_group_liveness(running, now_ms, refresh, liveness);
         }
         liveness
+    }
+
+    /// Returns one cached group sample after an owned Child has reported the
+    /// direct leader exited. The Child handle is the direct-leader identity
+    /// check on this path, so no PID probe is needed here.
+    #[cfg(target_os = "linux")]
+    fn owned_task_group_liveness(
+        running: &mut RunningTask,
+        now_ms: u64,
+        force_refresh: bool,
+    ) -> Liveness {
+        let (cached_group_liveness, refresh) = group_liveness_cache(running, now_ms, force_refresh);
+        let liveness =
+            cached_group_liveness.unwrap_or_else(|| task_group_liveness(running.record.pid));
+        remember_group_liveness(running, now_ms, refresh, liveness);
+        liveness
+    }
+
+    #[cfg(target_os = "linux")]
+    fn rehydrated_task_liveness(
+        running: &mut RunningTask,
+        now_ms: u64,
+        force_refresh: bool,
+    ) -> Liveness {
+        cached_task_execution_liveness(running, now_ms, force_refresh)
+    }
+
+    fn owned_task_execution_liveness(
+        running: &mut RunningTask,
+        now_ms: u64,
+        force_refresh: bool,
+    ) -> Liveness {
+        #[cfg(target_os = "linux")]
+        {
+            cached_task_execution_liveness(running, now_ms, force_refresh)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (now_ms, force_refresh);
+            task_execution_liveness(&running.record)
+        }
     }
 
     /// Returns one cached liveness sample for a rehydrated task. The injected
@@ -2504,8 +2571,8 @@ mod imp {
         if running.term_sent_at_ms.is_none()
             && max_duration_exceeded(elapsed_ms, running.record.spec.max_duration_ms)
         {
-            let liveness =
-                rehydrated_liveness.unwrap_or_else(|| task_execution_liveness(&running.record));
+            let liveness = rehydrated_liveness
+                .unwrap_or_else(|| owned_task_execution_liveness(running, now_ms, true));
             match liveness {
                 Liveness::Unresolved => return Ok(TaskTick::StillRunning),
                 Liveness::Live => {
@@ -2518,8 +2585,8 @@ mod imp {
             && !running.kill_sent
             && clock.now_ms().saturating_sub(term_at) >= KILL_GRACE_MS
         {
-            let liveness =
-                rehydrated_liveness.unwrap_or_else(|| task_execution_liveness(&running.record));
+            let liveness = rehydrated_liveness
+                .unwrap_or_else(|| owned_task_execution_liveness(running, now_ms, true));
             match liveness {
                 Liveness::Unresolved => return Ok(TaskTick::StillRunning),
                 Liveness::Live => {
@@ -2530,7 +2597,15 @@ mod imp {
             }
         }
 
-        match running.child.as_mut() {
+        let child_status = match running.child.as_mut() {
+            Some(child) => Some(
+                child
+                    .try_wait()
+                    .map_err(|err| BatonError::Io(format!("could not poll task {id}: {err}")))?,
+            ),
+            None => None,
+        };
+        match child_status {
             None => match rehydrated_liveness.expect("rehydrated liveness cached above") {
                 Liveness::Live | Liveness::Unresolved => Ok(TaskTick::StillRunning),
                 Liveness::Dead => {
@@ -2545,43 +2620,44 @@ mod imp {
                     finalize_task(control, running, state, None, elapsed_ms, clock)
                 }
             },
-            Some(child) => match child.try_wait() {
-                Ok(Some(status)) => {
-                    // Reaping the direct leader does not end a Unix task while a
-                    // descendant still occupies its process group. Keep the
-                    // Child handle so its exit status remains available for
-                    // finalization after the group drains. A mismatched PID is
-                    // never treated as this task's group.
-                    match task_execution_liveness(&running.record) {
-                        Liveness::Live | Liveness::Unresolved => {
-                            return Ok(TaskTick::StillRunning);
-                        }
-                        Liveness::Dead => {}
+            Some(None) => Ok(TaskTick::StillRunning),
+            Some(Some(status)) => {
+                // Reaping the direct leader does not end a Unix task while a
+                // descendant still occupies its process group. Keep the
+                // Child handle so its exit status remains available for
+                // finalization after the group drains. The Child handle is
+                // the direct-leader identity check for owned tasks.
+                #[cfg(target_os = "linux")]
+                let liveness = owned_task_group_liveness(running, now_ms, false);
+                #[cfg(not(target_os = "linux"))]
+                let liveness = task_execution_liveness(&running.record);
+                match liveness {
+                    Liveness::Live | Liveness::Unresolved => {
+                        return Ok(TaskTick::StillRunning);
                     }
-                    // An external `Stop`/`Teardown`/`Cancel` may already have
-                    // finalized and removed this task's record (they act
-                    // directly on the durable PID, independent of this `Run`
-                    // loop being alive) — if so, this reap is a no-op besides
-                    // dropping our own in-memory tracking below, so a race with
-                    // an external reaper never resurrects a torn-down record.
-                    if read_task_record(control, id)?.is_none() {
-                        return Ok(TaskTick::Finished);
-                    }
-                    let cancelled = consume_task_cancel_sentinel(control, id)?;
-                    let state = if cancelled {
-                        TaskState::Cancelled
-                    } else if running.term_sent_at_ms.is_some() {
-                        TaskState::Timeout
-                    } else if status.success() {
-                        TaskState::Completed
-                    } else {
-                        TaskState::Failed
-                    };
-                    finalize_task(control, running, state, status.code(), elapsed_ms, clock)
+                    Liveness::Dead => {}
                 }
-                Ok(None) => Ok(TaskTick::StillRunning),
-                Err(err) => Err(BatonError::Io(format!("could not poll task {id}: {err}"))),
-            },
+                // An external `Stop`/`Teardown`/`Cancel` may already have
+                // finalized and removed this task's record (they act
+                // directly on the durable PID, independent of this `Run`
+                // loop being alive) — if so, this reap is a no-op besides
+                // dropping our own in-memory tracking below, so a race with
+                // an external reaper never resurrects a torn-down record.
+                if read_task_record(control, id)?.is_none() {
+                    return Ok(TaskTick::Finished);
+                }
+                let cancelled = consume_task_cancel_sentinel(control, id)?;
+                let state = if cancelled {
+                    TaskState::Cancelled
+                } else if running.term_sent_at_ms.is_some() {
+                    TaskState::Timeout
+                } else if status.success() {
+                    TaskState::Completed
+                } else {
+                    TaskState::Failed
+                };
+                finalize_task(control, running, state, status.code(), elapsed_ms, clock)
+            }
         }
     }
 
@@ -3387,27 +3463,13 @@ mod imp {
     }
 
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     fn task_liveness(record: &TaskRecord) -> (Liveness, Option<i64>) {
-        match process_probe(record.pid) {
-            ProbeResult::Gone => (Liveness::Dead, None),
-            ProbeResult::Unreadable => (Liveness::Unresolved, None),
-            ProbeResult::Present(probe) if probe.is_zombie() => (Liveness::Dead, None),
-            ProbeResult::Present(probe) => match &record.started_at {
-                Some(recorded) if recorded == &probe.start_key => (Liveness::Live, None),
-                Some(_) => (Liveness::Dead, None),
-                None => match process_argv(record.pid) {
-                    ProbeResult::Gone => (Liveness::Dead, None),
-                    ProbeResult::Unreadable => (Liveness::Unresolved, None),
-                    ProbeResult::Present(actual) if linux_task_argv_matches(&actual, record) => {
-                        (Liveness::Live, None)
-                    }
-                    ProbeResult::Present(_) => (Liveness::Unresolved, None),
-                },
-            },
-        }
+        task_liveness_from_probe(record, &process_probe(record.pid))
     }
 
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     fn is_task_alive(record: &TaskRecord) -> Liveness {
         task_liveness(record).0
     }
@@ -3851,6 +3913,13 @@ mod imp {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    fn task_leader_exited(record: &TaskRecord) -> TaskLeaderExit {
+        task_leader_exited_from_probe(record, &process_probe(record.pid))
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn task_leader_exited(record: &TaskRecord) -> TaskLeaderExit {
         match process_probe(record.pid) {
             ProbeResult::Gone => TaskLeaderExit::Gone,
@@ -3891,6 +3960,12 @@ mod imp {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn task_execution_liveness(record: &TaskRecord) -> Liveness {
+        task_execution_liveness_from_probe(record, &process_probe(record.pid), None).0
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn task_execution_liveness(record: &TaskRecord) -> Liveness {
         match is_task_alive(record) {
             Liveness::Dead => match task_leader_exited(record) {
@@ -4506,7 +4581,7 @@ mod imp {
                 record,
                 child: Some(child),
                 #[cfg(target_os = "linux")]
-                rehydrated_group_liveness: None,
+                group_liveness: None,
                 #[cfg(not(target_os = "linux"))]
                 rehydrated_liveness: None,
                 started_ms,
@@ -4559,7 +4634,7 @@ mod imp {
                 record,
                 child: None,
                 #[cfg(target_os = "linux")]
-                rehydrated_group_liveness: None,
+                group_liveness: None,
                 #[cfg(not(target_os = "linux"))]
                 rehydrated_liveness: None,
                 started_ms: clock.now_ms(),
@@ -7213,6 +7288,105 @@ mod imp {
             assert_terminal_task_event(&callback_inbox, "task-timeout-group");
         }
 
+        /// An owned task reuses its cached group sample after the direct
+        /// leader exits. Timeout TERM and KILL decisions still force fresh
+        /// samples inside the cadence window.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn owned_linux_group_scan_is_rate_limited_and_forced_for_timeout() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("owned-linux-group-cache");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let spec = task_spec(
+                "svc-1",
+                "sh",
+                vec![
+                    "-c".to_string(),
+                    "trap '' TERM; sleep 30 & exit 0".to_string(),
+                ],
+                vec![],
+                100,
+                &callback_inbox.display().to_string(),
+            );
+            let mut running = spawn_running_task(&dir.path, "task-owned-linux-cache", spec, &clock);
+
+            wait_for_group_descendant(&mut running);
+            reset_group_scan_count();
+            assert!(matches!(
+                tick_one_task(&dir.path, "task-owned-linux-cache", &mut running, &clock),
+                Ok(TaskTick::StillRunning)
+            ));
+            assert_eq!(
+                group_scan_count(),
+                1,
+                "the first owned reaped-leader tick scans /proc once"
+            );
+
+            // The timeout is due at 100ms. TERM forces a fresh sample even
+            // though the first owned group sample is still inside the cache.
+            clock.advance(100);
+            assert!(matches!(
+                tick_one_task(&dir.path, "task-owned-linux-cache", &mut running, &clock),
+                Ok(TaskTick::StillRunning)
+            ));
+            assert!(running.term_sent_at_ms.is_some());
+            assert_eq!(group_scan_count(), 2, "TERM uses a fresh group sample");
+
+            clock.advance(100);
+            tick_one_task(&dir.path, "task-owned-linux-cache", &mut running, &clock)
+                .expect("cached owned group liveness tick");
+            assert_eq!(
+                group_scan_count(),
+                2,
+                "owned group scan remains cached inside the window"
+            );
+
+            // The sample was refreshed at 100ms, so 600ms is the exact
+            // inclusive cache boundary.
+            clock.advance(REHYDRATED_LIVENESS_CACHE_MS - 100);
+            tick_one_task(&dir.path, "task-owned-linux-cache", &mut running, &clock)
+                .expect("owned boundary group liveness tick");
+            assert_eq!(
+                group_scan_count(),
+                3,
+                "the exact boundary refreshes the owned group scan"
+            );
+
+            // Refresh shortly before KILL, then verify that the due decision
+            // forces another sample inside the cache window.
+            let term_sent_at = running.term_sent_at_ms.expect("TERM timestamp");
+            let pre_kill_at = term_sent_at + KILL_GRACE_MS - 100;
+            clock.advance(pre_kill_at - clock.now_ms());
+            tick_one_task(&dir.path, "task-owned-linux-cache", &mut running, &clock)
+                .expect("owned pre-KILL group liveness tick");
+            assert_eq!(
+                group_scan_count(),
+                4,
+                "pre-KILL sample refreshes after expiry"
+            );
+
+            clock.advance(100);
+            let kill_tick =
+                tick_one_task(&dir.path, "task-owned-linux-cache", &mut running, &clock)
+                    .expect("forced owned KILL liveness tick");
+            assert!(matches!(kill_tick, TaskTick::StillRunning));
+            assert!(running.kill_sent);
+            assert_eq!(group_scan_count(), 5, "KILL uses a fresh group sample");
+
+            clock.advance(REHYDRATED_LIVENESS_CACHE_MS);
+            reap_task_until_finished(
+                &dir.path,
+                "task-owned-linux-cache",
+                &mut running,
+                &clock,
+                kill_tick,
+            );
+            assert_eq!(running.record.state, TaskState::Timeout);
+            assert_durable_task_state(&dir.path, "task-owned-linux-cache", TaskState::Timeout);
+            assert_terminal_task_event(&callback_inbox, "task-owned-linux-cache");
+        }
+
         /// Linux rehydrated liveness probes the direct PID on every tick but
         /// rate-limits the table-wide group scan. Timeout TERM and KILL
         /// decisions force a fresh group sample even inside the cache window.
@@ -7247,7 +7421,7 @@ mod imp {
             let mut rehydrated = RunningTask {
                 record: owned.record.clone(),
                 child: None,
-                rehydrated_group_liveness: None,
+                group_liveness: None,
                 #[cfg(not(target_os = "linux"))]
                 rehydrated_liveness: None,
                 started_ms: owned.started_ms,
@@ -7471,7 +7645,7 @@ mod imp {
                 record: owned.record.clone(),
                 child: None,
                 #[cfg(target_os = "linux")]
-                rehydrated_group_liveness: None,
+                group_liveness: None,
                 #[cfg(not(target_os = "linux"))]
                 rehydrated_liveness: None,
                 started_ms: owned.started_ms,
