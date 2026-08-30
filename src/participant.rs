@@ -875,16 +875,20 @@ fn capture_child_output(
         Err(mpsc::RecvTimeoutError::Timeout) => {
             let _ = child.kill();
             let _ = child.wait();
+            let stderr = collect_stderr();
             Err(BatonError::Transport(format!(
-                "child process exceeded the {read_timeout:?} read timeout"
+                "child process exceeded the {read_timeout:?} read timeout{}",
+                stderr_detail(&stderr)
             )))
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             let _ = child.kill();
             let _ = child.wait();
-            Err(BatonError::Transport(
-                "child process stdout reader terminated unexpectedly".to_string(),
-            ))
+            let stderr = collect_stderr();
+            Err(BatonError::Transport(format!(
+                "child process stdout reader terminated unexpectedly{}",
+                stderr_detail(&stderr)
+            )))
         }
     }
 }
@@ -1856,6 +1860,31 @@ mod tests {
         assert!(
             err.to_string().contains("BOOM"),
             "transport error includes stderr: {err}"
+        );
+    }
+
+    /// A timed-out turn also folds buffered stderr into the transport error.
+    #[test]
+    fn capture_child_output_folds_stderr_on_timeout() {
+        let err = capture_child_output(
+            Path::new("sh"),
+            &[
+                "-c".to_string(),
+                "cat >/dev/null; echo TIMEOUT-DIAG >&2; while :; do :; done".to_string(),
+            ],
+            &[],
+            None,
+            b"",
+            Duration::from_millis(150),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("read timeout"),
+            "failure is reported as a timeout: {err}"
+        );
+        assert!(
+            err.to_string().contains("TIMEOUT-DIAG"),
+            "timeout error includes stderr: {err}"
         );
     }
 
