@@ -10,6 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
+## v0.3.36 (2026-08-30)
+
+### Fixes
+- fix(task): reject unordered milestones (#248)
+
 ## v0.3.35 … v0.3.20 (2026-08-29)
 
 ### Fixes
