@@ -2454,7 +2454,7 @@ mod imp {
         // A terminal record can remain in the tracker when callback delivery
         // failed after state persistence. Retry the deterministic event before
         // dropping it, including after startup reconciliation.
-        if read_task_record(control, id)?.is_none() {
+        if !task_record_exists(control, id)? {
             return Ok(TaskTick::Finished);
         }
         if running.record.state != TaskState::Running {
@@ -2856,6 +2856,27 @@ mod imp {
             }),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(BatonError::Io(format!("could not read {path:?}: {err}"))),
+        }
+    }
+
+    fn task_record_exists(control: &Path, id: &str) -> Result<bool> {
+        let path = task_record_path(control, id)?;
+        match path.try_exists() {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                let parent = tasks_dir(control);
+                match fs::metadata(&parent) {
+                    Ok(metadata) if metadata.is_dir() => Ok(false),
+                    Ok(_) => Err(BatonError::Io(format!(
+                        "could not probe task record {path:?}: parent {parent:?} is not a directory"
+                    ))),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                    Err(err) => Err(BatonError::Io(format!(
+                        "could not probe task record parent {parent:?}: {err}"
+                    ))),
+                }
+            }
+            Err(err) => Err(BatonError::Io(format!("could not probe {path:?}: {err}"))),
         }
     }
 
@@ -4550,6 +4571,64 @@ mod imp {
                 milestone_delivery_attempts: 0,
                 next_milestone_retry_ms: None,
                 milestone_retry_delay_ms: 0,
+            }
+        }
+
+        #[test]
+        fn tick_one_task_drops_when_durable_record_is_removed() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("tick-record-removed");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let mut running =
+                terminal_running_task(&dir.path, "task-record-removed", &callback_inbox, &clock);
+            remove_task_record(&dir.path, "task-record-removed").expect("remove task record");
+
+            assert!(matches!(
+                tick_one_task(&dir.path, "task-record-removed", &mut running, &clock)
+                    .expect("tick removed task"),
+                TaskTick::Finished
+            ));
+        }
+
+        #[test]
+        fn tick_one_task_ignores_malformed_durable_record_at_start() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("tick-record-malformed");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let mut running =
+                terminal_running_task(&dir.path, "task-record-malformed", &callback_inbox, &clock);
+            let path =
+                task_record_path(&dir.path, "task-record-malformed").expect("task record path");
+            fs::write(path, "not json").expect("write malformed task record");
+
+            assert!(matches!(
+                tick_one_task(&dir.path, "task-record-malformed", &mut running, &clock)
+                    .expect("tick malformed task"),
+                TaskTick::Finished
+            ));
+        }
+
+        #[test]
+        fn tick_one_task_reports_record_probe_io_error() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("tick-record-probe-error");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let mut running = terminal_running_task(
+                &dir.path,
+                "task-record-probe-error",
+                &callback_inbox,
+                &clock,
+            );
+            fs::remove_dir_all(dir.path.join("tasks")).expect("remove task record directory");
+            fs::write(dir.path.join("tasks"), "not a directory")
+                .expect("replace tasks directory with a file");
+
+            match tick_one_task(&dir.path, "task-record-probe-error", &mut running, &clock) {
+                Err(BatonError::Io(message)) => assert!(message.contains("could not probe")),
+                other => panic!("expected record probe I/O error, got {other:?}"),
             }
         }
 
