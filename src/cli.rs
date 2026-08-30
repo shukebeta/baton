@@ -60,6 +60,11 @@ pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session [--
 /// is unset.
 const DEFAULT_SERVE_POLL_MS: u64 = 500;
 
+/// Exact stdout line emitted once `baton serve` has finished startup and owns
+/// its mailbox. A launcher can use this flushed line as a readiness barrier;
+/// no line is emitted when participant setup or mailbox initialization fails.
+const SERVE_READY_TOKEN: &str = "baton serve: ready";
+
 /// Default `baton serve --agent-cmd` read timeout for one headless agent run, in
 /// milliseconds, when `--agent-timeout-ms` is unset. Very generous: a full-tooled
 /// agent run is many tool calls (git, edits, MCP), not one provider turn, so a
@@ -612,6 +617,7 @@ pub fn run() -> Result<()> {
             // cannot make this fresh start exit immediately.
             mailbox.poll_stop()?;
             mailbox.reclaim_stale()?;
+            announce_serve_ready(io::stdout().lock())?;
             let outbox = Path::new(&outbox);
 
             let poll = Duration::from_millis(poll_ms);
@@ -1174,6 +1180,14 @@ fn drain_mailbox(
         mailbox.complete(claimed)?;
         processed += 1;
     }
+}
+
+/// Announces that `serve` has completed initialization and entered its
+/// mailbox-owning phase. The explicit flush is required because launchers may
+/// redirect stdout to a file and use this exact line as their startup barrier.
+fn announce_serve_ready(mut out: impl Write) -> Result<()> {
+    writeln!(out, "{SERVE_READY_TOKEN}").map_err(io_err)?;
+    out.flush().map_err(io_err)
 }
 
 /// Delivers `envelope` into `inbox`'s `pending/` (lock-free producer), records
@@ -5534,6 +5548,16 @@ mod tests {
                 agent_result_key: None,
                 role: None,
             }
+        );
+    }
+
+    #[test]
+    fn serve_readiness_announcement_is_one_flushed_exact_line() {
+        let mut output = Vec::new();
+        announce_serve_ready(&mut output).expect("announce readiness");
+        assert_eq!(
+            String::from_utf8(output).expect("readiness is utf8"),
+            format!("{SERVE_READY_TOKEN}\n")
         );
     }
 

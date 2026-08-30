@@ -1877,61 +1877,177 @@ fn quickstart_script_runs_full_loop_against_mock() {
         .join("scripts")
         .join("quickstart.sh");
 
-    let out_dir = std::env::temp_dir().join(format!("baton-quickstart-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&out_dir);
+    let run_quickstart = |out_dir: &Path| {
+        // The script configures its own provider env; strip any host leakage so
+        // every run is deterministic regardless of the developer's shell.
+        Command::new("bash")
+            .arg(&script)
+            .env("BATON_BIN", &baton_bin)
+            .env("BATON_MOCK_BIN", &mock_bin)
+            .env("QUICKSTART_OUT", out_dir)
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+            .env_remove("ANTHROPIC_BASE_URL")
+            .env_remove("BATON_EVENT_LOG")
+            .output()
+            .expect("run quickstart.sh")
+    };
 
-    // The script configures its own provider env; strip any host leakage so the
-    // run is deterministic regardless of the developer's shell.
+    // Repeat the background startup ordering so a regression cannot pass only
+    // because one run happened to schedule `serve` before `send`.
+    for attempt in 0..3 {
+        let out_dir =
+            std::env::temp_dir().join(format!("baton-quickstart-{}-{attempt}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out_dir);
+        let out = run_quickstart(&out_dir);
+
+        assert!(
+            out.status.success(),
+            "quickstart.sh exits 0 on attempt {attempt}; stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+
+        // Both trails exist, are non-empty, and the printed paths name them.
+        let converse_trail = out_dir.join("converse-trail.jsonl");
+        let reply_trail = out_dir.join("serve-send-reply.jsonl");
+        for trail in [&converse_trail, &reply_trail] {
+            let bytes =
+                std::fs::read(trail).unwrap_or_else(|e| panic!("read {}: {e}", trail.display()));
+            assert!(!bytes.is_empty(), "{} is non-empty", trail.display());
+        }
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("quickstart: serve ready"),
+            "stdout records the serve readiness barrier: {stdout}"
+        );
+        assert!(
+            stdout.contains(converse_trail.to_str().unwrap()),
+            "stdout names the converse trail path: {stdout}"
+        );
+        assert!(
+            stdout.contains(reply_trail.to_str().unwrap()),
+            "stdout names the serve+send reply path: {stdout}"
+        );
+
+        // The consumed reply is a well-formed, correlated response envelope;
+        // an error envelope must never be accepted as a successful run.
+        let reply_line = std::fs::read_to_string(&reply_trail).expect("read reply trail");
+        let reply: serde_json::Value =
+            serde_json::from_str(reply_line.trim()).expect("reply is one JSON line");
+        assert_eq!(reply["kind"], "response");
+        assert!(
+            reply["in_reply_to"].is_string(),
+            "the consumed reply correlates to the sent request"
+        );
+
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+}
+
+/// A serve startup failure must stop the quickstart before it posts the first
+/// request. The wrapper makes that failure deterministic while delegating the
+/// converse half to the real binary, so the test also exercises the script's
+/// real process cleanup and captured-stderr path.
+#[cfg(unix)]
+#[test]
+fn quickstart_reports_serve_startup_failure_before_send() {
+    let cargo = option_env!("CARGO").unwrap_or("cargo");
+    let built = Command::new(cargo)
+        .args(["build", "--example", "mock_provider"])
+        .status()
+        .expect("build mock_provider example");
+    assert!(built.success(), "mock_provider example builds");
+
+    let baton_bin = PathBuf::from(env!("CARGO_BIN_EXE_baton"));
+    let mock_bin = baton_bin
+        .parent()
+        .expect("baton bin has a parent dir")
+        .join("examples")
+        .join("mock_provider");
+    assert!(mock_bin.exists(), "mock_provider at {}", mock_bin.display());
+
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("quickstart.sh");
+    let root = std::env::temp_dir().join(format!(
+        "baton-quickstart-startup-failure-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create failure-test root");
+
+    let wrapper = root.join("baton-wrapper.sh");
+    std::fs::write(
+        &wrapper,
+        r##"#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  serve)
+    for arg in "$@"; do
+      if [[ "$arg" == "--stop" ]]; then
+        exec "$REAL_BATON_BIN" "$@"
+      fi
+    done
+    echo "controlled serve failure" >&2
+    exit 42
+    ;;
+  send)
+    : > "$SEND_MARKER"
+    echo "send invoked unexpectedly" >&2
+    exit 43
+    ;;
+  *)
+    exec "$REAL_BATON_BIN" "$@"
+    ;;
+esac
+"##,
+    )
+    .expect("write baton wrapper");
+    let mut permissions = std::fs::metadata(&wrapper)
+        .expect("stat baton wrapper")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&wrapper, permissions).expect("make baton wrapper executable");
+
+    let out_dir = root.join("out");
+    let send_marker = root.join("send-invoked");
     let out = Command::new("bash")
         .arg(&script)
-        .env("BATON_BIN", &baton_bin)
+        .env("BATON_BIN", &wrapper)
         .env("BATON_MOCK_BIN", &mock_bin)
         .env("QUICKSTART_OUT", &out_dir)
+        .env("REAL_BATON_BIN", &baton_bin)
+        .env("SEND_MARKER", &send_marker)
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("ANTHROPIC_AUTH_TOKEN")
         .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
         .env_remove("ANTHROPIC_BASE_URL")
         .env_remove("BATON_EVENT_LOG")
         .output()
-        .expect("run quickstart.sh");
+        .expect("run quickstart startup-failure test");
 
     assert!(
-        out.status.success(),
-        "quickstart.sh exits 0; stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
+        !out.status.success(),
+        "quickstart rejects failed serve startup"
     );
-
-    // Both trails exist, are non-empty, and the printed paths name them.
-    let converse_trail = out_dir.join("converse-trail.jsonl");
-    let reply_trail = out_dir.join("serve-send-reply.jsonl");
-    for trail in [&converse_trail, &reply_trail] {
-        let bytes =
-            std::fs::read(trail).unwrap_or_else(|e| panic!("read {}: {e}", trail.display()));
-        assert!(!bytes.is_empty(), "{} is non-empty", trail.display());
-    }
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains(converse_trail.to_str().unwrap()),
-        "stdout names the converse trail path: {stdout}"
+        stderr.contains("quickstart: serve did not become ready"),
+        "stderr names the readiness failure: {stderr}"
     );
     assert!(
-        stdout.contains(reply_trail.to_str().unwrap()),
-        "stdout names the serve+send reply path: {stdout}"
+        stderr.contains("controlled serve failure"),
+        "stderr includes the daemon diagnostic: {stderr}"
     );
-
-    // The consumed reply is a well-formed, correlated response envelope.
-    let reply_line = std::fs::read_to_string(&reply_trail).expect("read reply trail");
-    let reply: serde_json::Value =
-        serde_json::from_str(reply_line.trim()).expect("reply is one JSON line");
-    assert_eq!(reply["kind"], "response");
     assert!(
-        reply["in_reply_to"].is_string(),
-        "the consumed reply correlates to the sent request"
+        !send_marker.exists(),
+        "send is not invoked after serve startup failure"
     );
 
-    let _ = std::fs::remove_dir_all(&out_dir);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 // ---------------------------------------------------------------------------
