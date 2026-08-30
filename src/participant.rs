@@ -1870,7 +1870,7 @@ mod tests {
             Path::new("sh"),
             &[
                 "-c".to_string(),
-                "cat >/dev/null; echo TIMEOUT-DIAG >&2; while :; do :; done".to_string(),
+                "cat >/dev/null; echo TIMEOUT-DIAG >&2; sleep 1 2>/dev/null &".to_string(),
             ],
             &[],
             None,
