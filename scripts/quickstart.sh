@@ -45,8 +45,14 @@ WORK="$(mktemp -d)"
 MOCK_PID=""
 SERVE_PID=""
 cleanup() {
-  [[ -n "$SERVE_PID" ]] && kill "$SERVE_PID" 2>/dev/null || true
-  [[ -n "$MOCK_PID" ]] && kill "$MOCK_PID" 2>/dev/null || true
+  if [[ -n "$SERVE_PID" ]]; then
+    kill "$SERVE_PID" 2>/dev/null || true
+    wait "$SERVE_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$MOCK_PID" ]]; then
+    kill "$MOCK_PID" 2>/dev/null || true
+    wait "$MOCK_PID" 2>/dev/null || true
+  fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -92,8 +98,42 @@ INBOX="$WORK/mailbox/inbox"
 OUTBOX="$WORK/mailbox/outbox"
 mkdir -p "$INBOX" "$OUTBOX"
 
-"$BATON_BIN" serve --inbox "$INBOX" --outbox "$OUTBOX" &
+SERVE_STDOUT="$WORK/serve.stdout"
+SERVE_STDERR="$WORK/serve.stderr"
+"$BATON_BIN" serve --inbox "$INBOX" --outbox "$OUTBOX" \
+  >"$SERVE_STDOUT" 2>"$SERVE_STDERR" &
 SERVE_PID=$!
+
+# `baton serve` emits this exact, flushed line only after participant setup,
+# mailbox lock acquisition, stale-stop handling, and stale-claim reclamation.
+# Waiting for it makes the first send independent of process scheduling.
+SERVE_READY_TOKEN="baton serve: ready"
+SERVE_READY=0
+for _ in $(seq 1 50); do
+  if grep -Fxq "$SERVE_READY_TOKEN" "$SERVE_STDOUT"; then
+    SERVE_READY=1
+    break
+  fi
+  if ! kill -0 "$SERVE_PID" 2>/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+if [[ "$SERVE_READY" -ne 1 ]]; then
+  echo "quickstart: serve did not become ready" >&2
+  if [[ -s "$SERVE_STDERR" ]]; then
+    cat "$SERVE_STDERR" >&2
+  fi
+  exit 1
+fi
+if ! kill -0 "$SERVE_PID" 2>/dev/null; then
+  echo "quickstart: serve exited after becoming ready" >&2
+  if [[ -s "$SERVE_STDERR" ]]; then
+    cat "$SERVE_STDERR" >&2
+  fi
+  exit 1
+fi
+echo "quickstart: serve ready"
 
 REPLY_TRAIL="$OUT_DIR/serve-send-reply.jsonl"
 # --await prints the correlated reply envelope (one JSON line) to stdout.

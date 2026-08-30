@@ -1877,61 +1877,74 @@ fn quickstart_script_runs_full_loop_against_mock() {
         .join("scripts")
         .join("quickstart.sh");
 
-    let out_dir = std::env::temp_dir().join(format!("baton-quickstart-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&out_dir);
+    let run_quickstart = |out_dir: &Path| {
+        // The script configures its own provider env; strip any host leakage so
+        // every run is deterministic regardless of the developer's shell.
+        Command::new("bash")
+            .arg(&script)
+            .env("BATON_BIN", &baton_bin)
+            .env("BATON_MOCK_BIN", &mock_bin)
+            .env("QUICKSTART_OUT", out_dir)
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+            .env_remove("ANTHROPIC_BASE_URL")
+            .env_remove("BATON_EVENT_LOG")
+            .output()
+            .expect("run quickstart.sh")
+    };
 
-    // The script configures its own provider env; strip any host leakage so the
-    // run is deterministic regardless of the developer's shell.
-    let out = Command::new("bash")
-        .arg(&script)
-        .env("BATON_BIN", &baton_bin)
-        .env("BATON_MOCK_BIN", &mock_bin)
-        .env("QUICKSTART_OUT", &out_dir)
-        .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("ANTHROPIC_AUTH_TOKEN")
-        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
-        .env_remove("ANTHROPIC_BASE_URL")
-        .env_remove("BATON_EVENT_LOG")
-        .output()
-        .expect("run quickstart.sh");
+    // Repeat the background startup ordering so a regression cannot pass only
+    // because one run happened to schedule `serve` before `send`.
+    for attempt in 0..3 {
+        let out_dir =
+            std::env::temp_dir().join(format!("baton-quickstart-{}-{attempt}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out_dir);
+        let out = run_quickstart(&out_dir);
 
-    assert!(
-        out.status.success(),
-        "quickstart.sh exits 0; stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
+        assert!(
+            out.status.success(),
+            "quickstart.sh exits 0 on attempt {attempt}; stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
 
-    // Both trails exist, are non-empty, and the printed paths name them.
-    let converse_trail = out_dir.join("converse-trail.jsonl");
-    let reply_trail = out_dir.join("serve-send-reply.jsonl");
-    for trail in [&converse_trail, &reply_trail] {
-        let bytes =
-            std::fs::read(trail).unwrap_or_else(|e| panic!("read {}: {e}", trail.display()));
-        assert!(!bytes.is_empty(), "{} is non-empty", trail.display());
+        // Both trails exist, are non-empty, and the printed paths name them.
+        let converse_trail = out_dir.join("converse-trail.jsonl");
+        let reply_trail = out_dir.join("serve-send-reply.jsonl");
+        for trail in [&converse_trail, &reply_trail] {
+            let bytes =
+                std::fs::read(trail).unwrap_or_else(|e| panic!("read {}: {e}", trail.display()));
+            assert!(!bytes.is_empty(), "{} is non-empty", trail.display());
+        }
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("quickstart: serve ready"),
+            "stdout records the serve readiness barrier: {stdout}"
+        );
+        assert!(
+            stdout.contains(converse_trail.to_str().unwrap()),
+            "stdout names the converse trail path: {stdout}"
+        );
+        assert!(
+            stdout.contains(reply_trail.to_str().unwrap()),
+            "stdout names the serve+send reply path: {stdout}"
+        );
+
+        // The consumed reply is a well-formed, correlated response envelope;
+        // an error envelope must never be accepted as a successful run.
+        let reply_line = std::fs::read_to_string(&reply_trail).expect("read reply trail");
+        let reply: serde_json::Value =
+            serde_json::from_str(reply_line.trim()).expect("reply is one JSON line");
+        assert_eq!(reply["kind"], "response");
+        assert!(
+            reply["in_reply_to"].is_string(),
+            "the consumed reply correlates to the sent request"
+        );
+
+        let _ = std::fs::remove_dir_all(&out_dir);
     }
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains(converse_trail.to_str().unwrap()),
-        "stdout names the converse trail path: {stdout}"
-    );
-    assert!(
-        stdout.contains(reply_trail.to_str().unwrap()),
-        "stdout names the serve+send reply path: {stdout}"
-    );
-
-    // The consumed reply is a well-formed, correlated response envelope.
-    let reply_line = std::fs::read_to_string(&reply_trail).expect("read reply trail");
-    let reply: serde_json::Value =
-        serde_json::from_str(reply_line.trim()).expect("reply is one JSON line");
-    assert_eq!(reply["kind"], "response");
-    assert!(
-        reply["in_reply_to"].is_string(),
-        "the consumed reply correlates to the sent request"
-    );
-
-    let _ = std::fs::remove_dir_all(&out_dir);
 }
 
 // ---------------------------------------------------------------------------

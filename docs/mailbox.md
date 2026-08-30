@@ -50,6 +50,12 @@ Without `--agent-cmd`, each side configures the answering participant exactly as
 the same trail. A `--role` supplies these same values from the role's home when
 the env leaves them unset.
 
+After participant setup, mailbox lock acquisition, stale-stop handling, and
+stale-claim reclamation all succeed, `serve` writes and flushes the exact line
+`baton serve: ready` to stdout before it begins polling. A launcher may use this
+line as a readiness barrier; it is not emitted when startup fails and it does
+not claim that any request has been answered yet.
+
 ### Delivery: atomic, addressable, crash-safe
 
 A sender delivers by writing a temp file and `rename(2)`-ing it into the inbox,

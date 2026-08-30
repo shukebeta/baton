@@ -150,8 +150,9 @@ at it via `ANTHROPIC_BASE_URL`, and drives both A2A surfaces:
    identities in `prompts/interviewer.md` and `prompts/candidate.md`, driven to
    the turn-cap.
 2. **`baton serve` + `baton send --await`** — an asynchronous mailbox
-   round-trip: `serve` answers a request dropped into an inbox, and `send`
-   consumes the correlated reply.
+   round-trip: the script waits for `serve` to report readiness, then `serve`
+   answers a request dropped into an inbox and `send` consumes the correlated
+   reply.
 
 The resulting JSONL trails are written under `target/quickstart/`
 (`converse-trail.jsonl` and `serve-send-reply.jsonl`); the script prints each
