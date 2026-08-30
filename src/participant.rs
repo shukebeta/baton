@@ -13,6 +13,7 @@
 //! verb performs, so the two share one source of truth (the verb delegates
 //! here); the CLI layers the `BATON_EVENT_LOG` side trail on top.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -570,6 +571,12 @@ impl Participant for ExternalAgentParticipant {
     }
 }
 
+/// Maximum bytes retained from a child's stdout. Beyond this the prefix is
+/// discarded and the retained tail is prefixed with a marker.
+const MAX_STDOUT_BYTES: usize = 8 * 1024 * 1024;
+const STDOUT_TRUNCATION_MARKER: &str =
+    "[truncated at 8 MiB: output prefix dropped; retained tail begins below]\n";
+
 /// Maximum bytes retained from a child's stderr. Beyond this the buffer is
 /// truncated and a marker appended so the reader knows output was lost.
 const MAX_STDERR_BYTES: usize = 1024 * 1024;
@@ -696,7 +703,8 @@ fn append_windows_msvc_arg(line: &mut String, token: &str) {
 /// Both stdout and stderr are drained on their own threads, started *before*
 /// the stdin write, so a child that emits before consuming all its input — or
 /// that writes more than a pipe buffer to stderr — cannot deadlock against a
-/// full pipe. Stderr is capped at [`MAX_STDERR_BYTES`].
+/// full pipe. Stdout is capped at [`MAX_STDOUT_BYTES`] with tail retention;
+/// stderr is capped at [`MAX_STDERR_BYTES`].
 ///
 /// A child that holds stdout open past `read_timeout` is killed and reaped.
 /// Returns `Ok((stdout, stderr))` only when the child exits 0 (either string
@@ -774,8 +782,44 @@ fn capture_child_output(
     let mut stdout_pipe = child.stdout.take().expect("child stdout is piped");
     let (stdout_tx, stdout_rx) = mpsc::channel();
     thread::spawn(move || {
-        let mut buf = Vec::new();
-        let result = stdout_pipe.read_to_end(&mut buf).map(|_| buf);
+        let result = (|| {
+            let mut buf = VecDeque::with_capacity(MAX_STDOUT_BYTES);
+            let mut chunk = [0u8; 8192];
+            let mut truncated = false;
+            loop {
+                match stdout_pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if n >= MAX_STDOUT_BYTES {
+                            buf.clear();
+                            buf.extend(&chunk[n - MAX_STDOUT_BYTES..n]);
+                            truncated = true;
+                        } else {
+                            let overflow =
+                                buf.len().saturating_add(n).saturating_sub(MAX_STDOUT_BYTES);
+                            if overflow > 0 {
+                                truncated = true;
+                                for _ in 0..overflow {
+                                    let _ = buf.pop_front();
+                                }
+                            }
+                            buf.extend(&chunk[..n]);
+                        }
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+
+            let tail: Vec<u8> = buf.into_iter().collect();
+            if truncated {
+                let mut output = Vec::with_capacity(STDOUT_TRUNCATION_MARKER.len() + tail.len());
+                output.extend_from_slice(STDOUT_TRUNCATION_MARKER.as_bytes());
+                output.extend_from_slice(&tail);
+                Ok(output)
+            } else {
+                Ok(tail)
+            }
+        })();
         let _ = stdout_tx.send(result);
     });
 
@@ -1913,6 +1957,66 @@ mod tests {
             "stderr should be near the cap, got {} bytes",
             stderr.len()
         );
+    }
+
+    /// Stdout exceeding `MAX_STDOUT_BYTES` retains only its tail and prefixes
+    /// it with a marker identifying the discarded output prefix.
+    #[test]
+    fn capture_child_output_truncates_stdout_to_tail() {
+        let script = format!(
+            "cat >/dev/null; printf 'DROPPED-HEAD'; dd if=/dev/zero bs=1024 count={} status=none | tr '\\0' 'X'; printf '\\nTAIL\\n'",
+            MAX_STDOUT_BYTES / 1024 + 1,
+        );
+        let (stdout, _) = capture_child_output(
+            Path::new("sh"),
+            &["-c".to_string(), script],
+            &[],
+            None,
+            b"",
+            Duration::from_secs(10),
+        )
+        .expect("exits 0");
+        assert!(
+            stdout.starts_with(STDOUT_TRUNCATION_MARKER),
+            "expected stdout truncation marker, got prefix: {}",
+            &stdout[..stdout.len().min(100)]
+        );
+        assert!(
+            !stdout.contains("DROPPED-HEAD"),
+            "discarded stdout prefix must not be retained"
+        );
+        assert!(
+            stdout.ends_with("TAIL\n"),
+            "retained stdout tail is missing"
+        );
+        assert!(
+            stdout.len() <= MAX_STDOUT_BYTES + STDOUT_TRUNCATION_MARKER.len(),
+            "stdout should be bounded by the cap plus marker, got {} bytes",
+            stdout.len()
+        );
+    }
+
+    /// The JSON adapter still finds a final result line in the retained tail.
+    #[test]
+    fn external_agent_json_adapter_extracts_result_from_truncated_stdout() {
+        let dir = TempDir::new("ext-json-truncated");
+        let script = format!(
+            "cat >/dev/null; printf 'DROPPED-HEAD'; dd if=/dev/zero bs=1024 count={} status=none | tr '\\0' 'X'; printf '\\n{{\"type\":\"result\",\"result\":\"tail result\"}}\\n'",
+            MAX_STDOUT_BYTES / 1024 + 1,
+        );
+        let participant = external_agent_with_output(
+            &script,
+            &dir.path,
+            OutputAdapter::Json {
+                result_key: "result".to_string(),
+            },
+            Duration::from_secs(10),
+        );
+
+        let response = participant.respond(&request_with_body("m-req-1", "go"));
+
+        assert_eq!(response.kind, MessageKind::Response);
+        assert_eq!(response.body, "tail result");
     }
 
     /// `ExternalAgentParticipant` with `stderr_dir` persists non-empty stderr

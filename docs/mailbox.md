@@ -139,6 +139,12 @@ Stderr is capped at **1 MiB** per turn; output beyond the cap is discarded and a
 failure (disk full, permissions) does not turn a successful agent turn into an
 error.
 
+Stdout is capped at **8 MiB** per turn. When output exceeds the cap, the front
+of the output is discarded and the final 8 MiB are retained, with a
+`[truncated at 8 MiB: output prefix dropped; retained tail begins below]`
+marker prepended. Tail retention preserves a final JSON result line for
+`--agent-output json` while keeping the daemon's captured reply bounded.
+
 On a **failed** turn (non-zero exit), stderr is inlined into the
 `BatonError::Transport` error message instead — it is not written to disk.
 
