@@ -2626,8 +2626,23 @@ fn read_task_record(control: &Path, id: &str) -> Result<Option<TaskRecord>> {
 
 fn task_record_exists(control: &Path, id: &str) -> Result<bool> {
     let path = task_record_path(control, id)?;
-    path.try_exists()
-        .map_err(|err| BatonError::Io(format!("could not probe {path:?}: {err}")))
+    match path.try_exists() {
+        Ok(true) => Ok(true),
+        Ok(false) => {
+            let parent = tasks_dir(control);
+            match fs::metadata(&parent) {
+                Ok(metadata) if metadata.is_dir() => Ok(false),
+                Ok(_) => Err(BatonError::Io(format!(
+                    "could not probe task record {path:?}: parent {parent:?} is not a directory"
+                ))),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(err) => Err(BatonError::Io(format!(
+                    "could not probe task record parent {parent:?}: {err}"
+                ))),
+            }
+        }
+        Err(err) => Err(BatonError::Io(format!("could not probe {path:?}: {err}"))),
+    }
 }
 
 fn remove_task_record(control: &Path, id: &str) -> Result<()> {
