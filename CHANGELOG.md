@@ -10,7 +10,7 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.3.40 … v0.3.36 (2026-08-30)
+## v0.3.41 … v0.3.36 (2026-08-30)
 
 ### Fixes
 - fix(task): reject unordered milestones (#248)
@@ -18,6 +18,7 @@ _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 - fix(task): validate milestone order at service admission (#252)
 - fix(quickstart): wait for serve readiness (#255)
 - fix(service): cache Linux rehydrated group scans (#258)
+- fix(service): probe task record existence without parsing (#260)
 
 ## v0.3.35 … v0.3.20 (2026-08-29)
 
