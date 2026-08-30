@@ -2987,12 +2987,7 @@ fn parse_task_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Co
         }
     }
 
-    if let Some((previous, current)) = milestones_ms
-        .iter()
-        .copied()
-        .zip(milestones_ms.iter().copied().skip(1))
-        .find(|(previous, current)| previous >= current)
-    {
+    if let Some((previous, current)) = task::first_non_ascending_milestone(&milestones_ms) {
         return Err(usage(&format!(
             "--milestone-ms values must be strictly ascending: got {previous} followed by {current}"
         )));
