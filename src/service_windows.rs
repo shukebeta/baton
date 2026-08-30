@@ -12,7 +12,7 @@ use crate::mailbox;
 use crate::message::{MessageEnvelope, MessageKind};
 use crate::task::{
     Clock, SystemClock, TaskAdmissionPhase, TaskEventBody, TaskEventKind, TaskRecord, TaskSpec,
-    TaskState, max_duration_exceeded, milestones_due, task_event_id,
+    TaskState, first_non_ascending_milestone, max_duration_exceeded, milestones_due, task_event_id,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, FALSE, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -1861,6 +1861,15 @@ fn handle_task_start_request(
         .map_err(|err| BatonError::Io(format!("could not read {spec_path:?}: {err}")))?;
     let spec: TaskSpec = serde_json::from_str(&data)
         .map_err(|err| BatonError::Decode(format!("malformed task spec {spec_path:?}: {err}")))?;
+    if let Some((previous, current)) = first_non_ascending_milestone(&spec.milestones_ms) {
+        return reject_task_start_request(
+            control,
+            request_id,
+            format!(
+                "task start rejected: --milestone-ms values must be strictly ascending: got {previous} followed by {current}"
+            ),
+        );
+    }
     let owner_live = if mailbox::is_safe_key(&spec.session) {
         read_session_record(control, &spec.session)?
             .map(|record| is_session_alive(&record) == Liveness::Live)

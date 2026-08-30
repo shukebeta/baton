@@ -215,7 +215,8 @@ mod imp {
     use crate::message::{MessageEnvelope, MessageKind};
     use crate::task::{
         Clock, SystemClock, TaskAdmissionPhase, TaskEventBody, TaskEventKind, TaskRecord, TaskSpec,
-        TaskState, max_duration_exceeded, milestones_due, task_event_id,
+        TaskState, first_non_ascending_milestone, max_duration_exceeded, milestones_due,
+        task_event_id,
     };
     #[cfg(test)]
     use crate::task::{FakeClock, TaskCallback};
@@ -2058,6 +2059,15 @@ mod imp {
         let spec: TaskSpec = serde_json::from_str(&data).map_err(|err| {
             BatonError::Decode(format!("malformed task spec {spec_path:?}: {err}"))
         })?;
+        if let Some((previous, current)) = first_non_ascending_milestone(&spec.milestones_ms) {
+            return reject_task_start_request(
+                control,
+                request_id,
+                format!(
+                    "task start rejected: --milestone-ms values must be strictly ascending: got {previous} followed by {current}"
+                ),
+            );
+        }
         // A session being stopped is not an admissible owner, even while its
         // process is still live. `service stop` releases the admission lock
         // across its grace windows (so it never freezes this loop), which
@@ -4645,6 +4655,80 @@ mod imp {
                     .error
                     .as_deref()
                     .is_some_and(|error| error.contains("does not name a live managed session")));
+            }
+        }
+
+        /// Non-ascending milestone schedules are rejected from the actual
+        /// task-requests/ admission path before owner validation or spawn.
+        #[test]
+        fn task_start_rejects_non_ascending_milestones_from_request_file() {
+            let _guard = serialize_forks_and_locks();
+            for (tag, milestones_ms, expected_pair) in [
+                (
+                    "milestones-descending",
+                    vec![5_000, 1_000],
+                    "5000 followed by 1000",
+                ),
+                (
+                    "milestones-duplicate",
+                    vec![1_000, 1_000],
+                    "1000 followed by 1000",
+                ),
+            ] {
+                let dir = TempDir::new(tag);
+                let request_id = format!("{tag}-request");
+                let spawned_marker = dir.path.join("spawned");
+                let request = task_spec(
+                    "missing-owner",
+                    "sh",
+                    vec![
+                        "-c".to_string(),
+                        format!("touch {}", spawned_marker.display()),
+                    ],
+                    milestones_ms,
+                    10_000,
+                    "/tmp/callback",
+                );
+                let requests = task_requests_dir(&dir.path);
+                fs::create_dir_all(&requests).expect("create task requests");
+                fs::write(
+                    requests.join(mailbox::file_name(&request_id)),
+                    serde_json::to_string(&request).expect("serialize task request"),
+                )
+                .expect("write task request");
+
+                let outcome = process_one_task_request(&dir.path, &FakeClock::new())
+                    .expect("ordering rejection is a handled response");
+                assert!(outcome.is_none(), "rejected request must not return a task");
+                assert!(!spawned_marker.exists(), "rejected request must not spawn");
+                assert!(
+                    !dir.path.join("tasks").exists(),
+                    "rejected request must not create a task record directory"
+                );
+                assert!(
+                    !dir.path.join("task-logs").exists(),
+                    "rejected request must not create task logs"
+                );
+                assert!(
+                    !requests.join(mailbox::file_name(&request_id)).exists()
+                        && !task_processing_dir(&dir.path)
+                            .join(mailbox::file_name(&request_id))
+                            .exists(),
+                    "rejected request must be removed from both request states"
+                );
+
+                let response: TaskStartResponse = serde_json::from_str(
+                    &fs::read_to_string(
+                        task_responses_dir(&dir.path).join(mailbox::file_name(&request_id)),
+                    )
+                    .expect("ordering rejection response"),
+                )
+                .expect("decode ordering rejection response");
+                assert!(response.task_id.is_none());
+                let expected_error = format!(
+                    "task start rejected: --milestone-ms values must be strictly ascending: got {expected_pair}"
+                );
+                assert_eq!(response.error.as_deref(), Some(expected_error.as_str()));
             }
         }
 

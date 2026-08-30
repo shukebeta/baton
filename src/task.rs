@@ -285,6 +285,15 @@ pub fn milestones_due(elapsed_ms: u64, milestones_ms: &[u64], already_fired: usi
         .collect()
 }
 
+/// Returns the first adjacent pair that is not strictly ascending.
+pub fn first_non_ascending_milestone(milestones_ms: &[u64]) -> Option<(u64, u64)> {
+    milestones_ms
+        .iter()
+        .copied()
+        .zip(milestones_ms.iter().copied().skip(1))
+        .find(|(previous, current)| previous >= current)
+}
+
 /// Whether `elapsed_ms` has crossed `max_duration_ms`.
 pub fn max_duration_exceeded(elapsed_ms: u64, max_duration_ms: u64) -> bool {
     elapsed_ms >= max_duration_ms
@@ -416,6 +425,19 @@ mod tests {
         let milestones = vec![5_000, 1_000];
         assert_eq!(milestones_due(1_000, &milestones, 0), vec![1]);
         assert_eq!(milestones_due(5_000, &milestones, 2), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn first_non_ascending_milestone_reports_duplicates_and_decreases() {
+        assert_eq!(
+            first_non_ascending_milestone(&[100, 100, 200]),
+            Some((100, 100))
+        );
+        assert_eq!(
+            first_non_ascending_milestone(&[5_000, 1_000, 2_000]),
+            Some((5_000, 1_000))
+        );
+        assert_eq!(first_non_ascending_milestone(&[100, 200]), None);
     }
 
     #[test]
