@@ -10,7 +10,7 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.3.43 … v0.3.36 (2026-08-30)
+## v0.3.44 … v0.3.36 (2026-08-30)
 
 ### Fixes
 - fix(task): reject unordered milestones (#248)
@@ -21,6 +21,7 @@ _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 - fix(service): probe task record existence without parsing (#260)
 - fix(service): cache owned Linux group scans (#262)
 - fix(participant): retain stderr on child timeout (#263)
+- fix(participant): cap child stdout retention (#267)
 
 ## v0.3.35 … v0.3.20 (2026-08-29)
 
