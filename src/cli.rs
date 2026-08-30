@@ -2987,6 +2987,17 @@ fn parse_task_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Co
         }
     }
 
+    if let Some((previous, current)) = milestones_ms
+        .iter()
+        .copied()
+        .zip(milestones_ms.iter().copied().skip(1))
+        .find(|(previous, current)| previous >= current)
+    {
+        return Err(usage(&format!(
+            "--milestone-ms values must be strictly ascending: got {previous} followed by {current}"
+        )));
+    }
+
     let control = require_dir(control, "--control")?;
     let session = require_value(session, "--session")?;
     let command = require_value(command, "--command")?;
@@ -6015,6 +6026,65 @@ mod tests {
                 assert_eq!(spec.callback.role.as_deref(), Some("reviewer"));
             }
             other => panic!("expected Task(Start), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_task_start_rejects_non_ascending_milestones() {
+        let error = parse_args(&argv(&[
+            "task",
+            "start",
+            "--control",
+            "/tmp/ctl",
+            "--session",
+            "svc-1",
+            "--command",
+            "true",
+            "--milestone-ms",
+            "5000",
+            "--milestone-ms=1000",
+            "--max-duration-ms",
+            "10000",
+            "--callback-inbox",
+            "/tmp/cb",
+        ]))
+        .expect_err("descending milestones must be rejected");
+        match error {
+            BatonError::Usage(detail) => {
+                assert!(detail.contains(
+                    "--milestone-ms values must be strictly ascending: got 5000 followed by 1000"
+                ));
+            }
+            other => panic!("expected usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_task_start_rejects_duplicate_milestones() {
+        let error = parse_args(&argv(&[
+            "task",
+            "start",
+            "--control",
+            "/tmp/ctl",
+            "--session",
+            "svc-1",
+            "--command",
+            "true",
+            "--milestone-ms=100",
+            "--milestone-ms=100",
+            "--max-duration-ms",
+            "10000",
+            "--callback-inbox",
+            "/tmp/cb",
+        ]))
+        .expect_err("duplicate milestones must be rejected");
+        match error {
+            BatonError::Usage(detail) => {
+                assert!(detail.contains(
+                    "--milestone-ms values must be strictly ascending: got 100 followed by 100"
+                ));
+            }
+            other => panic!("expected usage error, got {other:?}"),
         }
     }
 

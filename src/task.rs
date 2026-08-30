@@ -410,6 +410,15 @@ mod tests {
     }
 
     #[test]
+    fn milestones_due_assumes_ascending_input() {
+        // The CLI rejects this order before a task reaches the service. The
+        // index watermark only remains correct when milestones are ascending.
+        let milestones = vec![5_000, 1_000];
+        assert_eq!(milestones_due(1_000, &milestones, 0), vec![1]);
+        assert_eq!(milestones_due(5_000, &milestones, 2), Vec::<usize>::new());
+    }
+
+    #[test]
     fn max_duration_exceeded_is_inclusive_boundary() {
         assert!(!max_duration_exceeded(999, 1_000));
         assert!(max_duration_exceeded(1_000, 1_000));
