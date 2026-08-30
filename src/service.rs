@@ -3365,13 +3365,28 @@ mod imp {
         }
     }
 
-    #[cfg(all(target_os = "linux", test))]
+    #[cfg(target_os = "linux")]
     fn task_liveness(record: &TaskRecord) -> (Liveness, Option<i64>) {
-        let probe = process_probe(record.pid);
-        task_liveness_from_probe(record, &probe)
+        match process_probe(record.pid) {
+            ProbeResult::Gone => (Liveness::Dead, None),
+            ProbeResult::Unreadable => (Liveness::Unresolved, None),
+            ProbeResult::Present(probe) if probe.is_zombie() => (Liveness::Dead, None),
+            ProbeResult::Present(probe) => match &record.started_at {
+                Some(recorded) if recorded == &probe.start_key => (Liveness::Live, None),
+                Some(_) => (Liveness::Dead, None),
+                None => match process_argv(record.pid) {
+                    ProbeResult::Gone => (Liveness::Dead, None),
+                    ProbeResult::Unreadable => (Liveness::Unresolved, None),
+                    ProbeResult::Present(actual) if linux_task_argv_matches(&actual, record) => {
+                        (Liveness::Live, None)
+                    }
+                    ProbeResult::Present(_) => (Liveness::Unresolved, None),
+                },
+            },
+        }
     }
 
-    #[cfg(all(target_os = "linux", test))]
+    #[cfg(target_os = "linux")]
     fn is_task_alive(record: &TaskRecord) -> Liveness {
         task_liveness(record).0
     }
@@ -3560,11 +3575,8 @@ mod imp {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn task_liveness_from_probe(
-        record: &TaskRecord,
-        probe: &ProbeResult<ProcessProbe>,
-    ) -> (Liveness, Option<i64>) {
-        match probe {
+    fn task_liveness(record: &TaskRecord) -> (Liveness, Option<i64>) {
+        match process_probe(record.pid) {
             ProbeResult::Gone => (Liveness::Dead, None),
             ProbeResult::Unreadable => (Liveness::Unresolved, None),
             ProbeResult::Present(probe) if probe.is_zombie() => (Liveness::Dead, None),
@@ -3588,12 +3600,6 @@ mod imp {
                 },
             },
         }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn task_liveness(record: &TaskRecord) -> (Liveness, Option<i64>) {
-        let probe = process_probe(record.pid);
-        task_liveness_from_probe(record, &probe)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -3805,6 +3811,7 @@ mod imp {
     /// process-group probe only after its start identity matches the durable
     /// record. A mismatched or legacy identity is never allowed to use the
     /// numeric PID as a group id.
+    #[cfg(target_os = "linux")]
     fn task_leader_exited_from_probe(
         record: &TaskRecord,
         probe: &ProbeResult<ProcessProbe>,
@@ -3823,10 +3830,26 @@ mod imp {
         }
     }
 
+    fn task_leader_exited(record: &TaskRecord) -> TaskLeaderExit {
+        match process_probe(record.pid) {
+            ProbeResult::Gone => TaskLeaderExit::Gone,
+            ProbeResult::Present(probe) if probe.is_zombie() => {
+                match zombie_identity_matches(record, &probe) {
+                    Some(true) => TaskLeaderExit::MatchingZombie,
+                    Some(false) => TaskLeaderExit::Mismatched,
+                    None => TaskLeaderExit::Unresolved,
+                }
+            }
+            ProbeResult::Present(_) => TaskLeaderExit::NotExited,
+            ProbeResult::Unreadable => TaskLeaderExit::Unresolved,
+        }
+    }
+
     /// Combines the direct-PID identity with the Unix process-group boundary.
     /// A rehydrated task has no `Child` handle and its direct leader may have
     /// exited while descendants remain; that group is still live work. An
     /// unresolved group probe is retained rather than finalized or signalled.
+    #[cfg(target_os = "linux")]
     fn task_execution_liveness_from_probe(
         record: &TaskRecord,
         direct_probe: &ProbeResult<ProcessProbe>,
@@ -3848,8 +3871,16 @@ mod imp {
     }
 
     fn task_execution_liveness(record: &TaskRecord) -> Liveness {
-        let direct_probe = process_probe(record.pid);
-        task_execution_liveness_from_probe(record, &direct_probe, None).0
+        match is_task_alive(record) {
+            Liveness::Dead => match task_leader_exited(record) {
+                TaskLeaderExit::Gone | TaskLeaderExit::MatchingZombie => {
+                    task_group_liveness(record.pid)
+                }
+                TaskLeaderExit::Mismatched | TaskLeaderExit::Unresolved => Liveness::Unresolved,
+                TaskLeaderExit::NotExited => Liveness::Dead,
+            },
+            liveness => liveness,
+        }
     }
 
     /// Persists the canonical epoch after a legacy macOS record is rescued by
