@@ -559,17 +559,28 @@ fn stamp_claim_time(path: &Path) {
 /// best-effort removed after a successful read; a crash between the rename and
 /// the removal leaves a `.`-prefixed orphan, which is expected and harmless —
 /// [`json_key`] ignores it, so no scanner ever mistakes it for a message.
+/// If reading or parsing fails after the rename, the claim file is removed
+/// best-effort and the returned error names both the keyed reply and the
+/// underlying cause; the malformed reply is not left as an orphan or restored
+/// for retries.
 pub fn try_claim_response(outbox: &Path, request_key: &str) -> Result<Option<MessageEnvelope>> {
     let key = safe_key(request_key)?;
     let src = outbox.join(file_name(&key));
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let claim = outbox.join(format!(".{key}.{}.{seq}.claimed", std::process::id()));
     match fs::rename(&src, &claim) {
-        Ok(()) => {
-            let envelope = read_envelope(&claim)?;
-            let _ = fs::remove_file(&claim);
-            Ok(Some(envelope))
-        }
+        Ok(()) => match read_envelope(&claim) {
+            Ok(envelope) => {
+                let _ = fs::remove_file(&claim);
+                Ok(Some(envelope))
+            }
+            Err(err) => {
+                let _ = fs::remove_file(&claim);
+                Err(BatonError::Decode(format!(
+                    "reply {src:?} claimed as {claim:?} was unreadable: {err}"
+                )))
+            }
+        },
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(BatonError::Io(format!(
             "could not claim response {src:?}: {err}"
@@ -1060,6 +1071,30 @@ mod tests {
         let outbox = dir.path.join("outbox");
         fs::create_dir_all(&outbox).expect("outbox");
         assert!(try_claim_response(&outbox, "m-1").expect("claim").is_none());
+    }
+
+    /// A malformed reply is consumed with a diagnostic, without leaving the
+    /// private claim orphan behind.
+    #[test]
+    fn try_claim_response_removes_malformed_reply_claim() {
+        let dir = TempDir::new("claim-malformed");
+        let outbox = dir.path.join("outbox");
+        fs::create_dir_all(&outbox).expect("outbox");
+        let src = outbox.join(file_name("m-1"));
+        fs::write(&src, "garbage").expect("malformed reply");
+
+        let error = match try_claim_response(&outbox, "m-1") {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("malformed reply must return an error"),
+        };
+        assert!(error.contains(&format!("{src:?}")), "error: {error}");
+        assert!(error.contains("malformed envelope"), "error: {error}");
+        assert!(!src.exists(), "the keyed reply was consumed");
+        assert_eq!(
+            fs::read_dir(&outbox).expect("read outbox").count(),
+            0,
+            "the malformed claim was removed"
+        );
     }
 
     /// `poll_stop` is `false` when no sentinel is present.
