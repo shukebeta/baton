@@ -201,7 +201,7 @@ pub fn execute_task(cmd: TaskCommand, _out: impl Write) -> Result<()> {
 #[cfg(unix)]
 mod imp {
     use super::*;
-    #[cfg(all(test, not(target_os = "linux")))]
+    #[cfg(test)]
     use std::cell::Cell;
     use std::collections::HashMap;
     use std::fs::{self, File, OpenOptions, TryLockError};
@@ -246,10 +246,10 @@ mod imp {
     /// Interval between `Run`'s request-directory scans, and between polls of
     /// a pending await (start response, stop/kill grace).
     const POLL_INTERVAL_MS: u64 = 100;
-    /// Minimum interval between liveness probes for one rehydrated task. The
-    /// supervisor still ticks every 100 ms, but a non-Linux `ps` probe is
-    /// allowed at most twice per second in the steady state.
-    #[cfg(not(target_os = "linux"))]
+    /// Minimum interval between liveness samples for one rehydrated task's
+    /// process group. The supervisor still ticks every 100 ms, but the costly
+    /// Linux `/proc` table scan and non-Linux `ps` probe are each allowed at
+    /// most twice per second in the steady state.
     const REHYDRATED_LIVENESS_CACHE_MS: u64 = 500;
     /// Initial delay before retrying a failed task-event callback delivery.
     /// Governs both milestone and terminal delivery — the same bounded
@@ -273,24 +273,44 @@ mod imp {
     /// several calls within the same millisecond.
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
-    #[cfg(all(test, not(target_os = "linux")))]
+    #[cfg(test)]
     thread_local! {
         static PROCESS_PROBE_COUNT: Cell<u64> = const { Cell::new(0) };
     }
 
-    #[cfg(all(test, not(target_os = "linux")))]
+    #[cfg(test)]
     fn note_process_probe() {
         PROCESS_PROBE_COUNT.with(|count| count.set(count.get() + 1));
     }
 
-    #[cfg(all(test, not(target_os = "linux")))]
+    #[cfg(test)]
     fn reset_process_probe_count() {
         PROCESS_PROBE_COUNT.with(|count| count.set(0));
     }
 
-    #[cfg(all(test, not(target_os = "linux")))]
+    #[cfg(test)]
     fn process_probe_count() -> u64 {
         PROCESS_PROBE_COUNT.with(Cell::get)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    thread_local! {
+        static GROUP_SCAN_COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn note_group_scan() {
+        GROUP_SCAN_COUNT.with(|count| count.set(count.get() + 1));
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn reset_group_scan_count() {
+        GROUP_SCAN_COUNT.with(|count| count.set(0));
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn group_scan_count() -> u64 {
+        GROUP_SCAN_COUNT.with(Cell::get)
     }
 
     /// Opens any service lock with close-on-exec set. `Run` holds the control
@@ -1840,6 +1860,11 @@ mod imp {
         /// init, so it is represented by `None` and polled by corroborated
         /// PID liveness instead of `Child::try_wait`.
         child: Option<Child>,
+        /// Most recent Linux process-group liveness sample for a rehydrated
+        /// task. Direct PID identity is still probed on every tick; only the
+        /// table-wide group scan is rate-limited.
+        #[cfg(target_os = "linux")]
+        rehydrated_group_liveness: Option<(u64, Liveness, Instant)>,
         /// Most recent non-Linux liveness sample for a rehydrated task, with
         /// both injected-clock and monotonic wall-clock timestamps. The
         /// sample is intentionally in-memory: a restart must corroborate the
@@ -1913,6 +1938,8 @@ mod imp {
                 RunningTask {
                     record,
                     child: None,
+                    #[cfg(target_os = "linux")]
+                    rehydrated_group_liveness: None,
                     #[cfg(not(target_os = "linux"))]
                     rehydrated_liveness: None,
                     started_ms,
@@ -1995,6 +2022,8 @@ mod imp {
                     let running = RunningTask {
                         record,
                         child: Some(child),
+                        #[cfg(target_os = "linux")]
+                        rehydrated_group_liveness: None,
                         #[cfg(not(target_os = "linux"))]
                         rehydrated_liveness: None,
                         started_ms,
@@ -2333,15 +2362,44 @@ mod imp {
         })
     }
 
-    /// Returns one liveness sample for a rehydrated task. Linux deliberately
-    /// keeps its existing `/proc` cadence; non-Linux hosts cache the sample.
+    /// Returns one liveness sample for a rehydrated task. Linux always checks
+    /// direct PID identity, but rate-limits the table-wide group scan. A
+    /// forced refresh is used immediately before timeout escalation.
     #[cfg(target_os = "linux")]
     fn rehydrated_task_liveness(
         running: &mut RunningTask,
-        _now_ms: u64,
-        _force_refresh: bool,
+        now_ms: u64,
+        force_refresh: bool,
     ) -> Liveness {
-        task_execution_liveness(&running.record)
+        let direct_probe = process_probe(running.record.pid);
+        let refresh = force_refresh
+            || running
+                .rehydrated_group_liveness
+                .map(|(checked_ms, _, checked_at)| {
+                    now_ms.saturating_sub(checked_ms) >= REHYDRATED_LIVENESS_CACHE_MS
+                        || checked_at.elapsed()
+                            >= Duration::from_millis(REHYDRATED_LIVENESS_CACHE_MS)
+                })
+                .unwrap_or(true);
+        let cached_group_liveness = if refresh {
+            None
+        } else {
+            Some(
+                running
+                    .rehydrated_group_liveness
+                    .expect("rehydrated group liveness cache populated")
+                    .1,
+            )
+        };
+        let (liveness, used_group_liveness) = task_execution_liveness_from_probe(
+            &running.record,
+            &direct_probe,
+            cached_group_liveness,
+        );
+        if refresh && used_group_liveness {
+            running.rehydrated_group_liveness = Some((now_ms, liveness, Instant::now()));
+        }
+        liveness
     }
 
     /// Returns one cached liveness sample for a rehydrated task. The injected
@@ -3188,7 +3246,7 @@ mod imp {
         if pid <= 1 {
             return ProbeResult::Gone;
         }
-        #[cfg(all(test, not(target_os = "linux")))]
+        #[cfg(test)]
         note_process_probe();
         match fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => parse_linux_process_probe(&stat)
@@ -3284,8 +3342,11 @@ mod imp {
     }
 
     #[cfg(target_os = "linux")]
-    fn task_liveness(record: &TaskRecord) -> (Liveness, Option<i64>) {
-        match process_probe(record.pid) {
+    fn task_liveness_from_probe(
+        record: &TaskRecord,
+        probe: &ProbeResult<ProcessProbe>,
+    ) -> (Liveness, Option<i64>) {
+        match probe {
             ProbeResult::Gone => (Liveness::Dead, None),
             ProbeResult::Unreadable => (Liveness::Unresolved, None),
             ProbeResult::Present(probe) if probe.is_zombie() => (Liveness::Dead, None),
@@ -3304,7 +3365,13 @@ mod imp {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", test))]
+    fn task_liveness(record: &TaskRecord) -> (Liveness, Option<i64>) {
+        let probe = process_probe(record.pid);
+        task_liveness_from_probe(record, &probe)
+    }
+
+    #[cfg(all(target_os = "linux", test))]
     fn is_task_alive(record: &TaskRecord) -> Liveness {
         task_liveness(record).0
     }
@@ -3354,7 +3421,7 @@ mod imp {
         if pid <= 1 {
             return ProbeResult::Gone;
         }
-        #[cfg(all(test, not(target_os = "linux")))]
+        #[cfg(test)]
         note_process_probe();
         let output = match Command::new("ps")
             .args([
@@ -3493,8 +3560,11 @@ mod imp {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn task_liveness(record: &TaskRecord) -> (Liveness, Option<i64>) {
-        match process_probe(record.pid) {
+    fn task_liveness_from_probe(
+        record: &TaskRecord,
+        probe: &ProbeResult<ProcessProbe>,
+    ) -> (Liveness, Option<i64>) {
+        match probe {
             ProbeResult::Gone => (Liveness::Dead, None),
             ProbeResult::Unreadable => (Liveness::Unresolved, None),
             ProbeResult::Present(probe) if probe.is_zombie() => (Liveness::Dead, None),
@@ -3518,6 +3588,12 @@ mod imp {
                 },
             },
         }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn task_liveness(record: &TaskRecord) -> (Liveness, Option<i64>) {
+        let probe = process_probe(record.pid);
+        task_liveness_from_probe(record, &probe)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -3567,6 +3643,8 @@ mod imp {
     /// forever during cleanup.
     #[cfg(target_os = "linux")]
     fn process_group_member_liveness(pgid: u32) -> Liveness {
+        #[cfg(test)]
+        note_group_scan();
         let entries = match fs::read_dir("/proc") {
             Ok(entries) => entries,
             Err(_) => return Liveness::Unresolved,
@@ -3727,11 +3805,14 @@ mod imp {
     /// process-group probe only after its start identity matches the durable
     /// record. A mismatched or legacy identity is never allowed to use the
     /// numeric PID as a group id.
-    fn task_leader_exited(record: &TaskRecord) -> TaskLeaderExit {
-        match process_probe(record.pid) {
+    fn task_leader_exited_from_probe(
+        record: &TaskRecord,
+        probe: &ProbeResult<ProcessProbe>,
+    ) -> TaskLeaderExit {
+        match probe {
             ProbeResult::Gone => TaskLeaderExit::Gone,
             ProbeResult::Present(probe) if probe.is_zombie() => {
-                match zombie_identity_matches(record, &probe) {
+                match zombie_identity_matches(record, probe) {
                     Some(true) => TaskLeaderExit::MatchingZombie,
                     Some(false) => TaskLeaderExit::Mismatched,
                     None => TaskLeaderExit::Unresolved,
@@ -3746,17 +3827,29 @@ mod imp {
     /// A rehydrated task has no `Child` handle and its direct leader may have
     /// exited while descendants remain; that group is still live work. An
     /// unresolved group probe is retained rather than finalized or signalled.
-    fn task_execution_liveness(record: &TaskRecord) -> Liveness {
-        match is_task_alive(record) {
-            Liveness::Dead => match task_leader_exited(record) {
-                TaskLeaderExit::Gone | TaskLeaderExit::MatchingZombie => {
-                    task_group_liveness(record.pid)
+    fn task_execution_liveness_from_probe(
+        record: &TaskRecord,
+        direct_probe: &ProbeResult<ProcessProbe>,
+        group_liveness: Option<Liveness>,
+    ) -> (Liveness, bool) {
+        match task_liveness_from_probe(record, direct_probe).0 {
+            Liveness::Dead => match task_leader_exited_from_probe(record, direct_probe) {
+                TaskLeaderExit::Gone | TaskLeaderExit::MatchingZombie => (
+                    group_liveness.unwrap_or_else(|| task_group_liveness(record.pid)),
+                    true,
+                ),
+                TaskLeaderExit::Mismatched | TaskLeaderExit::Unresolved => {
+                    (Liveness::Unresolved, false)
                 }
-                TaskLeaderExit::Mismatched | TaskLeaderExit::Unresolved => Liveness::Unresolved,
-                TaskLeaderExit::NotExited => Liveness::Dead,
+                TaskLeaderExit::NotExited => (Liveness::Dead, false),
             },
-            liveness => liveness,
+            liveness => (liveness, false),
         }
+    }
+
+    fn task_execution_liveness(record: &TaskRecord) -> Liveness {
+        let direct_probe = process_probe(record.pid);
+        task_execution_liveness_from_probe(record, &direct_probe, None).0
     }
 
     /// Persists the canonical epoch after a legacy macOS record is rescued by
@@ -4360,6 +4453,8 @@ mod imp {
             RunningTask {
                 record,
                 child: Some(child),
+                #[cfg(target_os = "linux")]
+                rehydrated_group_liveness: None,
                 #[cfg(not(target_os = "linux"))]
                 rehydrated_liveness: None,
                 started_ms,
@@ -4411,6 +4506,8 @@ mod imp {
             RunningTask {
                 record,
                 child: None,
+                #[cfg(target_os = "linux")]
+                rehydrated_group_liveness: None,
                 #[cfg(not(target_os = "linux"))]
                 rehydrated_liveness: None,
                 started_ms: clock.now_ms(),
@@ -7006,6 +7103,185 @@ mod imp {
             assert_terminal_task_event(&callback_inbox, "task-timeout-group");
         }
 
+        /// Linux rehydrated liveness probes the direct PID on every tick but
+        /// rate-limits the table-wide group scan. Timeout TERM and KILL
+        /// decisions force a fresh group sample even inside the cache window.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn rehydrated_linux_group_scan_is_rate_limited_and_forced_for_timeout() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("rehydrate-linux-group-cache");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let spec = task_spec(
+                "svc-1",
+                "sh",
+                vec![
+                    "-c".to_string(),
+                    "trap '' TERM; sleep 30 & exit 0".to_string(),
+                ],
+                vec![],
+                100,
+                &callback_inbox.display().to_string(),
+            );
+            let mut owned =
+                spawn_running_task(&dir.path, "task-rehydrated-linux-cache", spec, &clock);
+
+            wait_for_group_descendant(&mut owned);
+            owned
+                .child
+                .take()
+                .expect("owned task child")
+                .wait()
+                .expect("wait for direct leader");
+            let mut rehydrated = RunningTask {
+                record: owned.record.clone(),
+                child: None,
+                rehydrated_group_liveness: None,
+                #[cfg(not(target_os = "linux"))]
+                rehydrated_liveness: None,
+                started_ms: owned.started_ms,
+                term_sent_at_ms: None,
+                kill_sent: false,
+                terminal_delivery_attempts: 0,
+                next_terminal_retry_ms: None,
+                terminal_retry_delay_ms: 0,
+                milestone_delivery_attempts: 0,
+                next_milestone_retry_ms: None,
+                milestone_retry_delay_ms: 0,
+            };
+
+            reset_process_probe_count();
+            reset_group_scan_count();
+            assert!(matches!(
+                tick_one_task(
+                    &dir.path,
+                    "task-rehydrated-linux-cache",
+                    &mut rehydrated,
+                    &clock,
+                ),
+                Ok(TaskTick::StillRunning)
+            ));
+            assert_eq!(
+                process_probe_count(),
+                1,
+                "direct PID is checked on the first tick"
+            );
+            assert_eq!(
+                group_scan_count(),
+                1,
+                "the first group sample scans /proc once"
+            );
+
+            // The timeout is due at 100ms, while the initial group sample is
+            // still fresh. The signal decision nevertheless forces a scan.
+            clock.advance(100);
+            assert!(matches!(
+                tick_one_task(
+                    &dir.path,
+                    "task-rehydrated-linux-cache",
+                    &mut rehydrated,
+                    &clock,
+                ),
+                Ok(TaskTick::StillRunning)
+            ));
+            assert!(rehydrated.term_sent_at_ms.is_some());
+            assert_eq!(
+                process_probe_count(),
+                2,
+                "direct PID is checked before TERM"
+            );
+            assert_eq!(group_scan_count(), 2, "TERM uses a fresh group sample");
+
+            clock.advance(100);
+            tick_one_task(
+                &dir.path,
+                "task-rehydrated-linux-cache",
+                &mut rehydrated,
+                &clock,
+            )
+            .expect("cached group liveness tick");
+            assert_eq!(process_probe_count(), 3, "direct PID remains per-tick");
+            assert_eq!(
+                group_scan_count(),
+                2,
+                "group scan remains cached inside the window"
+            );
+
+            // The sample was refreshed at 100ms, so 600ms is the exact
+            // inclusive cache boundary.
+            clock.advance(REHYDRATED_LIVENESS_CACHE_MS - 100);
+            tick_one_task(
+                &dir.path,
+                "task-rehydrated-linux-cache",
+                &mut rehydrated,
+                &clock,
+            )
+            .expect("boundary group liveness tick");
+            assert_eq!(
+                process_probe_count(),
+                4,
+                "direct PID remains per-tick at the boundary"
+            );
+            assert_eq!(
+                group_scan_count(),
+                3,
+                "the exact boundary refreshes the group scan"
+            );
+
+            // Refresh the group sample shortly before the real KILL deadline,
+            // then verify the due decision forces another sample inside the
+            // cache window without waiting in wall-clock time.
+            let term_sent_at = rehydrated.term_sent_at_ms.expect("TERM timestamp");
+            let pre_kill_at = term_sent_at + KILL_GRACE_MS - 100;
+            clock.advance(pre_kill_at - clock.now_ms());
+            tick_one_task(
+                &dir.path,
+                "task-rehydrated-linux-cache",
+                &mut rehydrated,
+                &clock,
+            )
+            .expect("pre-KILL group liveness tick");
+            assert_eq!(
+                process_probe_count(),
+                5,
+                "direct PID remains per-tick before KILL"
+            );
+            assert_eq!(
+                group_scan_count(),
+                4,
+                "pre-KILL sample refreshes after expiry"
+            );
+
+            clock.advance(100);
+            let kill_tick = tick_one_task(
+                &dir.path,
+                "task-rehydrated-linux-cache",
+                &mut rehydrated,
+                &clock,
+            )
+            .expect("forced KILL liveness tick");
+            assert!(matches!(kill_tick, TaskTick::StillRunning));
+            assert!(rehydrated.kill_sent);
+            assert_eq!(
+                process_probe_count(),
+                6,
+                "direct PID is checked before KILL"
+            );
+            assert_eq!(group_scan_count(), 5, "KILL uses a fresh group sample");
+
+            clock.advance(REHYDRATED_LIVENESS_CACHE_MS);
+            reap_task_until_finished(
+                &dir.path,
+                "task-rehydrated-linux-cache",
+                &mut rehydrated,
+                &clock,
+                kill_tick,
+            );
+            assert_eq!(rehydrated.record.state, TaskState::Timeout);
+            assert_terminal_task_event(&callback_inbox, "task-rehydrated-linux-cache");
+        }
+
         /// Rehydrated liveness is sampled once per tick and cached between
         /// ticks. The fake clock makes the 500 ms cadence deterministic while
         /// the process-probe seam proves that the supervisor does not repeat
@@ -7084,6 +7360,8 @@ mod imp {
             let mut rehydrated = RunningTask {
                 record: owned.record.clone(),
                 child: None,
+                #[cfg(target_os = "linux")]
+                rehydrated_group_liveness: None,
                 #[cfg(not(target_os = "linux"))]
                 rehydrated_liveness: None,
                 started_ms: owned.started_ms,
