@@ -1947,6 +1947,109 @@ fn quickstart_script_runs_full_loop_against_mock() {
     }
 }
 
+/// A serve startup failure must stop the quickstart before it posts the first
+/// request. The wrapper makes that failure deterministic while delegating the
+/// converse half to the real binary, so the test also exercises the script's
+/// real process cleanup and captured-stderr path.
+#[cfg(unix)]
+#[test]
+fn quickstart_reports_serve_startup_failure_before_send() {
+    let cargo = option_env!("CARGO").unwrap_or("cargo");
+    let built = Command::new(cargo)
+        .args(["build", "--example", "mock_provider"])
+        .status()
+        .expect("build mock_provider example");
+    assert!(built.success(), "mock_provider example builds");
+
+    let baton_bin = PathBuf::from(env!("CARGO_BIN_EXE_baton"));
+    let mock_bin = baton_bin
+        .parent()
+        .expect("baton bin has a parent dir")
+        .join("examples")
+        .join("mock_provider");
+    assert!(mock_bin.exists(), "mock_provider at {}", mock_bin.display());
+
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("quickstart.sh");
+    let root = std::env::temp_dir().join(format!(
+        "baton-quickstart-startup-failure-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create failure-test root");
+
+    let wrapper = root.join("baton-wrapper.sh");
+    std::fs::write(
+        &wrapper,
+        r##"#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  serve)
+    for arg in "$@"; do
+      if [[ "$arg" == "--stop" ]]; then
+        exec "$REAL_BATON_BIN" "$@"
+      fi
+    done
+    echo "controlled serve failure" >&2
+    exit 42
+    ;;
+  send)
+    : > "$SEND_MARKER"
+    echo "send invoked unexpectedly" >&2
+    exit 43
+    ;;
+  *)
+    exec "$REAL_BATON_BIN" "$@"
+    ;;
+esac
+"##,
+    )
+    .expect("write baton wrapper");
+    let mut permissions = std::fs::metadata(&wrapper)
+        .expect("stat baton wrapper")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&wrapper, permissions).expect("make baton wrapper executable");
+
+    let out_dir = root.join("out");
+    let send_marker = root.join("send-invoked");
+    let out = Command::new("bash")
+        .arg(&script)
+        .env("BATON_BIN", &wrapper)
+        .env("BATON_MOCK_BIN", &mock_bin)
+        .env("QUICKSTART_OUT", &out_dir)
+        .env("REAL_BATON_BIN", &baton_bin)
+        .env("SEND_MARKER", &send_marker)
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env_remove("ANTHROPIC_BASE_URL")
+        .env_remove("BATON_EVENT_LOG")
+        .output()
+        .expect("run quickstart startup-failure test");
+
+    assert!(
+        !out.status.success(),
+        "quickstart rejects failed serve startup"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("quickstart: serve did not become ready"),
+        "stderr names the readiness failure: {stderr}"
+    );
+    assert!(
+        stderr.contains("controlled serve failure"),
+        "stderr includes the daemon diagnostic: {stderr}"
+    );
+    assert!(
+        !send_marker.exists(),
+        "send is not invoked after serve startup failure"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // ---------------------------------------------------------------------------
 // N-party `baton converse-ring` over a static routing registry.
 //
