@@ -4575,6 +4575,40 @@ mod imp {
         // that can reach one of those takes the guard.
         use crate::test_support::serialize_forks_and_locks;
 
+        #[cfg(not(target_os = "linux"))]
+        struct ChildCleanup {
+            child: Option<Child>,
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        impl ChildCleanup {
+            fn new(child: Child) -> Self {
+                Self { child: Some(child) }
+            }
+
+            fn child(&self) -> &Child {
+                self.child.as_ref().expect("child fixture exists")
+            }
+
+            fn id(&self) -> u32 {
+                self.child().id()
+            }
+
+            fn reap(&mut self) {
+                if let Some(mut child) = self.child.take() {
+                    let _ = signal_group(child.id(), "-KILL");
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        impl Drop for ChildCleanup {
+            fn drop(&mut self) {
+                self.reap();
+            }
+        }
+
         struct TempDir {
             path: std::path::PathBuf,
         }
@@ -6659,7 +6693,6 @@ mod imp {
             assert_eq!(claimed.key, format!("{task_id}-terminal"));
         }
 
-        #[cfg(target_os = "linux")]
         fn wait_for_zombie_group_descendant(child: &Child) {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
@@ -7850,7 +7883,9 @@ mod imp {
                 "/tmp/callback",
             );
             let mut running = spawn_running_task(&dir.path, "task-grace-non-linux", task, &clock);
-            wait_for_group_descendant(&mut running);
+            let task_child = running.child.take().expect("task fixture child");
+            let mut task_cleanup = ChildCleanup::new(task_child);
+            wait_for_zombie_group_descendant(task_cleanup.child());
 
             reset_group_scan_count();
             assert_eq!(
@@ -7863,11 +7898,45 @@ mod imp {
                 1,
                 "the retry helper performs one fresh process-table scan"
             );
+
+            let session_spec = task_spec(
+                "svc-1",
+                "sleep",
+                vec!["30".to_string()],
+                vec![],
+                60_000,
+                "/tmp/callback",
+            );
+            let session_logs = task_logs_dir(&dir.path, "session-grace-non-linux");
+            fs::create_dir_all(&session_logs).expect("create session fixture logs");
+            let session_child = spawn_task_child(
+                &session_spec,
+                &session_logs.join("stdout.log"),
+                &session_logs.join("stderr.log"),
+            )
+            .expect("spawn session fixture");
+            let mut session_cleanup = ChildCleanup::new(session_child);
+            let (started_at, start_epoch_secs) = recorded_start_identity(session_cleanup.id());
+            let session = SessionRecord {
+                id: "svc-grace-non-linux".to_string(),
+                spec: spec("/tmp/in", "/tmp/out"),
+                pid: session_cleanup.id(),
+                started_at,
+                start_epoch_secs,
+                stderr_path: String::new(),
+            };
+
+            // A live leader with no durable identity and an impossible
+            // historical start time is unresolved without entering the group
+            // path. Keep this separate from the zombie fixture: macOS may
+            // reap that leader between probes, which would correctly take a
+            // Gone -> group-Live path instead of exercising retry/deadline.
             let mut unresolved = running.record.clone();
-            unresolved.start_epoch_secs = unresolved
-                .start_epoch_secs
-                .map(|start_epoch_secs| start_epoch_secs.saturating_add(1))
-                .or(Some(i64::MAX));
+            unresolved.pid = session.pid;
+            unresolved.spec = session_spec;
+            unresolved.started_at = None;
+            unresolved.start_epoch_secs = None;
+            unresolved.started_ms = Some(SystemClock.now_ms().saturating_add(10_000));
             let retry_grace_ms = POLL_INTERVAL_MS * 2;
             reset_process_probe_count();
             reset_group_scan_count();
@@ -7908,39 +7977,7 @@ mod imp {
                 group_scan_count() > 1,
                 "task wait did not exercise repeated process-table scans"
             );
-            signal_group(running.record.pid, "-KILL").expect("kill task fixture group");
-            running
-                .child
-                .take()
-                .expect("task fixture child")
-                .wait()
-                .expect("reap task fixture");
-
-            let session_spec = task_spec(
-                "svc-1",
-                "sleep",
-                vec!["30".to_string()],
-                vec![],
-                60_000,
-                "/tmp/callback",
-            );
-            let session_logs = task_logs_dir(&dir.path, "session-grace-non-linux");
-            fs::create_dir_all(&session_logs).expect("create session fixture logs");
-            let mut session_child = spawn_task_child(
-                &session_spec,
-                &session_logs.join("stdout.log"),
-                &session_logs.join("stderr.log"),
-            )
-            .expect("spawn session fixture");
-            let (started_at, start_epoch_secs) = recorded_start_identity(session_child.id());
-            let session = SessionRecord {
-                id: "svc-grace-non-linux".to_string(),
-                spec: spec("/tmp/in", "/tmp/out"),
-                pid: session_child.id(),
-                started_at,
-                start_epoch_secs,
-                stderr_path: String::new(),
-            };
+            task_cleanup.reap();
             reset_process_probe_count();
             let started = Instant::now();
             wait_while_alive(&session, grace_ms);
@@ -7953,8 +7990,7 @@ mod imp {
                 "session probe chain exceeded the 500ms budget: {}",
                 process_probe_count()
             );
-            signal_group(session.pid, "-KILL").expect("kill session fixture group");
-            session_child.wait().expect("reap session fixture");
+            session_cleanup.reap();
         }
 
         /// A restarted supervisor has no Child handle, but still waits for a
