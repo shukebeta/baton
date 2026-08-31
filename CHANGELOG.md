@@ -10,11 +10,12 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.3.46 … v0.3.45 (2026-08-31)
+## v0.3.47 … v0.3.45 (2026-08-31)
 
 ### Fixes
 - fix(service): rate-limit grace-wait liveness scans (#269)
 - fix(log): warn on uncorrelated session pairing loss (#274)
+- fix(transport): preserve Claude stop reason (#276)
 
 ## v0.3.44 … v0.3.36 (2026-08-30)
 
