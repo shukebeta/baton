@@ -3850,6 +3850,31 @@ mod imp {
     }
 
     #[cfg(target_os = "linux")]
+    fn task_group_liveness_with_cached_sample(
+        pid: u32,
+        cached_liveness: Option<Liveness>,
+    ) -> (Liveness, bool) {
+        if pid <= 1 || pid > i32::MAX as u32 {
+            return (Liveness::Dead, false);
+        }
+        let result = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
+        match result {
+            0 => (
+                cached_liveness.unwrap_or_else(|| group_scan_with_absence_recheck(pid)),
+                true,
+            ),
+            _ => match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ESRCH) => (Liveness::Dead, false),
+                Some(libc::EPERM) => (
+                    cached_liveness.unwrap_or_else(|| group_scan_with_absence_recheck(pid)),
+                    true,
+                ),
+                _ => (Liveness::Unresolved, false),
+            },
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     fn parse_linux_process_group_member(stat: &str) -> Option<(u32, bool, u32)> {
         let pid = stat.split_once(' ')?.0.parse::<u32>().ok()?;
         let after_comm = stat.rsplit_once(')')?.1;
@@ -3947,10 +3972,9 @@ mod imp {
     ) -> (Liveness, bool) {
         match task_liveness_from_probe(record, direct_probe).0 {
             Liveness::Dead => match task_leader_exited_from_probe(record, direct_probe) {
-                TaskLeaderExit::Gone | TaskLeaderExit::MatchingZombie => (
-                    group_liveness.unwrap_or_else(|| task_group_liveness(record.pid)),
-                    true,
-                ),
+                TaskLeaderExit::Gone | TaskLeaderExit::MatchingZombie => {
+                    task_group_liveness_with_cached_sample(record.pid, group_liveness)
+                }
                 TaskLeaderExit::Mismatched | TaskLeaderExit::Unresolved => {
                     (Liveness::Unresolved, false)
                 }
@@ -4053,16 +4077,86 @@ mod imp {
             .map_err(|err| BatonError::Io(format!("could not run kill {sig} -{pid}: {err}")))
     }
 
+    /// Caches only the probes whose cost is amplified by a grace wait. The
+    /// cache is deliberately created by each wait invocation: a sample from
+    /// one cleanup ladder must not authorize a later signal in another one.
+    struct GraceWaitLivenessCache {
+        #[cfg(target_os = "linux")]
+        group_liveness: Option<(Instant, Liveness)>,
+        #[cfg(not(target_os = "linux"))]
+        liveness: Option<(Instant, Liveness)>,
+    }
+
+    impl GraceWaitLivenessCache {
+        fn new() -> Self {
+            Self {
+                #[cfg(target_os = "linux")]
+                group_liveness: None,
+                #[cfg(not(target_os = "linux"))]
+                liveness: None,
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        fn task_liveness(&mut self, record: &TaskRecord) -> Liveness {
+            let direct_probe = process_probe(record.pid);
+            let cached_group_liveness = self
+                .group_liveness
+                .filter(|(checked_at, _)| {
+                    checked_at.elapsed() < Duration::from_millis(REHYDRATED_LIVENESS_CACHE_MS)
+                })
+                .map(|(_, liveness)| liveness);
+            let refresh_group_liveness = cached_group_liveness.is_none();
+            let (liveness, used_group_liveness) =
+                task_execution_liveness_from_probe(record, &direct_probe, cached_group_liveness);
+            if used_group_liveness && refresh_group_liveness {
+                self.group_liveness = Some((Instant::now(), liveness));
+            }
+            liveness
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        fn task_liveness(&mut self, record: &TaskRecord) -> Liveness {
+            self.cached(|| task_execution_liveness(record))
+        }
+
+        #[cfg(target_os = "linux")]
+        fn session_liveness(&mut self, record: &SessionRecord) -> Liveness {
+            // Linux's session probe is a cheap direct /proc read (plus a
+            // legacy argv read), so retain its per-poll death detection.
+            is_session_alive(record)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        fn session_liveness(&mut self, record: &SessionRecord) -> Liveness {
+            self.cached(|| is_session_alive(record))
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        fn cached(&mut self, probe: impl FnOnce() -> Liveness) -> Liveness {
+            if let Some((checked_at, liveness)) = self.liveness
+                && checked_at.elapsed() < Duration::from_millis(REHYDRATED_LIVENESS_CACHE_MS)
+            {
+                return liveness;
+            }
+            let liveness = probe();
+            self.liveness = Some((Instant::now(), liveness));
+            liveness
+        }
+    }
+
     fn wait_while_alive(record: &SessionRecord, grace_ms: u64) {
+        let mut cache = GraceWaitLivenessCache::new();
         let deadline = Instant::now() + Duration::from_millis(grace_ms);
-        while is_session_alive(record) != Liveness::Dead && Instant::now() < deadline {
+        while cache.session_liveness(record) != Liveness::Dead && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         }
     }
 
     fn wait_while_task_alive(record: &TaskRecord, grace_ms: u64) {
+        let mut cache = GraceWaitLivenessCache::new();
         let deadline = Instant::now() + Duration::from_millis(grace_ms);
-        while task_execution_liveness(record) != Liveness::Dead && Instant::now() < deadline {
+        while cache.task_liveness(record) != Liveness::Dead && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         }
     }
@@ -4072,9 +4166,12 @@ mod imp {
     /// this only gives a transient `/proc` or `ps` snapshot a chance to become
     /// complete before a cancellation or escalation decision is made.
     fn task_execution_liveness_after_retry(record: &TaskRecord, grace_ms: u64) -> Liveness {
+        // Start empty so a Live/Dead result returned to the caller is never
+        // authorized by an earlier grace wait's cached sample.
+        let mut cache = GraceWaitLivenessCache::new();
         let deadline = Instant::now() + Duration::from_millis(grace_ms);
         loop {
-            let liveness = task_execution_liveness(record);
+            let liveness = cache.task_liveness(record);
             if liveness != Liveness::Unresolved || Instant::now() >= deadline {
                 return liveness;
             }
@@ -7612,6 +7709,175 @@ mod imp {
 
             signal_group(running.record.pid, "-KILL").expect("clean up rehydrated task");
             child.wait().expect("wait for rehydrated task");
+        }
+
+        /// Record-based task waits keep the direct PID probe live on every
+        /// Linux poll while limiting the expensive process-group scan to the
+        /// shared 500ms budget. Session waits retain their per-poll direct
+        /// liveness check. Both fixtures are real children so cleanup covers
+        /// the process groups used by the production paths.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn record_grace_waits_rate_limit_linux_group_scans() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("record-grace-linux-cache");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let task = task_spec(
+                "svc-1",
+                "sh",
+                vec![
+                    "-c".to_string(),
+                    "trap '' TERM; sleep 30 & exit 0".to_string(),
+                ],
+                vec![],
+                60_000,
+                &callback_inbox.display().to_string(),
+            );
+            let mut running = spawn_running_task(&dir.path, "task-grace-linux", task, &clock);
+            wait_for_group_descendant(&mut running);
+
+            let grace_ms = REHYDRATED_LIVENESS_CACHE_MS * 4 + POLL_INTERVAL_MS;
+            reset_group_scan_count();
+            let started = Instant::now();
+            wait_while_task_alive(&running.record, grace_ms);
+            assert!(
+                started.elapsed() >= Duration::from_millis(grace_ms),
+                "task wait returned before its deadline"
+            );
+            assert!(
+                group_scan_count() <= grace_ms / REHYDRATED_LIVENESS_CACHE_MS + 1,
+                "task group scans exceeded the 500ms budget: {}",
+                group_scan_count()
+            );
+            signal_group(running.record.pid, "-KILL").expect("kill task fixture group");
+            running
+                .child
+                .take()
+                .expect("task fixture child")
+                .wait()
+                .expect("reap task fixture");
+
+            let session_spec = task_spec(
+                "svc-1",
+                "sh",
+                vec!["-c".to_string(), "exec sleep 30".to_string()],
+                vec![],
+                60_000,
+                "/tmp/callback",
+            );
+            let session_logs = task_logs_dir(&dir.path, "session-grace-linux");
+            fs::create_dir_all(&session_logs).expect("create session fixture logs");
+            let mut session_child = spawn_task_child(
+                &session_spec,
+                &session_logs.join("stdout.log"),
+                &session_logs.join("stderr.log"),
+            )
+            .expect("spawn session fixture");
+            let (started_at, start_epoch_secs) = recorded_start_identity(session_child.id());
+            let session = SessionRecord {
+                id: "svc-grace-linux".to_string(),
+                spec: spec("/tmp/in", "/tmp/out"),
+                pid: session_child.id(),
+                started_at,
+                start_epoch_secs,
+                stderr_path: String::new(),
+            };
+            reset_process_probe_count();
+            let started = Instant::now();
+            wait_while_alive(&session, grace_ms);
+            assert!(
+                started.elapsed() >= Duration::from_millis(grace_ms),
+                "session wait returned before its deadline"
+            );
+            assert!(
+                process_probe_count() > 1,
+                "Linux session wait no longer performs its per-poll direct probe"
+            );
+            signal_group(session.pid, "-KILL").expect("kill session fixture group");
+            session_child.wait().expect("reap session fixture");
+        }
+
+        /// Non-Linux record-based waits cache their complete `ps` liveness
+        /// chain, including direct-leader and process-group probes. Task and
+        /// session fixtures both exercise the cache and are explicitly
+        /// reaped after the wall-clock cadence check.
+        #[cfg(not(target_os = "linux"))]
+        #[test]
+        fn record_grace_waits_rate_limit_non_linux_probe_chain() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("record-grace-non-linux-cache");
+            let clock = FakeClock::new();
+            let grace_ms = REHYDRATED_LIVENESS_CACHE_MS * 4 + POLL_INTERVAL_MS;
+            let task = task_spec(
+                "svc-1",
+                "sleep",
+                vec!["30".to_string()],
+                vec![],
+                60_000,
+                "/tmp/callback",
+            );
+            let mut running = spawn_running_task(&dir.path, "task-grace-non-linux", task, &clock);
+
+            reset_process_probe_count();
+            let started = Instant::now();
+            wait_while_task_alive(&running.record, grace_ms);
+            assert!(
+                started.elapsed() >= Duration::from_millis(grace_ms),
+                "task wait returned before its deadline"
+            );
+            assert!(
+                process_probe_count() <= grace_ms / REHYDRATED_LIVENESS_CACHE_MS + 1,
+                "task probe chain exceeded the 500ms budget: {}",
+                process_probe_count()
+            );
+            signal_group(running.record.pid, "-KILL").expect("kill task fixture group");
+            running
+                .child
+                .take()
+                .expect("task fixture child")
+                .wait()
+                .expect("reap task fixture");
+
+            let session_spec = task_spec(
+                "svc-1",
+                "sleep",
+                vec!["30".to_string()],
+                vec![],
+                60_000,
+                "/tmp/callback",
+            );
+            let session_logs = task_logs_dir(&dir.path, "session-grace-non-linux");
+            fs::create_dir_all(&session_logs).expect("create session fixture logs");
+            let mut session_child = spawn_task_child(
+                &session_spec,
+                &session_logs.join("stdout.log"),
+                &session_logs.join("stderr.log"),
+            )
+            .expect("spawn session fixture");
+            let (started_at, start_epoch_secs) = recorded_start_identity(session_child.id());
+            let session = SessionRecord {
+                id: "svc-grace-non-linux".to_string(),
+                spec: spec("/tmp/in", "/tmp/out"),
+                pid: session_child.id(),
+                started_at,
+                start_epoch_secs,
+                stderr_path: String::new(),
+            };
+            reset_process_probe_count();
+            let started = Instant::now();
+            wait_while_alive(&session, grace_ms);
+            assert!(
+                started.elapsed() >= Duration::from_millis(grace_ms),
+                "session wait returned before its deadline"
+            );
+            assert!(
+                process_probe_count() <= grace_ms / REHYDRATED_LIVENESS_CACHE_MS + 1,
+                "session probe chain exceeded the 500ms budget: {}",
+                process_probe_count()
+            );
+            signal_group(session.pid, "-KILL").expect("kill session fixture group");
+            session_child.wait().expect("reap session fixture");
         }
 
         /// A restarted supervisor has no Child handle, but still waits for a
