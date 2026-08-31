@@ -1076,7 +1076,7 @@ mod imp {
         // `std::process::Child` does not kill), so leaving it running here
         // would leak a live, unrecorded, unreapable `serve` process.
         if !spawn_start_key_ok(&started_at, &start_epoch_secs) {
-            let _ = signal_group(pid, "-KILL");
+            let _ = signal_group(pid, libc::SIGKILL);
             let _ = child.wait();
             let _ = fs::remove_dir_all(&log_dir);
             return reject_start_request(
@@ -1096,7 +1096,7 @@ mod imp {
             stderr_path: stderr_path.display().to_string(),
         };
         if let Err(err) = write_session_record(control, &record) {
-            let _ = signal_group(pid, "-KILL");
+            let _ = signal_group(pid, libc::SIGKILL);
             let _ = child.wait();
             let _ = fs::remove_dir_all(&log_dir);
             return reject_start_request(control, request_id, admission_error_text(&err));
@@ -1110,7 +1110,7 @@ mod imp {
             },
         );
         if let Err(err) = respond {
-            let _ = signal_group(pid, "-KILL");
+            let _ = signal_group(pid, libc::SIGKILL);
             let _ = child.wait();
             let _ = remove_session_record(control, &record.id);
             let _ = fs::remove_dir_all(&log_dir);
@@ -1187,10 +1187,10 @@ mod imp {
             .map_err(|err| BatonError::Io(format!("could not create {stderr_path:?}: {err}")))?;
         command.stderr(Stdio::from(stderr_file));
         // A fresh process group (not this service's own) so a later
-        // `kill -- -<pid>` escalation reaches exactly this session's `serve`
-        // process and its `agent-cmd` grandchild, nothing else this service
-        // manages. Safe and stable — deliberately not `pre_exec(setsid)`,
-        // which would require `unsafe`.
+        // `libc::kill(-pid, sig)` escalation reaches exactly this session's
+        // `serve` process and its `agent-cmd` grandchild, nothing else this
+        // service manages. Safe and stable — deliberately not
+        // `pre_exec(setsid)`, which would require `unsafe`.
         command.process_group(0);
         command
             .spawn()
@@ -1804,11 +1804,11 @@ mod imp {
                 return Ok(false);
             }
             if liveness == Liveness::Live {
-                let _ = signal_group(record.pid, "-TERM");
+                let _ = signal_group(record.pid, libc::SIGTERM);
                 wait_while_task_alive(&record, KILL_GRACE_MS);
                 liveness = task_execution_liveness_after_retry(&record, KILL_GRACE_MS);
                 if liveness == Liveness::Live {
-                    let _ = signal_group(record.pid, "-KILL");
+                    let _ = signal_group(record.pid, libc::SIGKILL);
                     wait_while_task_alive(&record, KILL_GRACE_MS);
                     liveness = task_execution_liveness_after_retry(&record, KILL_GRACE_MS);
                 }
@@ -2143,7 +2143,7 @@ mod imp {
         let pid = child.id();
         let (started_at, start_epoch_secs) = recorded_start_identity(pid);
         if !spawn_start_key_ok(&started_at, &start_epoch_secs) {
-            let _ = signal_group(pid, "-KILL");
+            let _ = signal_group(pid, libc::SIGKILL);
             let _ = child.wait();
             return reject_task_start_request(
                 control,
@@ -2172,14 +2172,14 @@ mod imp {
             delivered_milestones: 0,
         };
         if let Err(err) = write_task_record(control, &record) {
-            let _ = signal_group(pid, "-KILL");
+            let _ = signal_group(pid, libc::SIGKILL);
             let _ = child.wait();
             return reject_task_start_request(control, request_id, admission_error_text(&err));
         }
         wait_for_test_task_admission_barrier();
         record.admission = TaskAdmissionPhase::Committed;
         if let Err(err) = write_task_record(control, &record) {
-            let _ = signal_group(pid, "-KILL");
+            let _ = signal_group(pid, libc::SIGKILL);
             let _ = child.wait();
             let _ = remove_task_record(control, &record.id);
             return reject_task_start_request(control, request_id, admission_error_text(&err));
@@ -2352,8 +2352,9 @@ mod imp {
         command.stdout(Stdio::from(stdout_file));
         command.stderr(Stdio::from(stderr_file));
         // Own process-group leader, like `spawn_serve_child`, so a later
-        // `kill -- -<pid>` (max-duration enforcement or `baton task cancel`)
-        // reaches the task's whole subtree, not just this direct child.
+        // `libc::kill(-pid, sig)` (max-duration enforcement or `baton task
+        // cancel`) reaches the task's whole subtree, not just this direct
+        // child.
         command.process_group(0);
         command.spawn().map_err(|err| {
             BatonError::Io(format!(
@@ -2576,7 +2577,7 @@ mod imp {
             match liveness {
                 Liveness::Unresolved => return Ok(TaskTick::StillRunning),
                 Liveness::Live => {
-                    let _ = signal_group(running.record.pid, "-TERM");
+                    let _ = signal_group(running.record.pid, libc::SIGTERM);
                     running.term_sent_at_ms = Some(clock.now_ms());
                 }
                 Liveness::Dead => {}
@@ -2590,7 +2591,7 @@ mod imp {
             match liveness {
                 Liveness::Unresolved => return Ok(TaskTick::StillRunning),
                 Liveness::Live => {
-                    let _ = signal_group(running.record.pid, "-KILL");
+                    let _ = signal_group(running.record.pid, libc::SIGKILL);
                     running.kill_sent = true;
                 }
                 Liveness::Dead => {}
@@ -3058,8 +3059,8 @@ mod imp {
             let mut liveness = task_execution_liveness(&record);
             if force {
                 if liveness != Liveness::Dead {
-                    let _ = signal_group(record.pid, "-TERM");
-                    let _ = signal_group(record.pid, "-KILL");
+                    let _ = signal_group(record.pid, libc::SIGTERM);
+                    let _ = signal_group(record.pid, libc::SIGKILL);
                 }
                 remove_reaped_task_record(control, &record)?;
                 continue;
@@ -3070,7 +3071,7 @@ mod imp {
             }
             let mut term_sent = false;
             if liveness == Liveness::Live {
-                let _ = signal_group(record.pid, "-TERM");
+                let _ = signal_group(record.pid, libc::SIGTERM);
                 term_sent = true;
             }
             if liveness != Liveness::Dead {
@@ -3080,14 +3081,14 @@ mod imp {
                 })?;
             }
             if liveness == Liveness::Live && !term_sent {
-                let _ = signal_group(record.pid, "-TERM");
+                let _ = signal_group(record.pid, libc::SIGTERM);
                 liveness = admission.unlocked_wait(|| {
                     wait(&record, KILL_GRACE_MS);
                     task_execution_liveness_after_retry(&record, KILL_GRACE_MS)
                 })?;
             }
             if liveness == Liveness::Live {
-                let _ = signal_group(record.pid, "-KILL");
+                let _ = signal_group(record.pid, libc::SIGKILL);
                 liveness = admission.unlocked_wait(|| {
                     wait(&record, KILL_GRACE_MS);
                     task_execution_liveness_after_retry(&record, KILL_GRACE_MS)
@@ -3148,8 +3149,8 @@ mod imp {
             let liveness = task_execution_liveness(&record);
             if force {
                 if liveness != Liveness::Dead {
-                    let _ = signal_group(record.pid, "-TERM");
-                    let _ = signal_group(record.pid, "-KILL");
+                    let _ = signal_group(record.pid, libc::SIGTERM);
+                    let _ = signal_group(record.pid, libc::SIGKILL);
                 }
                 remove_reaped_task_record(control, &record)?;
                 continue;
@@ -4051,32 +4052,29 @@ mod imp {
         Ok(())
     }
 
-    /// Builds the argv for sending `sig` (e.g. `"-TERM"`) to the process
-    /// **group** led by `pid`. The `--` is required: procps-ng otherwise parses
-    /// the negative process-group id as another option and can turn
-    /// `kill -TERM -<pid>` into `kill(-1, SIGTERM)`, signalling every process
-    /// the invoking user owns.
-    fn signal_group_arguments(pid: u32, sig: &str) -> Option<[String; 3]> {
-        if pid <= 1 {
-            return None;
-        }
-        Some([sig.to_string(), "--".to_string(), format!("-{pid}")])
-    }
-
-    /// Sends `sig` to the process **group** led by `pid`. A failure (the group
-    /// is already gone) is not surfaced — only a failure to run `kill` itself
-    /// is.
-    fn signal_group(pid: u32, sig: &str) -> Result<()> {
-        let Some(args) = signal_group_arguments(pid, sig) else {
+    /// Sends `sig` to the process **group** led by `pid`.
+    ///
+    /// A process-group id is represented by a negative PID for `kill(2)`.
+    /// Invalid low or out-of-range PIDs are ignored because they cannot
+    /// identify one of the process groups owned by this service. A group that
+    /// has already exited is also treated as success, matching the old
+    /// command's ignored exit status at every call site.
+    fn signal_group(pid: u32, sig: libc::c_int) -> Result<()> {
+        if pid <= 1 || pid > i32::MAX as u32 {
             return Ok(());
-        };
-        Command::new("kill")
-            .args(&args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|_| ())
-            .map_err(|err| BatonError::Io(format!("could not run kill {sig} -{pid}: {err}")))
+        }
+        let result = unsafe { libc::kill(-(pid as libc::pid_t), sig) };
+        if result == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(BatonError::Io(format!(
+                "could not signal process group -{pid}: {err}"
+            )))
+        }
     }
 
     /// Caches only the probes whose cost is amplified by a grace wait. The
@@ -4224,19 +4222,19 @@ mod imp {
         let mut liveness = is_session_alive(&record);
         if force {
             if liveness != Liveness::Dead {
-                let _ = signal_group(record.pid, "-TERM");
-                let _ = signal_group(record.pid, "-KILL");
+                let _ = signal_group(record.pid, libc::SIGTERM);
+                let _ = signal_group(record.pid, libc::SIGKILL);
             }
             liveness = Liveness::Dead;
         } else {
             admission.unlocked_wait(|| session_wait(&record, STOP_GRACE_MS))?;
             liveness = is_session_alive(&record);
             if liveness == Liveness::Live {
-                let _ = signal_group(record.pid, "-TERM");
+                let _ = signal_group(record.pid, libc::SIGTERM);
                 admission.unlocked_wait(|| session_wait(&record, KILL_GRACE_MS))?;
                 liveness = is_session_alive(&record);
                 if liveness == Liveness::Live {
-                    let _ = signal_group(record.pid, "-KILL");
+                    let _ = signal_group(record.pid, libc::SIGKILL);
                     admission.unlocked_wait(|| session_wait(&record, KILL_GRACE_MS))?;
                     liveness = is_session_alive(&record);
                 }
@@ -4485,11 +4483,11 @@ mod imp {
         request_task_cancel_sentinel(control, &record.id)?;
         let mut liveness = task_execution_liveness_after_retry(record, KILL_GRACE_MS);
         if liveness == Liveness::Live {
-            let _ = signal_group(record.pid, "-TERM");
+            let _ = signal_group(record.pid, libc::SIGTERM);
             wait_while_task_alive(record, KILL_GRACE_MS);
             liveness = task_execution_liveness_after_retry(record, KILL_GRACE_MS);
             if liveness == Liveness::Live {
-                let _ = signal_group(record.pid, "-KILL");
+                let _ = signal_group(record.pid, libc::SIGKILL);
                 wait_while_task_alive(record, KILL_GRACE_MS);
             }
         }
@@ -4568,8 +4566,8 @@ mod imp {
         // locks open. See `crate::test_support`.
         //
         // "Forks a real child" includes the *indirect* forks a liveness check
-        // performs off Linux: `process_probe` shells out to `ps` and
-        // `signal_group` to `kill`, so `execute_status`/`execute_stop`/
+        // performs off Linux: `process_probe` shells out to `ps`, so
+        // `execute_status`/`execute_stop`/
         // `execute_teardown`/`reconcile_task_admissions` and friends fork on
         // macOS even when the test itself never spawns anything. Every test
         // that can reach one of those takes the guard.
@@ -4596,7 +4594,7 @@ mod imp {
 
             fn reap(&mut self) {
                 if let Some(mut child) = self.child.take() {
-                    let _ = signal_group(child.id(), "-KILL");
+                    let _ = signal_group(child.id(), libc::SIGKILL);
                     let _ = child.wait();
                 }
             }
@@ -4993,7 +4991,7 @@ mod imp {
                 upgraded_task.start_epoch_secs
             );
 
-            signal_group(task_child.id(), "-KILL").expect("kill task child");
+            signal_group(task_child.id(), libc::SIGKILL).expect("kill task child");
             task_child.wait().expect("wait for task child");
         }
 
@@ -5488,20 +5486,51 @@ mod imp {
             assert!(!dir.path.join(CONTROL_STOP_FILE).exists());
         }
 
-        /// A negative process-group id must follow `--`; without the option
-        /// terminator procps-ng interprets it as an option and can broadcast
-        /// the signal with `kill(-1, ...)`.
+        /// A low PID is ignored rather than becoming a process-group signal.
         #[test]
-        fn signal_group_arguments_terminate_options_before_negative_pgid() {
-            assert_eq!(
-                signal_group_arguments(1_072_950, "-TERM"),
-                Some([
-                    "-TERM".to_string(),
-                    "--".to_string(),
-                    "-1072950".to_string(),
-                ])
-            );
-            assert_eq!(signal_group_arguments(1, "-TERM"), None);
+        fn signal_group_ignores_low_pid() {
+            signal_group(1, libc::SIGTERM).expect("low PID is a safe no-op");
+        }
+
+        #[test]
+        fn signal_group_ignores_pid_outside_pid_t() {
+            signal_group(i32::MAX as u32 + 1, libc::SIGTERM)
+                .expect("out-of-range PID is a safe no-op");
+        }
+
+        #[test]
+        fn signal_group_treats_gone_group_as_success() {
+            let _guard = serialize_forks_and_locks();
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .process_group(0)
+                .spawn()
+                .expect("spawn process-group fixture");
+            let pid = child.id();
+            child.wait().expect("reap process-group fixture");
+
+            signal_group(pid, libc::SIGKILL).expect("gone process group is already stopped");
+        }
+
+        #[test]
+        fn signal_group_surfaces_invalid_signal() {
+            let _guard = serialize_forks_and_locks();
+            let mut child = Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .expect("spawn process-group fixture");
+            let pid = child.id();
+            let result = signal_group(pid, -1);
+
+            signal_group(pid, libc::SIGKILL).expect("clean up process-group fixture");
+            child.wait().expect("reap process-group fixture");
+
+            let error = result.expect_err("invalid signal must be returned");
+            assert!(matches!(
+                error,
+                BatonError::Io(message) if message.contains("could not signal process group")
+            ));
         }
 
         /// `serve_argv` reconstructs a plain daemon invocation with only
@@ -6118,7 +6147,7 @@ mod imp {
                 "unresolved prepared record is not active work"
             );
 
-            signal_group(record.pid, "-KILL").expect("kill unresolved task");
+            signal_group(record.pid, libc::SIGKILL).expect("kill unresolved task");
             child.wait().expect("wait for unresolved task");
             reconcile_task_admissions(&dir.path).expect("remove dead admission");
 
@@ -6201,7 +6230,7 @@ mod imp {
                 "a mismatched PID is not signalled"
             );
 
-            let _ = signal_group(child.id(), "-KILL");
+            let _ = signal_group(child.id(), libc::SIGKILL);
             let _ = child.wait();
         }
 
@@ -6294,7 +6323,7 @@ mod imp {
                 "the descendant's process group remains alive after the rejected probes"
             );
 
-            signal_group(pid, "-KILL").expect("kill fixture group");
+            signal_group(pid, libc::SIGKILL).expect("kill fixture group");
             let _ = child.wait();
         }
 
@@ -6388,7 +6417,7 @@ mod imp {
                 child.try_wait().expect("poll exec-replaced task").is_none(),
                 "an unresolved task is not signalled"
             );
-            let _ = signal_group(child.id(), "-KILL");
+            let _ = signal_group(child.id(), libc::SIGKILL);
             let _ = child.wait();
         }
 
@@ -6517,7 +6546,7 @@ mod imp {
             assert!(matches!(tick, TaskTick::StillRunning));
             assert_eq!(running.record.delivered_milestones, 1);
 
-            let _ = signal_group(running.record.pid, "-KILL");
+            let _ = signal_group(running.record.pid, libc::SIGKILL);
             let _ = running.child.as_mut().expect("owned child").wait();
         }
 
@@ -6651,7 +6680,7 @@ mod imp {
                     panic!("task timeout helper exited before becoming ready");
                 }
                 if Instant::now() >= deadline {
-                    let _ = signal_group(running.record.pid, "-KILL");
+                    let _ = signal_group(running.record.pid, libc::SIGKILL);
                     let _ = running.child.as_mut().expect("owned helper").wait();
                     panic!("task timeout helper did not become ready within the test bound");
                 }
@@ -6912,7 +6941,7 @@ mod imp {
                 "milestone delivered exactly once"
             );
 
-            let _ = signal_group(running.record.pid, "-KILL");
+            let _ = signal_group(running.record.pid, libc::SIGKILL);
             let _ = running.child.as_mut().expect("owned child").wait();
         }
 
@@ -6994,7 +7023,7 @@ mod imp {
                 "milestone 0 is not redelivered after recovery"
             );
 
-            let _ = signal_group(running.record.pid, "-KILL");
+            let _ = signal_group(running.record.pid, libc::SIGKILL);
             let _ = running.child.as_mut().expect("owned child").wait();
         }
 
@@ -7054,7 +7083,7 @@ mod imp {
                 "failed callback remains unavailable"
             );
 
-            let _ = signal_group(running.record.pid, "-KILL");
+            let _ = signal_group(running.record.pid, libc::SIGKILL);
             let _ = running.child.as_mut().expect("owned child").wait();
         }
 
@@ -7219,7 +7248,7 @@ mod imp {
                 "an incomplete group scan remains safe: {status}"
             );
 
-            signal_group(running.record.pid, "-KILL").expect("kill group descendant");
+            signal_group(running.record.pid, libc::SIGKILL).expect("kill group descendant");
             reap_task_until_finished(&dir.path, "task-group-drain", &mut running, &clock, tick);
             let record =
                 assert_durable_task_state(&dir.path, "task-group-drain", TaskState::Completed);
@@ -7300,7 +7329,7 @@ mod imp {
 
             let mut child = running.child.take().expect("unresolved task child");
             assert!(child.try_wait().expect("poll unresolved task").is_none());
-            signal_group(running.record.pid, "-KILL").expect("clean up unresolved task");
+            signal_group(running.record.pid, libc::SIGKILL).expect("clean up unresolved task");
             child.wait().expect("wait for unresolved task");
         }
 
@@ -7371,7 +7400,7 @@ mod imp {
             }
 
             drop(churn);
-            signal_group(running.record.pid, "-KILL").expect("kill group descendant");
+            signal_group(running.record.pid, libc::SIGKILL).expect("kill group descendant");
         }
 
         /// Max-duration escalation after the direct leader exits still
@@ -7753,7 +7782,7 @@ mod imp {
                 .expect("refresh liveness tick");
             assert_eq!(process_probe_count(), 2);
 
-            signal_group(running.record.pid, "-KILL").expect("clean up rehydrated task");
+            signal_group(running.record.pid, libc::SIGKILL).expect("clean up rehydrated task");
             child.wait().expect("wait for rehydrated task");
         }
 
@@ -7812,7 +7841,7 @@ mod imp {
                 process_probe_count() > group_scan_count(),
                 "Linux task wait no longer performs the direct probe per poll"
             );
-            signal_group(running.record.pid, "-KILL").expect("kill task fixture group");
+            signal_group(running.record.pid, libc::SIGKILL).expect("kill task fixture group");
             running
                 .child
                 .take()
@@ -7856,7 +7885,7 @@ mod imp {
                 process_probe_count() > 1,
                 "Linux session wait no longer performs its per-poll direct probe"
             );
-            signal_group(session.pid, "-KILL").expect("kill session fixture group");
+            signal_group(session.pid, libc::SIGKILL).expect("kill session fixture group");
             session_child.wait().expect("reap session fixture");
         }
 
@@ -8043,7 +8072,7 @@ mod imp {
             assert!(matches!(tick, TaskTick::StillRunning));
             assert_durable_task_state(&dir.path, "task-rehydrated-group", TaskState::Running);
 
-            signal_group(rehydrated.record.pid, "-KILL").expect("kill group descendant");
+            signal_group(rehydrated.record.pid, libc::SIGKILL).expect("kill group descendant");
             reap_task_until_finished(
                 &dir.path,
                 "task-rehydrated-group",
@@ -8585,7 +8614,7 @@ mod imp {
                 "the session record is not removed while an owned task is outstanding"
             );
 
-            signal_group(child.id(), "-KILL").expect("kill racer");
+            signal_group(child.id(), libc::SIGKILL).expect("kill racer");
             child.wait().expect("reap racer");
             reaped_child
                 .wait()
@@ -8770,7 +8799,7 @@ mod imp {
             }
 
             for mut child in children {
-                signal_group(child.id(), "-KILL").expect("kill unresolved task");
+                signal_group(child.id(), libc::SIGKILL).expect("kill unresolved task");
                 child.wait().expect("wait for unresolved task");
             }
         }
