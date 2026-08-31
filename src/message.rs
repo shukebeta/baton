@@ -173,7 +173,7 @@ mod tests {
                 reply: "hi there".to_string(),
                 input_tokens: None,
                 output_tokens: None,
-                stop_reason: None,
+                stop_reason: Some("max_tokens".to_string()),
             },
         })
     }
@@ -240,9 +240,19 @@ mod tests {
             value["exchange"]["exchange"]["outcome"]["event"],
             "response_ok"
         );
+        assert_eq!(
+            value["exchange"]["exchange"]["outcome"]["stop_reason"],
+            "max_tokens"
+        );
 
         let back: MessageEnvelope = serde_json::from_str(&json).expect("parses");
         assert_eq!(msg, back);
+        match &back.exchange.expect("wrapped").exchange.outcome {
+            Outcome::Ok { stop_reason, .. } => {
+                assert_eq!(stop_reason.as_deref(), Some("max_tokens"));
+            }
+            other => panic!("expected Ok outcome, got {other:?}"),
+        }
     }
 
     /// A message with no wrapped exchange round-trips with `exchange: null`.
