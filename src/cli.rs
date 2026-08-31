@@ -1870,10 +1870,10 @@ fn timed_exchange(
     let result = call();
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    if let Ok(reply) = &result {
-        if let Some(stop_reason) = reply.stop_reason.as_deref() {
-            warn_if_truncated(stop_reason);
-        }
+    if let Ok(reply) = &result
+        && let Some(stop_reason) = reply.stop_reason.as_deref()
+    {
+        warn_if_truncated(stop_reason);
     }
 
     let event = match (&result, session) {
