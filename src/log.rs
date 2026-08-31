@@ -571,6 +571,8 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
             Some("response_ok") => {
                 let ok: OkRecord = from_value(value, line_no, "response_ok")?;
                 let has_correlation = has_complete_correlation(&ok.session_id, ok.turn_index);
+                let suppress_sessionless = last_request_was_sessionless;
+                last_request_was_sessionless = false;
                 let target = match (ok.session_id, ok.turn_index) {
                     (Some(session_id), Some(turn_index)) => {
                         let target = pending_by_correlation.remove(&(session_id, turn_index));
@@ -585,7 +587,7 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
                         &mut pending_without_correlation,
                     ),
                 };
-                if !has_correlation && target.is_none() && !last_request_was_sessionless {
+                if !has_correlation && target.is_none() && !suppress_sessionless {
                     report
                         .warnings
                         .push(dangling_outcome_warning(line_no, "response_ok"));
@@ -605,6 +607,8 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
             Some("response_error") => {
                 let err: ErrRecord = from_value(value, line_no, "response_error")?;
                 let has_correlation = has_complete_correlation(&err.session_id, err.turn_index);
+                let suppress_sessionless = last_request_was_sessionless;
+                last_request_was_sessionless = false;
                 let target = match (err.session_id, err.turn_index) {
                     (Some(session_id), Some(turn_index)) => {
                         let target = pending_by_correlation.remove(&(session_id, turn_index));
@@ -619,7 +623,7 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
                         &mut pending_without_correlation,
                     ),
                 };
-                if !has_correlation && target.is_none() && !last_request_was_sessionless {
+                if !has_correlation && target.is_none() && !suppress_sessionless {
                     report
                         .warnings
                         .push(dangling_outcome_warning(line_no, "response_error"));
@@ -2051,6 +2055,8 @@ mod tests {
             "\n",
             r#"{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":2,"duration_ms":1,"reply":"a"}"#,
             "\n",
+            r#"{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":3,"duration_ms":1,"reply":"orphan"}"#,
+            "\n",
         );
         let report = parse_sessions(Cursor::new(ask)).expect("parses");
         assert!(
@@ -2058,10 +2064,11 @@ mod tests {
             "ask lines form no session, got: {:?}",
             report.sessions
         );
+        assert_eq!(report.warnings.len(), 1, "warnings: {:?}", report.warnings);
         assert!(
-            report.warnings.is_empty(),
-            "sessionless ask lines remain silent: {:?}",
-            report.warnings
+            report.warnings[0].contains("line 3") && report.warnings[0].contains("dangling"),
+            "only the subsequent dangling outcome is warned: {}",
+            report.warnings[0]
         );
     }
 }
