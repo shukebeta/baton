@@ -229,6 +229,9 @@ const START_AWAIT_MS: u64 = 10_000;
 const STOP_GRACE_MS: u64 = 5_000;
 /// Bound on the second `TerminateJobObject` attempt's grace.
 const KILL_GRACE_MS: u64 = 2_000;
+/// Bound on how long teardown waits for `Run` to release the control
+/// lock before continuing with record cleanup.
+const CONTROL_RELEASE_TIMEOUT_MS: u64 = 10_000;
 
 /// Process-local sequence, making request/session ids unique even across
 /// several calls within the same millisecond.
@@ -3394,10 +3397,27 @@ fn execute_task_cancel(control: &Path, task: &str, mut out: impl Write) -> Resul
     }
 }
 
-fn execute_teardown(control: &Path, force: bool, mut out: impl Write) -> Result<()> {
+fn execute_teardown(control: &Path, force: bool, out: impl Write) -> Result<()> {
+    let mut stderr = std::io::stderr();
+    execute_teardown_with_timeout(
+        control,
+        force,
+        out,
+        Duration::from_millis(CONTROL_RELEASE_TIMEOUT_MS),
+        &mut stderr,
+    )
+}
+
+fn execute_teardown_with_timeout(
+    control: &Path,
+    force: bool,
+    mut out: impl Write,
+    control_release_timeout: Duration,
+    mut warning: impl Write,
+) -> Result<()> {
     let service_liveness = request_control_stop(control)?;
     if service_liveness == ControlLiveness::Live {
-        wait_for_control_release(control)?;
+        wait_for_control_release_with_timeout(control, control_release_timeout, &mut warning)?;
     }
     let _admission = acquire_admission_lock(control)?;
     let mut residue = Vec::new();
@@ -3427,15 +3447,33 @@ fn execute_teardown(control: &Path, force: bool, mut out: impl Write) -> Result<
     result
 }
 
-/// Waits until the supervisor has observed its stop request and released
-/// the control lock. A released lock is the admission barrier: every
-/// request handled by the supervisor was committed to a session record
-/// before this point, and later `service start` calls fail fast.
-fn wait_for_control_release(control: &Path) -> Result<()> {
-    while probe_control(control)? == ControlLiveness::Live {
-        std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+/// Waits for the supervisor's control lock with a bounded deadline. A
+/// timeout is deliberately non-fatal: the admission lock is independent
+/// from `service.lock`, so teardown can still drain the durable records.
+fn wait_for_control_release_with_timeout(
+    control: &Path,
+    timeout: Duration,
+    mut warning: impl Write,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if probe_control(control)? == ControlLiveness::NotRunning {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            writeln!(
+                warning,
+                "warning: baton service supervisor did not release the control lock for {} within {}ms; continuing teardown. The supervisor may still hold {}; identify and terminate it before reusing the control directory",
+                control.display(),
+                timeout.as_millis(),
+                control.join(CONTROL_LOCK_FILE).display(),
+            )
+            .map_err(io_err)?;
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS).min(remaining));
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -3525,6 +3563,88 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("create test control directory");
         path
+    }
+
+    #[test]
+    fn control_release_wait_timeout_warns_and_returns() {
+        let control = temp_control("control-release-timeout");
+        let held = acquire_control_lock(&control).expect("lock");
+        let mut warning = Vec::new();
+
+        wait_for_control_release_with_timeout(&control, Duration::from_millis(20), &mut warning)
+            .expect("bounded control-release wait");
+
+        let warning = String::from_utf8(warning).expect("warning text");
+        assert!(warning.contains(&control.display().to_string()));
+        assert!(warning.contains("service.lock"));
+        assert_eq!(
+            probe_control(&control).expect("probe after timeout"),
+            ControlLiveness::Live,
+            "timeout leaves the held control lock untouched"
+        );
+        drop(held);
+        let _ = fs::remove_dir_all(control);
+    }
+
+    #[test]
+    fn teardown_continues_after_control_release_timeout() {
+        let control = temp_control("teardown-control-release-timeout");
+        let held = acquire_control_lock(&control).expect("lock");
+        let record = SessionRecord {
+            id: "svc-timeout".to_string(),
+            spec: session_spec(),
+            pid: u32::MAX - 1,
+            started_at: None,
+            start_epoch_secs: None,
+            job: None,
+        };
+        write_session_record(&control, &record).expect("write stale session");
+        let mut out = Vec::new();
+        let mut warning = Vec::new();
+
+        execute_teardown_with_timeout(
+            &control,
+            false,
+            &mut out,
+            Duration::from_millis(20),
+            &mut warning,
+        )
+        .expect("teardown after control-release timeout");
+
+        let warning = String::from_utf8(warning).expect("warning text");
+        assert!(warning.contains(&control.display().to_string()));
+        assert!(warning.contains("service.lock"));
+        assert!(
+            String::from_utf8(out)
+                .expect("teardown output")
+                .contains("requested teardown of baton service")
+        );
+        assert!(
+            read_session_record(&control, "svc-timeout")
+                .expect("read session after teardown")
+                .is_none(),
+            "teardown reached durable-record cleanup after the warning"
+        );
+        drop(held);
+        let _ = fs::remove_dir_all(control);
+    }
+
+    #[test]
+    fn control_release_wait_returns_without_warning_when_released() {
+        let control = temp_control("control-release-responsive");
+        let held = acquire_control_lock(&control).expect("lock");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            drop(held);
+        });
+        let mut warning = Vec::new();
+
+        wait_for_control_release_with_timeout(&control, Duration::from_millis(200), &mut warning)
+            .expect("responsive control-release wait");
+        releaser.join().expect("release control lock");
+
+        assert!(warning.is_empty(), "normal release emitted a warning");
+        let _ = fs::remove_dir_all(control);
     }
 
     fn terminal_running_task(

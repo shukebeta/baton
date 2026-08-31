@@ -174,8 +174,12 @@ baton service teardown --control <dir> [--force]
   admission.
   Idempotent — stopping an already-gone session is a no-op success.
 - **`service teardown`** first requests `run`'s cooperative stop, then waits
-  for `run` to release the control lock before taking its session snapshot and
-  applying `stop` to every record. The released lock is the admission barrier:
+  up to ten seconds for `run` to release the control lock before taking its
+  session snapshot and applying `stop` to every record. If the supervisor
+  does not release `service.lock` by then, teardown warns with the control
+  directory and lock path and continues through the durable-record cleanup;
+  the operator should identify and terminate the still-running supervisor
+  before reusing that control directory. The released lock is the admission barrier:
   a concurrent `service start` either was handled before the barrier and is in
   the snapshot, or fails because no live service remains (an already-written
   request may remain unprocessed); it cannot spawn a session outside the
