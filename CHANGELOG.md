@@ -10,7 +10,7 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.3.49 … v0.3.45 (2026-08-31)
+## v0.3.50 … v0.3.45 (2026-08-31)
 
 ### Fixes
 - fix(service): rate-limit grace-wait liveness scans (#269)
@@ -18,6 +18,7 @@ _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 - fix(transport): preserve Claude stop reason (#276)
 - fix(log): preserve session pairing across message paths (#277)
 - fix(service): signal groups without PATH dependency (#280)
+- fix(service): bound teardown control release wait (#281)
 
 ## v0.3.44 … v0.3.36 (2026-08-30)
 
