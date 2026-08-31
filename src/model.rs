@@ -141,6 +141,8 @@ pub struct AssistantReply {
     pub text: String,
     /// Provider-reported token usage for the call, when available.
     pub usage: TokenUsage,
+    /// Provider-reported terminal reason, when available.
+    pub stop_reason: Option<String>,
 }
 
 impl AssistantReply {
@@ -149,14 +151,25 @@ impl AssistantReply {
         Self {
             text: text.into(),
             usage: TokenUsage::default(),
+            stop_reason: None,
         }
     }
 
     /// Creates a reply carrying the provider's reported token usage.
     pub fn with_usage(text: impl Into<String>, usage: TokenUsage) -> Self {
+        Self::with_usage_and_stop_reason(text, usage, None)
+    }
+
+    /// Creates a reply carrying provider usage and its terminal reason.
+    pub fn with_usage_and_stop_reason(
+        text: impl Into<String>,
+        usage: TokenUsage,
+        stop_reason: Option<String>,
+    ) -> Self {
         Self {
             text: text.into(),
             usage,
+            stop_reason,
         }
     }
 }
@@ -174,6 +187,7 @@ mod tests {
     #[test]
     fn reply_new_stores_text() {
         assert_eq!(AssistantReply::new("ok").text, "ok");
+        assert_eq!(AssistantReply::new("ok").stop_reason, None);
     }
 
     #[test]

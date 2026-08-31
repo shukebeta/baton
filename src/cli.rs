@@ -461,6 +461,7 @@ pub fn run() -> Result<()> {
                 build_seed_envelope(&seed_body),
                 &governance,
             );
+            warn_on_truncated_replies(&transcript);
             eprintln!("conversation ended: {:?}", transcript.reason);
             write_transcript(&transcript, open_output(out_path.as_deref())?)
         }
@@ -502,6 +503,7 @@ pub fn run() -> Result<()> {
             // Seed is addressed roster[0] -> roster[1]; guaranteed ≥2 by the parser.
             let seed_envelope = build_ring_seed_envelope(&seed_body, &roster[0], &roster[1]);
             let transcript = converse::converse_ring(&ring, seed_envelope, &governance);
+            warn_on_truncated_replies(&transcript);
             eprintln!("conversation ended: {:?}", transcript.reason);
             write_transcript(&transcript, open_output(out_path.as_deref())?)
         }
@@ -984,7 +986,20 @@ fn execute_ask(
     meta: &ExchangeMeta,
     prompt: &str,
 ) -> Result<String> {
-    timed_exchange(sink, meta, prompt, None, || {
+    let stderr = io::stderr();
+    let mut warning = stderr.lock();
+    execute_ask_with_warning(transport, sink, meta, prompt, &mut warning)
+}
+
+/// Testable form of [`execute_ask`] with an injected warning sink.
+fn execute_ask_with_warning(
+    transport: &impl Transport,
+    sink: &mut dyn EventSink,
+    meta: &ExchangeMeta,
+    prompt: &str,
+    warning: &mut dyn Write,
+) -> Result<String> {
+    timed_exchange_with_warning(sink, meta, prompt, None, warning, || {
         transport.send(&Prompt::new(prompt))
     })
     .map(|reply| reply.text)
@@ -1484,6 +1499,51 @@ fn write_transcript(transcript: &Transcript, mut output: impl Write) -> Result<(
     Ok(())
 }
 
+/// Warns the invoking conversation driver about truncated provider replies.
+///
+/// The warning is emitted here, rather than by a participant, so it is visible
+/// when a reply comes from a mailbox or subprocess whose stderr is separate
+/// from the driver's stderr. The reason is carried by the nested
+/// `baton.exchange/v1` outcome in each response envelope.
+fn warn_on_truncated_replies(transcript: &Transcript) {
+    let stderr = io::stderr();
+    let mut warning = stderr.lock();
+    let _ = warn_on_truncated_replies_to(transcript, &mut warning);
+}
+
+/// Testable form of [`warn_on_truncated_replies`] with an injected warning sink.
+fn warn_on_truncated_replies_to(
+    transcript: &Transcript,
+    warning: &mut dyn Write,
+) -> io::Result<()> {
+    for envelope in transcript.trail.iter().skip(1) {
+        let Some(crate::log::Outcome::Ok {
+            stop_reason: Some(stop_reason),
+            ..
+        }) = envelope
+            .exchange
+            .as_ref()
+            .map(|wrapped| &wrapped.exchange.outcome)
+        else {
+            continue;
+        };
+        write_truncation_warning(&mut *warning, stop_reason.as_str())?;
+    }
+    Ok(())
+}
+
+/// Writes the truncation warning to an arbitrary sink so its exact CLI text is
+/// testable without redirecting the process's stderr.
+fn write_truncation_warning(mut output: impl Write, stop_reason: &str) -> io::Result<()> {
+    if stop_reason == "max_tokens" {
+        writeln!(
+            output,
+            "warning: provider reply was truncated (stop_reason=max_tokens); the answer may be incomplete"
+        )?;
+    }
+    Ok(())
+}
+
 /// Drives an interactive multi-turn REPL over `input`/`output`.
 ///
 /// Each line read from `input` becomes a user turn appended to the in-memory
@@ -1607,10 +1667,38 @@ fn run_session_repl(
     sink: &mut dyn EventSink,
     meta: &ExchangeMeta,
     input: impl BufRead,
+    output: impl Write,
+    session_id: String,
+    conversation: Conversation,
+    turn_index: u64,
+) -> Result<()> {
+    let stderr = io::stderr();
+    let mut warning = stderr.lock();
+    run_session_repl_with_warning(
+        transport,
+        sink,
+        meta,
+        input,
+        output,
+        session_id,
+        conversation,
+        turn_index,
+        &mut warning,
+    )
+}
+
+/// Testable form of [`run_session_repl`] with an injected warning sink.
+#[allow(clippy::too_many_arguments)]
+fn run_session_repl_with_warning(
+    transport: &impl Transport,
+    sink: &mut dyn EventSink,
+    meta: &ExchangeMeta,
+    input: impl BufRead,
     mut output: impl Write,
     session_id: String,
     mut conversation: Conversation,
     mut turn_index: u64,
+    warning: &mut dyn Write,
 ) -> Result<()> {
     for line in input.lines() {
         let line = line.map_err(io_err)?;
@@ -1623,9 +1711,14 @@ fn run_session_repl(
         }
 
         conversation.push_user(line.as_str());
-        let result = timed_exchange(sink, meta, &line, Some((&session_id, turn_index)), || {
-            transport.send_conversation(conversation.messages())
-        });
+        let result = timed_exchange_with_warning(
+            sink,
+            meta,
+            &line,
+            Some((&session_id, turn_index)),
+            warning,
+            || transport.send_conversation(conversation.messages()),
+        );
         turn_index += 1;
 
         match result {
@@ -1781,23 +1874,13 @@ fn new_ask_message_id() -> String {
     format!("ask-{}-{}", std::process::id(), now_ms())
 }
 
-/// Records the request event, times `call`, records the matching outcome event,
-/// and returns the call's result.
-///
-/// Emits the `request` → `response_ok`/`response_error` event pair for the
-/// `ask` and session paths, whose orchestration lives here. (`baton exchange`
-/// does not route through this: it delegates the call to a [`Participant`] and
-/// wires its own trail in [`execute_exchange`].) `event_prompt` is the user text
-/// recorded on the `request` event (the turn's input). `session` carries the
-/// run's `session_id` and this turn's `turn_index` on the session path, and is
-/// `None` on the single-turn `ask` path (whose `request` line stays unframed). A
-/// failed event write is downgraded to a stderr warning and never changes the
-/// exchange result.
-fn timed_exchange(
+/// Testable form of the timed exchange used by the `ask` and session paths.
+fn timed_exchange_with_warning(
     sink: &mut dyn EventSink,
     meta: &ExchangeMeta,
     event_prompt: &str,
     session: Option<(&str, u64)>,
+    warning: &mut dyn Write,
     call: impl FnOnce() -> Result<AssistantReply>,
 ) -> Result<AssistantReply> {
     // On the single-turn `ask` path there is no envelope to correlate against, so
@@ -1829,20 +1912,30 @@ fn timed_exchange(
     let result = call();
     let duration_ms = start.elapsed().as_millis() as u64;
 
+    if let Ok(reply) = &result
+        && let Some(stop_reason) = reply.stop_reason.as_deref()
+    {
+        let _ = write_truncation_warning(&mut *warning, stop_reason);
+    }
+
     let event = match (&result, session) {
-        (Ok(reply), Some((session_id, turn_index))) => ExchangeEvent::session_response_ok(
+        (Ok(reply), Some((session_id, turn_index))) => {
+            ExchangeEvent::session_response_ok_with_stop_reason(
+                now_ms(),
+                duration_ms,
+                &reply.text,
+                &reply.usage,
+                reply.stop_reason.as_deref(),
+                session_id,
+                turn_index,
+            )
+        }
+        (Ok(reply), None) => ExchangeEvent::correlated_response_ok_with_stop_reason(
             now_ms(),
             duration_ms,
             &reply.text,
             &reply.usage,
-            session_id,
-            turn_index,
-        ),
-        (Ok(reply), None) => ExchangeEvent::correlated_response_ok(
-            now_ms(),
-            duration_ms,
-            &reply.text,
-            &reply.usage,
+            reply.stop_reason.as_deref(),
             ask_message_id
                 .as_deref()
                 .expect("ask path mints a message_id"),
@@ -3606,6 +3699,30 @@ mod tests {
         }
     }
 
+    /// A transport that returns a reply with a provider stop reason, for
+    /// exercising the warning paths without a real provider call.
+    struct StopReasonTransport {
+        stop_reason: Option<String>,
+    }
+
+    impl StopReasonTransport {
+        fn new(stop_reason: Option<&str>) -> Self {
+            Self {
+                stop_reason: stop_reason.map(str::to_string),
+            }
+        }
+    }
+
+    impl Transport for StopReasonTransport {
+        fn send_conversation(&self, _messages: &[Message]) -> Result<AssistantReply> {
+            Ok(AssistantReply::with_usage_and_stop_reason(
+                "unfinished",
+                TokenUsage::default(),
+                self.stop_reason.clone(),
+            ))
+        }
+    }
+
     /// A transport that always fails at the transport layer.
     struct ErrTransport;
 
@@ -3804,6 +3921,60 @@ mod tests {
     }
 
     #[test]
+    fn execute_ask_records_stop_reason_from_reply() {
+        let transport = StopReasonTransport::new(Some("max_tokens"));
+        let mut sink = RecordingSink::new();
+        let mut warning = Vec::new();
+        execute_ask_with_warning(&transport, &mut sink, &test_meta(), "q", &mut warning)
+            .expect("should succeed");
+
+        match &sink.events[1] {
+            ExchangeEvent::ResponseOk { stop_reason, .. } => {
+                assert_eq!(stop_reason.as_deref(), Some("max_tokens"));
+            }
+            other => panic!("expected ResponseOk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_ask_warns_on_max_tokens_reply() {
+        let transport = StopReasonTransport::new(Some("max_tokens"));
+        let mut sink = RecordingSink::new();
+        let mut warning = Vec::new();
+
+        let reply =
+            execute_ask_with_warning(&transport, &mut sink, &test_meta(), "q", &mut warning)
+                .expect("should succeed");
+
+        assert_eq!(reply, "unfinished");
+        assert_eq!(
+            String::from_utf8(warning).expect("warning is utf8"),
+            "warning: provider reply was truncated (stop_reason=max_tokens); the answer may be incomplete\n"
+        );
+        assert!(matches!(
+            sink.events[1],
+            ExchangeEvent::ResponseOk {
+                stop_reason: Some(ref reason),
+                ..
+            } if reason == "max_tokens"
+        ));
+    }
+
+    #[test]
+    fn truncation_warning_is_visible_only_for_max_tokens() {
+        let mut output = Vec::new();
+        write_truncation_warning(&mut output, "max_tokens").expect("writes warning");
+        assert_eq!(
+            String::from_utf8(output).expect("warning is utf8"),
+            "warning: provider reply was truncated (stop_reason=max_tokens); the answer may be incomplete\n"
+        );
+
+        let mut output = Vec::new();
+        write_truncation_warning(&mut output, "end_turn").expect("writes no warning");
+        assert!(output.is_empty());
+    }
+
+    #[test]
     fn execute_ask_records_error_outcome_even_on_failure() {
         let mut sink = RecordingSink::new();
         execute_ask(&ErrTransport, &mut sink, &test_meta(), "hi").expect_err("transport fails");
@@ -3986,6 +4157,7 @@ mod tests {
                 reply: "r".to_string(),
                 input_tokens: None,
                 output_tokens: None,
+                stop_reason: None,
             },
         }
     }
@@ -4299,6 +4471,105 @@ mod tests {
     }
 
     #[test]
+    fn session_repl_warns_on_max_tokens_reply() {
+        let transport = StopReasonTransport::new(Some("max_tokens"));
+        let mut sink = RecordingSink::new();
+        let mut output = Vec::new();
+        let mut warning = Vec::new();
+
+        run_session_repl_with_warning(
+            &transport,
+            &mut sink,
+            &test_meta(),
+            Cursor::new("hello\n"),
+            &mut output,
+            "sess-test".to_string(),
+            Conversation::new(),
+            0,
+            &mut warning,
+        )
+        .expect("EOF must exit cleanly");
+
+        assert_eq!(
+            String::from_utf8(output).expect("output is utf8"),
+            "unfinished\n"
+        );
+        assert_eq!(
+            String::from_utf8(warning).expect("warning is utf8"),
+            "warning: provider reply was truncated (stop_reason=max_tokens); the answer may be incomplete\n"
+        );
+        assert!(matches!(
+            sink.events[1],
+            ExchangeEvent::ResponseOk {
+                stop_reason: Some(ref reason),
+                session_id: Some(ref session_id),
+                turn_index: Some(0),
+                ..
+            } if reason == "max_tokens" && session_id == "sess-test"
+        ));
+    }
+
+    fn nested_reply(stop_reason: Option<&str>) -> MessageEnvelope {
+        let mut reply = MessageEnvelope::new(
+            "m-reply",
+            "c-1",
+            "agent-b",
+            "agent-a",
+            MessageKind::Response,
+            "reply",
+            1_700_000_000_001,
+        );
+        reply.exchange = Some(crate::message::WrappedExchange::new(Exchange {
+            request: crate::log::RequestRecord {
+                ts_ms: 1_700_000_000_000,
+                model: "claude-test-model".to_string(),
+                base_url: "https://api.anthropic.com".to_string(),
+                prompt: "hello".to_string(),
+                session_id: None,
+                turn_index: None,
+            },
+            outcome: crate::log::Outcome::Ok {
+                ts_ms: 1_700_000_000_001,
+                duration_ms: 1,
+                reply: "reply".to_string(),
+                input_tokens: None,
+                output_tokens: None,
+                stop_reason: stop_reason.map(str::to_string),
+            },
+        }));
+        reply
+    }
+
+    #[test]
+    fn transcript_warns_only_for_nested_max_tokens_outcomes() {
+        let transcript = Transcript {
+            trail: vec![
+                MessageEnvelope::new(
+                    "m-seed",
+                    "c-1",
+                    "agent-a",
+                    "agent-b",
+                    MessageKind::Request,
+                    "hello",
+                    1_700_000_000_000,
+                ),
+                nested_reply(Some("max_tokens")),
+                nested_reply(None),
+                nested_reply(Some("end_turn")),
+            ],
+            reason: crate::converse::TerminalReason::TurnCap,
+        };
+        let mut warning = Vec::new();
+
+        warn_on_truncated_replies_to(&transcript, &mut warning).expect("warning sink works");
+
+        assert_eq!(
+            String::from_utf8(warning).expect("warning is utf8"),
+            "warning: provider reply was truncated (stop_reason=max_tokens); the answer may be incomplete\n"
+        );
+    }
+
+    #[test]
     fn session_rolls_back_failed_turn_and_continues() {
         let transport = FailFirstTransport::new();
         let mut sink = RecordingSink::new();
@@ -4394,6 +4665,7 @@ mod tests {
                 reply: reply.to_string(),
                 input_tokens: None,
                 output_tokens: None,
+                stop_reason: None,
             }),
         }
     }
@@ -7044,6 +7316,7 @@ mod tests {
                 reply: "hi there".to_string(),
                 input_tokens: None,
                 output_tokens: None,
+                stop_reason: None,
             },
         }));
         recorder.record_turn(&req1, &resp1).expect("records turn 1");
@@ -7143,6 +7416,7 @@ mod tests {
                 reply: "hi there".to_string(),
                 input_tokens: None,
                 output_tokens: None,
+                stop_reason: None,
             })
         );
         // Turn 1: the nested provider error remains the recorded outcome.

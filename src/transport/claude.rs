@@ -137,7 +137,8 @@ fn parse_response(status: u16, body: &str) -> Result<AssistantReply> {
 
 /// Decodes a successful Messages response into an [`AssistantReply`].
 ///
-/// All `text` content blocks are concatenated in order. A body that fails to
+/// All `text` content blocks are concatenated in order and the provider's
+/// optional terminal reason is retained on the reply. A body that fails to
 /// decode, or that carries no assistant text, is a [`BatonError::Decode`] — the
 /// client never returns a silently empty reply.
 fn parse_success(body: &str) -> Result<AssistantReply> {
@@ -166,7 +167,11 @@ fn parse_success(body: &str) -> Result<AssistantReply> {
             output_tokens: u.output_tokens,
         });
 
-    Ok(AssistantReply::with_usage(text, usage))
+    Ok(AssistantReply::with_usage_and_stop_reason(
+        text,
+        usage,
+        response.stop_reason,
+    ))
 }
 
 /// Pulls `error.message` out of a Claude error body, falling back to the raw
@@ -204,6 +209,9 @@ struct MessagesResponse {
     content: Vec<ContentBlock>,
     #[serde(default)]
     usage: Option<UsageBlock>,
+    #[serde(default)]
+    /// Provider terminal state, such as `end_turn` or `max_tokens`.
+    stop_reason: Option<String>,
 }
 
 /// The provider's `usage` object. Each count is optional so a partial or absent
@@ -319,6 +327,40 @@ mod tests {
         );
         let reply = client.send(&Prompt::new("hi")).expect("should succeed");
         assert_eq!(reply.text, "Hello there");
+        assert_eq!(reply.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[test]
+    fn decodes_max_tokens_stop_reason_without_rejecting_reply() {
+        let body = r#"{
+            "content": [{"type": "text", "text": "unfinished"}],
+            "stop_reason": "max_tokens"
+        }"#;
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            FakeHttp::new(200, body),
+        );
+
+        let reply = client.send(&Prompt::new("hi")).expect("should succeed");
+
+        assert_eq!(reply.text, "unfinished");
+        assert_eq!(reply.stop_reason.as_deref(), Some("max_tokens"));
+    }
+
+    #[test]
+    fn success_without_stop_reason_remains_backward_compatible() {
+        let body = r#"{
+            "content": [{"type": "text", "text": "complete enough"}]
+        }"#;
+        let client = ClaudeClient::with_http(
+            config_with("https://api.anthropic.com", "claude-sonnet-4-6"),
+            FakeHttp::new(200, body),
+        );
+
+        let reply = client.send(&Prompt::new("hi")).expect("should succeed");
+
+        assert_eq!(reply.text, "complete enough");
+        assert_eq!(reply.stop_reason, None);
     }
 
     #[test]

@@ -29,6 +29,9 @@ cargo run -- ask -p "hello"
 - On success, **stdout contains only the assistant text** (followed by a single
   newline). The prompt is taken from `-p` / `--prompt` (the `--prompt=<text>`
   form is also accepted).
+- If the provider reports `stop_reason: "max_tokens"`, Baton keeps the reply on
+  stdout and emits a visible warning on stderr because the text may be
+  truncated.
 - On failure (bad arguments, missing configuration, or a provider/transport
   error) Baton prints the error to **stderr** and exits with a non-zero status;
   stdout stays empty.
@@ -63,6 +66,9 @@ Brazil, 3–0.
 - A turn that fails (rate limit, transport error, …) is **not** fatal: the
   error is printed to stderr, the failed turn is dropped from the history, and
   the REPL continues so you can retry.
+- If the provider reports `stop_reason: "max_tokens"`, the reply is retained
+  and the session emits the same visible stderr warning as `ask` because the
+  text may be truncated.
 - History lives only in memory: it is not persisted across process restarts.
   Setting `BATON_EVENT_LOG` records a real-time, self-delimiting JSONL **session
   trail** — a `session_id`, per-turn `turn_index`, and session start/end markers —
@@ -184,7 +190,10 @@ The full trail is written as **JSONL**, one `baton.message/v1` envelope per line
 in turn order: the seed request first, then each reply. Each reply preserves the
 `conversation_id`, links `in_reply_to`, swaps addressing (so a reply's `from`
 names its speaker), and wraps the provider call it ran under `exchange` — so per
-turn token usage is observable in-band. The terminal reason is printed to stderr.
+turn token usage and provider `stop_reason` are observable in-band. If any
+reply reports `stop_reason: "max_tokens"`, the invoking driver emits a visible
+warning on stderr; this also applies when the reply arrived through a mailbox
+or subprocess participant. The terminal reason is printed to stderr.
 
 ### Terminal conditions
 
@@ -200,6 +209,10 @@ Whichever trips first ends the run:
   `response`/`error`; `done` is honored if a participant returns it.)
 - **delivered error** — a `kind: "error"` reply is recorded as the terminal turn
   and ends the run.
+
+A `stop_reason` of `max_tokens` is not a conversation terminal condition by
+itself: the truncated reply is recorded and relayed, while the driver warns
+that the text may be incomplete.
 
 ```bash
 baton converse \
@@ -317,6 +330,7 @@ baton converse-ring \
 
 The trail's replies advance by ring position — `bob`, `carol`, then `alice` on
 the wrap — each carrying its peer's nested `baton.exchange/v1` provider call. The
-end-to-end proof is `converse_ring_drives_three_live_serve_peers` in
+If a nested outcome reports `stop_reason: "max_tokens"`, the invoking ring
+driver emits the same visible truncation warning. The end-to-end proof is `converse_ring_drives_three_live_serve_peers` in
 `tests/integration_test.rs`, which drives three independent daemons against
 loopback mock servers with no external network.
