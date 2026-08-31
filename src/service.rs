@@ -4055,12 +4055,12 @@ mod imp {
     /// Sends `sig` to the process **group** led by `pid`.
     ///
     /// A process-group id is represented by a negative PID for `kill(2)`.
-    /// Invalid low PIDs are ignored because they cannot identify one of the
-    /// process groups owned by this service. A group that has already exited
-    /// is also treated as success, matching the old command's ignored exit
-    /// status at every call site.
+    /// Invalid low or out-of-range PIDs are ignored because they cannot
+    /// identify one of the process groups owned by this service. A group that
+    /// has already exited is also treated as success, matching the old
+    /// command's ignored exit status at every call site.
     fn signal_group(pid: u32, sig: libc::c_int) -> Result<()> {
-        if pid <= 1 {
+        if pid <= 1 || pid > i32::MAX as u32 {
             return Ok(());
         }
         let result = unsafe { libc::kill(-(pid as libc::pid_t), sig) };
@@ -5493,6 +5493,12 @@ mod imp {
         }
 
         #[test]
+        fn signal_group_ignores_pid_outside_pid_t() {
+            signal_group(i32::MAX as u32 + 1, libc::SIGTERM)
+                .expect("out-of-range PID is a safe no-op");
+        }
+
+        #[test]
         fn signal_group_treats_gone_group_as_success() {
             let _guard = serialize_forks_and_locks();
             let mut child = Command::new("/bin/sh")
@@ -5504,6 +5510,27 @@ mod imp {
             child.wait().expect("reap process-group fixture");
 
             signal_group(pid, libc::SIGKILL).expect("gone process group is already stopped");
+        }
+
+        #[test]
+        fn signal_group_surfaces_invalid_signal() {
+            let _guard = serialize_forks_and_locks();
+            let mut child = Command::new("/bin/sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .expect("spawn process-group fixture");
+            let pid = child.id();
+            let result = signal_group(pid, -1);
+
+            signal_group(pid, libc::SIGKILL).expect("clean up process-group fixture");
+            child.wait().expect("reap process-group fixture");
+
+            let error = result.expect_err("invalid signal must be returned");
+            assert!(matches!(
+                error,
+                BatonError::Io(message) if message.contains("could not signal process group")
+            ));
         }
 
         /// `serve_argv` reconstructs a plain daemon invocation with only
