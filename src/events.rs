@@ -127,6 +127,9 @@ pub enum ExchangeEvent {
         /// Provider-reported output (completion) tokens; omitted when unknown.
         #[serde(skip_serializing_if = "Option::is_none")]
         output_tokens: Option<u64>,
+        /// Provider-reported terminal reason; omitted when unknown.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
         /// Session this outcome belongs to, when emitted for a human↔agent
         /// session turn. Omitted on the `ask` path and on A2A seat outcomes.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -410,7 +413,7 @@ impl ExchangeEvent {
 
     /// Builds the success outcome event, carrying any reported token usage.
     pub fn response_ok(ts_ms: u64, duration_ms: u64, reply: &str, usage: &TokenUsage) -> Self {
-        Self::response_ok_with_correlation(ts_ms, duration_ms, reply, usage, None, None)
+        Self::response_ok_with_correlation(ts_ms, duration_ms, reply, usage, None, None, None)
     }
 
     /// Builds a success outcome for a human↔agent session turn, carrying the
@@ -430,6 +433,7 @@ impl ExchangeEvent {
             usage,
             Some((session_id, turn_index)),
             None,
+            None,
         )
     }
 
@@ -442,7 +446,58 @@ impl ExchangeEvent {
         usage: &TokenUsage,
         message_id: &str,
     ) -> Self {
-        Self::response_ok_with_correlation(ts_ms, duration_ms, reply, usage, None, Some(message_id))
+        Self::response_ok_with_correlation(
+            ts_ms,
+            duration_ms,
+            reply,
+            usage,
+            None,
+            Some(message_id),
+            None,
+        )
+    }
+
+    /// Builds a success outcome for a session turn while retaining the
+    /// provider's terminal reason, when one was supplied.
+    pub fn session_response_ok_with_stop_reason(
+        ts_ms: u64,
+        duration_ms: u64,
+        reply: &str,
+        usage: &TokenUsage,
+        stop_reason: Option<&str>,
+        session_id: &str,
+        turn_index: u64,
+    ) -> Self {
+        Self::response_ok_with_correlation(
+            ts_ms,
+            duration_ms,
+            reply,
+            usage,
+            Some((session_id, turn_index)),
+            None,
+            stop_reason,
+        )
+    }
+
+    /// Builds a success outcome for an `ask`/`serve` call while retaining the
+    /// provider's terminal reason, when one was supplied.
+    pub fn correlated_response_ok_with_stop_reason(
+        ts_ms: u64,
+        duration_ms: u64,
+        reply: &str,
+        usage: &TokenUsage,
+        stop_reason: Option<&str>,
+        message_id: &str,
+    ) -> Self {
+        Self::response_ok_with_correlation(
+            ts_ms,
+            duration_ms,
+            reply,
+            usage,
+            None,
+            Some(message_id),
+            stop_reason,
+        )
     }
 
     fn response_ok_with_correlation(
@@ -452,6 +507,7 @@ impl ExchangeEvent {
         usage: &TokenUsage,
         correlation: Option<(&str, u64)>,
         message_id: Option<&str>,
+        stop_reason: Option<&str>,
     ) -> Self {
         ExchangeEvent::ResponseOk {
             schema: SCHEMA,
@@ -460,6 +516,7 @@ impl ExchangeEvent {
             reply: reply.to_string(),
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
+            stop_reason: stop_reason.map(str::to_string),
             session_id: correlation.map(|(session_id, _)| session_id.to_string()),
             turn_index: correlation.map(|(_, turn_index)| turn_index),
             message_id: message_id.map(str::to_string),
@@ -572,6 +629,7 @@ impl ExchangeEvent {
                 reply,
                 input_tokens,
                 output_tokens,
+                stop_reason,
             } => ExchangeEvent::ResponseOk {
                 schema: SCHEMA,
                 ts_ms: *ts_ms,
@@ -579,6 +637,7 @@ impl ExchangeEvent {
                 reply: reply.clone(),
                 input_tokens: *input_tokens,
                 output_tokens: *output_tokens,
+                stop_reason: stop_reason.clone(),
                 session_id: None,
                 turn_index: None,
                 message_id: message_id.map(str::to_string),
@@ -698,6 +757,21 @@ mod tests {
     }
 
     #[test]
+    fn response_ok_event_serializes_stop_reason_when_present() {
+        let event = ExchangeEvent::correlated_response_ok_with_stop_reason(
+            1_700_000_000_001,
+            42,
+            "unfinished",
+            &TokenUsage::default(),
+            Some("max_tokens"),
+            "m-1",
+        );
+        let value: Value = serde_json::to_value(&event).expect("serializes");
+        assert_eq!(value["event"], "response_ok");
+        assert_eq!(value["stop_reason"], "max_tokens");
+    }
+
+    #[test]
     fn response_ok_event_omits_token_fields_when_usage_absent() {
         let event = ExchangeEvent::response_ok(1_700_000_000_001, 42, "hi", &TokenUsage::default());
         let value: Value = serde_json::to_value(&event).expect("serializes");
@@ -793,6 +867,7 @@ mod tests {
             reply: "r".to_string(),
             input_tokens: None,
             output_tokens: None,
+            stop_reason: None,
         };
         let bare: Value = serde_json::to_value(ExchangeEvent::from_outcome(&outcome)).unwrap();
         assert!(

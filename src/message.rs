@@ -173,6 +173,7 @@ mod tests {
                 reply: "hi there".to_string(),
                 input_tokens: None,
                 output_tokens: None,
+                stop_reason: None,
             },
         })
     }

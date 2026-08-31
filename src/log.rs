@@ -89,6 +89,9 @@ pub enum Outcome {
         /// Provider-reported output (completion) tokens; omitted when unknown.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_tokens: Option<u64>,
+        /// Provider-reported terminal reason; omitted when unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
     },
     /// The call failed; `kind` is the stable machine class.
     #[serde(rename = "response_error")]
@@ -114,6 +117,8 @@ struct OkRecord {
     input_tokens: Option<u64>,
     #[serde(default)]
     output_tokens: Option<u64>,
+    #[serde(default)]
+    stop_reason: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
@@ -270,6 +275,7 @@ pub fn parse_jsonl<R: Read>(reader: R) -> Result<ParseReport> {
                             reply: ok.reply,
                             input_tokens: ok.input_tokens,
                             output_tokens: ok.output_tokens,
+                            stop_reason: ok.stop_reason,
                         },
                     }),
                     None => report
@@ -601,6 +607,7 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
                         reply: ok.reply,
                         input_tokens: ok.input_tokens,
                         output_tokens: ok.output_tokens,
+                        stop_reason: ok.stop_reason,
                     },
                 );
             }
@@ -1055,6 +1062,7 @@ mod tests {
                 reply: "hi there".to_string(),
                 input_tokens: None,
                 output_tokens: None,
+                stop_reason: None,
             }
         );
     }
@@ -1077,6 +1085,31 @@ mod tests {
                 reply: "hi".to_string(),
                 input_tokens: Some(12),
                 output_tokens: Some(34),
+                stop_reason: None,
+            }
+        );
+    }
+
+    /// A provider terminal reason is retained when parsing the nested outcome.
+    #[test]
+    fn parses_response_ok_stop_reason() {
+        let log = concat!(
+            r#"{"event":"request","ts_ms":1,"model":"m","base_url":"u","prompt":"hello"}"#,
+            "\n",
+            r#"{"event":"response_ok","ts_ms":2,"duration_ms":3,"reply":"unfinished","stop_reason":"max_tokens"}"#,
+            "\n",
+        );
+        let exchanges = parse_jsonl(Cursor::new(log)).expect("parses").exchanges;
+
+        assert_eq!(
+            exchanges[0].outcome,
+            Outcome::Ok {
+                ts_ms: 2,
+                duration_ms: 3,
+                reply: "unfinished".to_string(),
+                input_tokens: None,
+                output_tokens: None,
+                stop_reason: Some("max_tokens".to_string()),
             }
         );
     }
@@ -1422,6 +1455,7 @@ mod tests {
                 reply: "the answer".to_string(),
                 input_tokens: Some(12),
                 output_tokens: Some(34),
+                stop_reason: None,
             },
         };
         let rendered = format_exchange(1, &ex);
@@ -1451,6 +1485,7 @@ mod tests {
                 reply: "a".to_string(),
                 input_tokens: None,
                 output_tokens: None,
+                stop_reason: None,
             },
         };
         let rendered = format_exchange(1, &ex);
@@ -1707,6 +1742,7 @@ mod tests {
                 reply: "hello".to_string(),
                 input_tokens: None,
                 output_tokens: None,
+                stop_reason: None,
             })
         );
     }
@@ -1803,6 +1839,7 @@ mod tests {
                 reply: "reply-A".to_string(),
                 input_tokens: None,
                 output_tokens: None,
+                stop_reason: None,
             })
         );
         assert_eq!(report.sessions[1].turns[0].request.prompt, "b0");
@@ -1902,6 +1939,7 @@ mod tests {
                 reply: "reply-A".to_string(),
                 input_tokens: None,
                 output_tokens: None,
+                stop_reason: None,
             })
         );
         assert_eq!(report.warnings.len(), 2, "warnings: {:?}", report.warnings);

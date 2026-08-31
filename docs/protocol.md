@@ -43,13 +43,13 @@ emits a `reply_consumed` line when it consumes the correlated reply:
 
 ```jsonl
 {"event":"request","schema":"baton.exchange/v1","ts_ms":1700000000000,"model":"claude-sonnet-4-6","base_url":"https://api.anthropic.com","prompt":"hello"}
-{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":1700000000420,"duration_ms":418,"reply":"Hi there!","input_tokens":9,"output_tokens":3}
+{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":1700000000420,"duration_ms":418,"reply":"Hi there!","input_tokens":9,"output_tokens":3,"stop_reason":"end_turn"}
 ```
 
 | `event`          | Fields beyond `schema` / `ts_ms`                            | Meaning                                              |
 | ---------------- | ----------------------------------------------------------- | ---------------------------------------------------- |
 | `request`        | `model`, `base_url`, `prompt`, `session_id?`, `turn_index?`, `from?`, `to?`, `conversation_id?`, `message_id?`, `in_reply_to?` | Emitted before the call; carries enough to replay it. `session_id` / `turn_index` are present on a `session` turn (see below). An `ask` request carries a generated `message_id`, and a `serve`/`exchange` request the request envelope's `message_id` + `conversation_id`, so its outcome pairs unambiguously on a shared trail. A `serve --role` seat request also carries the optional A2A addressing and correlation fields; its `session_id` equals `conversation_id` and its `turn_index` is omitted. |
-| `response_ok`    | `duration_ms`, `reply`, `input_tokens`, `output_tokens`, `session_id?`, `turn_index?`, `message_id?` | The call succeeded. `message_id` echoes the `ask`/`serve` request it answers. |
+| `response_ok`    | `duration_ms`, `reply`, `input_tokens`, `output_tokens`, `stop_reason?`, `session_id?`, `turn_index?`, `message_id?` | The call succeeded. `stop_reason` is the provider terminal reason when supplied (for example, `max_tokens`); `message_id` echoes the `ask`/`serve` request it answers. |
 | `response_error` | `duration_ms`, `kind`, `message`, `session_id?`, `turn_index?`, `message_id?`             | The call failed; `kind` is the stable machine class. `message_id` echoes the `ask`/`serve` request it answers. |
 | `message_sent`   | `message_id`, `conversation_id`, `from`, `to`              | Emitted when `baton send` delivers a request into a mailbox. |
 | `reply_consumed` | `message_id`, `in_reply_to?`, `conversation_id`             | Emitted by `baton send --await` when it consumes a correlated reply; `in_reply_to` is present when the reply carries the request id it answers. |
@@ -61,6 +61,11 @@ call. They are **optional**: a `2xx` response that omits the `usage` block (or a
 field within it) still succeeds, and the missing count is simply left off the
 `response_ok` line rather than failing the exchange — so a consumer must treat
 either field as possibly absent.
+
+`stop_reason` is also optional and is omitted when the provider does not return
+it. A value of `max_tokens` means the provider stopped at the output-token cap;
+the reply text is retained, but callers should treat it as potentially
+truncated.
 
 For provider-backed exchange records, `response_error.kind` is one of the six
 provider failure classes (`transport`, `auth`, `rate_limited`, `server`, `api`,
@@ -241,7 +246,9 @@ carry no transport, I/O, or addressing semantics.
 An envelope carries a `schema` discriminator (`baton.message/v1`), a
 `message_id`, the `conversation_id` it belongs to, `from` / `to` addresses, a
 nullable `in_reply_to` linking it to the message it answers, a `kind`, a `body`,
-and a `ts_ms` wall-clock timestamp (Unix epoch milliseconds).
+and a `ts_ms` wall-clock timestamp (Unix epoch milliseconds). Provider replies
+retain their optional terminal metadata inside the nested `baton.exchange/v1`
+outcome.
 
 | Field           | Type              | Meaning                                                        |
 | --------------- | ----------------- | -------------------------------------------------------------- |
@@ -294,7 +301,8 @@ the resulting exchange under `exchange`, a self-describing object pairing the
         "duration_ms": 418,
         "reply": "France.",
         "input_tokens": 9,
-        "output_tokens": 3
+        "output_tokens": 3,
+        "stop_reason": "end_turn"
       }
     }
   }

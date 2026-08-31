@@ -88,6 +88,7 @@ impl<T: Transport> Participant for LocalParticipant<T> {
                     reply: reply.text.clone(),
                     input_tokens: reply.usage.input_tokens,
                     output_tokens: reply.usage.output_tokens,
+                    stop_reason: reply.stop_reason.clone(),
                 };
                 (MessageKind::Response, reply.text, outcome)
             }
@@ -1095,6 +1096,7 @@ pub mod testing {
                         reply: self.body.clone(),
                         input_tokens: Some(input),
                         output_tokens: Some(output),
+                        stop_reason: None,
                     },
                 }));
             }
@@ -1239,6 +1241,31 @@ mod tests {
             } => {
                 assert_eq!(*input_tokens, Some(7));
                 assert_eq!(*output_tokens, Some(11));
+            }
+            other => panic!("expected Ok outcome, got {other:?}"),
+        }
+    }
+
+    /// The provider terminal reason remains available in the nested exchange
+    /// so a conversation driver can warn even when this participant is remote.
+    #[test]
+    fn local_participant_wraps_stop_reason() {
+        let body =
+            r#"{"content": [{"type": "text", "text": "unfinished"}], "stop_reason": "max_tokens"}"#;
+        let client = ClaudeClient::with_http(
+            test_config(),
+            FakeHttp {
+                status: 200,
+                body: body.to_string(),
+            },
+        );
+        let participant = LocalParticipant::new(client, test_meta());
+
+        let response = participant.respond(&request_envelope());
+
+        match &response.exchange.expect("wrapped").exchange.outcome {
+            Outcome::Ok { stop_reason, .. } => {
+                assert_eq!(stop_reason.as_deref(), Some("max_tokens"));
             }
             other => panic!("expected Ok outcome, got {other:?}"),
         }
@@ -2131,6 +2158,7 @@ mod tests {
                     reply: "pong".to_string(),
                     input_tokens: Some(3),
                     output_tokens: Some(5),
+                    stop_reason: None,
                 },
             }));
         }
