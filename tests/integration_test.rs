@@ -6479,6 +6479,11 @@ fn service_tasks_reconcile_after_run_restart() {
 
     let mut run = Command::new(env!("CARGO_BIN_EXE_baton"));
     run.args(["service", "run", "--control", control_str]);
+    // Linux liveness probes are PATH-independent, so this isolates the
+    // signal path from the host's `kill` binary. macOS probes still resolve
+    // `ps` through PATH and retain the normal environment here.
+    #[cfg(target_os = "linux")]
+    run.env("PATH", "/nonexistent");
     run.stdout(Stdio::null());
     // Captured, like the restart below: a supervisor that exits during
     // startup otherwise shows up only as an opaque liveness timeout.
@@ -6523,11 +6528,11 @@ fn service_tasks_reconcile_after_run_restart() {
             "--poll-ms",
             "20",
             "--agent-cmd",
-            "sh",
+            "/bin/sh",
             "--agent-arg",
             "-c",
             "--agent-arg",
-            "cat >/dev/null; printf ready",
+            "/bin/cat >/dev/null; printf ready",
         ])
         .output()
         .expect("start task owner session");
@@ -6550,7 +6555,7 @@ fn service_tasks_reconcile_after_run_restart() {
             "--session",
             &session_id,
             "--command",
-            "sleep",
+            "/bin/sleep",
             "--arg",
             "2",
             "--milestone-ms",
@@ -6587,12 +6592,12 @@ fn service_tasks_reconcile_after_run_restart() {
             "--session",
             &session_id,
             "--command",
-            "sh",
+            "/bin/sh",
             "--arg",
             "-c",
             "--arg",
             &format!(
-                "while [ ! -e '{}' ]; do sleep 0.05; done",
+                "while [ ! -e '{}' ]; do /bin/sleep 0.05; done",
                 finished_release.display()
             ),
             "--max-duration-ms",
@@ -6624,11 +6629,11 @@ fn service_tasks_reconcile_after_run_restart() {
             "--session",
             &session_id,
             "--command",
-            "sh",
+            "/bin/sh",
             "--arg",
             "-c",
             "--arg",
-            "trap 'exit 0' TERM; sleep 30",
+            "trap 'exit 0' TERM; /bin/sleep 30",
             "--max-duration-ms",
             "2000",
             "--callback-inbox",
@@ -6658,11 +6663,11 @@ fn service_tasks_reconcile_after_run_restart() {
             "--session",
             &session_id,
             "--command",
-            "sh",
+            "/bin/sh",
             "--arg",
             "-c",
             "--arg",
-            "trap '' TERM; exec sleep 30",
+            "trap '' TERM; exec /bin/sleep 30",
             "--max-duration-ms",
             "2000",
             "--callback-inbox",
@@ -6729,6 +6734,8 @@ fn service_tasks_reconcile_after_run_restart() {
 
     let mut restarted_run = Command::new(env!("CARGO_BIN_EXE_baton"));
     restarted_run.args(["service", "run", "--control", control_str]);
+    #[cfg(target_os = "linux")]
+    restarted_run.env("PATH", "/nonexistent");
     restarted_run.stdout(Stdio::null());
     restarted_run.stderr(Stdio::piped());
     let mut restarted_child = restarted_run.spawn().expect("spawn restarted service run");
