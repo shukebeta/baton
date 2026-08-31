@@ -10,6 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
+## v0.3.45 (2026-08-31)
+
+### Fixes
+- fix(service): rate-limit grace-wait liveness scans (#269)
+
 ## v0.3.44 … v0.3.36 (2026-08-30)
 
 ### Fixes
