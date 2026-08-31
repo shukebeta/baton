@@ -293,22 +293,22 @@ mod imp {
         PROCESS_PROBE_COUNT.with(Cell::get)
     }
 
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(test)]
     thread_local! {
         static GROUP_SCAN_COUNT: Cell<u64> = const { Cell::new(0) };
     }
 
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(test)]
     fn note_group_scan() {
         GROUP_SCAN_COUNT.with(|count| count.set(count.get() + 1));
     }
 
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(test)]
     fn reset_group_scan_count() {
         GROUP_SCAN_COUNT.with(|count| count.set(0));
     }
 
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(test)]
     fn group_scan_count() -> u64 {
         GROUP_SCAN_COUNT.with(Cell::get)
     }
@@ -3794,6 +3794,8 @@ mod imp {
 
     #[cfg(not(target_os = "linux"))]
     fn process_group_member_liveness(pgid: u32) -> Liveness {
+        #[cfg(test)]
+        note_group_scan();
         let output = match Command::new("ps")
             .args(["-ww", "-axo", "pid=,pgid=,state="])
             .env("LC_ALL", "C")
@@ -6221,6 +6223,17 @@ mod imp {
                 Liveness::Unresolved,
                 "a mismatched zombie remains unresolved"
             );
+            let retry_grace_ms = POLL_INTERVAL_MS * 2;
+            let started = Instant::now();
+            assert_eq!(
+                task_execution_liveness_after_retry(&record, retry_grace_ms),
+                Liveness::Unresolved,
+                "a mismatched zombie remains unresolved after retry"
+            );
+            assert!(
+                started.elapsed() >= Duration::from_millis(retry_grace_ms),
+                "unresolved retry returned before its deadline"
+            );
             let mut admission = AdmissionGuard::acquire(&dir.path).expect("admission lock");
             let residue =
                 reap_session_tasks_with_wait(&mut admission, "svc-1", false, wait_while_task_alive)
@@ -7739,6 +7752,18 @@ mod imp {
 
             let grace_ms = REHYDRATED_LIVENESS_CACHE_MS * 4 + POLL_INTERVAL_MS;
             reset_group_scan_count();
+            reset_process_probe_count();
+            assert_eq!(
+                task_execution_liveness_after_retry(&running.record, POLL_INTERVAL_MS),
+                Liveness::Live,
+                "the retry helper recognizes the live descendant group"
+            );
+            assert_eq!(
+                group_scan_count(),
+                1,
+                "the retry helper performs one fresh group scan"
+            );
+            reset_group_scan_count();
             let started = Instant::now();
             wait_while_task_alive(&running.record, grace_ms);
             assert!(
@@ -7749,6 +7774,10 @@ mod imp {
                 group_scan_count() <= grace_ms / REHYDRATED_LIVENESS_CACHE_MS + 1,
                 "task group scans exceeded the 500ms budget: {}",
                 group_scan_count()
+            );
+            assert!(
+                process_probe_count() > group_scan_count(),
+                "Linux task wait no longer performs the direct probe per poll"
             );
             signal_group(running.record.pid, "-KILL").expect("kill task fixture group");
             running
@@ -7811,15 +7840,54 @@ mod imp {
             let grace_ms = REHYDRATED_LIVENESS_CACHE_MS * 4 + POLL_INTERVAL_MS;
             let task = task_spec(
                 "svc-1",
-                "sleep",
-                vec!["30".to_string()],
+                "sh",
+                vec![
+                    "-c".to_string(),
+                    "trap '' TERM; sleep 30 & exit 0".to_string(),
+                ],
                 vec![],
                 60_000,
                 "/tmp/callback",
             );
             let mut running = spawn_running_task(&dir.path, "task-grace-non-linux", task, &clock);
+            wait_for_group_descendant(&mut running);
 
+            reset_group_scan_count();
+            assert_eq!(
+                task_execution_liveness_after_retry(&running.record, POLL_INTERVAL_MS),
+                Liveness::Live,
+                "the retry helper recognizes the live descendant group"
+            );
+            assert_eq!(
+                group_scan_count(),
+                1,
+                "the retry helper performs one fresh process-table scan"
+            );
+            let mut unresolved = running.record.clone();
+            unresolved.start_epoch_secs = unresolved
+                .start_epoch_secs
+                .map(|start_epoch_secs| start_epoch_secs.saturating_add(1))
+                .or(Some(i64::MAX));
+            let retry_grace_ms = POLL_INTERVAL_MS * 2;
             reset_process_probe_count();
+            reset_group_scan_count();
+            let started = Instant::now();
+            assert_eq!(
+                task_execution_liveness_after_retry(&unresolved, retry_grace_ms),
+                Liveness::Unresolved,
+                "a mismatched zombie remains unresolved after retry"
+            );
+            assert!(
+                started.elapsed() >= Duration::from_millis(retry_grace_ms),
+                "unresolved retry returned before its deadline"
+            );
+            assert_eq!(
+                group_scan_count(),
+                0,
+                "mismatched identity never reaches the process-table scan"
+            );
+            reset_process_probe_count();
+            reset_group_scan_count();
             let started = Instant::now();
             wait_while_task_alive(&running.record, grace_ms);
             assert!(
@@ -7827,9 +7895,18 @@ mod imp {
                 "task wait returned before its deadline"
             );
             assert!(
-                process_probe_count() <= grace_ms / REHYDRATED_LIVENESS_CACHE_MS + 1,
+                process_probe_count() <= 2 * (grace_ms / REHYDRATED_LIVENESS_CACHE_MS + 1),
                 "task probe chain exceeded the 500ms budget: {}",
                 process_probe_count()
+            );
+            assert!(
+                group_scan_count() <= grace_ms / REHYDRATED_LIVENESS_CACHE_MS + 1,
+                "task process-table scans exceeded the 500ms budget: {}",
+                group_scan_count()
+            );
+            assert!(
+                group_scan_count() > 1,
+                "task wait did not exercise repeated process-table scans"
             );
             signal_group(running.record.pid, "-KILL").expect("kill task fixture group");
             running
