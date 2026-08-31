@@ -123,6 +123,8 @@ struct OkRecord {
     session_id: Option<String>,
     #[serde(default)]
     turn_index: Option<u64>,
+    #[serde(default)]
+    message_id: Option<String>,
 }
 
 /// Deserialization mirror of a `response_error` line.
@@ -136,6 +138,8 @@ struct ErrRecord {
     session_id: Option<String>,
     #[serde(default)]
     turn_index: Option<u64>,
+    #[serde(default)]
+    message_id: Option<String>,
 }
 
 /// The outcome of parsing an exchange trail: the complete [`Exchange`] pairs and
@@ -456,16 +460,23 @@ struct SessionEndRecord {
 ///   turns intact; two sequential sessions in one file separate cleanly by id.
 /// - **Outcome correlation** — a `response_ok` / `response_error` line carrying
 ///   both `session_id` and `turn_index` closes that exact pending request. An
-///   outcome without those fields closes the current pending request in file
-///   order, preserving older session trails and A2A seat trails.
+///   outcome carrying a `message_id` but no complete session pair belongs to a
+///   message path and is skipped. An outcome without those fields closes the
+///   current pending request in file order, preserving older session trails and
+///   A2A seat trails.
 /// - **Overwritten uncorrelated request** — a session request without a
 ///   `turn_index` arriving while the file-order fallback slot is occupied
 ///   records a warning naming the displaced turn; the newer request keeps the
 ///   existing fallback slot.
+/// - **Message-path outcomes** — an `ask`/`serve` outcome carrying a
+///   `message_id` but no complete `(session_id, turn_index)` pair is skipped
+///   silently; it never consumes the session fallback slot. A correlated
+///   human session outcome still uses its complete session pair.
 /// - **Dangling uncorrelated outcome** — an outcome without a complete
-///   `(session_id, turn_index)` pair and without a pending fallback request is
-///   skipped and recorded in [`SessionParseReport::warnings`]. A sessionless
-///   `ask` request and its outcome remain skipped silently.
+///   `(session_id, turn_index)` pair, without a `message_id`, and without a
+///   pending fallback request is skipped and recorded in
+///   [`SessionParseReport::warnings`]. A legacy sessionless request without a
+///   correlation id retains its historical silent pairing behavior.
 /// - **Trailing partial line**: the final unterminated line (an unclean
 ///   shutdown's signature) that fails to parse is skipped-with-warning, exactly
 ///   as in [`parse_jsonl`]; any newline-terminated malformed line stays a hard
@@ -485,10 +496,11 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
     // omit correlation fields. Preserve the old file-order fallback for those
     // lines; only one such request can be safely pending at a time.
     let mut pending_without_correlation: Option<(usize, usize)> = None;
-    // A sessionless ask request deliberately clears the session fallback; its
-    // outcome must remain silent rather than being reported as a session
-    // dangling outcome.
-    let mut last_request_was_sessionless = false;
+    // Pre-correlation sessionless requests had no key to distinguish their
+    // outcome from a dangling legacy outcome. Retain their historical silence
+    // separately from the session fallback; modern ask/serve lines use their
+    // `message_id` and never need this compatibility marker.
+    let mut pending_uncorrelated_sessionless = false;
     let mut buf: Vec<u8> = Vec::new();
     let mut line_no = 0usize;
 
@@ -532,6 +544,11 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
                 report.sessions[idx].declared_turns = Some(end.turns);
             }
             Some("request") => {
+                // `RequestRecord` intentionally mirrors only replay fields, so
+                // inspect the raw value before deserializing it. A correlated
+                // ask/serve request must not clear a pending legacy session
+                // fallback that another writer may still complete.
+                let has_message_id = value.get("message_id").and_then(Value::as_str).is_some();
                 let record: RequestRecord = from_value(value, line_no, "request")?;
                 match record.session_id.clone() {
                     Some(session_id) => {
@@ -564,36 +581,50 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
                             ));
                         }
                         pending_without_correlation = Some((idx, turn_idx));
-                        last_request_was_sessionless = false;
+                        pending_uncorrelated_sessionless = false;
                     }
                     // Sessionless (`ask`) request: not part of any session, and
                     // its outcome must not attach to the previous session turn.
                     None => {
-                        pending_without_correlation = None;
-                        last_request_was_sessionless = true;
+                        if has_message_id {
+                            pending_uncorrelated_sessionless = false;
+                        } else {
+                            pending_without_correlation = None;
+                            pending_uncorrelated_sessionless = true;
+                        }
                     }
                 }
             }
             Some("response_ok") => {
                 let ok: OkRecord = from_value(value, line_no, "response_ok")?;
                 let has_correlation = has_complete_correlation(&ok.session_id, ok.turn_index);
-                let suppress_sessionless = last_request_was_sessionless;
-                last_request_was_sessionless = false;
-                let target = match (ok.session_id, ok.turn_index) {
-                    (Some(session_id), Some(turn_index)) => {
-                        let target = pending_by_correlation.remove(&(session_id, turn_index));
-                        if target == pending_without_correlation {
-                            pending_without_correlation = None;
+                let has_message_id = ok.message_id.is_some();
+                let suppress_sessionless = pending_uncorrelated_sessionless;
+                pending_uncorrelated_sessionless = false;
+                let target = if has_correlation {
+                    match (ok.session_id, ok.turn_index) {
+                        (Some(session_id), Some(turn_index)) => {
+                            let target = pending_by_correlation.remove(&(session_id, turn_index));
+                            if target == pending_without_correlation {
+                                pending_without_correlation = None;
+                            }
+                            target
                         }
-                        target
+                        _ => unreachable!("complete correlation checked above"),
                     }
-                    _ => take_uncorrelated_pending(
+                } else if has_message_id {
+                    // Message-path outcomes are self-correlated and do not
+                    // participate in session fallback pairing.
+                    None
+                } else {
+                    take_uncorrelated_pending(
                         &report.sessions,
                         &mut pending_by_correlation,
                         &mut pending_without_correlation,
-                    ),
+                    )
                 };
-                if !has_correlation && target.is_none() && !suppress_sessionless {
+                if !has_correlation && !has_message_id && target.is_none() && !suppress_sessionless
+                {
                     report
                         .warnings
                         .push(dangling_outcome_warning(line_no, "response_ok"));
@@ -614,23 +645,33 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
             Some("response_error") => {
                 let err: ErrRecord = from_value(value, line_no, "response_error")?;
                 let has_correlation = has_complete_correlation(&err.session_id, err.turn_index);
-                let suppress_sessionless = last_request_was_sessionless;
-                last_request_was_sessionless = false;
-                let target = match (err.session_id, err.turn_index) {
-                    (Some(session_id), Some(turn_index)) => {
-                        let target = pending_by_correlation.remove(&(session_id, turn_index));
-                        if target == pending_without_correlation {
-                            pending_without_correlation = None;
+                let has_message_id = err.message_id.is_some();
+                let suppress_sessionless = pending_uncorrelated_sessionless;
+                pending_uncorrelated_sessionless = false;
+                let target = if has_correlation {
+                    match (err.session_id, err.turn_index) {
+                        (Some(session_id), Some(turn_index)) => {
+                            let target = pending_by_correlation.remove(&(session_id, turn_index));
+                            if target == pending_without_correlation {
+                                pending_without_correlation = None;
+                            }
+                            target
                         }
-                        target
+                        _ => unreachable!("complete correlation checked above"),
                     }
-                    _ => take_uncorrelated_pending(
+                } else if has_message_id {
+                    // Message-path outcomes are self-correlated and do not
+                    // participate in session fallback pairing.
+                    None
+                } else {
+                    take_uncorrelated_pending(
                         &report.sessions,
                         &mut pending_by_correlation,
                         &mut pending_without_correlation,
-                    ),
+                    )
                 };
-                if !has_correlation && target.is_none() && !suppress_sessionless {
+                if !has_correlation && !has_message_id && target.is_none() && !suppress_sessionless
+                {
                     report
                         .warnings
                         .push(dangling_outcome_warning(line_no, "response_error"));
@@ -2107,6 +2148,145 @@ mod tests {
             report.warnings[0].contains("line 3") && report.warnings[0].contains("dangling"),
             "only the subsequent dangling outcome is warned: {}",
             report.warnings[0]
+        );
+    }
+
+    /// Builds the shared-trail ordering from #275: an A2A/legacy session turn
+    /// uses the file-order fallback while an ask exchange is self-correlated by
+    /// `message_id`.
+    fn interleaved_message_and_legacy_trail(ask_outcome_first: bool) -> String {
+        let meta = ExchangeMeta {
+            model: "m".to_string(),
+            base_url: "u".to_string(),
+        };
+        let session_request = line(&ExchangeEvent::a2a_turn_request(
+            1,
+            &meta,
+            "session prompt",
+            "sess-A",
+            "peer",
+            "agent",
+            "m-session",
+            None,
+        ));
+        let ask_request = line(&ExchangeEvent::correlated_request(
+            2,
+            &meta,
+            "ask prompt",
+            None,
+            "m-ask",
+        ));
+        let session_outcome = line(&ExchangeEvent::response_ok(
+            3,
+            1,
+            "session reply",
+            &TokenUsage::default(),
+        ));
+        let ask_outcome = line(&ExchangeEvent::correlated_response_ok(
+            4,
+            1,
+            "ask reply",
+            &TokenUsage::default(),
+            "m-ask",
+        ));
+        let outcomes = if ask_outcome_first {
+            [ask_outcome, session_outcome]
+        } else {
+            [session_outcome, ask_outcome]
+        };
+        [
+            session_request,
+            ask_request,
+            outcomes[0].clone(),
+            outcomes[1].clone(),
+        ]
+        .join("\n")
+            + "\n"
+    }
+
+    /// A message-correlated ask outcome that lands after the session outcome
+    /// must not produce a warning or disturb the completed session turn.
+    #[test]
+    fn parse_sessions_pairs_session_turn_when_session_outcome_lands_first() {
+        let report = parse_sessions(Cursor::new(interleaved_message_and_legacy_trail(false)))
+            .expect("parses");
+        assert_eq!(report.sessions.len(), 1);
+        assert_eq!(report.sessions[0].turns.len(), 1);
+        assert!(matches!(
+            report.sessions[0].turns[0].outcome,
+            Some(Outcome::Ok { ref reply, .. }) if reply == "session reply"
+        ));
+        assert!(
+            report.warnings.is_empty(),
+            "message-correlated ask outcome is silent: {:?}",
+            report.warnings
+        );
+    }
+
+    /// The same pairing must hold when the message-correlated ask outcome lands
+    /// before the legacy session outcome, leaving the fallback slot untouched.
+    #[test]
+    fn parse_sessions_pairs_session_turn_when_ask_outcome_lands_first() {
+        let report = parse_sessions(Cursor::new(interleaved_message_and_legacy_trail(true)))
+            .expect("parses");
+        assert_eq!(report.sessions.len(), 1);
+        assert_eq!(report.sessions[0].turns.len(), 1);
+        assert!(matches!(
+            report.sessions[0].turns[0].outcome,
+            Some(Outcome::Ok { ref reply, .. }) if reply == "session reply"
+        ));
+        assert!(
+            report.warnings.is_empty(),
+            "message-correlated ask outcome is silent: {:?}",
+            report.warnings
+        );
+    }
+
+    /// Error outcomes use the same message-path discrimination and leave an
+    /// uncorrelated session outcome available for the legacy fallback.
+    #[test]
+    fn parse_sessions_skips_message_correlated_error_without_consuming_fallback() {
+        let meta = ExchangeMeta {
+            model: "m".to_string(),
+            base_url: "u".to_string(),
+        };
+        let ask_error = BatonError::Auth("ask failed".to_string());
+        let session_error = BatonError::Transport("session failed".to_string());
+        let trail = [
+            line(&ExchangeEvent::a2a_turn_request(
+                1,
+                &meta,
+                "session prompt",
+                "sess-A",
+                "peer",
+                "agent",
+                "m-session",
+                None,
+            )),
+            line(&ExchangeEvent::correlated_request(
+                2,
+                &meta,
+                "ask prompt",
+                None,
+                "m-ask",
+            )),
+            line(&ExchangeEvent::correlated_response_error(
+                3, 1, &ask_error, "m-ask",
+            )),
+            line(&ExchangeEvent::response_error(4, 1, &session_error)),
+        ]
+        .join("\n")
+            + "\n";
+
+        let report = parse_sessions(Cursor::new(trail)).expect("parses");
+        assert!(matches!(
+            report.sessions[0].turns[0].outcome,
+            Some(Outcome::Error { ref message, .. }) if message == "transport error: session failed"
+        ));
+        assert!(
+            report.warnings.is_empty(),
+            "warnings: {:?}",
+            report.warnings
         );
     }
 }

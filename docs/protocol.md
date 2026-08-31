@@ -118,10 +118,12 @@ without guessing from line ordering:
   failed turn still emits its `request` and advances the index.
 - Each human↔agent session outcome carries the same `session_id` and
   `turn_index` as its request. This pair lets the reader close multiple pending
-  turns from interleaved sessions without relying on append order. `ask`
-  outcomes remain sessionless. A2A seat outcomes may also omit the pair because
-  their requests have no `turn_index`; the reader pairs an outcome lacking both
-  correlation fields with the current pending request in file order.
+  turns from interleaved sessions without relying on append order. An `ask` or
+  provider `serve` outcome carries the request's `message_id`; the session
+  reader recognizes that message path by id and skips it rather than consuming
+  a session fallback slot. A2A seat outcomes may omit both correlation fields
+  because their requests have no `turn_index`; the reader pairs those legacy
+  outcomes with the current pending request in file order.
 - One `session_end` line closes the run on a clean exit (EOF / `/exit`), carrying
   the `session_id` and the total `turns` count.
 
@@ -144,9 +146,12 @@ seat trails. A second uncorrelated request that arrives before the previous
 fallback outcome replaces the single fallback target and produces a warning
 naming the displaced turn. An uncorrelated outcome with no fallback target
 likewise produces a dangling-outcome warning and is not attached. Sequential
-single-writer trails remain warning-free. A sessionless `ask` request and its
-outcome remain skipped without a session warning. A correlated outcome with no
-matching pending request is not attached to another session's turn. The
+single-writer trails remain warning-free. A message-correlated `ask`/`serve`
+request does not clear an outstanding legacy fallback, and its outcome remains
+skipped without a session warning regardless of which outcome lands first. For
+backward compatibility, a sessionless request with no correlation id retains
+the historical silent pairing behavior. A correlated outcome with no matching
+pending request is not attached to another session's turn. The
 `session_start` / `session_end` markers ride the same `baton.exchange/v1` trail;
 `baton log show` / `replay` skip them, so they are unaffected.
 
