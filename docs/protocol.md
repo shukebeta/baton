@@ -135,8 +135,13 @@ partial-trail tolerance above covers it). The `ask` path is unframed: its
 reader matches an outcome carrying both correlation fields to the exact request
 with that pair. For compatibility, an outcome lacking both fields uses the
 legacy file-order pairing; this covers older sequential session trails and A2A
-seat trails. A correlated outcome with no matching pending request is not
-attached to another session's turn. The
+seat trails. A second uncorrelated request that arrives before the previous
+fallback outcome replaces the single fallback target and produces a warning
+naming the displaced turn. An uncorrelated outcome with no fallback target
+likewise produces a dangling-outcome warning and is not attached. Sequential
+single-writer trails remain warning-free. A sessionless `ask` request and its
+outcome remain skipped without a session warning. A correlated outcome with no
+matching pending request is not attached to another session's turn. The
 `session_start` / `session_end` markers ride the same `baton.exchange/v1` trail;
 `baton log show` / `replay` skip them, so they are unaffected.
 

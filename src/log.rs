@@ -452,6 +452,14 @@ struct SessionEndRecord {
 ///   both `session_id` and `turn_index` closes that exact pending request. An
 ///   outcome without those fields closes the current pending request in file
 ///   order, preserving older session trails and A2A seat trails.
+/// - **Overwritten uncorrelated request** — a session request without a
+///   `turn_index` arriving while the file-order fallback slot is occupied
+///   records a warning naming the displaced turn; the newer request keeps the
+///   existing fallback slot.
+/// - **Dangling uncorrelated outcome** — an outcome without a complete
+///   `(session_id, turn_index)` pair and without a pending fallback request is
+///   skipped and recorded in [`SessionParseReport::warnings`]. A sessionless
+///   `ask` request and its outcome remain skipped silently.
 /// - **Trailing partial line**: the final unterminated line (an unclean
 ///   shutdown's signature) that fails to parse is skipped-with-warning, exactly
 ///   as in [`parse_jsonl`]; any newline-terminated malformed line stays a hard
@@ -471,6 +479,10 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
     // omit correlation fields. Preserve the old file-order fallback for those
     // lines; only one such request can be safely pending at a time.
     let mut pending_without_correlation: Option<(usize, usize)> = None;
+    // A sessionless ask request deliberately clears the session fallback; its
+    // outcome must remain silent rather than being reported as a session
+    // dangling outcome.
+    let mut last_request_was_sessionless = false;
     let mut buf: Vec<u8> = Vec::new();
     let mut line_no = 0usize;
 
@@ -519,6 +531,7 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
                     Some(session_id) => {
                         let idx = session_index(&mut report.sessions, &mut index, &session_id);
                         let turn_idx = report.sessions[idx].turns.len();
+                        let is_uncorrelated = record.turn_index.is_none();
                         let correlation = record
                             .turn_index
                             .map(|turn_index| (session_id.clone(), turn_index));
@@ -532,16 +545,34 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
                         }
                         // Requests with no turn_index (A2A seat turns) and
                         // requests from legacy session trails both rely on the
-                        // outcome's missing-correlation fallback.
+                        // outcome's missing-correlation fallback. Warn when an
+                        // uncorrelated request replaces an occupied fallback
+                        // slot; correlated session interleaving retains its
+                        // existing key-based behavior without this warning.
+                        if is_uncorrelated && let Some(previous) = pending_without_correlation {
+                            let previous_request =
+                                &report.sessions[previous.0].turns[previous.1].request;
+                            report.warnings.push(uncorrelated_request_overwrite_warning(
+                                line_no,
+                                previous_request,
+                            ));
+                        }
                         pending_without_correlation = Some((idx, turn_idx));
+                        last_request_was_sessionless = false;
                     }
                     // Sessionless (`ask`) request: not part of any session, and
                     // its outcome must not attach to the previous session turn.
-                    None => pending_without_correlation = None,
+                    None => {
+                        pending_without_correlation = None;
+                        last_request_was_sessionless = true;
+                    }
                 }
             }
             Some("response_ok") => {
                 let ok: OkRecord = from_value(value, line_no, "response_ok")?;
+                let has_correlation = has_complete_correlation(&ok.session_id, ok.turn_index);
+                let suppress_sessionless = last_request_was_sessionless;
+                last_request_was_sessionless = false;
                 let target = match (ok.session_id, ok.turn_index) {
                     (Some(session_id), Some(turn_index)) => {
                         let target = pending_by_correlation.remove(&(session_id, turn_index));
@@ -556,6 +587,11 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
                         &mut pending_without_correlation,
                     ),
                 };
+                if !has_correlation && target.is_none() && !suppress_sessionless {
+                    report
+                        .warnings
+                        .push(dangling_outcome_warning(line_no, "response_ok"));
+                }
                 complete_pending_turn(
                     &mut report.sessions,
                     target,
@@ -570,6 +606,9 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
             }
             Some("response_error") => {
                 let err: ErrRecord = from_value(value, line_no, "response_error")?;
+                let has_correlation = has_complete_correlation(&err.session_id, err.turn_index);
+                let suppress_sessionless = last_request_was_sessionless;
+                last_request_was_sessionless = false;
                 let target = match (err.session_id, err.turn_index) {
                     (Some(session_id), Some(turn_index)) => {
                         let target = pending_by_correlation.remove(&(session_id, turn_index));
@@ -584,6 +623,11 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
                         &mut pending_without_correlation,
                     ),
                 };
+                if !has_correlation && target.is_none() && !suppress_sessionless {
+                    report
+                        .warnings
+                        .push(dangling_outcome_warning(line_no, "response_error"));
+                }
                 complete_pending_turn(
                     &mut report.sessions,
                     target,
@@ -602,6 +646,26 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
     }
 
     Ok(report)
+}
+
+/// Whether an outcome has the complete key used by the correlated session
+/// lookup. A partially populated pair remains on the legacy fallback path.
+fn has_complete_correlation(session_id: &Option<String>, turn_index: Option<u64>) -> bool {
+    session_id.is_some() && turn_index.is_some()
+}
+
+/// Warning for a concurrent uncorrelated session request that replaces the
+/// only file-order fallback target before its outcome arrives.
+fn uncorrelated_request_overwrite_warning(
+    line_no: usize,
+    previous_request: &RequestRecord,
+) -> String {
+    format!(
+        "line {line_no}: a request with no turn_index arrived before the previous fallback request's outcome — the earlier session {:?} turn (prompt {:?}, ts_ms {}) cannot be reconstructed; concurrent writers to one session trail need correlation fields",
+        previous_request.session_id,
+        excerpt(&previous_request.prompt, 60),
+        previous_request.ts_ms
+    )
 }
 
 /// Takes the legacy file-order target and removes its explicit key too when
@@ -1751,6 +1815,11 @@ mod tests {
                 message: "authentication error: bad key".to_string(),
             })
         );
+        assert!(
+            report.warnings.is_empty(),
+            "correlated interleaving remains warning-free: {:?}",
+            report.warnings
+        );
     }
 
     /// Outcome lines from older session trails have no correlation fields and
@@ -1783,6 +1852,126 @@ mod tests {
         assert_eq!(turns.len(), 2);
         assert!(matches!(turns[0].outcome, Some(Outcome::Ok { .. })));
         assert!(matches!(turns[1].outcome, Some(Outcome::Error { .. })));
+        assert!(
+            report.warnings.is_empty(),
+            "warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    /// Interleaved A2A/legacy requests share one file-order fallback slot. The
+    /// newer request still receives the first outcome for compatibility, but
+    /// both the displaced request and the later dangling outcome are surfaced.
+    #[test]
+    fn parse_sessions_warns_on_interleaved_uncorrelated_requests_and_outcomes() {
+        let meta = ExchangeMeta {
+            model: "m".to_string(),
+            base_url: "u".to_string(),
+        };
+        let trail = [
+            line(&ExchangeEvent::a2a_turn_request(
+                1, &meta, "A", "sess-A", "peer", "agent", "m-A", None,
+            )),
+            line(&ExchangeEvent::a2a_turn_request(
+                2, &meta, "B", "sess-B", "peer", "agent", "m-B", None,
+            )),
+            line(&ExchangeEvent::response_ok(
+                3,
+                1,
+                "reply-A",
+                &TokenUsage::default(),
+            )),
+            line(&ExchangeEvent::response_ok(
+                4,
+                1,
+                "reply-B",
+                &TokenUsage::default(),
+            )),
+        ]
+        .join("\n")
+            + "\n";
+
+        let report = parse_sessions(Cursor::new(trail)).expect("parses");
+        assert_eq!(report.sessions.len(), 2);
+        assert_eq!(report.sessions[0].turns[0].outcome, None);
+        assert_eq!(
+            report.sessions[1].turns[0].outcome,
+            Some(Outcome::Ok {
+                ts_ms: 3,
+                duration_ms: 1,
+                reply: "reply-A".to_string(),
+                input_tokens: None,
+                output_tokens: None,
+            })
+        );
+        assert_eq!(report.warnings.len(), 2, "warnings: {:?}", report.warnings);
+        assert!(
+            report.warnings[0].contains("line 2")
+                && report.warnings[0].contains("sess-A")
+                && report.warnings[0].contains("A"),
+            "overwrite warning names the displaced turn: {}",
+            report.warnings[0]
+        );
+        assert!(
+            report.warnings[1].contains("line 4") && report.warnings[1].contains("dangling"),
+            "dangling warning names the unmatched outcome: {}",
+            report.warnings[1]
+        );
+    }
+
+    /// An uncorrelated error with no pending fallback request is diagnosed just
+    /// like an unmatched success outcome.
+    #[test]
+    fn parse_sessions_warns_on_dangling_uncorrelated_error() {
+        let error = BatonError::Auth("bad key".to_string());
+        let trail = line(&ExchangeEvent::response_error(1, 1, &error)) + "\n";
+
+        let report = parse_sessions(Cursor::new(trail)).expect("parses");
+        assert!(report.sessions.is_empty());
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("response_error"));
+        assert!(report.warnings[0].contains("dangling"));
+    }
+
+    /// A single A2A seat writer keeps file-order pairing and does not emit the
+    /// concurrency warning merely because its turns omit `turn_index`.
+    #[test]
+    fn parse_sessions_sequential_a2a_trail_has_no_warnings() {
+        let meta = ExchangeMeta {
+            model: "m".to_string(),
+            base_url: "u".to_string(),
+        };
+        let trail = [
+            line(&ExchangeEvent::a2a_turn_request(
+                1, &meta, "A", "sess-A", "peer", "agent", "m-A", None,
+            )),
+            line(&ExchangeEvent::response_ok(
+                2,
+                1,
+                "reply-A",
+                &TokenUsage::default(),
+            )),
+            line(&ExchangeEvent::a2a_turn_request(
+                3, &meta, "B", "sess-A", "peer", "agent", "m-B", None,
+            )),
+            line(&ExchangeEvent::response_ok(
+                4,
+                1,
+                "reply-B",
+                &TokenUsage::default(),
+            )),
+        ]
+        .join("\n")
+            + "\n";
+
+        let report = parse_sessions(Cursor::new(trail)).expect("parses");
+        assert_eq!(report.sessions.len(), 1);
+        assert_eq!(report.sessions[0].turns.len(), 2);
+        assert!(
+            report.warnings.is_empty(),
+            "warnings: {:?}",
+            report.warnings
+        );
     }
 
     /// A session killed mid-run — a `session_start` and turns but no
@@ -1866,12 +2055,20 @@ mod tests {
             "\n",
             r#"{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":2,"duration_ms":1,"reply":"a"}"#,
             "\n",
+            r#"{"event":"response_ok","schema":"baton.exchange/v1","ts_ms":3,"duration_ms":1,"reply":"orphan"}"#,
+            "\n",
         );
         let report = parse_sessions(Cursor::new(ask)).expect("parses");
         assert!(
             report.sessions.is_empty(),
             "ask lines form no session, got: {:?}",
             report.sessions
+        );
+        assert_eq!(report.warnings.len(), 1, "warnings: {:?}", report.warnings);
+        assert!(
+            report.warnings[0].contains("line 3") && report.warnings[0].contains("dangling"),
+            "only the subsequent dangling outcome is warned: {}",
+            report.warnings[0]
         );
     }
 }
