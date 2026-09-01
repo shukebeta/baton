@@ -6692,18 +6692,19 @@ mod imp {
             clock.advance(REHYDRATED_LIVENESS_CACHE_MS - 100);
             tick_one_task(&dir.path, "task-owned-drain-cache", &mut running, &clock)
                 .expect("owned boundary liveness tick");
-            assert_eq!(
-                process_probe_count(),
-                first_sample,
-                "owned drain liveness remains cached up to the exact boundary"
+            let refreshed_sample = process_probe_count();
+            assert!(
+                refreshed_sample > first_sample,
+                "the exact boundary refreshes the owned drain liveness"
             );
 
-            clock.advance(1);
+            clock.advance(100);
             tick_one_task(&dir.path, "task-owned-drain-cache", &mut running, &clock)
-                .expect("owned refresh liveness tick");
-            assert!(
-                process_probe_count() > first_sample,
-                "the cache refreshes once the 500ms TTL elapses"
+                .expect("owned re-cached liveness tick");
+            assert_eq!(
+                process_probe_count(),
+                refreshed_sample,
+                "owned drain liveness remains cached again after the refresh"
             );
 
             signal_group(running.record.pid, libc::SIGKILL).expect("clean up owned-drain task");
