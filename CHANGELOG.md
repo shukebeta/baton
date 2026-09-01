@@ -10,7 +10,7 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.4.13 … v0.3.51 (2026-09-01)
+## v0.4.14 … v0.3.51 (2026-09-01)
 
 ### Features
 - feat(cli): default service control directory (#295)
@@ -22,6 +22,7 @@ _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 - fix(service/windows): serialize finalize_task's terminal write with the admission lock (#311)
 - fix(service): rate-limit the non-Linux owned-drain and Windows liveness probes (#312)
 - fix(service): reap terminal task records after a retention window (#317)
+- fix(service): skip malformed durable records instead of bricking startup/status (#320)
 
 ### Refactors
 - refactor(service): share session and task control plumbing (#285)
