@@ -16,12 +16,12 @@ use super::records::{
 };
 #[cfg(test)]
 use super::records::{mark_task_start_ack, task_record_path};
-#[cfg(test)]
-use super::task_tick::tick_one_task;
 use super::task_tick::{
     self, Liveness, RunningTask as SharedRunningTask, ServicePlatform, TaskLivenessMode,
     TaskLivenessRefresh, TerminationSignal, task_cancel_sentinel_path,
 };
+#[cfg(test)]
+use super::task_tick::{finalize_task, tick_one_task};
 use super::*;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -468,6 +468,10 @@ impl ServicePlatform for WindowsServicePlatform {
         exit_code: Option<i32>,
         elapsed_ms: u64,
     ) -> Result<bool> {
+        let _admission = acquire_admission_lock(control)?;
+        if read_task_record(control, &record.id)?.is_none() {
+            return Ok(false);
+        }
         record.state = state;
         record.exit_code = exit_code;
         record.elapsed_ms = Some(elapsed_ms);
@@ -2687,6 +2691,28 @@ mod tests {
                 .expect("tick removed task"),
             TaskTick::Finished
         ));
+    }
+
+    #[test]
+    fn finalize_task_does_not_resurrect_removed_record() {
+        let control = temp_control("finalize-removed-task");
+        let clock = FakeClock::new();
+        let callback_inbox = control.join("callback");
+        let mut running =
+            terminal_running_task(&control, "task-finalize-removed", &callback_inbox, &clock);
+        remove_task_record(&control, "task-finalize-removed").expect("remove task record");
+
+        assert!(matches!(
+            finalize_task(&control, &mut running, TaskState::Failed, None, 10, &clock)
+                .expect("finalize removed task"),
+            TaskTick::Finished
+        ));
+        assert!(
+            read_task_record(&control, "task-finalize-removed")
+                .expect("read removed task")
+                .is_none(),
+            "finalizing an externally removed task does not resurrect its record"
+        );
     }
 
     #[test]
