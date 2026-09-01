@@ -224,14 +224,14 @@ mod imp {
         list_task_start_acks, list_task_start_response_claims, list_task_start_rollbacks,
         mark_task_start_rollback, read_session_record, read_task_record, reclaim_stale_requests,
         remove_session_record, remove_task_record, remove_task_start_ack,
-        remove_task_start_response_files, remove_task_start_rollback,
-        remove_task_start_transaction, responses_dir, restore_task_start_response_claim,
-        sessions_dir, start_channel, take_task_start_response_locked, task_cancel_dir,
-        task_channel, task_logs_dir, task_start_ack_exists, task_start_response_boundary_exists,
-        task_start_response_claim_path, task_start_response_id, task_start_response_path,
-        task_start_rollback_exists, wait_for_test_task_admission_barrier,
-        wait_for_test_task_response_phase_barrier, wait_for_test_task_rollback_cleanup_barrier,
-        write_session_record, write_start_response, write_task_record, write_task_start_response,
+        remove_task_start_response_files, remove_task_start_rollback, responses_dir,
+        restore_task_start_response_claim, sessions_dir, start_channel,
+        take_task_start_response_locked, task_cancel_dir, task_channel, task_logs_dir,
+        task_start_ack_exists, task_start_response_boundary_exists, task_start_response_claim_path,
+        task_start_response_id, task_start_response_path, task_start_rollback_exists,
+        wait_for_test_task_admission_barrier, wait_for_test_task_response_phase_barrier,
+        wait_for_test_task_rollback_cleanup_barrier, write_session_record, write_start_response,
+        write_task_record, write_task_start_response,
     };
     #[cfg(test)]
     use super::records::{
@@ -239,13 +239,15 @@ mod imp {
         task_responses_dir, task_start_ack_path, task_start_rollback_dir,
     };
     use super::task_tick::{
-        self, DEFAULT_TASK_RETENTION_MS, Liveness, REHYDRATED_LIVENESS_CACHE_MS,
-        RunningTask as SharedRunningTask, ServicePlatform, TaskLivenessMode, TaskLivenessRefresh,
-        TerminationSignal, liveness_sample_is_fresh, remove_reaped_task_record,
-        task_cancel_sentinel_path,
+        self, Liveness, REHYDRATED_LIVENESS_CACHE_MS, RunningTask as SharedRunningTask,
+        ServicePlatform, TaskLivenessMode, TaskLivenessRefresh, TerminationSignal,
+        liveness_sample_is_fresh, remove_reaped_task_record,
     };
     #[cfg(test)]
-    use super::task_tick::{deliver_task_event, finalize_task, tick_one_task};
+    use super::task_tick::{
+        DEFAULT_TASK_RETENTION_MS, deliver_task_event, finalize_task, task_cancel_sentinel_path,
+        tick_one_task,
+    };
     use super::*;
     #[cfg(test)]
     use std::cell::Cell;
@@ -1433,7 +1435,7 @@ mod imp {
         let mut retained_rollbacks = std::collections::HashSet::new();
         let mut seen_acks = std::collections::HashSet::new();
 
-        for record in records.clone() {
+        for record in &records {
             if record.admission == TaskAdmissionPhase::Prepared {
                 let request_id = record.request_id.as_deref();
                 let rollback = request_id
@@ -5941,7 +5943,6 @@ mod imp {
                 "delivery succeeds but the record is retained until it ages out"
             );
             assert_terminal_task_event(&callback_inbox, "task-terminal-retry");
-            fs::remove_file(&callback_inbox).expect("consume delivered callback event");
 
             // Re-ticking before retention elapses neither redelivers nor reaps.
             clock.advance(running.retention_ms - 1);
@@ -5950,10 +5951,15 @@ mod imp {
                     .expect("terminal tick within retention window"),
                 TaskTick::StillRunning
             ));
+            let mailbox = mailbox::Mailbox::open(&callback_inbox).expect("reopen callback mailbox");
             assert!(
-                !callback_inbox.exists(),
+                mailbox
+                    .claim_next()
+                    .expect("check for redelivered terminal event")
+                    .is_none(),
                 "a retained terminal record is not redelivered"
             );
+            drop(mailbox);
             assert_durable_task_state(&dir.path, "task-terminal-retry", TaskState::Completed);
 
             // Once retention elapses the record is reaped.

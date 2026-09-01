@@ -122,6 +122,9 @@ impl<'a> RequestChannel<'a> {
         let json = serde_json::to_string(request).map_err(|err| {
             BatonError::Io(format!("could not serialize {request_name}: {err}"))
         })?;
+        fs::create_dir_all(&self.requests).map_err(|err| {
+            BatonError::Io(format!("could not create {:?}: {err}", self.requests))
+        })?;
         mailbox::atomic_write(&self.requests, &mailbox::file_name(request_id), &json)?;
         await_response()
     }
