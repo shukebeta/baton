@@ -7603,6 +7603,11 @@ mod imp {
                 "rescan_owned_tasks' force branch removes the racing task's record"
             );
 
+            // The force branch signals the process group asynchronously, so
+            // an immediate probe can observe `Live` while signal delivery and
+            // child reaping are still in flight. Poll until the kill is
+            // observable, with the same bounded grace used by cleanup.
+            wait_while_task_alive(&racer, KILL_GRACE_MS);
             let liveness = task_execution_liveness_after_retry(&racer, KILL_GRACE_MS);
             assert_eq!(
                 liveness,
