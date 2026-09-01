@@ -539,6 +539,15 @@ mod imp {
             matches!(process_probe(pid), ProbeResult::Gone)
         }
 
+        fn unresolved_task_is_gone(
+            _control: &Path,
+            _id: &str,
+            _record: &TaskRecord,
+            _term_sent_at_ms: Option<u64>,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+
         fn rehydrate_task(_record: &TaskRecord) -> Result<Option<Self::TaskHandle>> {
             Ok(None)
         }

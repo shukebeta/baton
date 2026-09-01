@@ -441,6 +441,17 @@ impl ServicePlatform for WindowsServicePlatform {
         recorded_pid_is_gone(pid)
     }
 
+    fn unresolved_task_is_gone(
+        control: &Path,
+        id: &str,
+        record: &TaskRecord,
+        term_sent_at_ms: Option<u64>,
+    ) -> Result<bool> {
+        let controlled =
+            term_sent_at_ms.is_some() || task_cancel_sentinel_path(control, id).is_file();
+        Ok(controlled && Self::pid_is_gone(record.pid))
+    }
+
     fn rehydrate_task(record: &TaskRecord) -> Result<Option<Self::TaskHandle>> {
         record
             .job

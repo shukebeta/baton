@@ -115,6 +115,12 @@ pub(super) trait ServicePlatform {
         force: bool,
     ) -> Result<()>;
     fn pid_is_gone(pid: u32) -> bool;
+    fn unresolved_task_is_gone(
+        control: &Path,
+        id: &str,
+        record: &TaskRecord,
+        term_sent_at_ms: Option<u64>,
+    ) -> Result<bool>;
     fn rehydrate_task(record: &TaskRecord) -> Result<Option<Self::TaskHandle>>;
     fn persist_terminal_task(
         control: &Path,
@@ -267,7 +273,14 @@ pub(super) fn tick_one_task<P: ServicePlatform>(
                 return finalize_task(control, running, state, exit_code, elapsed_ms, clock);
             }
             Liveness::Live => {}
-            Liveness::Unresolved if controlled_task_pid_is_gone::<P>(control, id, running)? => {
+            Liveness::Unresolved
+                if P::unresolved_task_is_gone(
+                    control,
+                    id,
+                    &running.record,
+                    running.term_sent_at_ms,
+                )? =>
+            {
                 let cancelled = consume_task_cancel_sentinel(control, id)?;
                 let (state, exit_code) = parked_terminal(running, cancelled);
                 return finalize_task(control, running, state, exit_code, elapsed_ms, clock);
@@ -641,14 +654,4 @@ pub(super) fn consume_task_cancel_sentinel(control: &Path, task_id: &str) -> Res
             "could not consume task cancel sentinel: {err}"
         ))),
     }
-}
-
-fn controlled_task_pid_is_gone<P: ServicePlatform>(
-    control: &Path,
-    id: &str,
-    running: &RunningTask<P>,
-) -> Result<bool> {
-    let controlled =
-        running.term_sent_at_ms.is_some() || task_cancel_sentinel_path(control, id).is_file();
-    Ok(controlled && P::pid_is_gone(running.record.pid))
 }
