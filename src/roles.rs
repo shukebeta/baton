@@ -708,10 +708,29 @@ mod tests {
             .expect("resolves HOME default");
         assert_eq!(user_home, Path::new("/home/alice/.baton/service"));
 
+        let profile_root = temp_home("user-profile");
+        let user_profile = resolve_control_dir_with(
+            None,
+            lookup_from(&[("USERPROFILE", profile_root.to_str().unwrap())]),
+        )
+        .expect("resolves USERPROFILE default");
+        assert_eq!(user_profile, profile_root.join(".baton").join("service"));
+
         let explicit =
             resolve_control_dir_with(Some("relative/control".to_string()), lookup_from(&[]))
                 .expect("preserves explicit path without a home");
         assert_eq!(explicit, Path::new("relative/control"));
+
+        let missing = resolve_control_dir_with(None, lookup_from(&[]))
+            .expect_err("omitted control requires a resolvable home");
+        match missing {
+            BatonError::Config(message) => {
+                assert!(message.contains("BATON_HOME"));
+                assert!(message.contains("HOME"));
+                assert!(message.contains("USERPROFILE"));
+            }
+            other => panic!("expected config error, got {other:?}"),
+        }
     }
 
     #[test]
