@@ -1,29 +1,25 @@
 use super::records::{
-    AwaitConfig, SessionRecord, StartResponse, TEST_TASK_ROLLBACK_RECONCILE_BARRIER,
-    TEST_TASK_ROLLBACK_REQUEST_BARRIER, TaskStartResponse, discard_pending_task_start_request,
-    fresh_request_id, fresh_session_id, fresh_task_id, list_session_records, list_task_record_ids,
-    list_task_records, list_task_start_acks, list_task_start_response_claims,
-    list_task_start_rollbacks, mark_task_start_rollback, read_session_record, read_task_record,
-    reclaim_stale_requests, remove_session_record, remove_task_logs_dir, remove_task_record,
-    remove_task_start_ack, remove_task_start_response_files, remove_task_start_rollback,
-    responses_dir, restore_task_start_response_claim, start_channel,
-    take_task_start_response_locked, task_cancel_dir, task_channel, task_logs_dir,
-    task_start_ack_exists, task_start_response_boundary_exists, task_start_response_claim_path,
-    task_start_response_id, task_start_response_path, task_start_rollback_exists,
-    wait_for_test_task_admission_barrier, wait_for_test_task_response_phase_barrier,
-    wait_for_test_task_rollback_cleanup_barrier, write_session_record, write_start_response,
-    write_task_record, write_task_start_response,
+    AwaitConfig, SessionRecord, StartResponse, TaskStartResponse,
+    discard_pending_task_start_request, fresh_request_id, fresh_session_id, list_session_records,
+    list_task_record_ids, list_task_records, mark_task_start_rollback, read_session_record,
+    read_task_record, reclaim_stale_requests, remove_session_record, responses_dir, start_channel,
+    take_task_start_response_locked, task_cancel_dir, task_channel, task_start_ack_exists,
+    task_start_response_boundary_exists, task_start_response_id, write_session_record,
+    write_start_response, write_task_record,
 };
 #[cfg(test)]
-use super::records::{mark_task_start_ack, session_record_path, task_record_path};
+use super::records::{
+    mark_task_start_ack, remove_task_record, session_record_path, task_logs_dir, task_record_path,
+    task_start_response_path,
+};
 use super::task_tick::{
-    self, Liveness, RunningTask as SharedRunningTask, ServicePlatform, TaskLivenessMode,
-    TaskLivenessRefresh, TerminationSignal, liveness_sample_is_fresh, remove_reaped_task_record,
-    task_cancel_sentinel_path,
+    self, Liveness, ServicePlatform, TaskLivenessMode, TaskLivenessRefresh, TerminationSignal,
+    liveness_sample_is_fresh, remove_reaped_task_record, task_cancel_sentinel_path,
 };
 #[cfg(test)]
 use super::task_tick::{
-    DEFAULT_TASK_RETENTION_MS, REHYDRATED_LIVENESS_CACHE_MS, finalize_task, tick_one_task,
+    DEFAULT_TASK_RETENTION_MS, REHYDRATED_LIVENESS_CACHE_MS, RunningTask as SharedRunningTask,
+    finalize_task, tick_one_task,
 };
 use super::*;
 use std::collections::HashMap;
@@ -36,11 +32,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::mailbox;
-use crate::task::{
-    Clock, SystemClock, TaskAdmissionPhase, TaskRecord, TaskSpec, TaskState,
-    first_non_ascending_milestone,
-};
+#[cfg(test)]
+use crate::task::{Clock, TaskAdmissionPhase};
+use crate::task::{SystemClock, TaskRecord, TaskSpec, TaskState};
 
+#[cfg(test)]
 type RunningTask = SharedRunningTask<WindowsServicePlatform>;
 #[cfg(test)]
 type TaskTick = task_tick::TaskTick;
@@ -65,20 +61,25 @@ use windows_sys::Win32::System::Threading::{
 
 /// A non-inheritable Windows Job Object handle owned by the supervisor.
 /// The handle stays open while a managed process tree remains active and
-/// closes only after `ActiveProcesses == 0`.
-struct JobHandle(HANDLE);
+/// closes only after `ActiveProcesses == 0`. `name` is the durable job name
+/// a [`TaskRecord`] persists so a later `baton service run` can rehydrate
+/// the handle via [`open_job`].
+struct JobHandle {
+    handle: HANDLE,
+    name: String,
+}
 
 impl JobHandle {
     fn raw(&self) -> HANDLE {
-        self.0
+        self.handle
     }
 }
 
 impl Drop for JobHandle {
     fn drop(&mut self) {
-        if self.0 != 0 {
+        if self.handle != 0 {
             // SAFETY: This wrapper owns the handle and drops it exactly once.
-            unsafe { CloseHandle(self.0) };
+            unsafe { CloseHandle(self.handle) };
         }
     }
 }
@@ -99,6 +100,7 @@ fn fresh_job_name(kind: &str) -> String {
 }
 
 fn create_job(name: &str, inheritable: bool) -> Result<JobHandle> {
+    let name_owned = name.to_string();
     let name = wide_null(name);
     let mut attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -121,7 +123,10 @@ fn create_job(name: &str, inheritable: bool) -> Result<JobHandle> {
             std::io::Error::last_os_error()
         )));
     }
-    Ok(JobHandle(handle))
+    Ok(JobHandle {
+        handle,
+        name: name_owned,
+    })
 }
 
 fn open_job(name: &str) -> Result<Option<JobHandle>> {
@@ -136,7 +141,10 @@ fn open_job(name: &str) -> Result<Option<JobHandle>> {
         )
     };
     if handle != 0 {
-        return Ok(Some(JobHandle(handle)));
+        return Ok(Some(JobHandle {
+            handle,
+            name: name.to_string(),
+        }));
     }
     let error = std::io::Error::last_os_error();
     if error.raw_os_error() == Some(2) || error.raw_os_error() == Some(3) {
@@ -382,6 +390,14 @@ impl ServicePlatform for WindowsServicePlatform {
         Ok((child, job))
     }
 
+    fn task_handle_identity(handle: &Self::TaskHandle) -> Option<String> {
+        Some(handle.name.clone())
+    }
+
+    fn abort_uncommitted_spawn(_pid: u32, handle: &Self::TaskHandle) -> Result<()> {
+        terminate_job(handle)
+    }
+
     fn recorded_start_identity(pid: u32) -> (Option<String>, Option<i64>) {
         recorded_start_identity(pid)
     }
@@ -501,6 +517,29 @@ impl ServicePlatform for WindowsServicePlatform {
             .map(|job| job.flatten())
     }
 
+    fn upgrade_legacy_task_record(control: &Path, record: &mut TaskRecord) -> Result<()> {
+        upgrade_legacy_task_record(control, record)
+    }
+
+    fn escalate_task_to_death(record: &TaskRecord, grace_ms: u64) -> Liveness {
+        let mut liveness = is_task_alive(record);
+        if liveness == Liveness::Live {
+            let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-TERM");
+            wait_while_task_alive(record, grace_ms);
+            liveness = cleanup_liveness_after_pid_signal(is_task_alive(record), record.pid);
+            if liveness == Liveness::Live {
+                let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-KILL");
+                wait_while_task_alive(record, grace_ms);
+                liveness = cleanup_liveness_after_pid_signal(is_task_alive(record), record.pid);
+            }
+        }
+        liveness
+    }
+
+    fn acquire_admission_lock(control: &Path) -> Result<File> {
+        acquire_admission_lock(control)
+    }
+
     fn persist_terminal_task(
         control: &Path,
         record: &mut TaskRecord,
@@ -605,7 +644,8 @@ fn run_service(control: &Path, task_retention_ms: u64, mut out: impl Write) -> R
     // this pass with a submitting client writing a rollback marker after
     // observing the previous supervisor disappear.
     let _admission = acquire_admission_lock(control)?;
-    let (reconciled_records, reconcile_mutated) = reconcile_task_admissions(control)?;
+    let (reconciled_records, reconcile_mutated) =
+        admission::reconcile_task_admissions::<WindowsServicePlatform>(control)?;
     // A request left mid-`processing/` by a crash between claim and
     // response is returned to `requests/`, mirroring
     // `Mailbox::reclaim_stale` — reprocessed harmlessly under a fresh
@@ -615,7 +655,7 @@ fn run_service(control: &Path, task_retention_ms: u64, mut out: impl Write) -> R
     // it exits at once, leaving only a transient stale session record
     // behind (reaped the next time it's inspected).
     reclaim_stale_requests(control)?;
-    reclaim_stale_task_requests(control)?;
+    admission::reclaim_stale_task_requests(control)?;
     drop(_admission);
     let clock = SystemClock;
     let mut sessions = rehydrate_sessions(control)?;
@@ -669,7 +709,7 @@ fn run_service(control: &Path, task_retention_ms: u64, mut out: impl Write) -> R
                 );
             }
         }
-        match process_one_task_request(control, &clock) {
+        match admission::process_one_task_request::<WindowsServicePlatform>(control, &clock) {
             Ok(Some((task_id, running))) => {
                 tasks.insert(task_id, running.with_retention_ms(task_retention_ms));
                 did_work = true;
@@ -1086,16 +1126,6 @@ fn process_one_request(control: &Path) -> Result<Option<(String, RunningSession)
     })
 }
 
-/// Renders `err` for a start-response `error` field. The client re-wraps
-/// that text in [`BatonError::Io`], so the rendered form must not repeat
-/// the kind prefix `Display` already adds.
-fn admission_error_text(err: &BatonError) -> String {
-    match err {
-        BatonError::Io(msg) => msg.clone(),
-        other => other.to_string(),
-    }
-}
-
 /// Answers a claimed start request with an admission failure the supervisor
 /// can name, so the client fails immediately with the real reason instead of
 /// waiting out [`START_AWAIT_MS`]. Only the response write itself can still
@@ -1136,14 +1166,22 @@ fn handle_start_request(
     let job = match create_job(&job_name, false) {
         Ok(job) => job,
         Err(err) => {
-            return reject_start_request(control, request_id, admission_error_text(&err));
+            return reject_start_request(
+                control,
+                request_id,
+                admission::admission_error_text(&err),
+            );
         }
     };
     let mut child = match spawn_serve_child(&spec, &job_name) {
         Ok(child) => child,
         Err(err) => {
             drop(job);
-            return reject_start_request(control, request_id, admission_error_text(&err));
+            return reject_start_request(
+                control,
+                request_id,
+                admission::admission_error_text(&err),
+            );
         }
     };
     if let Err(err) =
@@ -1151,7 +1189,7 @@ fn handle_start_request(
     {
         let _ = terminate_job(&job);
         let _ = child.wait();
-        return reject_start_request(control, request_id, admission_error_text(&err));
+        return reject_start_request(control, request_id, admission::admission_error_text(&err));
     }
     let pid = child.id();
     let (started_at, start_epoch_secs) = recorded_start_identity(pid);
@@ -1182,7 +1220,7 @@ fn handle_start_request(
     if let Err(err) = write_session_record(control, &record) {
         let _ = terminate_job(&job);
         let _ = child.wait();
-        return reject_start_request(control, request_id, admission_error_text(&err));
+        return reject_start_request(control, request_id, admission::admission_error_text(&err));
     }
     let respond = write_start_response(
         control,
@@ -1361,417 +1399,6 @@ fn take_task_start_response(control: &Path, request_id: &str) -> Result<Option<T
     }
     let _admission = acquire_admission_lock(control)?;
     take_task_start_response_locked(control, request_id)
-}
-
-/// Reconciles task-start transactions before the request loop can accept
-/// new work. The caller holds the admission lock for the whole pass.
-/// Prepared records are never safe to rehydrate; a rollback marker also
-/// wins over a committed or responded record because the client observed
-/// no response. A durable acknowledgement wins over any response file and
-/// upgrades a committed record to responded. A committed record with a
-/// response or a recoverable claim is finalized as responded, while a
-/// committed record with neither is given one response before that phase
-/// is persisted. Rollback, claim, and acknowledgement cleanup is
-/// idempotent across interrupted startup passes. An unresolved prepared
-/// record remains durable cleanup residue, including its rollback marker,
-/// until a later liveness probe can prove that its process is dead.
-/// Returns the `tasks/` records observed at the start of the pass,
-/// alongside whether the pass mutated any of them (removed one via
-/// [`abort_task_admission`] or promoted `Committed` to `Responded`). A
-/// caller that finds `mutated == false` may reuse the returned records as an
-/// accurate post-reconciliation snapshot instead of re-listing `tasks/`.
-fn reconcile_task_admissions(control: &Path) -> Result<(Vec<TaskRecord>, bool)> {
-    let rollback_ids = list_task_start_rollbacks(control)?;
-    let ack_ids = list_task_start_acks(control)?;
-    let claim_ids = list_task_start_response_claims(control)?;
-    let records = list_task_records(control)?;
-    let mut mutated = false;
-    let mut seen_rollbacks = std::collections::HashSet::new();
-    let mut retained_rollbacks = std::collections::HashSet::new();
-    let mut seen_acks = std::collections::HashSet::new();
-
-    for record in records.clone() {
-        if record.admission == TaskAdmissionPhase::Prepared {
-            let request_id = record.request_id.as_deref();
-            let rollback = request_id
-                .map(|id| rollback_ids.iter().any(|rollback_id| rollback_id == id))
-                .unwrap_or(false);
-            if rollback && let Some(request_id) = request_id {
-                seen_rollbacks.insert(request_id.to_string());
-            }
-            if let Some(request_id) = request_id {
-                discard_pending_task_start_request(control, request_id)?;
-            }
-            // `abort_task_admission` may durably rewrite the record even
-            // when it reports the admission unresolved, so it counts as a
-            // mutation regardless of its return value.
-            let removed = abort_task_admission(control, &record)?;
-            mutated = true;
-            if !removed {
-                if rollback && let Some(request_id) = request_id {
-                    retained_rollbacks.insert(request_id.to_string());
-                }
-                eprintln!(
-                    "warning: task {} admission remains unresolved; preserving its record",
-                    record.id
-                );
-                continue;
-            }
-            if let Some(request_id) = request_id {
-                remove_task_start_response_files(control, request_id)?;
-                remove_task_start_ack(control, request_id)?;
-                if rollback {
-                    wait_for_test_task_rollback_cleanup_barrier(
-                        TEST_TASK_ROLLBACK_RECONCILE_BARRIER,
-                    );
-                }
-                remove_task_start_rollback(control, request_id)?;
-            }
-            continue;
-        }
-        let Some(request_id) = record.request_id.as_deref() else {
-            continue;
-        };
-        let rollback = rollback_ids.iter().any(|id| id == request_id);
-        if rollback {
-            seen_rollbacks.insert(request_id.to_string());
-        }
-        if rollback {
-            // See the Prepared-admission arm above: this call may durably
-            // rewrite the record even on an unresolved outcome.
-            let removed = abort_task_admission(control, &record)?;
-            mutated = true;
-            if !removed {
-                retained_rollbacks.insert(request_id.to_string());
-                eprintln!(
-                    "warning: task {} rollback remains unresolved; preserving its record",
-                    record.id
-                );
-                continue;
-            }
-            discard_pending_task_start_request(control, request_id)?;
-            remove_task_start_response_files(control, request_id)?;
-            remove_task_start_ack(control, request_id)?;
-            wait_for_test_task_rollback_cleanup_barrier(TEST_TASK_ROLLBACK_RECONCILE_BARRIER);
-            remove_task_start_rollback(control, request_id)?;
-            continue;
-        }
-
-        discard_pending_task_start_request(control, request_id)?;
-        if task_start_ack_exists(control, request_id)? {
-            seen_acks.insert(request_id.to_string());
-            remove_task_start_response_files(control, request_id)?;
-            if record.admission == TaskAdmissionPhase::Committed {
-                let mut responded = record.clone();
-                responded.admission = TaskAdmissionPhase::Responded;
-                if let Err(err) = write_task_record(control, &responded) {
-                    eprintln!(
-                        "warning: task {} acknowledgement was durable but responded phase could not be persisted: {err}",
-                        record.id
-                    );
-                    continue;
-                }
-                mutated = true;
-            }
-            remove_task_start_ack(control, request_id)?;
-            continue;
-        }
-
-        restore_task_start_response_claim(control, request_id)?;
-        if record.admission == TaskAdmissionPhase::Committed {
-            let response_path = task_start_response_path(control, request_id)?;
-            if !response_path.is_file()
-                && let Err(err) = write_task_start_response(
-                    control,
-                    request_id,
-                    &TaskStartResponse {
-                        task_id: Some(record.id.clone()),
-                        error: None,
-                    },
-                )
-            {
-                eprintln!(
-                    "warning: task {} response restoration failed; retaining committed admission: {err}",
-                    record.id
-                );
-                continue;
-            }
-            let mut responded = record.clone();
-            responded.admission = TaskAdmissionPhase::Responded;
-            if let Err(err) = write_task_record(control, &responded) {
-                eprintln!(
-                    "warning: task {} restored response was written but responded phase could not be persisted: {err}",
-                    record.id
-                );
-            } else {
-                mutated = true;
-            }
-        }
-    }
-
-    for request_id in ack_ids {
-        if !seen_acks.contains(&request_id) {
-            discard_pending_task_start_request(control, &request_id)?;
-            remove_task_start_response_files(control, &request_id)?;
-            remove_task_start_ack(control, &request_id)?;
-        }
-    }
-
-    for request_id in claim_ids {
-        let claim_path = task_start_response_claim_path(control, &request_id)?;
-        if !claim_path.is_file() {
-            continue;
-        }
-        if task_start_ack_exists(control, &request_id)? {
-            remove_task_start_response_files(control, &request_id)?;
-            remove_task_start_ack(control, &request_id)?;
-        } else {
-            restore_task_start_response_claim(control, &request_id)?;
-        }
-    }
-
-    for request_id in rollback_ids {
-        if !seen_rollbacks.contains(&request_id) {
-            discard_pending_task_start_request(control, &request_id)?;
-            remove_task_start_response_files(control, &request_id)?;
-            remove_task_start_ack(control, &request_id)?;
-            wait_for_test_task_rollback_cleanup_barrier(TEST_TASK_ROLLBACK_RECONCILE_BARRIER);
-        }
-        if !retained_rollbacks.contains(&request_id) {
-            remove_task_start_rollback(control, &request_id)?;
-        }
-    }
-    Ok((records, mutated))
-}
-
-fn abort_task_admission(control: &Path, record: &TaskRecord) -> Result<bool> {
-    if record.state == TaskState::Running {
-        let mut record = record.clone();
-        upgrade_legacy_task_record(control, &mut record)?;
-        let mut liveness = is_task_alive(&record);
-        if liveness == Liveness::Unresolved {
-            return Ok(false);
-        }
-        if liveness == Liveness::Live {
-            let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-TERM");
-            wait_while_task_alive(&record, KILL_GRACE_MS);
-            liveness = cleanup_liveness_after_pid_signal(is_task_alive(&record), record.pid);
-            if liveness == Liveness::Live {
-                let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-KILL");
-                wait_while_task_alive(&record, KILL_GRACE_MS);
-                liveness = cleanup_liveness_after_pid_signal(is_task_alive(&record), record.pid);
-            }
-        }
-        if liveness != Liveness::Dead {
-            return Ok(false);
-        }
-    }
-    remove_task_record(control, &record.id)?;
-    // The aborted admission is the last reference to this task's captured
-    // output, so its log tree goes with the record rather than becoming
-    // unidentifiable garbage under `task-logs/`.
-    remove_task_logs_dir(control, &record.id);
-    Ok(true)
-}
-
-/// Returns any `task-processing/` entry a crash left mid-request to
-/// `task-requests/` through the shared request channel.
-fn reclaim_stale_task_requests(control: &Path) -> Result<()> {
-    task_channel(control).reclaim_stale()
-}
-
-/// Claims the next task-start request through the shared request channel, then
-/// applies task-specific admission and lifecycle handling.
-fn process_one_task_request(
-    control: &Path,
-    clock: &dyn Clock,
-) -> Result<Option<(String, RunningTask)>> {
-    task_channel(control).process_one(|request_id, claimed_path| {
-        // The lock is intentionally acquired after the request is claimed but
-        // before owner validation and spawn. If session cleanup wins the race,
-        // validation observes the removed/dead owner; if admission wins,
-        // cleanup waits and reaps the newly recorded task.
-        let outcome = acquire_admission_lock(control).and_then(|_admission| {
-            if task_start_rollback_exists(control, request_id)? {
-                discard_pending_task_start_request(control, request_id)?;
-                wait_for_test_task_rollback_cleanup_barrier(TEST_TASK_ROLLBACK_REQUEST_BARRIER);
-                remove_task_start_rollback(control, request_id)?;
-                return Ok(None);
-            }
-            handle_task_start_request(control, request_id, claimed_path, clock)
-        });
-        let Some((record, child, job, started_ms)) = outcome? else {
-            return Ok(None);
-        };
-        let id = record.id.clone();
-        let running = RunningTask::new(record, Some(child), Some(job), started_ms);
-        Ok(Some((id, running)))
-    })
-}
-
-/// Answers a claimed task-start request with an admission failure the
-/// supervisor can name, mirroring [`reject_start_request`].
-fn reject_task_start_request(
-    control: &Path,
-    request_id: &str,
-    error: String,
-) -> Result<Option<(TaskRecord, Child, JobHandle, u64)>> {
-    task_channel(control).reject(
-        request_id,
-        &TaskStartResponse {
-            task_id: None,
-            error: Some(error),
-        },
-        "task start response",
-    )
-}
-
-/// Validates the requested owner, then spawns the task, persists its
-/// [`TaskRecord`], and answers the request with its task id. It shares the
-/// session handler's admission failure discipline while retaining the
-/// task-only transaction phases.
-/// kill-and-unwind-on-any-later-failure discipline until the committed
-/// record is durable. After that point the task remains tracked when
-/// response delivery or phase persistence fails, so restart reconciliation
-/// can retry the response boundary without spawning again.
-///
-/// Every admission failure before that point — owner rejection, log-dir
-/// creation, spawn, post-spawn corroboration, record write — is answered as an
-/// error response and reported as `Ok(None)`, so the client fails immediately
-/// with the real reason instead of waiting out [`START_AWAIT_MS`]. Only a
-/// failure to deliver a response at all is propagated as `Err`.
-fn handle_task_start_request(
-    control: &Path,
-    request_id: &str,
-    spec_path: &Path,
-    clock: &dyn Clock,
-) -> Result<Option<(TaskRecord, Child, JobHandle, u64)>> {
-    let data = fs::read_to_string(spec_path)
-        .map_err(|err| BatonError::Io(format!("could not read {spec_path:?}: {err}")))?;
-    let spec: TaskSpec = serde_json::from_str(&data)
-        .map_err(|err| BatonError::Decode(format!("malformed task spec {spec_path:?}: {err}")))?;
-    if let Some((previous, current)) = first_non_ascending_milestone(&spec.milestones_ms) {
-        return reject_task_start_request(
-            control,
-            request_id,
-            format!(
-                "task start rejected: --milestone-ms values must be strictly ascending: got {previous} followed by {current}"
-            ),
-        );
-    }
-    // A session being stopped is not an admissible owner, even while its
-    // process is still live. `service stop` releases the admission lock
-    // across its grace windows (so it never freezes this loop), which
-    // leaves a window where the owner still probes `Live`; without this
-    // gate a start racing that window would be answered with a task id
-    // for a process the very same stop is about to kill.
-    let owner_live = if mailbox::is_safe_key(&spec.session) {
-        read_session_record(control, &spec.session)?
-            .map(|record| is_session_alive(&record) == Liveness::Live)
-            .unwrap_or(false)
-            && !session_stop_in_progress(control, &spec.session)?
-    } else {
-        false
-    };
-    if !owner_live {
-        let error = format!(
-            "task start rejected: --session {:?} does not name a live managed session on {:?} (the session record is absent, its process is no longer live, or it is draining a stop request)",
-            spec.session, control
-        );
-        return reject_task_start_request(control, request_id, error);
-    }
-    let task_id = fresh_task_id();
-    let log_dir = task_logs_dir(control, &task_id);
-    if let Err(err) = fs::create_dir_all(&log_dir) {
-        return reject_task_start_request(
-            control,
-            request_id,
-            format!("could not create {log_dir:?}: {err}"),
-        );
-    }
-    let stdout_path = log_dir.join("stdout.log");
-    let stderr_path = log_dir.join("stderr.log");
-    let (mut child, job, job_name) = match spawn_task_child(&spec, &stdout_path, &stderr_path) {
-        Ok(spawned) => spawned,
-        Err(err) => {
-            // Nothing ever ran under this id, so its just-created log
-            // directory holds two empty files and no record refers to
-            // it: drop it rather than leaking one per failed start.
-            let _ = fs::remove_dir_all(&log_dir);
-            return reject_task_start_request(control, request_id, admission_error_text(&err));
-        }
-    };
-    let pid = child.id();
-    let (started_at, start_epoch_secs) = recorded_start_identity(pid);
-    if !spawn_start_key_ok(&started_at, &start_epoch_secs) {
-        let _ = terminate_job(&job);
-        let _ = child.wait();
-        return reject_task_start_request(
-            control,
-            request_id,
-            format!(
-                "task command (pid {pid}) could not be corroborated right after spawn; treating as a spawn failure"
-            ),
-        );
-    }
-    let started_ms = clock.now_ms();
-    let mut record = TaskRecord {
-        id: task_id,
-        request_id: Some(request_id.to_string()),
-        admission: TaskAdmissionPhase::Prepared,
-        spec,
-        pid,
-        started_at,
-        start_epoch_secs,
-        job: Some(job_name),
-        started_ms: Some(started_ms),
-        state: TaskState::Running,
-        exit_code: None,
-        elapsed_ms: None,
-        stdout_path: stdout_path.display().to_string(),
-        stderr_path: stderr_path.display().to_string(),
-        delivered_milestones: 0,
-        terminal_delivered_at_ms: None,
-    };
-    if let Err(err) = write_task_record(control, &record) {
-        let _ = terminate_job(&job);
-        let _ = child.wait();
-        return reject_task_start_request(control, request_id, admission_error_text(&err));
-    }
-    wait_for_test_task_admission_barrier();
-    record.admission = TaskAdmissionPhase::Committed;
-    if let Err(err) = write_task_record(control, &record) {
-        let _ = terminate_job(&job);
-        let _ = child.wait();
-        let _ = remove_task_record(control, &record.id);
-        remove_task_logs_dir(control, &record.id);
-        return reject_task_start_request(control, request_id, admission_error_text(&err));
-    }
-    let respond = write_task_start_response(
-        control,
-        request_id,
-        &TaskStartResponse {
-            task_id: Some(record.id.clone()),
-            error: None,
-        },
-    );
-    if let Err(err) = respond {
-        eprintln!(
-            "warning: task {id} admission response could not be written; retaining committed admission: {err}",
-            id = record.id
-        );
-        return Ok(Some((record, child, job, started_ms)));
-    }
-    wait_for_test_task_response_phase_barrier();
-    record.admission = TaskAdmissionPhase::Responded;
-    if let Err(err) = write_task_record(control, &record) {
-        eprintln!(
-            "warning: task {id} response was written but its responded phase could not be persisted: {err}",
-            id = record.id
-        );
-        record.admission = TaskAdmissionPhase::Committed;
-    }
-    Ok(Some((record, child, job, started_ms)))
 }
 
 fn resume_initial_thread(pid: u32) -> Result<()> {
@@ -2385,43 +2012,6 @@ struct SessionStopMarker {
     start_epoch_secs: Option<i64>,
 }
 
-fn session_stop_markers_dir(control: &Path) -> std::path::PathBuf {
-    control.join("session-stopping")
-}
-
-fn session_stop_marker_path(control: &Path, id: &str) -> Result<std::path::PathBuf> {
-    if !mailbox::is_safe_key(id) {
-        return Err(BatonError::Io(format!(
-            "session id is not usable as a filename: {id:?}"
-        )));
-    }
-    Ok(session_stop_markers_dir(control).join(mailbox::file_name(id)))
-}
-
-/// Whether some live `service stop`/`teardown` currently owns `id`'s
-/// cleanup. Removes a stale marker as a side effect, so one orphaned by a
-/// killed stop costs at most one rejected start.
-fn session_stop_in_progress(control: &Path, id: &str) -> Result<bool> {
-    let path = session_stop_marker_path(control, id)?;
-    let data = match fs::read_to_string(&path) {
-        Ok(data) => data,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(BatonError::Io(format!("could not read {path:?}: {err}"))),
-    };
-    // A malformed marker is not evidence of a live stop, and leaving it
-    // would wedge admission for good.
-    let Ok(marker) = serde_json::from_str::<SessionStopMarker>(&data) else {
-        let _ = fs::remove_file(&path);
-        return Ok(false);
-    };
-    let (started_at, start_epoch_secs) = recorded_start_identity(marker.pid);
-    if started_at == marker.started_at && start_epoch_secs == marker.start_epoch_secs {
-        return Ok(true);
-    }
-    let _ = fs::remove_file(&path);
-    Ok(false)
-}
-
 /// Owns a [`SessionStopMarker`] for the length of one session's cleanup,
 /// removing it on every exit path including an early `?`.
 struct SessionStopGuard {
@@ -2441,12 +2031,12 @@ impl SessionStopGuard {
         let json = serde_json::to_string(&marker).map_err(|err| {
             BatonError::Io(format!("could not serialize session stop marker: {err}"))
         })?;
-        let dir = session_stop_markers_dir(control);
+        let dir = admission::session_stop_markers_dir(control);
         fs::create_dir_all(&dir)
             .map_err(|err| BatonError::Io(format!("could not create {dir:?}: {err}")))?;
         mailbox::atomic_write(&dir, &mailbox::file_name(id), &json)?;
         Ok(Self {
-            path: session_stop_marker_path(control, id)?,
+            path: admission::session_stop_marker_path(control, id)?,
             pid,
         })
     }
@@ -4053,7 +3643,9 @@ mod tests {
         let record = task_record("svc-test", std::process::id(), None, None);
         write_task_record(&control, &record).expect("write task record");
 
-        let (records, mutated) = reconcile_task_admissions(&control).expect("reconcile clean boot");
+        let (records, mutated) =
+            admission::reconcile_task_admissions::<WindowsServicePlatform>(&control)
+                .expect("reconcile clean boot");
         assert!(!mutated, "a clean tasks/ directory reports no mutation");
 
         fs::remove_dir_all(control.join("tasks")).expect("remove tasks directory");
@@ -4103,7 +3695,8 @@ mod tests {
         write_task_record(&control, &settled).expect("write settled task record");
 
         let (records, mutated) =
-            reconcile_task_admissions(&control).expect("reconcile mutated boot");
+            admission::reconcile_task_admissions::<WindowsServicePlatform>(&control)
+                .expect("reconcile mutated boot");
         assert!(mutated, "aborting the prepared admission is a mutation");
         assert_eq!(
             records.len(),
@@ -4569,8 +4162,13 @@ mod tests {
                     "the owner process is still live at this instant"
                 );
                 *racing_outcome.borrow_mut() = Some(
-                    handle_task_start_request(&control, "racing-request", &spec_path, &SystemClock)
-                        .expect("handle racing start"),
+                    admission::handle_task_start_request::<WindowsServicePlatform>(
+                        &control,
+                        "racing-request",
+                        &spec_path,
+                        &SystemClock,
+                    )
+                    .expect("handle racing start"),
                 );
             },
             |_, _| {},
@@ -4603,7 +4201,11 @@ mod tests {
             response.error
         );
         assert!(
-            !session_stop_in_progress(&control, "svc-stopping").expect("probe"),
+            !admission::session_stop_in_progress::<WindowsServicePlatform>(
+                &control,
+                "svc-stopping"
+            )
+            .expect("probe"),
             "the finished stop released its marker"
         );
         let _ = child.wait();
@@ -4622,16 +4224,18 @@ mod tests {
         {
             let _claim = SessionStopGuard::claim(&control, "svc-1").expect("claim");
             assert!(
-                session_stop_in_progress(&control, "svc-1").expect("probe"),
+                admission::session_stop_in_progress::<WindowsServicePlatform>(&control, "svc-1")
+                    .expect("probe"),
                 "a live stop owns the session"
             );
         }
         assert!(
-            !session_stop_in_progress(&control, "svc-1").expect("probe"),
+            !admission::session_stop_in_progress::<WindowsServicePlatform>(&control, "svc-1")
+                .expect("probe"),
             "finishing the stop releases the marker"
         );
 
-        let dir_path = session_stop_markers_dir(&control);
+        let dir_path = admission::session_stop_markers_dir(&control);
         fs::create_dir_all(&dir_path).expect("create marker dir");
         let orphan = serde_json::to_string(&SessionStopMarker {
             pid: u32::MAX - 1,
@@ -4642,11 +4246,12 @@ mod tests {
         mailbox::atomic_write(&dir_path, &mailbox::file_name("svc-1"), &orphan)
             .expect("write orphan marker");
         assert!(
-            !session_stop_in_progress(&control, "svc-1").expect("probe"),
+            !admission::session_stop_in_progress::<WindowsServicePlatform>(&control, "svc-1")
+                .expect("probe"),
             "a marker whose owner no longer resolves is stale"
         );
         assert!(
-            !session_stop_marker_path(&control, "svc-1")
+            !admission::session_stop_marker_path(&control, "svc-1")
                 .expect("marker path")
                 .exists(),
             "and is cleared, so it costs at most one rejected start"
@@ -4655,7 +4260,8 @@ mod tests {
         mailbox::atomic_write(&dir_path, &mailbox::file_name("svc-1"), "not json")
             .expect("write malformed marker");
         assert!(
-            !session_stop_in_progress(&control, "svc-1").expect("probe"),
+            !admission::session_stop_in_progress::<WindowsServicePlatform>(&control, "svc-1")
+                .expect("probe"),
             "a malformed marker is not evidence of a live stop"
         );
     }

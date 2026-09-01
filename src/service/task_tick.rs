@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::Path;
 use std::process::Child;
 use std::time::{Duration, Instant};
@@ -108,6 +109,14 @@ pub(super) trait ServicePlatform {
         stdout_path: &Path,
         stderr_path: &Path,
     ) -> Result<(Child, Self::TaskHandle)>;
+    /// The durable identity string a spawned task handle should persist in
+    /// [`TaskRecord::job`] for later rehydration, or `None` on platforms that
+    /// rehydrate by PID alone.
+    fn task_handle_identity(handle: &Self::TaskHandle) -> Option<String>;
+    /// Kills a just-spawned task that has not yet been committed to a durable
+    /// record (no [`TaskRecord`] exists yet to route through
+    /// [`Self::terminate_owned_task`]).
+    fn abort_uncommitted_spawn(pid: u32, handle: &Self::TaskHandle) -> Result<()>;
     fn recorded_start_identity(pid: u32) -> (Option<String>, Option<i64>);
     fn start_identity_is_valid(started_at: &Option<String>, start_epoch_secs: &Option<i64>)
     -> bool;
@@ -141,6 +150,20 @@ pub(super) trait ServicePlatform {
         term_sent_at_ms: Option<u64>,
     ) -> Result<bool>;
     fn rehydrate_task(record: &TaskRecord) -> Result<Option<Self::TaskHandle>>;
+    /// Upgrades a legacy durable record in place before its admission is
+    /// evaluated (a no-op on every platform but macOS, which backfills a
+    /// missing start epoch from a live process).
+    fn upgrade_legacy_task_record(control: &Path, record: &mut TaskRecord) -> Result<()>;
+    /// Escalates a running task toward termination and returns the settled
+    /// [`Liveness`] once dead, still live after both signals, or unresolved
+    /// (an unresolved probe short-circuits before any signal is sent). Each
+    /// platform retains its own probe-retry and signal-escalation shape.
+    fn escalate_task_to_death(record: &TaskRecord, grace_ms: u64) -> Liveness;
+    /// Takes the short-lived lock shared by task admission and session
+    /// cleanup. Each platform opens its own lock file with its own
+    /// close-on-exec/sharing discipline, so this cannot be a plain shared
+    /// function.
+    fn acquire_admission_lock(control: &Path) -> Result<File>;
     fn persist_terminal_task(
         control: &Path,
         record: &mut TaskRecord,
