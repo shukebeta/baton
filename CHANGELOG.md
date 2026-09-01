@@ -10,7 +10,7 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.4.0 … v0.3.51 (2026-09-01)
+## v0.4.1 … v0.3.51 (2026-09-01)
 
 ### Features
 - feat(cli): default service control directory (#295)
@@ -19,6 +19,9 @@ _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 - refactor(service): share session and task control plumbing (#285)
 - refactor(cli): share session spec flag parsing (#286)
 - refactor(log): share session outcome pairing (#287)
+
+### Other Changes
+- design(service): add platform process seam (#297)
 
 ## v0.3.50 … v0.3.45 (2026-08-31)
 
