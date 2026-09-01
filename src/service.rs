@@ -219,6 +219,8 @@ mod task_tick;
 mod imp {
     #[cfg(all(test, target_os = "linux"))]
     use super::records::mark_task_start_ack;
+    #[cfg(all(test, target_os = "linux"))]
+    use super::records::task_start_rollback_exists;
     use super::records::{
         AwaitConfig, SessionRecord, StartResponse, TaskStartResponse,
         discard_pending_task_start_request, fresh_request_id, fresh_session_id,
@@ -233,7 +235,7 @@ mod imp {
         remove_task_record, session_record_path, task_logs_dir, task_processing_dir,
         task_record_path, task_requests_dir, task_responses_dir, task_start_ack_path,
         task_start_response_claim_path, task_start_response_path, task_start_rollback_dir,
-        task_start_rollback_exists, write_task_start_response,
+        write_task_start_response,
     };
     #[cfg(all(test, target_os = "linux"))]
     use super::task_tick::task_cancel_sentinel_path;
