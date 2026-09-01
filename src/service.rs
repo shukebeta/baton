@@ -7541,12 +7541,25 @@ mod imp {
             let dir = TempDir::new("record-grace-non-linux-cache");
             let clock = FakeClock::new();
             let grace_ms = REHYDRATED_LIVENESS_CACHE_MS * 4 + POLL_INTERVAL_MS;
+            // The leader holds its exit on this gate. `spawn_running_task`
+            // records the start identity by probing `ps` *after* spawn, and a
+            // zombie yields no identity at all: a leader that exits first
+            // leaves a record whose zombie identity can never match, which
+            // resolves as `Unresolved` instead of reaching the group probe.
+            let gate = dir.path.join("leader-gate");
+            let gate_arg = gate.display().to_string();
+            assert!(
+                !gate_arg.contains('\''),
+                "fixture gate path is not shell-safe: {gate_arg}"
+            );
             let task = task_spec(
                 "svc-1",
                 "sh",
                 vec![
                     "-c".to_string(),
-                    "trap '' TERM; sleep 30 & exit 0".to_string(),
+                    format!(
+                        "trap '' TERM; sleep 30 & while [ ! -f '{gate_arg}' ]; do sleep 0.05; done; exit 0"
+                    ),
                 ],
                 vec![],
                 60_000,
@@ -7555,6 +7568,11 @@ mod imp {
             let mut running = spawn_running_task(&dir.path, "task-grace-non-linux", task, &clock);
             let task_child = running.child.take().expect("task fixture child");
             let mut task_cleanup = ChildCleanup::new(task_child);
+            assert!(
+                running.record.started_at.is_some() && running.record.start_epoch_secs.is_some(),
+                "task fixture recorded no start identity: the leader exited before its live probe"
+            );
+            fs::write(&gate, b"go").expect("release task fixture leader");
             wait_for_zombie_group_descendant(task_cleanup.child());
 
             reset_group_scan_count();
