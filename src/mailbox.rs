@@ -678,8 +678,7 @@ pub(crate) fn atomic_write(dir: &Path, final_name: &str, contents: &str) -> Resu
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!(".{final_name}.{}.{seq}.tmp", std::process::id()));
     {
-        let mut file = File::create(&tmp)
-            .map_err(|err| BatonError::Io(format!("could not create {tmp:?}: {err}")))?;
+        let mut file = create_tmp_file(dir, &tmp)?;
         file.write_all(contents.as_bytes())
             .map_err(|err| BatonError::Io(format!("could not write {tmp:?}: {err}")))?;
         file.flush()
@@ -690,6 +689,46 @@ pub(crate) fn atomic_write(dir: &Path, final_name: &str, contents: &str) -> Resu
         let _ = fs::remove_file(&tmp);
         BatonError::Io(format!("could not rename {tmp:?} to {dest:?}: {err}"))
     })
+}
+
+/// Windows CI has been observed to transiently report `ERROR_PATH_NOT_FOUND`
+/// (os error 3) creating a file in `dir` immediately after `create_dir_all`
+/// reported it created — a filesystem-driver race outside this process
+/// (baton#243), not a caller ordering bug: every `atomic_write` caller already
+/// creates `dir` first. A handful of short retries, recreating `dir` each
+/// time, absorbs that without masking a genuinely missing ancestor path past
+/// the bound.
+fn create_tmp_file(dir: &Path, tmp: &Path) -> Result<File> {
+    const ATTEMPTS: u32 = 5;
+    let mut last_err = None;
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            let _ = fs::create_dir_all(dir);
+            std::thread::sleep(Duration::from_millis(10 * u64::from(attempt)));
+        }
+        match File::create(tmp) {
+            Ok(file) => {
+                if attempt > 0 {
+                    eprintln!(
+                        "warning: baton::mailbox::atomic_write retried creating {tmp:?} \
+                         {attempt} time(s) after a transient error: {}",
+                        last_err.expect("a retry only happens after a recorded error")
+                    );
+                }
+                return Ok(file);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                last_err = Some(err);
+            }
+            Err(err) => {
+                return Err(BatonError::Io(format!("could not create {tmp:?}: {err}")));
+            }
+        }
+    }
+    Err(BatonError::Io(format!(
+        "could not create {tmp:?}: {}",
+        last_err.expect("the attempts loop always records an error before exhausting ATTEMPTS")
+    )))
 }
 
 #[cfg(test)]
@@ -759,6 +798,26 @@ mod tests {
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    /// `atomic_write` recovers from a transient `NotFound` creating its temp
+    /// file (baton#243's Windows CI flake) by recreating the directory and
+    /// retrying, rather than failing on the first `ERROR_PATH_NOT_FOUND`.
+    #[test]
+    fn atomic_write_retries_past_a_missing_directory() {
+        let dir = TempDir::new("retry");
+        let missing = dir.path.join("requests");
+        // Not created yet: the first `File::create` inside `atomic_write`
+        // must see `NotFound`, and the retry loop's own `create_dir_all`
+        // must recover it.
+        assert!(!missing.exists());
+
+        atomic_write(&missing, "req-1.json", "{}").expect("recovers past the missing directory");
+
+        assert_eq!(
+            fs::read_to_string(missing.join("req-1.json")).expect("written file"),
+            "{}"
+        );
     }
 
     /// deliver → claim round-trips the envelope and moves it out of `pending/`.
