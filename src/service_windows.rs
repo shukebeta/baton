@@ -17,12 +17,11 @@ use super::records::{
 #[cfg(test)]
 use super::records::{mark_task_start_ack, task_record_path};
 use super::task_tick::{
-    self, Liveness, REHYDRATED_LIVENESS_CACHE_MS, RunningTask as SharedRunningTask,
-    ServicePlatform, TaskLivenessMode, TaskLivenessRefresh, TerminationSignal,
-    task_cancel_sentinel_path,
+    self, Liveness, RunningTask as SharedRunningTask, ServicePlatform, TaskLivenessMode,
+    TaskLivenessRefresh, TerminationSignal, liveness_sample_is_fresh, task_cancel_sentinel_path,
 };
 #[cfg(test)]
-use super::task_tick::{finalize_task, tick_one_task};
+use super::task_tick::{REHYDRATED_LIVENESS_CACHE_MS, finalize_task, tick_one_task};
 use super::*;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -410,14 +409,12 @@ impl ServicePlatform for WindowsServicePlatform {
         let _ = mode;
         let force_refresh = matches!(refresh, TaskLivenessRefresh::Forced);
         let refresh_sample = force_refresh
-            || cache
+            || !cache
                 .sample
                 .map(|(checked_ms, _, checked_at)| {
-                    now_ms.saturating_sub(checked_ms) >= REHYDRATED_LIVENESS_CACHE_MS
-                        || checked_at.elapsed()
-                            >= Duration::from_millis(REHYDRATED_LIVENESS_CACHE_MS)
+                    liveness_sample_is_fresh(checked_ms, checked_at, now_ms)
                 })
-                .unwrap_or(true);
+                .unwrap_or(false);
         if refresh_sample {
             #[cfg(test)]
             note_task_liveness_probe();
