@@ -10,7 +10,10 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.3.53 … v0.3.51 (2026-09-01)
+## v0.4.0 … v0.3.51 (2026-09-01)
+
+### Features
+- feat(cli): default service control directory (#295)
 
 ### Refactors
 - refactor(service): share session and task control plumbing (#285)
