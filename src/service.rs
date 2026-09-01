@@ -226,7 +226,7 @@ mod imp {
         wait_for_test_task_rollback_cleanup_barrier, write_session_record, write_start_response,
         write_task_record, write_task_start_response,
     };
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     use super::records::{
         mark_task_start_ack, session_record_path, task_processing_dir, task_record_path,
         task_requests_dir, task_responses_dir, task_start_ack_path, task_start_rollback_dir,

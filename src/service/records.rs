@@ -103,6 +103,7 @@ impl<'a> RequestChannel<'a> {
         }
     }
 
+    #[rustfmt::skip]
     pub(super) fn submit<Req, Response>(
         &self,
         request_id: &str,
@@ -118,8 +119,9 @@ impl<'a> RequestChannel<'a> {
         if !is_running(self.control)? {
             return Err(BatonError::Io(no_live_error(self.control)));
         }
-        let json = serde_json::to_string(request)
-            .map_err(|err| BatonError::Io(format!("could not serialize {request_name}: {err}")))?;
+        let json = serde_json::to_string(request).map_err(|err| {
+            BatonError::Io(format!("could not serialize {request_name}: {err}"))
+        })?;
         mailbox::atomic_write(&self.requests, &mailbox::file_name(request_id), &json)?;
         await_response()
     }
@@ -231,14 +233,16 @@ impl<'a> RequestChannel<'a> {
         Ok(None)
     }
 
+    #[rustfmt::skip]
     pub(super) fn write_response<Body: Serialize>(
         &self,
         request_id: &str,
         response: &Body,
         response_name: &str,
     ) -> Result<()> {
-        let json = serde_json::to_string(response)
-            .map_err(|err| BatonError::Io(format!("could not serialize {response_name}: {err}")))?;
+        let json = serde_json::to_string(response).map_err(|err| {
+            BatonError::Io(format!("could not serialize {response_name}: {err}"))
+        })?;
         fs::create_dir_all(&self.responses).map_err(|err| {
             BatonError::Io(format!("could not create {:?}: {err}", self.responses))
         })?;
