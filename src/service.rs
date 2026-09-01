@@ -222,9 +222,9 @@ mod imp {
         TEST_TASK_ROLLBACK_REQUEST_BARRIER, TaskStartResponse, discard_pending_task_start_request,
         fresh_request_id, fresh_session_id, fresh_task_id, list_session_records,
         list_task_record_ids, list_task_records, list_task_start_acks,
-        list_task_start_response_claims, list_task_start_rollbacks,
-        mark_task_start_rollback, read_session_record, read_task_record, reclaim_stale_requests,
-        remove_session_record, remove_task_logs_dir, remove_task_record, remove_task_start_ack,
+        list_task_start_response_claims, list_task_start_rollbacks, mark_task_start_rollback,
+        read_session_record, read_task_record, reclaim_stale_requests, remove_session_record,
+        remove_task_logs_dir, remove_task_record, remove_task_start_ack,
         remove_task_start_response_files, remove_task_start_rollback, responses_dir,
         restore_task_start_response_claim, sessions_dir, start_channel,
         take_task_start_response_locked, task_cancel_dir, task_channel, task_logs_dir,
@@ -874,6 +874,16 @@ mod imp {
     #[cfg(test)]
     static TASK_NEW_ID_PARSES: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
+    /// Counts direct `read_task_record` confirmations of a cached `Running`
+    /// entry inside [`reap_session_tasks_with_wait`] and
+    /// [`wait_then_recheck_terminal`] only. `rescan_owned_tasks` performs the
+    /// same kind of confirmation read for its own cached-`Running` entries
+    /// but deliberately does not add to this counter: it exists to bound the
+    /// reap pass's confirmation cost, and rescan only ever runs against ids
+    /// the reap pass has not already handled (a genuinely rare path — a
+    /// stop-owned rescan sees an untouched `Running` id only when
+    /// `refresh_new_task_ids` admitted it after the reap pass's own loop
+    /// already read past it).
     #[cfg(test)]
     static TASK_CONFIRM_READS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
@@ -4803,7 +4813,7 @@ mod imp {
         /// per-record read beyond the listing's own parse is needed.
         #[test]
         fn execute_stop_with_terminal_only_history_performs_one_full_listing_and_no_confirm_reads()
-         {
+        {
             let _guard = serialize_forks_and_locks();
             TASK_FULL_LISTINGS.store(0, std::sync::atomic::Ordering::Relaxed);
             TASK_CONFIRM_READS.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -4836,8 +4846,10 @@ mod imp {
                 delivered_milestones: 0,
                 terminal_delivered_at_ms: None,
             };
-            write_task_record(&dir.path, &terminal("task-owned-1", "svc-1")).expect("write owned-1");
-            write_task_record(&dir.path, &terminal("task-owned-2", "svc-1")).expect("write owned-2");
+            write_task_record(&dir.path, &terminal("task-owned-1", "svc-1"))
+                .expect("write owned-1");
+            write_task_record(&dir.path, &terminal("task-owned-2", "svc-1"))
+                .expect("write owned-2");
             write_task_record(&dir.path, &terminal("task-other", "svc-2")).expect("write other");
 
             let mut out = Vec::new();
@@ -8467,9 +8479,14 @@ mod imp {
                 "the racer is discovered by unlocked_wait's embedded refresh during svc-j's own wait"
             );
 
-            let residue_k =
-                stop_session_record_with_wait(&mut admission, &session_k, false, |_, _| {}, |_, _| {})
-                    .expect("stop svc-k");
+            let residue_k = stop_session_record_with_wait(
+                &mut admission,
+                &session_k,
+                false,
+                |_, _| {},
+                |_, _| {},
+            )
+            .expect("stop svc-k");
             drop(admission);
 
             assert!(
@@ -8530,10 +8547,7 @@ mod imp {
                 "bash",
                 vec![
                     "-c".to_string(),
-                    format!(
-                        "trap '' TERM; touch '{}'; exec sleep 30",
-                        ready.display()
-                    ),
+                    format!("trap '' TERM; touch '{}'; exec sleep 30", ready.display()),
                 ],
                 Vec::new(),
                 60_000,

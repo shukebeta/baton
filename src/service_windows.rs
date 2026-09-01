@@ -1,18 +1,18 @@
 use super::records::{
     AwaitConfig, SessionRecord, StartResponse, TEST_TASK_ROLLBACK_RECONCILE_BARRIER,
     TEST_TASK_ROLLBACK_REQUEST_BARRIER, TaskStartResponse, discard_pending_task_start_request,
-    fresh_request_id, fresh_session_id, fresh_task_id, list_session_records,
-    list_task_record_ids, list_task_records, list_task_start_acks,
-    list_task_start_response_claims, list_task_start_rollbacks,
-    mark_task_start_rollback, read_session_record, read_task_record, reclaim_stale_requests,
-    remove_session_record, remove_task_logs_dir, remove_task_record, remove_task_start_ack,
-    remove_task_start_response_files, remove_task_start_rollback, responses_dir,
-    restore_task_start_response_claim, start_channel, take_task_start_response_locked,
-    task_cancel_dir, task_channel, task_logs_dir, task_start_ack_exists,
-    task_start_response_boundary_exists, task_start_response_claim_path, task_start_response_id,
-    task_start_response_path, task_start_rollback_exists, wait_for_test_task_admission_barrier,
-    wait_for_test_task_response_phase_barrier, wait_for_test_task_rollback_cleanup_barrier,
-    write_session_record, write_start_response, write_task_record, write_task_start_response,
+    fresh_request_id, fresh_session_id, fresh_task_id, list_session_records, list_task_record_ids,
+    list_task_records, list_task_start_acks, list_task_start_response_claims,
+    list_task_start_rollbacks, mark_task_start_rollback, read_session_record, read_task_record,
+    reclaim_stale_requests, remove_session_record, remove_task_logs_dir, remove_task_record,
+    remove_task_start_ack, remove_task_start_response_files, remove_task_start_rollback,
+    responses_dir, restore_task_start_response_claim, start_channel,
+    take_task_start_response_locked, task_cancel_dir, task_channel, task_logs_dir,
+    task_start_ack_exists, task_start_response_boundary_exists, task_start_response_claim_path,
+    task_start_response_id, task_start_response_path, task_start_rollback_exists,
+    wait_for_test_task_admission_barrier, wait_for_test_task_response_phase_barrier,
+    wait_for_test_task_rollback_cleanup_barrier, write_session_record, write_start_response,
+    write_task_record, write_task_start_response,
 };
 #[cfg(test)]
 use super::records::{mark_task_start_ack, session_record_path, task_record_path};
@@ -840,11 +840,18 @@ struct AdmissionGuard<'a> {
 #[cfg(test)]
 static TASK_FULL_LISTINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
-static TASK_NEW_ID_PARSES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static TASK_NEW_ID_PARSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Counts direct `read_task_record` confirmations of a cached `Running`
+/// entry inside [`reap_session_tasks_with_wait`] and
+/// [`wait_then_recheck_terminal`] only. `rescan_owned_tasks` performs the
+/// same kind of confirmation read for its own cached-`Running` entries but
+/// deliberately does not add to this counter: it exists to bound the reap
+/// pass's confirmation cost, and rescan only ever runs against ids the reap
+/// pass has not already handled (a genuinely rare path — a stop-owned
+/// rescan sees an untouched `Running` id only when `refresh_new_task_ids`
+/// admitted it after the reap pass's own loop already read past it).
 #[cfg(test)]
-static TASK_CONFIRM_READS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static TASK_CONFIRM_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl<'a> AdmissionGuard<'a> {
     fn acquire(control: &'a Path) -> Result<Self> {
@@ -1969,39 +1976,26 @@ fn reap_session_tasks_with_wait(
             term_sent = true;
         }
         if liveness != Liveness::Dead
-            && let Some(terminal) = wait_then_recheck_terminal(
-                admission,
-                &record,
-                &mut liveness,
-                KILL_GRACE_MS,
-                &wait,
-            )?
+            && let Some(terminal) =
+                wait_then_recheck_terminal(admission, &record, &mut liveness, KILL_GRACE_MS, &wait)?
         {
             remove_reaped_task_record(control, &terminal)?;
             continue;
         }
         if liveness == Liveness::Live && !term_sent {
             let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-TERM");
-            if let Some(terminal) = wait_then_recheck_terminal(
-                admission,
-                &record,
-                &mut liveness,
-                KILL_GRACE_MS,
-                &wait,
-            )? {
+            if let Some(terminal) =
+                wait_then_recheck_terminal(admission, &record, &mut liveness, KILL_GRACE_MS, &wait)?
+            {
                 remove_reaped_task_record(control, &terminal)?;
                 continue;
             }
         }
         if liveness == Liveness::Live {
             let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-KILL");
-            if let Some(terminal) = wait_then_recheck_terminal(
-                admission,
-                &record,
-                &mut liveness,
-                KILL_GRACE_MS,
-                &wait,
-            )? {
+            if let Some(terminal) =
+                wait_then_recheck_terminal(admission, &record, &mut liveness, KILL_GRACE_MS, &wait)?
+            {
                 remove_reaped_task_record(control, &terminal)?;
                 continue;
             }
@@ -4139,8 +4133,7 @@ mod tests {
     /// history performs exactly one full `tasks/` listing and confirms
     /// nothing directly.
     #[test]
-    fn execute_stop_with_terminal_only_history_performs_one_full_listing_and_no_confirm_reads()
-     {
+    fn execute_stop_with_terminal_only_history_performs_one_full_listing_and_no_confirm_reads() {
         let _guard = serialize_forks_and_locks();
         TASK_FULL_LISTINGS.store(0, std::sync::atomic::Ordering::Relaxed);
         TASK_CONFIRM_READS.store(0, std::sync::atomic::Ordering::Relaxed);
