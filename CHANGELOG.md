@@ -10,6 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
+## v0.3.51 (2026-09-01)
+
+### Refactors
+- refactor(service): share session and task control plumbing (#285)
+
 ## v0.3.50 … v0.3.45 (2026-08-31)
 
 ### Fixes
