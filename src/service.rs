@@ -5136,6 +5136,30 @@ mod imp {
                 Liveness::Unresolved,
                 "a mismatched zombie remains unresolved"
             );
+            let clock = FakeClock::new();
+            let mut tasks = task_tick::rehydrate_tasks::<UnixServicePlatform>(&dir.path, &clock)
+                .expect("rehydrate unresolved task");
+            let mut running = tasks
+                .remove(&record.id)
+                .expect("rehydrated unresolved task");
+            assert!(
+                running.child.is_none(),
+                "fixture follows the rehydrated tick path"
+            );
+            running.term_sent_at_ms = Some(clock.now_ms().saturating_sub(KILL_GRACE_MS));
+            assert!(matches!(
+                tick_one_task(&dir.path, &record.id, &mut running, &clock),
+                Ok(TaskTick::StillRunning)
+            ));
+            assert_eq!(running.record.state, TaskState::Running);
+            assert_eq!(
+                read_task_record(&dir.path, &record.id)
+                    .expect("read unresolved task after tick")
+                    .expect("unresolved task remains durable")
+                    .state,
+                TaskState::Running,
+                "an unresolved Unix group is not finalized by the shared tick"
+            );
             let retry_grace_ms = POLL_INTERVAL_MS * 2;
             let started = Instant::now();
             assert_eq!(
