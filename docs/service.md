@@ -536,12 +536,18 @@ in [`src/service/task_tick.rs`](../src/service/task_tick.rs)) has elapsed
 since that stamp. Once the window elapses, the next tick reaps the record —
 removing `tasks/<id>.json`, its task-start transaction files, and its cancel
 sentinel — the same way a task with no configured retention grace was reaped
-before this contract existed. It does not remove the task's `stdout`/`stderr`
-logs under `task-logs/<task-id>/`, and `task status` reports an empty result
-for a reaped id exactly as it does for one that never existed. This retention
-window applies only to the tick-driven reap on delivery; `service stop`/
-`service teardown` still remove a task's terminal record immediately as part
-of reaping its owning session, described next.
+before this contract existed. The reap also removes the task's captured
+`stdout`/`stderr` logs under `task-logs/<task-id>/`: the record is the only
+pointer to that tree, so the two are reclaimed together and `--task-retention`
+is the single knob bounding both. Until the window elapses the logs stay in
+place, so a finished task's `stdout_path`/`stderr_path` from `task status`
+still resolve to readable files. Afterwards, `task status` reports an empty
+result for a reaped id exactly as it does for one that never existed. Windows
+reclaims task logs through the same shared reap helper, so the behavior is
+identical on both platforms. This retention window applies only to the
+tick-driven reap on delivery; `service stop`/`service teardown` still remove a
+task's terminal record immediately as part of reaping its owning session,
+described next.
 
 ### Ownership vs. callback
 
@@ -551,7 +557,14 @@ names, never to its callback target. `service stop --session <id>` and
 corroborated live identity have their process group stopped on Unix or Job
 Object terminated on Windows and their records removed, initially unresolved
 tasks are retained for a later cleanup attempt, and terminal task records are
-removed without signalling their recorded PID.
+removed without signalling their recorded PID. Every task record removed on
+these paths takes its `task-logs/<task-id>/` tree with it, and a session that
+is reaped cleanly — dead, with no residue left behind — also has its own
+`sessions/<id>/` log directory removed along with `sessions/<id>.json`. A
+session or task left as residue keeps both its record and its logs, so the
+operator can still read why. Windows `serve` sessions write no session log
+directory at all, so only the record is removed there; Windows *task* logs are
+reclaimed exactly as on Unix.
 This applies even if a task's `--callback-inbox` points somewhere entirely
 outside the owning session's own mailbox. Task admission and those cleanup
 paths share the short-lived `service.admission.lock`, so cleanup cannot leave a

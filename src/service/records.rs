@@ -424,6 +424,17 @@ pub(super) fn task_logs_dir(control: &Path, task_id: &str) -> PathBuf {
     control.join("task-logs").join(task_id)
 }
 
+/// Reclaims a task's captured `stdout`/`stderr` tree once nothing refers to it
+/// any more. Best effort: an already-absent directory is success, and an id
+/// that is not usable as a filename is refused here rather than at each call
+/// site, so no caller can walk `remove_dir_all` out of `task-logs/`.
+pub(super) fn remove_task_logs_dir(control: &Path, task_id: &str) {
+    if !mailbox::is_safe_key(task_id) {
+        return;
+    }
+    let _ = fs::remove_dir_all(task_logs_dir(control, task_id));
+}
+
 pub(super) fn task_start_rollback_dir(control: &Path) -> PathBuf {
     control.join("task-start-rollback")
 }
