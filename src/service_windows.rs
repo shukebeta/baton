@@ -15,13 +15,13 @@ use super::records::{
     write_task_record, write_task_start_response,
 };
 #[cfg(test)]
+use super::records::{mark_task_start_ack, task_record_path};
+#[cfg(test)]
 use super::task_tick::tick_one_task;
 use super::task_tick::{
     self, Liveness, RunningTask as SharedRunningTask, ServicePlatform, TaskLivenessMode,
     TaskLivenessRefresh, TerminationSignal, task_cancel_sentinel_path,
 };
-#[cfg(test)]
-use super::records::{mark_task_start_ack, task_record_path};
 use super::*;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
