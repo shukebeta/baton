@@ -5002,6 +5002,12 @@ fn service_prepared_unresolved_admission_is_not_rehydrated_or_finalized() {
     final_run.stderr(Stdio::null());
     let mut final_child = final_run.spawn().expect("spawn final service run");
     wait_for_live();
+    let reconcile_deadline = integration_test_deadline();
+    while (task_record_path.exists() || rollback_path.exists())
+        && std::time::Instant::now() < reconcile_deadline
+    {
+        thread::sleep(Duration::from_millis(20));
+    }
     assert!(
         !task_record_path.exists(),
         "dead prepared record is reconciled"
