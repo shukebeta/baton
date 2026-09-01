@@ -122,12 +122,17 @@ reply — is [`baton send`](#posting-to-a-mailbox-baton-send).
 ### Agent stderr capture (`--agent-cmd` only)
 
 When `serve` runs an external agent (`--agent-cmd`), the agent's stderr is
-captured on every turn — success and failure alike — and on a **successful**
-turn persisted to:
+captured on every turn — success and failure alike. Where it ends up depends
+on how the turn concludes:
 
-```
-<inbox>/agent-stderr/<message-id>.stderr
-```
+- **Exit 0, turn succeeds** — stderr is persisted to
+  `<inbox>/agent-stderr/<message-id>.stderr`.
+- **Exit 0, turn fails a decode check** (empty stdout, an unextractable
+  result, or an empty result) — stderr is **also** persisted to that same
+  path; the delivered `BatonError::Decode` message does not inline it, so the
+  file is the only place to see it.
+- **Non-zero exit or timeout** — stderr is inlined into the
+  `BatonError::Transport` error message instead; nothing is written to disk.
 
 This mirrors the per-task `<control>/task-logs/<task-id>/stderr.log` convention
 established by `baton task start` (see [Service § Task
@@ -144,9 +149,6 @@ of the output is discarded and the final 8 MiB are retained, with a
 `[truncated at 8 MiB: output prefix dropped; retained tail begins below]`
 marker prepended. Tail retention preserves a final JSON result line for
 `--agent-output json` while keeping the daemon's captured reply bounded.
-
-On a **failed** turn (non-zero exit), stderr is inlined into the
-`BatonError::Transport` error message instead — it is not written to disk.
 
 ## Posting to a mailbox (`baton send`)
 
