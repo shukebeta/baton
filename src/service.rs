@@ -1451,7 +1451,7 @@ mod imp {
                 // a macOS legacy-record epoch upgrade) even when it reports
                 // the admission unresolved, so it counts as a mutation
                 // regardless of its return value.
-                let removed = abort_task_admission(control, &record)?;
+                let removed = abort_task_admission(control, record)?;
                 mutated = true;
                 if !removed {
                     if rollback && let Some(request_id) = request_id {
@@ -1485,7 +1485,7 @@ mod imp {
             if rollback {
                 // See the Prepared-admission arm above: this call may
                 // durably rewrite the record even on an unresolved outcome.
-                let removed = abort_task_admission(control, &record)?;
+                let removed = abort_task_admission(control, record)?;
                 mutated = true;
                 if !removed {
                     retained_rollbacks.insert(request_id.to_string());
@@ -3496,7 +3496,12 @@ mod imp {
         /// [`RunningTask`], mirroring what `handle_task_start_request` does
         /// inside the real request protocol — but callable directly, so a
         /// test can drive [`tick_one_task`] without going through the
-        /// request-file dance or the infinite `run_service` loop.
+        /// request-file dance or the infinite `run_service` loop. Retention
+        /// is zeroed so callers exercising `reap_task_until_finished`'s
+        /// bounded real-time loop see an immediate reap on terminal
+        /// delivery, as tests unrelated to retention expect; tests that
+        /// exercise retention itself build their own `RunningTask` with an
+        /// explicit `.with_retention_ms(...)`.
         fn spawn_running_task(
             dir: &Path,
             id: &str,
@@ -3530,7 +3535,7 @@ mod imp {
                 terminal_delivered_at_ms: None,
             };
             write_task_record(dir, &record).expect("write task record");
-            RunningTask::new(record, Some(child), None, started_ms)
+            RunningTask::new(record, Some(child), None, started_ms).with_retention_ms(0)
         }
 
         /// Builds a terminal task without a live child so callback delivery
@@ -5102,13 +5107,9 @@ mod imp {
             };
             write_task_record(&dir.path, &record).expect("write task record");
 
-            let mut tasks = task_tick::rehydrate_tasks::<UnixServicePlatform>(
-                &dir.path,
-                &clock,
-                DEFAULT_TASK_RETENTION_MS,
-                None,
-            )
-            .expect("rehydrate task");
+            let mut tasks =
+                task_tick::rehydrate_tasks::<UnixServicePlatform>(&dir.path, &clock, 0, None)
+                    .expect("rehydrate task");
             let mut running = tasks.remove("task-reused").expect("rehydrated task");
             assert!(
                 running.child.is_none(),
@@ -6753,7 +6754,8 @@ mod imp {
                 .wait()
                 .expect("wait for direct leader");
             let mut rehydrated =
-                RunningTask::new(owned.record.clone(), None, None, owned.started_ms);
+                RunningTask::new(owned.record.clone(), None, None, owned.started_ms)
+                    .with_retention_ms(0);
 
             reset_process_probe_count();
             reset_group_scan_count();
@@ -7287,7 +7289,8 @@ mod imp {
                 .wait()
                 .expect("wait for direct leader");
             let mut rehydrated =
-                RunningTask::new(owned.record.clone(), None, None, owned.started_ms);
+                RunningTask::new(owned.record.clone(), None, None, owned.started_ms)
+                    .with_retention_ms(0);
 
             let tick = tick_one_task(&dir.path, "task-rehydrated-group", &mut rehydrated, &clock)
                 .expect("rehydrated tick while group remains");
