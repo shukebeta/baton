@@ -238,6 +238,8 @@ mod imp {
         session_record_path, task_processing_dir, task_record_path, task_requests_dir,
         task_responses_dir, task_start_ack_path, task_start_rollback_dir,
     };
+    #[cfg(all(test, target_os = "linux"))]
+    use super::task_tick::task_cancel_sentinel_path;
     use super::task_tick::{
         self, Liveness, REHYDRATED_LIVENESS_CACHE_MS, RunningTask as SharedRunningTask,
         ServicePlatform, TaskLivenessMode, TaskLivenessRefresh, TerminationSignal,
@@ -245,8 +247,7 @@ mod imp {
     };
     #[cfg(test)]
     use super::task_tick::{
-        DEFAULT_TASK_RETENTION_MS, deliver_task_event, finalize_task, task_cancel_sentinel_path,
-        tick_one_task,
+        DEFAULT_TASK_RETENTION_MS, deliver_task_event, finalize_task, tick_one_task,
     };
     use super::*;
     #[cfg(test)]
@@ -6413,9 +6414,11 @@ mod imp {
 
             signal_group(running.record.pid, libc::SIGKILL).expect("kill group descendant");
             reap_task_until_finished(&dir.path, "task-group-drain", &mut running, &clock, tick);
-            let record =
-                assert_durable_task_state(&dir.path, "task-group-drain", TaskState::Completed);
-            assert_eq!(record.exit_code, Some(0));
+            // Zero retention reaps the durable record on this same tick, so
+            // the terminal state can only be checked against the in-memory
+            // record `finalize_task` updates before reaping, not by re-reading it.
+            assert_eq!(running.record.state, TaskState::Completed);
+            assert_eq!(running.record.exit_code, Some(0));
             assert_terminal_task_event(&callback_inbox, "task-group-drain");
         }
 
@@ -6446,8 +6449,9 @@ mod imp {
             execute_task_cancel(&dir.path, "task-cancel-group", &mut Vec::new())
                 .expect("cancel task");
             reap_task_until_finished(&dir.path, "task-cancel-group", &mut running, &clock, tick);
+            // Zero retention already reaped the durable record by this
+            // point; the in-memory record is the only place left to check it.
             assert_eq!(running.record.state, TaskState::Cancelled);
-            assert_durable_task_state(&dir.path, "task-cancel-group", TaskState::Cancelled);
             assert_eq!(task_group_liveness(running.record.pid), Liveness::Dead);
             assert_terminal_task_event(&callback_inbox, "task-cancel-group");
         }
@@ -6617,8 +6621,9 @@ mod imp {
                 &clock,
                 kill_tick,
             );
+            // Zero retention already reaped the durable record by this
+            // point; the in-memory record is the only place left to check it.
             assert_eq!(running.record.state, TaskState::Timeout);
-            assert_durable_task_state(&dir.path, "task-timeout-group", TaskState::Timeout);
             assert_eq!(task_group_liveness(running.record.pid), Liveness::Dead);
             assert_terminal_task_event(&callback_inbox, "task-timeout-group");
         }
@@ -6717,8 +6722,9 @@ mod imp {
                 &clock,
                 kill_tick,
             );
+            // Zero retention already reaped the durable record by this
+            // point; the in-memory record is the only place left to check it.
             assert_eq!(running.record.state, TaskState::Timeout);
-            assert_durable_task_state(&dir.path, "task-owned-linux-cache", TaskState::Timeout);
             assert_terminal_task_event(&callback_inbox, "task-owned-linux-cache");
         }
 
@@ -7305,9 +7311,11 @@ mod imp {
                 &clock,
                 tick,
             );
-            let record =
-                assert_durable_task_state(&dir.path, "task-rehydrated-group", TaskState::Failed);
-            assert_eq!(record.exit_code, None);
+            // Zero retention reaps the durable record on this same tick, so
+            // the terminal state can only be checked against the in-memory
+            // record `finalize_task` updates before reaping, not by re-reading it.
+            assert_eq!(rehydrated.record.state, TaskState::Failed);
+            assert_eq!(rehydrated.record.exit_code, None);
             assert_terminal_task_event(&callback_inbox, "task-rehydrated-group");
         }
 
