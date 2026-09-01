@@ -726,6 +726,261 @@ mod imp {
         Present(T),
     }
 
+    /// The lifecycle operation requested from a future platform adapter.
+    /// Unix maps these to signals; Windows maps them to Job Object
+    /// termination while retaining the phase text used by its fallback
+    /// warnings.
+    #[allow(dead_code)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TerminationSignal {
+        Term,
+        Kill,
+    }
+
+    #[allow(dead_code)]
+    impl TerminationSignal {
+        fn phase(self) -> &'static str {
+            match self {
+                Self::Term => "-TERM",
+                Self::Kill => "-KILL",
+            }
+        }
+
+        fn unix_signal(self) -> libc::c_int {
+            match self {
+                Self::Term => libc::SIGTERM,
+                Self::Kill => libc::SIGKILL,
+            }
+        }
+    }
+
+    /// Identifies the two task paths whose liveness control flow differs:
+    /// an owned task can use its Child as the direct-leader identity, while a
+    /// rehydrated task must corroborate the durable PID on every observation.
+    /// `leader_exited` additionally lets a future consumer request the
+    /// descendant-boundary probe after the direct child has been reaped.
+    #[allow(dead_code)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TaskLivenessMode {
+        Owned { leader_exited: bool },
+        Rehydrated,
+    }
+
+    /// Controls whether a platform may use its bounded liveness sample or
+    /// must take a fresh observation before authorizing termination/reaping.
+    #[allow(dead_code)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TaskLivenessRefresh {
+        Cached,
+        Forced,
+    }
+
+    /// Platform-owned liveness state. Linux caches only its expensive group
+    /// scan; other Unix hosts cache the complete rehydrated execution sample.
+    #[allow(dead_code)]
+    #[derive(Default)]
+    struct UnixTaskLivenessCache {
+        #[cfg(target_os = "linux")]
+        group: Option<(u64, Liveness, Instant)>,
+        #[cfg(not(target_os = "linux"))]
+        rehydrated: Option<(u64, Liveness, Instant)>,
+    }
+
+    /// Private platform boundary for the later service extraction tickets.
+    /// The current supervisor deliberately continues to call its existing
+    /// free functions; these adapters only make the intended seam concrete.
+    #[allow(dead_code)]
+    trait ServicePlatform {
+        type SessionHandle;
+        type TaskHandle;
+        type TaskLivenessCache: Default;
+
+        fn spawn_session(
+            spec: &SessionSpec,
+            stderr_path: &Path,
+        ) -> Result<(Child, Self::SessionHandle)>;
+        fn spawn_task(
+            spec: &TaskSpec,
+            stdout_path: &Path,
+            stderr_path: &Path,
+        ) -> Result<(Child, Self::TaskHandle)>;
+        fn recorded_start_identity(pid: u32) -> (Option<String>, Option<i64>);
+        fn start_identity_is_valid(
+            started_at: &Option<String>,
+            start_epoch_secs: &Option<i64>,
+        ) -> bool;
+        fn session_liveness(record: &SessionRecord) -> Liveness;
+        fn task_liveness(record: &TaskRecord) -> Liveness;
+        fn task_liveness_for_tick(
+            record: &TaskRecord,
+            mode: TaskLivenessMode,
+            cache: &mut Self::TaskLivenessCache,
+            now_ms: u64,
+            refresh: TaskLivenessRefresh,
+        ) -> Liveness;
+        fn terminate_session(
+            record: &SessionRecord,
+            signal: TerminationSignal,
+            force: bool,
+        ) -> Result<()>;
+        fn terminate_task(
+            record: &TaskRecord,
+            signal: TerminationSignal,
+            force: bool,
+        ) -> Result<()>;
+        fn terminate_owned_task(
+            owner: Option<&Self::TaskHandle>,
+            record: &TaskRecord,
+            signal: TerminationSignal,
+            force: bool,
+        ) -> Result<()>;
+        fn pid_is_gone(pid: u32) -> bool;
+    }
+
+    #[allow(dead_code)]
+    struct UnixServicePlatform;
+
+    #[allow(dead_code)]
+    impl ServicePlatform for UnixServicePlatform {
+        type SessionHandle = ();
+        type TaskHandle = ();
+        type TaskLivenessCache = UnixTaskLivenessCache;
+
+        fn spawn_session(
+            spec: &SessionSpec,
+            stderr_path: &Path,
+        ) -> Result<(Child, Self::SessionHandle)> {
+            spawn_serve_child(spec, stderr_path).map(|child| (child, ()))
+        }
+
+        fn spawn_task(
+            spec: &TaskSpec,
+            stdout_path: &Path,
+            stderr_path: &Path,
+        ) -> Result<(Child, Self::TaskHandle)> {
+            spawn_task_child(spec, stdout_path, stderr_path).map(|child| (child, ()))
+        }
+
+        fn recorded_start_identity(pid: u32) -> (Option<String>, Option<i64>) {
+            recorded_start_identity(pid)
+        }
+
+        fn start_identity_is_valid(
+            started_at: &Option<String>,
+            start_epoch_secs: &Option<i64>,
+        ) -> bool {
+            spawn_start_key_ok(started_at, start_epoch_secs)
+        }
+
+        fn session_liveness(record: &SessionRecord) -> Liveness {
+            is_session_alive(record)
+        }
+
+        fn task_liveness(record: &TaskRecord) -> Liveness {
+            task_execution_liveness(record)
+        }
+
+        fn task_liveness_for_tick(
+            record: &TaskRecord,
+            mode: TaskLivenessMode,
+            cache: &mut Self::TaskLivenessCache,
+            now_ms: u64,
+            refresh: TaskLivenessRefresh,
+        ) -> Liveness {
+            #[cfg(target_os = "linux")]
+            {
+                let force_refresh = matches!(refresh, TaskLivenessRefresh::Forced);
+                let (cached_group, refresh_group) = match cache.group {
+                    Some((checked_ms, _, checked_at))
+                        if !force_refresh
+                            && now_ms.saturating_sub(checked_ms) < REHYDRATED_LIVENESS_CACHE_MS
+                            && checked_at.elapsed()
+                                < Duration::from_millis(REHYDRATED_LIVENESS_CACHE_MS) =>
+                    {
+                        (
+                            Some(cache.group.expect("group liveness cache populated").1),
+                            false,
+                        )
+                    }
+                    _ => (None, true),
+                };
+                let (liveness, used_group_liveness) = match mode {
+                    TaskLivenessMode::Owned {
+                        leader_exited: true,
+                    } => task_group_liveness_with_cached_sample(record.pid, cached_group),
+                    TaskLivenessMode::Owned {
+                        leader_exited: false,
+                    }
+                    | TaskLivenessMode::Rehydrated => {
+                        let direct_probe = process_probe(record.pid);
+                        task_execution_liveness_from_probe(record, &direct_probe, cached_group)
+                    }
+                };
+                if used_group_liveness && refresh_group {
+                    cache.group = Some((now_ms, liveness, Instant::now()));
+                }
+                liveness
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                if !matches!(mode, TaskLivenessMode::Rehydrated) {
+                    let _ = (cache, now_ms, refresh);
+                    return task_execution_liveness(record);
+                }
+                let force_refresh = matches!(refresh, TaskLivenessRefresh::Forced);
+                let refresh_sample = force_refresh
+                    || cache
+                        .rehydrated
+                        .map(|(checked_ms, _, checked_at)| {
+                            now_ms.saturating_sub(checked_ms) >= REHYDRATED_LIVENESS_CACHE_MS
+                                || checked_at.elapsed()
+                                    >= Duration::from_millis(REHYDRATED_LIVENESS_CACHE_MS)
+                        })
+                        .unwrap_or(true);
+                if refresh_sample {
+                    cache.rehydrated =
+                        Some((now_ms, task_execution_liveness(record), Instant::now()));
+                }
+                cache
+                    .rehydrated
+                    .expect("rehydrated liveness cache populated")
+                    .1
+            }
+        }
+
+        fn terminate_session(
+            record: &SessionRecord,
+            signal: TerminationSignal,
+            force: bool,
+        ) -> Result<()> {
+            let _ = force;
+            signal_group(record.pid, signal.unix_signal())
+        }
+
+        fn terminate_task(
+            record: &TaskRecord,
+            signal: TerminationSignal,
+            force: bool,
+        ) -> Result<()> {
+            let _ = force;
+            signal_group(record.pid, signal.unix_signal())
+        }
+
+        fn terminate_owned_task(
+            owner: Option<&Self::TaskHandle>,
+            record: &TaskRecord,
+            signal: TerminationSignal,
+            force: bool,
+        ) -> Result<()> {
+            let _ = (owner, force);
+            signal_group(record.pid, signal.unix_signal())
+        }
+
+        fn pid_is_gone(pid: u32) -> bool {
+            matches!(process_probe(pid), ProbeResult::Gone)
+        }
+    }
+
     /// Dispatches one parsed [`ServiceCommand`].
     pub(super) fn dispatch(cmd: ServiceCommand, mut out: impl Write) -> Result<()> {
         match cmd {

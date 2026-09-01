@@ -314,6 +314,225 @@ enum ProbeResult<T> {
     Present(T),
 }
 
+/// The lifecycle operation requested from a future platform adapter.
+/// Windows maps both operations to Job Object termination while retaining
+/// the phase text used by its PID fallback warnings.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminationSignal {
+    Term,
+    Kill,
+}
+
+#[allow(dead_code)]
+impl TerminationSignal {
+    fn phase(self) -> &'static str {
+        match self {
+            Self::Term => "-TERM",
+            Self::Kill => "-KILL",
+        }
+    }
+}
+
+/// Identifies the two task paths whose liveness control flow differs:
+/// an owned task can use its Child as the direct-leader identity, while a
+/// rehydrated task must corroborate the durable PID on every observation.
+/// `leader_exited` additionally identifies the descendant-boundary probe
+/// after the direct child has been reaped.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskLivenessMode {
+    Owned { leader_exited: bool },
+    Rehydrated,
+}
+
+/// Controls whether a platform may use a bounded liveness sample or must
+/// take a fresh observation before authorizing termination/reaping.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskLivenessRefresh {
+    Cached,
+    Forced,
+}
+
+/// Private platform boundary for the later service extraction tickets. The
+/// current supervisor deliberately continues to call its existing free
+/// functions; this adapter only makes the intended seam concrete.
+#[allow(dead_code)]
+trait ServicePlatform {
+    type SessionHandle;
+    type TaskHandle;
+    type TaskLivenessCache: Default;
+
+    fn spawn_session(
+        spec: &SessionSpec,
+        stderr_path: &Path,
+    ) -> Result<(Child, Self::SessionHandle)>;
+    fn spawn_task(
+        spec: &TaskSpec,
+        stdout_path: &Path,
+        stderr_path: &Path,
+    ) -> Result<(Child, Self::TaskHandle)>;
+    fn recorded_start_identity(pid: u32) -> (Option<String>, Option<i64>);
+    fn start_identity_is_valid(started_at: &Option<String>, start_epoch_secs: &Option<i64>)
+    -> bool;
+    fn session_liveness(record: &SessionRecord) -> Liveness;
+    fn task_liveness(record: &TaskRecord) -> Liveness;
+    fn task_liveness_for_tick(
+        record: &TaskRecord,
+        mode: TaskLivenessMode,
+        cache: &mut Self::TaskLivenessCache,
+        now_ms: u64,
+        refresh: TaskLivenessRefresh,
+    ) -> Liveness;
+    fn terminate_session(
+        record: &SessionRecord,
+        signal: TerminationSignal,
+        force: bool,
+    ) -> Result<()>;
+    fn terminate_task(record: &TaskRecord, signal: TerminationSignal, force: bool) -> Result<()>;
+    fn terminate_owned_task(
+        owner: Option<&Self::TaskHandle>,
+        record: &TaskRecord,
+        signal: TerminationSignal,
+        force: bool,
+    ) -> Result<()>;
+    fn pid_is_gone(pid: u32) -> bool;
+}
+
+/// Job Object ownership returned by the future platform spawn seam. The
+/// durable name remains paired with the handle because a restarted service
+/// reopens the name while an in-process tracker uses the handle directly.
+#[allow(dead_code)]
+struct WindowsProcessOwner {
+    job: JobHandle,
+    name: String,
+}
+
+#[allow(dead_code)]
+struct WindowsServicePlatform;
+
+#[allow(dead_code)]
+impl ServicePlatform for WindowsServicePlatform {
+    type SessionHandle = WindowsProcessOwner;
+    type TaskHandle = WindowsProcessOwner;
+    // Windows currently recomputes its Job Object/PID observation each tick;
+    // the shared API still carries cache state so a later migration can make
+    // that policy explicit without changing the consumer shape.
+    type TaskLivenessCache = ();
+
+    fn spawn_session(
+        spec: &SessionSpec,
+        stderr_path: &Path,
+    ) -> Result<(Child, Self::SessionHandle)> {
+        let job_name = fresh_job_name("session");
+        let job = create_job(&job_name, false)?;
+        let mut child = match spawn_serve_child(spec, &job_name) {
+            Ok(child) => child,
+            Err(err) => {
+                drop(job);
+                return Err(err);
+            }
+        };
+        let assign =
+            assign_job_to_child(&job, &child).and_then(|_| resume_initial_thread(child.id()));
+        if let Err(err) = assign {
+            let _ = terminate_job(&job);
+            let _ = child.wait();
+            return Err(err);
+        }
+        let _ = stderr_path;
+        Ok((
+            child,
+            WindowsProcessOwner {
+                job,
+                name: job_name,
+            },
+        ))
+    }
+
+    fn spawn_task(
+        spec: &TaskSpec,
+        stdout_path: &Path,
+        stderr_path: &Path,
+    ) -> Result<(Child, Self::TaskHandle)> {
+        let (child, job, name) = spawn_task_child(spec, stdout_path, stderr_path)?;
+        Ok((child, WindowsProcessOwner { job, name }))
+    }
+
+    fn recorded_start_identity(pid: u32) -> (Option<String>, Option<i64>) {
+        recorded_start_identity(pid)
+    }
+
+    fn start_identity_is_valid(
+        started_at: &Option<String>,
+        start_epoch_secs: &Option<i64>,
+    ) -> bool {
+        spawn_start_key_ok(started_at, start_epoch_secs)
+    }
+
+    fn session_liveness(record: &SessionRecord) -> Liveness {
+        is_session_alive(record)
+    }
+
+    fn task_liveness(record: &TaskRecord) -> Liveness {
+        is_task_alive(record)
+    }
+
+    fn task_liveness_for_tick(
+        record: &TaskRecord,
+        mode: TaskLivenessMode,
+        cache: &mut Self::TaskLivenessCache,
+        now_ms: u64,
+        refresh: TaskLivenessRefresh,
+    ) -> Liveness {
+        // Windows has no Unix process-group scan cache today. Keep the
+        // ownership, clock, and refresh inputs in the seam even though this
+        // implementation intentionally follows its current recomputed path.
+        let _ = (mode, cache, now_ms, refresh);
+        is_task_alive(record)
+    }
+
+    fn terminate_session(
+        record: &SessionRecord,
+        signal: TerminationSignal,
+        force: bool,
+    ) -> Result<()> {
+        if force {
+            force_terminate_record_job(record.job.as_deref(), record.pid, signal.phase())
+        } else {
+            terminate_record_job_or_pid(record.job.as_deref(), record.pid, signal.phase())
+        }
+    }
+
+    fn terminate_task(record: &TaskRecord, signal: TerminationSignal, force: bool) -> Result<()> {
+        if force {
+            force_terminate_record_job(record.job.as_deref(), record.pid, signal.phase())
+        } else {
+            terminate_record_job_or_pid(record.job.as_deref(), record.pid, signal.phase())
+        }
+    }
+
+    fn terminate_owned_task(
+        owner: Option<&Self::TaskHandle>,
+        record: &TaskRecord,
+        signal: TerminationSignal,
+        force: bool,
+    ) -> Result<()> {
+        match owner {
+            Some(owner) => terminate_job(&owner.job),
+            None if force => {
+                force_terminate_record_job(record.job.as_deref(), record.pid, signal.phase())
+            }
+            None => terminate_record_job_or_pid(record.job.as_deref(), record.pid, signal.phase()),
+        }
+    }
+
+    fn pid_is_gone(pid: u32) -> bool {
+        recorded_pid_is_gone(pid)
+    }
+}
+
 /// Dispatches one parsed [`ServiceCommand`].
 pub(super) fn dispatch(cmd: ServiceCommand, mut out: impl Write) -> Result<()> {
     match cmd {
