@@ -17,8 +17,9 @@ use super::records::{
 #[cfg(test)]
 use super::records::{mark_task_start_ack, task_record_path};
 use super::task_tick::{
-    self, Liveness, RunningTask as SharedRunningTask, ServicePlatform, TaskLivenessMode,
-    TaskLivenessRefresh, TerminationSignal, task_cancel_sentinel_path,
+    self, Liveness, REHYDRATED_LIVENESS_CACHE_MS, RunningTask as SharedRunningTask,
+    ServicePlatform, TaskLivenessMode, TaskLivenessRefresh, TerminationSignal,
+    task_cancel_sentinel_path,
 };
 #[cfg(test)]
 use super::task_tick::{finalize_task, tick_one_task};
@@ -302,6 +303,35 @@ struct WindowsProcessOwner {
     name: String,
 }
 
+/// Bounds how often [`WindowsServicePlatform::task_liveness_for_tick`]
+/// re-runs the Job Object/PID probe: one sample is reused for the rest of
+/// the [`REHYDRATED_LIVENESS_CACHE_MS`] window unless a force refresh is
+/// requested, mirroring Unix's rehydrated liveness cache.
+#[derive(Default)]
+struct WindowsTaskLivenessCache {
+    sample: Option<(u64, Liveness, Instant)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TASK_LIVENESS_PROBE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_task_liveness_probe() {
+    TASK_LIVENESS_PROBE_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+fn reset_task_liveness_probe_count() {
+    TASK_LIVENESS_PROBE_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn task_liveness_probe_count() -> u64 {
+    TASK_LIVENESS_PROBE_COUNT.with(std::cell::Cell::get)
+}
+
 #[allow(dead_code)]
 struct WindowsServicePlatform;
 
@@ -309,10 +339,7 @@ struct WindowsServicePlatform;
 impl ServicePlatform for WindowsServicePlatform {
     type SessionHandle = WindowsProcessOwner;
     type TaskHandle = JobHandle;
-    // Windows currently recomputes its Job Object/PID observation each tick;
-    // the shared API still carries cache state so a later migration can make
-    // that policy explicit without changing the consumer shape.
-    type TaskLivenessCache = ();
+    type TaskLivenessCache = WindowsTaskLivenessCache;
 
     fn spawn_session(
         spec: &SessionSpec,
@@ -380,26 +407,39 @@ impl ServicePlatform for WindowsServicePlatform {
         now_ms: u64,
         refresh: TaskLivenessRefresh,
     ) -> Liveness {
-        // Windows has no Unix process-group scan cache today. Keep the
-        // ownership, clock, and refresh inputs in the seam even though this
-        // implementation intentionally follows its current recomputed path.
-        let _ = (mode, cache, now_ms, refresh);
-        match process_probe(record.pid) {
-            ProbeResult::Gone => match owner {
-                Some(job) => match active_job_processes(job) {
-                    Ok(0) => Liveness::Dead,
-                    Ok(_) => Liveness::Live,
-                    Err(_) => Liveness::Unresolved,
+        let _ = mode;
+        let force_refresh = matches!(refresh, TaskLivenessRefresh::Forced);
+        let refresh_sample = force_refresh
+            || cache
+                .sample
+                .map(|(checked_ms, _, checked_at)| {
+                    now_ms.saturating_sub(checked_ms) >= REHYDRATED_LIVENESS_CACHE_MS
+                        || checked_at.elapsed()
+                            >= Duration::from_millis(REHYDRATED_LIVENESS_CACHE_MS)
+                })
+                .unwrap_or(true);
+        if refresh_sample {
+            #[cfg(test)]
+            note_task_liveness_probe();
+            let liveness = match process_probe(record.pid) {
+                ProbeResult::Gone => match owner {
+                    Some(job) => match active_job_processes(job) {
+                        Ok(0) => Liveness::Dead,
+                        Ok(_) => Liveness::Live,
+                        Err(_) => Liveness::Unresolved,
+                    },
+                    None => job_tree_liveness(record.job.as_deref()).unwrap_or(Liveness::Dead),
                 },
-                None => job_tree_liveness(record.job.as_deref()).unwrap_or(Liveness::Dead),
-            },
-            ProbeResult::Unreadable => Liveness::Unresolved,
-            ProbeResult::Present(current) => match &record.started_at {
-                Some(expected) if expected == &current => Liveness::Live,
-                Some(_) => Liveness::Unresolved,
-                None => Liveness::Unresolved,
-            },
+                ProbeResult::Unreadable => Liveness::Unresolved,
+                ProbeResult::Present(current) => match &record.started_at {
+                    Some(expected) if expected == &current => Liveness::Live,
+                    Some(_) => Liveness::Unresolved,
+                    None => Liveness::Unresolved,
+                },
+            };
+            cache.sample = Some((now_ms, liveness, Instant::now()));
         }
+        cache.sample.expect("task liveness cache populated").1
     }
 
     fn terminate_session(
@@ -3226,6 +3266,84 @@ mod tests {
         );
         assert_eq!(session_liveness(&gone).0, Liveness::Unresolved);
         drop(job);
+    }
+
+    /// A rehydrated/draining task's liveness now stays inside the same
+    /// 500ms TTL cache the Unix rehydrated path already had, instead of
+    /// recomputing the Job Object/PID probe on every 100ms tick.
+    #[test]
+    fn rehydrated_task_liveness_is_rate_limited() {
+        let control = temp_control("rehydrated-liveness-cache");
+        let clock = FakeClock::new();
+        let callback_inbox = control.join("callback");
+        let spec = TaskSpec {
+            schema: TASK_SPEC_SCHEMA.to_string(),
+            session: "svc-test".to_string(),
+            command: "cmd.exe".to_string(),
+            args: vec![
+                "/D".to_string(),
+                "/C".to_string(),
+                "ping".to_string(),
+                "-n".to_string(),
+                "31".to_string(),
+                "127.0.0.1".to_string(),
+            ],
+            cwd: None,
+            env: Vec::new(),
+            milestones_ms: Vec::new(),
+            max_duration_ms: 3_600_000,
+            callback: TaskCallback {
+                inbox: callback_inbox.display().to_string(),
+                role: None,
+            },
+        };
+        let mut running = spawn_running_task(&control, "task-rehydrated-cache", spec, &clock);
+        let mut child = running.child.take().expect("rehydrated task child");
+
+        reset_task_liveness_probe_count();
+        assert!(matches!(
+            tick_one_task(&control, "task-rehydrated-cache", &mut running, &clock),
+            Ok(TaskTick::StillRunning)
+        ));
+        assert_eq!(
+            task_liveness_probe_count(),
+            1,
+            "the first rehydrated tick samples liveness once"
+        );
+
+        clock.advance(100);
+        tick_one_task(&control, "task-rehydrated-cache", &mut running, &clock)
+            .expect("cached liveness tick");
+        assert_eq!(
+            task_liveness_probe_count(),
+            1,
+            "rehydrated liveness remains cached inside the 500ms window"
+        );
+
+        clock.advance(REHYDRATED_LIVENESS_CACHE_MS - 101);
+        tick_one_task(&control, "task-rehydrated-cache", &mut running, &clock)
+            .expect("cached liveness tick before refresh");
+        assert_eq!(
+            task_liveness_probe_count(),
+            1,
+            "rehydrated liveness remains cached up to the exact boundary"
+        );
+
+        clock.advance(1);
+        tick_one_task(&control, "task-rehydrated-cache", &mut running, &clock)
+            .expect("refresh liveness tick");
+        assert_eq!(
+            task_liveness_probe_count(),
+            2,
+            "the cache refreshes once the 500ms TTL elapses"
+        );
+
+        if let Some(job) = running.task_handle.take() {
+            let _ = terminate_job(&job);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(control);
     }
 
     #[test]

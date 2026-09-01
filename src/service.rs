@@ -235,8 +235,9 @@ mod imp {
         task_responses_dir, task_start_ack_path, task_start_rollback_dir,
     };
     use super::task_tick::{
-        self, Liveness, RunningTask as SharedRunningTask, ServicePlatform, TaskLivenessMode,
-        TaskLivenessRefresh, TerminationSignal, task_cancel_sentinel_path,
+        self, Liveness, REHYDRATED_LIVENESS_CACHE_MS, RunningTask as SharedRunningTask,
+        ServicePlatform, TaskLivenessMode, TaskLivenessRefresh, TerminationSignal,
+        task_cancel_sentinel_path,
     };
     #[cfg(test)]
     use super::task_tick::{deliver_task_event, finalize_task, tick_one_task};
@@ -283,11 +284,6 @@ mod imp {
     /// Interval between `Run`'s request-directory scans, and between polls of
     /// a pending await (start response, stop/kill grace).
     const POLL_INTERVAL_MS: u64 = 100;
-    /// Minimum interval between liveness samples for one rehydrated task's
-    /// process group. The supervisor still ticks every 100 ms, but the costly
-    /// Linux `/proc` table scan and non-Linux `ps` probe are each allowed at
-    /// most twice per second in the steady state.
-    const REHYDRATED_LIVENESS_CACHE_MS: u64 = 500;
     /// Initial delay before retrying a failed task-event callback delivery.
     /// Governs both milestone and terminal delivery — the same bounded
     /// exponential backoff policy applies to every task event.
@@ -482,10 +478,7 @@ mod imp {
             }
             #[cfg(not(target_os = "linux"))]
             {
-                if !matches!(mode, TaskLivenessMode::Rehydrated) {
-                    let _ = (cache, now_ms, refresh);
-                    return task_execution_liveness(record);
-                }
+                let _ = mode;
                 let force_refresh = matches!(refresh, TaskLivenessRefresh::Forced);
                 let refresh_sample = force_refresh
                     || cache
@@ -6644,6 +6637,77 @@ mod imp {
 
             signal_group(running.record.pid, libc::SIGKILL).expect("clean up rehydrated task");
             child.wait().expect("wait for rehydrated task");
+        }
+
+        /// The owned-drain arm (leader reaped, group descendant still alive)
+        /// now shares the same rehydrated liveness cache instead of
+        /// re-probing on every 100ms tick. `max_duration_ms` is set far in
+        /// the future so only the cache is under test, not TERM/KILL
+        /// escalation (the force-refresh-before-signalling rule is preserved
+        /// by construction, since escalation always passes
+        /// `TaskLivenessRefresh::Forced`, and is exercised end-to-end by
+        /// `owned_linux_group_scan_is_rate_limited_and_forced_for_timeout`'s
+        /// shared `task_tick.rs` logic on Linux).
+        #[cfg(not(target_os = "linux"))]
+        #[test]
+        fn owned_drain_liveness_is_rate_limited() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("owned-drain-liveness-cache");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let spec = task_spec(
+                "svc-1",
+                "sh",
+                vec![
+                    "-c".to_string(),
+                    "trap '' TERM; sleep 30 & exit 0".to_string(),
+                ],
+                vec![],
+                3_600_000,
+                &callback_inbox.display().to_string(),
+            );
+            let mut running = spawn_running_task(&dir.path, "task-owned-drain-cache", spec, &clock);
+            wait_for_group_descendant(&mut running);
+
+            reset_process_probe_count();
+            assert!(matches!(
+                tick_one_task(&dir.path, "task-owned-drain-cache", &mut running, &clock),
+                Ok(TaskTick::StillRunning)
+            ));
+            let first_sample = process_probe_count();
+            assert!(
+                first_sample >= 1,
+                "the first owned reaped-leader tick samples liveness"
+            );
+
+            clock.advance(100);
+            tick_one_task(&dir.path, "task-owned-drain-cache", &mut running, &clock)
+                .expect("cached owned liveness tick");
+            assert_eq!(
+                process_probe_count(),
+                first_sample,
+                "owned drain liveness remains cached inside the 500ms window"
+            );
+
+            clock.advance(REHYDRATED_LIVENESS_CACHE_MS - 100);
+            tick_one_task(&dir.path, "task-owned-drain-cache", &mut running, &clock)
+                .expect("owned boundary liveness tick");
+            let refreshed_sample = process_probe_count();
+            assert!(
+                refreshed_sample > first_sample,
+                "the exact boundary refreshes the owned drain liveness"
+            );
+
+            clock.advance(100);
+            tick_one_task(&dir.path, "task-owned-drain-cache", &mut running, &clock)
+                .expect("owned re-cached liveness tick");
+            assert_eq!(
+                process_probe_count(),
+                refreshed_sample,
+                "owned drain liveness remains cached again after the refresh"
+            );
+
+            signal_group(running.record.pid, libc::SIGKILL).expect("clean up owned-drain task");
         }
 
         /// Record-based task waits keep the direct PID probe live on every
