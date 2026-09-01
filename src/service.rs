@@ -209,6 +209,8 @@ mod records;
 
 #[cfg(unix)]
 mod imp {
+    #[cfg(all(test, target_os = "linux"))]
+    use super::records::mark_task_start_ack;
     use super::records::{
         AwaitConfig, SessionRecord, StartResponse, TEST_TASK_ROLLBACK_RECONCILE_BARRIER,
         TEST_TASK_ROLLBACK_REQUEST_BARRIER, TaskStartResponse, discard_pending_task_start_request,
@@ -226,10 +228,10 @@ mod imp {
         wait_for_test_task_rollback_cleanup_barrier, write_session_record, write_start_response,
         write_task_record, write_task_start_response,
     };
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(test)]
     use super::records::{
-        mark_task_start_ack, session_record_path, task_processing_dir, task_record_path,
-        task_requests_dir, task_responses_dir, task_start_ack_path, task_start_rollback_dir,
+        session_record_path, task_processing_dir, task_record_path, task_requests_dir,
+        task_responses_dir, task_start_ack_path, task_start_rollback_dir,
     };
     use super::*;
     #[cfg(test)]
