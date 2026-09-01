@@ -7571,6 +7571,48 @@ mod imp {
                 .expect("reap the terminated fixture task");
         }
 
+        /// `force=true` skips every wait, so a racing admission can never
+        /// land through the `task_wait`/`session_wait` callbacks the
+        /// non-force rescan tests above use. `rescan_owned_tasks` is
+        /// exercised directly instead: a live task record present when the
+        /// rescan runs must be force-terminated and its record removed, not
+        /// merely reported as residue.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn rescan_force_terminates_and_removes_a_racing_task_record() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("rescan-force-racer");
+            let mut child = spawn_live_task_child(&dir.path, "task-racer");
+            let racer = live_task_record("svc-1", "task-racer", child.id());
+            write_task_record(&dir.path, &racer).expect("write racing task");
+
+            let admission = AdmissionGuard::acquire(&dir.path).expect("admission lock");
+            let mut residue = Vec::new();
+            rescan_owned_tasks(&admission, "svc-1", true, &mut residue)
+                .expect("force rescan_owned_tasks");
+            drop(admission);
+
+            assert!(
+                residue.is_empty(),
+                "rescan_owned_tasks' force branch removes the racer instead of reporting it: {residue:?}"
+            );
+            assert!(
+                read_task_record(&dir.path, "task-racer")
+                    .expect("read")
+                    .is_none(),
+                "rescan_owned_tasks' force branch removes the racing task's record"
+            );
+
+            let liveness = task_execution_liveness_after_retry(&racer, KILL_GRACE_MS);
+            assert_eq!(
+                liveness,
+                Liveness::Dead,
+                "rescan_owned_tasks' force branch terminates the racing task's process"
+            );
+
+            child.wait().expect("reap racer");
+        }
+
         /// Multiple unresolved task records are retained without entering a
         /// grace wait or signalling their uncorroborated process groups.
         #[cfg(target_os = "linux")]

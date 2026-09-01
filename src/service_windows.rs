@@ -3637,4 +3637,54 @@ mod tests {
         drop(reaped_job);
         let _ = fs::remove_dir_all(control);
     }
+
+    /// `force=true` skips every wait, so a racing admission can never land
+    /// through the `task_wait`/`session_wait` callbacks the non-force rescan
+    /// tests above use. `rescan_owned_tasks` is exercised directly instead,
+    /// mirroring `unresolved_task_cleanup_retains_then_force_removes_record`'s
+    /// direct-call style: a live task record present when the rescan runs
+    /// must be force-terminated and its record removed, not merely reported
+    /// as residue.
+    #[test]
+    fn rescan_force_terminates_and_removes_a_racing_task_record() {
+        let control = temp_control("rescan-force-racer");
+        let (mut child, job, job_name) = spawn_live_task_child(&control, "task-racer");
+        let racer = live_task_record("svc-1", "task-racer", child.id(), Some(job_name));
+        write_task_record(&control, &racer).expect("write racing task");
+
+        let admission = AdmissionGuard::acquire(&control).expect("admission lock");
+        let mut residue = Vec::new();
+        rescan_owned_tasks(&admission, "svc-1", true, &mut residue)
+            .expect("force rescan_owned_tasks");
+        drop(admission);
+
+        assert!(
+            residue.is_empty(),
+            "rescan_owned_tasks' force branch removes the racer instead of reporting it: {residue:?}"
+        );
+        assert!(
+            read_task_record(&control, "task-racer")
+                .expect("read")
+                .is_none(),
+            "rescan_owned_tasks' force branch removes the racing task's record"
+        );
+
+        // `TerminateJobObject` is asynchronous, so poll rather than trusting
+        // a single reprobe right after the call returns.
+        let deadline = Instant::now() + Duration::from_millis(KILL_GRACE_MS);
+        let mut liveness = is_task_alive(&racer);
+        while liveness != Liveness::Dead && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            liveness = is_task_alive(&racer);
+        }
+        assert_eq!(
+            liveness,
+            Liveness::Dead,
+            "rescan_owned_tasks' force branch terminates the racing task's process"
+        );
+
+        let _ = child.wait();
+        drop(job);
+        let _ = fs::remove_dir_all(control);
+    }
 }
