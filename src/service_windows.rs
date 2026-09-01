@@ -1,8 +1,9 @@
 use super::records::{
     AwaitConfig, SessionRecord, StartResponse, TEST_TASK_ROLLBACK_RECONCILE_BARRIER,
     TEST_TASK_ROLLBACK_REQUEST_BARRIER, TaskStartResponse, discard_pending_task_start_request,
-    fresh_request_id, fresh_session_id, fresh_task_id, list_session_records, list_task_records,
-    list_task_start_acks, list_task_start_response_claims, list_task_start_rollbacks,
+    fresh_request_id, fresh_session_id, fresh_task_id, list_session_records,
+    list_task_record_ids, list_task_records, list_task_start_acks,
+    list_task_start_response_claims, list_task_start_rollbacks,
     mark_task_start_rollback, read_session_record, read_task_record, reclaim_stale_requests,
     remove_session_record, remove_task_logs_dir, remove_task_record, remove_task_start_ack,
     remove_task_start_response_files, remove_task_start_rollback, responses_dir,
@@ -827,13 +828,32 @@ struct AdmissionGuard<'a> {
     /// `Some` whenever the lock is held; `None` only inside
     /// [`AdmissionGuard::unlocked_wait`]. Dropping the `File` unlocks.
     lock: Option<File>,
+    /// Every task record classified so far, keyed by id via
+    /// `task_index`. Seeded once by [`AdmissionGuard::task_ids_for_session`]
+    /// and grown only by [`AdmissionGuard::refresh_new_task_ids`] — an id
+    /// already present here is never re-parsed.
+    task_records: Vec<TaskRecord>,
+    task_index: std::collections::HashMap<String, usize>,
+    task_records_loaded: bool,
 }
+
+#[cfg(test)]
+static TASK_FULL_LISTINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TASK_NEW_ID_PARSES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TASK_CONFIRM_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 impl<'a> AdmissionGuard<'a> {
     fn acquire(control: &'a Path) -> Result<Self> {
         Ok(Self {
             control,
             lock: Some(acquire_admission_lock(control)?),
+            task_records: Vec::new(),
+            task_index: std::collections::HashMap::new(),
+            task_records_loaded: false,
         })
     }
 
@@ -843,12 +863,86 @@ impl<'a> AdmissionGuard<'a> {
 
     /// Runs `wait` with the admission lock released, then re-acquires it
     /// before returning. Callers must re-probe any liveness they decided
-    /// on before the wait.
+    /// on before the wait. Also the sole point that refreshes the task
+    /// cache for newly admitted ids: this is the only place the lock is
+    /// ever released, so it is the only place a new admission could have
+    /// landed.
     fn unlocked_wait<T>(&mut self, wait: impl FnOnce() -> T) -> Result<T> {
         self.lock = None;
         let value = wait();
         self.lock = Some(acquire_admission_lock(self.control)?);
+        self.refresh_new_task_ids()?;
         Ok(value)
+    }
+
+    /// Picks up any task admitted while the lock was released: one cheap
+    /// id-only directory scan (no JSON decode), then one parse per id not
+    /// already cached. A no-op before the first `task_ids_for_session`
+    /// call, since there is nothing to refresh yet — that call performs
+    /// the one full listing this cache is seeded from, and nothing can be
+    /// admitted before this guard's own first lock acquisition anyway.
+    fn refresh_new_task_ids(&mut self) -> Result<()> {
+        if !self.task_records_loaded {
+            return Ok(());
+        }
+        for id in list_task_record_ids(self.control)? {
+            if !self.task_index.contains_key(&id)
+                && let Some(record) = read_task_record(self.control, &id)?
+            {
+                self.task_index.insert(id, self.task_records.len());
+                self.task_records.push(record);
+                #[cfg(test)]
+                TASK_NEW_ID_PARSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Ids currently known to belong to `session_id`. The first call
+    /// across this guard's lifetime performs the one full `tasks/`
+    /// listing+parse the whole cache is seeded from; every later call is
+    /// a plain in-memory read — freshness for anything admitted since is
+    /// already maintained by `unlocked_wait`, not by this accessor. An id
+    /// already cached is never re-parsed here: a task's
+    /// `spec`/`spec.session` never changes after creation
+    /// (`upgrade_legacy_task_record` only ever touches
+    /// `start_epoch_secs`), so the classification this returns is always
+    /// correct. The lifecycle fields (`state`/`exit_code`/...) a cached
+    /// entry carries can go stale if the daemon's own supervisor tick
+    /// (`task_tick::finalize_task`) terminalizes it later — callers must
+    /// treat [`AdmissionGuard::cached_task`] accordingly (see its doc
+    /// comment).
+    fn task_ids_for_session(&mut self, session_id: &str) -> Result<Vec<String>> {
+        if !self.task_records_loaded {
+            self.task_records = list_task_records(self.control)?;
+            self.task_index = self
+                .task_records
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (r.id.clone(), i))
+                .collect();
+            self.task_records_loaded = true;
+            #[cfg(test)]
+            TASK_FULL_LISTINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(self
+            .task_records
+            .iter()
+            .filter(|r| r.spec.session == session_id)
+            .map(|r| r.id.clone())
+            .collect())
+    }
+
+    /// The last-classified copy of `id`, if known. **Trust it directly
+    /// only when it is already terminal** (a task's terminal state is
+    /// final, so a cached terminal read is never stale in a way that
+    /// changes a cleanup decision). Never use a cached `Running` copy to
+    /// decide whether to probe or signal a process — confirm it first
+    /// with a direct `read_task_record`, since the supervisor can
+    /// terminalize it at any time this guard is not the one holding the
+    /// lock exclusively.
+    fn cached_task(&self, id: &str) -> Option<&TaskRecord> {
+        self.task_index.get(id).map(|&i| &self.task_records[i])
     }
 }
 
@@ -1822,18 +1916,33 @@ fn reap_session_tasks_with_wait(
     session_id: &str,
     force: bool,
     wait: impl Fn(&TaskRecord, u64),
-) -> Result<Vec<CleanupResidue>> {
+) -> Result<(Vec<CleanupResidue>, std::collections::HashSet<String>)> {
     let control = admission.control();
+    let ids = admission.task_ids_for_session(session_id)?;
+    let mut handled = std::collections::HashSet::new();
     let mut residue = Vec::new();
-    for record in list_task_records(control)? {
-        if record.spec.session != session_id {
+    for id in ids {
+        handled.insert(id.clone());
+        let Some(mut record) = admission.cached_task(&id).cloned() else {
             continue;
-        }
+        };
         if record.state != TaskState::Running {
             remove_reaped_task_record(control, &record)?;
             continue;
         }
-        let mut record = record;
+        // The cached copy says Running; confirm before acting on it — the
+        // supervisor's own tick can have terminalized it since this guard
+        // classified it.
+        match read_task_record(control, &id)? {
+            Some(fresh) => record = fresh,
+            None => continue,
+        }
+        #[cfg(test)]
+        TASK_CONFIRM_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if record.state != TaskState::Running {
+            remove_reaped_task_record(control, &record)?;
+            continue;
+        }
         upgrade_legacy_task_record(control, &mut record)?;
         let mut liveness = is_task_alive(&record);
         if force {
@@ -1859,25 +1968,43 @@ fn reap_session_tasks_with_wait(
             let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-TERM");
             term_sent = true;
         }
-        if liveness != Liveness::Dead {
-            liveness = admission.unlocked_wait(|| {
-                wait(&record, KILL_GRACE_MS);
-                cleanup_liveness_after_pid_signal(is_task_alive(&record), record.pid)
-            })?;
+        if liveness != Liveness::Dead
+            && let Some(terminal) = wait_then_recheck_terminal(
+                admission,
+                &record,
+                &mut liveness,
+                KILL_GRACE_MS,
+                &wait,
+            )?
+        {
+            remove_reaped_task_record(control, &terminal)?;
+            continue;
         }
         if liveness == Liveness::Live && !term_sent {
             let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-TERM");
-            liveness = admission.unlocked_wait(|| {
-                wait(&record, KILL_GRACE_MS);
-                cleanup_liveness_after_pid_signal(is_task_alive(&record), record.pid)
-            })?;
+            if let Some(terminal) = wait_then_recheck_terminal(
+                admission,
+                &record,
+                &mut liveness,
+                KILL_GRACE_MS,
+                &wait,
+            )? {
+                remove_reaped_task_record(control, &terminal)?;
+                continue;
+            }
         }
         if liveness == Liveness::Live {
             let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-KILL");
-            liveness = admission.unlocked_wait(|| {
-                wait(&record, KILL_GRACE_MS);
-                cleanup_liveness_after_pid_signal(is_task_alive(&record), record.pid)
-            })?;
+            if let Some(terminal) = wait_then_recheck_terminal(
+                admission,
+                &record,
+                &mut liveness,
+                KILL_GRACE_MS,
+                &wait,
+            )? {
+                remove_reaped_task_record(control, &terminal)?;
+                continue;
+            }
         }
         if liveness == Liveness::Dead {
             remove_reaped_task_record(control, &record)?;
@@ -1885,7 +2012,35 @@ fn reap_session_tasks_with_wait(
             residue.push(task_residue(&record, liveness));
         }
     }
-    Ok(residue)
+    Ok((residue, handled))
+}
+
+/// Runs one grace wait like [`AdmissionGuard::unlocked_wait`], then
+/// re-reads this one record directly: the daemon's own supervisor tick can
+/// persist a terminal state for it while the lock was released
+/// (`task_tick::finalize_task`), and a definitive terminal record beats
+/// continuing the probe-based ladder on a now-stale `Running` copy, whose
+/// pid could since have been reused by an unrelated process. Returns the
+/// terminal record to remove without further signaling, or `None` when the
+/// record is still genuinely `Running` and the wait's own probe verdict
+/// (written back into `liveness`) should govern.
+fn wait_then_recheck_terminal(
+    admission: &mut AdmissionGuard,
+    record: &TaskRecord,
+    liveness: &mut Liveness,
+    grace_ms: u64,
+    wait: &impl Fn(&TaskRecord, u64),
+) -> Result<Option<TaskRecord>> {
+    *liveness = admission.unlocked_wait(|| {
+        wait(record, grace_ms);
+        cleanup_liveness_after_pid_signal(is_task_alive(record), record.pid)
+    })?;
+    #[cfg(test)]
+    TASK_CONFIRM_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    match read_task_record(admission.control(), &record.id)? {
+        Some(fresh) if fresh.state != TaskState::Running => Ok(Some(fresh)),
+        _ => Ok(None),
+    }
 }
 
 /// Accounts for every task record owned by `session_id` that the reaper's
@@ -1908,24 +2063,37 @@ fn reap_session_tasks_with_wait(
 /// `force` it mirrors the reaper's force branch instead, so `--force`
 /// still leaves nothing behind.
 fn rescan_owned_tasks(
-    admission: &AdmissionGuard,
+    admission: &mut AdmissionGuard,
     session_id: &str,
     force: bool,
+    handled: &std::collections::HashSet<String>,
     residue: &mut Vec<CleanupResidue>,
 ) -> Result<()> {
     let control = admission.control();
-    for record in list_task_records(control)? {
-        if record.spec.session != session_id {
+    let ids = admission.task_ids_for_session(session_id)?;
+    for id in ids {
+        if handled.contains(&id) {
             continue;
         }
-        if residue.iter().any(|entry| entry.id == record.id) {
+        let Some(cached) = admission.cached_task(&id).cloned() else {
             continue;
-        }
+        };
+        // A cached terminal entry is trusted directly, same rule as the
+        // reaper; a cached Running entry was never handled by reap's own
+        // pass, so it still needs one direct confirmation before this pass
+        // decides anything from it.
+        let mut record = if cached.state != TaskState::Running {
+            cached
+        } else {
+            match read_task_record(control, &id)? {
+                Some(fresh) => fresh,
+                None => continue,
+            }
+        };
         if record.state != TaskState::Running {
             remove_reaped_task_record(control, &record)?;
             continue;
         }
-        let mut record = record;
         upgrade_legacy_task_record(control, &mut record)?;
         // The same probe the reaper's first pass uses, so a record that
         // only this pass sees is judged identically. The non-retrying
@@ -2398,11 +2566,12 @@ fn stop_session_record_with_wait(
             }
         }
     }
-    let mut residue = reap_session_tasks_with_wait(admission, &record.id, force, task_wait)?;
+    let (mut residue, handled) =
+        reap_session_tasks_with_wait(admission, &record.id, force, task_wait)?;
     // From here to the session-record decision the admission lock is held
     // without interruption, so nothing can be admitted between the rescan
     // and `remove_session_record`.
-    rescan_owned_tasks(admission, &record.id, force, &mut residue)?;
+    rescan_owned_tasks(admission, &record.id, force, &handled, &mut residue)?;
     if liveness == Liveness::Dead && residue.is_empty() {
         remove_session_record(control, &record.id)?;
     } else if liveness != Liveness::Dead {
@@ -2680,6 +2849,7 @@ fn wait_for_control_release_with_timeout(
 mod tests {
     use super::*;
     use crate::task::{FakeClock, TASK_SPEC_SCHEMA, TaskCallback};
+    use crate::test_support::serialize_forks_and_locks;
     use std::path::PathBuf;
 
     fn session_spec() -> SessionSpec {
@@ -2839,6 +3009,7 @@ mod tests {
 
     #[test]
     fn teardown_continues_after_control_release_timeout() {
+        let _guard = serialize_forks_and_locks();
         let control = temp_control("teardown-control-release-timeout");
         let held = acquire_control_lock(&control).expect("lock");
         let record = SessionRecord {
@@ -2877,6 +3048,90 @@ mod tests {
             "teardown reached durable-record cleanup after the warning"
         );
         drop(held);
+        let _ = fs::remove_dir_all(control);
+    }
+
+    /// A non-force `service teardown` across several sessions with only
+    /// terminal task history performs exactly one full `tasks/` listing
+    /// for the whole run — not one per session — and confirms nothing
+    /// directly.
+    #[test]
+    fn execute_teardown_with_timeout_with_terminal_only_history_performs_one_full_listing_and_no_confirm_reads()
+     {
+        let _guard = serialize_forks_and_locks();
+        TASK_FULL_LISTINGS.store(0, std::sync::atomic::Ordering::Relaxed);
+        TASK_CONFIRM_READS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let control = temp_control("teardown-terminal-only-history");
+        for id in ["svc-1", "svc-2", "svc-3"] {
+            write_session_record(
+                &control,
+                &SessionRecord {
+                    id: id.to_string(),
+                    spec: session_spec(),
+                    pid: u32::MAX - 1,
+                    started_at: None,
+                    start_epoch_secs: None,
+                    job: None,
+                },
+            )
+            .expect("write session");
+        }
+        let terminal = |id: &str, session: &str| TaskRecord {
+            id: id.to_string(),
+            request_id: None,
+            admission: TaskAdmissionPhase::Committed,
+            spec: task_spec(session),
+            pid: u32::MAX - 1,
+            started_at: None,
+            start_epoch_secs: None,
+            job: None,
+            started_ms: None,
+            state: TaskState::Completed,
+            exit_code: Some(0),
+            elapsed_ms: Some(1),
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            delivered_milestones: 0,
+            terminal_delivered_at_ms: None,
+        };
+        write_task_record(&control, &terminal("task-1a", "svc-1")).expect("write task-1a");
+        write_task_record(&control, &terminal("task-1b", "svc-1")).expect("write task-1b");
+        write_task_record(&control, &terminal("task-2a", "svc-2")).expect("write task-2a");
+        write_task_record(&control, &terminal("task-3a", "svc-3")).expect("write task-3a");
+
+        let mut out = Vec::new();
+        let mut warning = Vec::new();
+        execute_teardown_with_timeout(
+            &control,
+            false,
+            &mut out,
+            Duration::from_millis(20),
+            &mut warning,
+        )
+        .expect("teardown");
+
+        assert_eq!(
+            TASK_FULL_LISTINGS.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one full tasks/ listing for the entire multi-session teardown"
+        );
+        assert_eq!(
+            TASK_CONFIRM_READS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "every entry is trusted directly as cached-terminal"
+        );
+        for id in ["svc-1", "svc-2", "svc-3"] {
+            assert!(
+                read_session_record(&control, id).expect("read").is_none(),
+                "{id}'s session record is removed"
+            );
+        }
+        for id in ["task-1a", "task-1b", "task-2a", "task-3a"] {
+            assert!(
+                read_task_record(&control, id).expect("read").is_none(),
+                "{id}'s task record is removed"
+            );
+        }
         let _ = fs::remove_dir_all(control);
     }
 
@@ -3880,8 +4135,96 @@ mod tests {
         let _ = fs::remove_dir_all(control);
     }
 
+    /// A non-force `service stop` on a session with only terminal task
+    /// history performs exactly one full `tasks/` listing and confirms
+    /// nothing directly.
+    #[test]
+    fn execute_stop_with_terminal_only_history_performs_one_full_listing_and_no_confirm_reads()
+     {
+        let _guard = serialize_forks_and_locks();
+        TASK_FULL_LISTINGS.store(0, std::sync::atomic::Ordering::Relaxed);
+        TASK_CONFIRM_READS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let control = temp_control("stop-terminal-only-history");
+        let session_record = SessionRecord {
+            id: "svc-1".to_string(),
+            spec: session_spec(),
+            pid: u32::MAX - 1,
+            started_at: None,
+            start_epoch_secs: None,
+            job: None,
+        };
+        write_session_record(&control, &session_record).expect("write session");
+
+        let terminal = |id: &str, session: &str| TaskRecord {
+            id: id.to_string(),
+            request_id: None,
+            admission: TaskAdmissionPhase::Committed,
+            spec: task_spec(session),
+            pid: u32::MAX - 1,
+            started_at: None,
+            start_epoch_secs: None,
+            job: None,
+            started_ms: None,
+            state: TaskState::Completed,
+            exit_code: Some(0),
+            elapsed_ms: Some(1),
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            delivered_milestones: 0,
+            terminal_delivered_at_ms: None,
+        };
+        write_task_record(&control, &terminal("task-owned-1", "svc-1")).expect("write owned-1");
+        write_task_record(&control, &terminal("task-owned-2", "svc-1")).expect("write owned-2");
+        write_task_record(&control, &terminal("task-other", "svc-2")).expect("write other");
+
+        let mut out = Vec::new();
+        execute_stop(&control, "svc-1", false, &mut out).expect("stop svc-1");
+
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("stopped session svc-1")
+        );
+        assert_eq!(
+            TASK_FULL_LISTINGS.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "exactly one full tasks/ listing"
+        );
+        assert_eq!(
+            TASK_CONFIRM_READS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a terminal cache entry is trusted directly, with no confirm read"
+        );
+        assert!(
+            read_session_record(&control, "svc-1")
+                .expect("read")
+                .is_none(),
+            "svc-1's session record is removed"
+        );
+        assert!(
+            read_task_record(&control, "task-owned-1")
+                .expect("read")
+                .is_none(),
+            "svc-1's first owned task record is removed"
+        );
+        assert!(
+            read_task_record(&control, "task-owned-2")
+                .expect("read")
+                .is_none(),
+            "svc-1's second owned task record is removed"
+        );
+        assert!(
+            read_task_record(&control, "task-other")
+                .expect("read")
+                .is_some(),
+            "an unrelated session's task record is untouched"
+        );
+        let _ = fs::remove_dir_all(control);
+    }
+
     #[test]
     fn unresolved_task_cleanup_retains_then_force_removes_record() {
+        let _guard = serialize_forks_and_locks();
         let control = temp_control("unresolved-cleanup");
         let record = task_record(
             "svc-test",
@@ -3892,8 +4235,9 @@ mod tests {
         write_task_record(&control, &record).expect("write unresolved task");
 
         let mut admission = AdmissionGuard::acquire(&control).expect("admission lock");
-        let residue = reap_session_tasks_with_wait(&mut admission, "svc-test", false, |_, _| {})
-            .expect("retain unresolved task");
+        let (residue, _handled) =
+            reap_session_tasks_with_wait(&mut admission, "svc-test", false, |_, _| {})
+                .expect("retain unresolved task");
         assert_eq!(residue.len(), 1);
         assert_eq!(residue[0].liveness, Liveness::Unresolved);
         assert!(
@@ -3902,8 +4246,9 @@ mod tests {
                 .is_some()
         );
 
-        let residue = reap_session_tasks_with_wait(&mut admission, "svc-test", true, |_, _| {})
-            .expect("force unresolved task cleanup");
+        let (residue, _handled) =
+            reap_session_tasks_with_wait(&mut admission, "svc-test", true, |_, _| {})
+                .expect("force unresolved task cleanup");
         assert!(residue.is_empty());
         assert!(
             read_task_record(&control, &record.id)
@@ -3967,6 +4312,7 @@ mod tests {
     /// every task-start client for up to the sum of the grace windows.
     #[test]
     fn stop_grace_does_not_hold_the_admission_lock() {
+        let _guard = serialize_forks_and_locks();
         let control = temp_control("stop-grace-unlocked");
         let inbox = control.join("inbox");
         fs::create_dir_all(&inbox).expect("create session inbox");
@@ -4072,6 +4418,7 @@ mod tests {
     /// and the session record is retained.
     #[test]
     fn rescan_reports_a_task_admitted_during_a_released_grace_wait() {
+        let _guard = serialize_forks_and_locks();
         let control = temp_control("rescan-live-racer");
         let session_record = SessionRecord {
             id: "svc-1".to_string(),
@@ -4165,6 +4512,7 @@ mod tests {
     /// `task_start_is_rejected_while_a_stop_owns_the_session`.
     #[test]
     fn task_start_is_rejected_while_a_stop_owns_the_session() {
+        let _guard = serialize_forks_and_locks();
         let control = temp_control("admit-stopping");
         let inbox = control.join("inbox");
         fs::create_dir_all(&inbox).expect("create inbox");
@@ -4326,6 +4674,7 @@ mod tests {
     /// success path.
     #[test]
     fn rescan_cleans_up_a_terminal_task_admitted_during_a_released_grace_wait() {
+        let _guard = serialize_forks_and_locks();
         let control = temp_control("rescan-terminal-racer");
         let session_record = SessionRecord {
             id: "svc-1".to_string(),
@@ -4406,6 +4755,206 @@ mod tests {
         let _ = fs::remove_dir_all(control);
     }
 
+    /// A task admitted for a session not yet reached in a teardown loop —
+    /// or one already finished — is discovered the moment `unlocked_wait`
+    /// releases the lock, via its embedded id-only refresh, not by a
+    /// second full listing. One shared `AdmissionGuard`, mirroring how
+    /// `execute_teardown_with_timeout` shares one guard across its session
+    /// loop, proves the delta lands during svc-j's own wait.
+    #[test]
+    fn unlocked_wait_discovers_a_task_admitted_for_a_later_session() {
+        let _guard = serialize_forks_and_locks();
+        let control = temp_control("unlocked-wait-later-session");
+        TASK_FULL_LISTINGS.store(0, std::sync::atomic::Ordering::Relaxed);
+        TASK_NEW_ID_PARSES.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        let session_j = SessionRecord {
+            id: "svc-j".to_string(),
+            spec: session_spec(),
+            pid: u32::MAX - 1,
+            started_at: None,
+            start_epoch_secs: None,
+            job: None,
+        };
+        write_session_record(&control, &session_j).expect("write svc-j");
+        let session_k = SessionRecord {
+            id: "svc-k".to_string(),
+            spec: session_spec(),
+            pid: u32::MAX - 1,
+            started_at: None,
+            start_epoch_secs: None,
+            job: None,
+        };
+        write_session_record(&control, &session_k).expect("write svc-k");
+
+        // A live task the reaper does see, so svc-j's reap reaches its
+        // task-level grace wait — the point at which the racing admission
+        // for svc-k lands. Terminating its job ends this one, so it leaves
+        // no residue of its own.
+        let (mut task_j_child, task_j_job, task_j_job_name) =
+            spawn_live_task_child(&control, "task-j");
+        let task_j = live_task_record("svc-j", "task-j", task_j_child.id(), Some(task_j_job_name));
+        write_task_record(&control, &task_j).expect("write task-j");
+
+        let mut racer = live_task_record("svc-k", "task-k-racer", u32::MAX - 1, None);
+        racer.started_at = None;
+        racer.state = TaskState::Completed;
+        racer.exit_code = Some(0);
+        racer.elapsed_ms = Some(1);
+
+        let mut admission = AdmissionGuard::acquire(&control).expect("admission lock");
+        let residue_j = stop_session_record_with_wait(
+            &mut admission,
+            &session_j,
+            false,
+            |_, _| {},
+            // Stands in for a task admitted for a session this teardown
+            // loop has not reached yet. `TerminateJobObject` is
+            // asynchronous, so poll the terminated fixture task rather
+            // than trusting a single reprobe right after the write.
+            |record, grace_ms| {
+                write_task_record(&control, &racer).expect("admit racing task for svc-k");
+                let deadline = Instant::now() + Duration::from_millis(grace_ms);
+                while is_task_alive(record) != Liveness::Dead && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            },
+        )
+        .expect("stop svc-j");
+
+        assert!(
+            residue_j.is_empty(),
+            "svc-j has nothing outstanding: {residue_j:?}"
+        );
+        assert_eq!(
+            TASK_FULL_LISTINGS.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one full listing seeds the whole guard's cache"
+        );
+        assert_eq!(
+            TASK_NEW_ID_PARSES.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the racer is discovered by unlocked_wait's embedded refresh during svc-j's own wait"
+        );
+
+        let residue_k =
+            stop_session_record_with_wait(&mut admission, &session_k, false, |_, _| {}, |_, _| {})
+                .expect("stop svc-k");
+        drop(admission);
+
+        assert!(
+            residue_k.is_empty(),
+            "svc-k has nothing outstanding: {residue_k:?}"
+        );
+        assert!(
+            read_task_record(&control, "task-k-racer")
+                .expect("read")
+                .is_none(),
+            "the cached-terminal racer is removed when svc-k is stopped"
+        );
+        assert!(
+            read_session_record(&control, "svc-j")
+                .expect("read")
+                .is_none(),
+            "svc-j's session record is removed"
+        );
+        assert!(
+            read_session_record(&control, "svc-k")
+                .expect("read")
+                .is_none(),
+            "svc-k's session record is removed"
+        );
+        let _ = task_j_child.wait();
+        drop(task_j_job);
+        let _ = fs::remove_dir_all(control);
+    }
+
+    /// The daemon's own supervisor tick can persist a terminal state for a
+    /// task while this guard's cached copy still says `Running` and a
+    /// grace wait is in flight. The post-wait recheck must see that write
+    /// and stop the escalation ladder before ever reaching a second
+    /// (`-KILL`) round — continuing to act on the stale `Running` copy
+    /// would risk targeting a pid/job Windows has already begun tearing
+    /// down on its own asynchronous schedule. Unlike the Unix side,
+    /// Windows has no signal-ignoring disposition to fake a stubborn
+    /// process with, so `TASK_CONFIRM_READS == 2` (entry confirmation plus
+    /// exactly one post-wait recheck) is the decisive proof here: a second
+    /// round would add a third.
+    #[test]
+    fn wait_then_recheck_terminal_stops_the_ladder_before_the_kill_round_when_the_supervisor_wins_the_race()
+     {
+        let _guard = serialize_forks_and_locks();
+        let control = temp_control("wait-then-recheck-terminal");
+        TASK_CONFIRM_READS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let session_record = SessionRecord {
+            id: "svc-1".to_string(),
+            spec: session_spec(),
+            pid: u32::MAX - 1,
+            started_at: None,
+            start_epoch_secs: None,
+            job: None,
+        };
+        write_session_record(&control, &session_record).expect("write session");
+
+        let (mut child, job, job_name) = spawn_live_task_child(&control, "task-stubborn");
+        let record = live_task_record("svc-1", "task-stubborn", child.id(), Some(job_name.clone()));
+        write_task_record(&control, &record).expect("write stubborn task");
+
+        let invocations = std::sync::atomic::AtomicUsize::new(0);
+        let mut admission = AdmissionGuard::acquire(&control).expect("admission lock");
+        let residue = stop_session_record_with_wait(
+            &mut admission,
+            &session_record,
+            false,
+            |_, _| {},
+            |wait_record, _| {
+                if invocations.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    // Test seam simulating `task_tick::finalize_task`
+                    // winning the race: not a faithful reproduction of the
+                    // real supervisor's own exit-detection logic, which
+                    // only persists a terminal state after observing the
+                    // process's owned boundary dead. It exists solely to
+                    // prove the confirm-then-decide discipline governs
+                    // regardless of how the terminal record came to be,
+                    // and regardless of whether `TerminateJobObject`'s own
+                    // asynchronous kill has finished yet.
+                    let mut terminal = wait_record.clone();
+                    terminal.state = TaskState::Completed;
+                    terminal.exit_code = Some(0);
+                    terminal.elapsed_ms = Some(1);
+                    write_task_record(&control, &terminal).expect("supervisor wins the race");
+                }
+            },
+        )
+        .expect("stop session");
+        drop(admission);
+
+        assert!(
+            invocations.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "the wait callback ran"
+        );
+        assert!(
+            residue.is_empty(),
+            "the racing termination leaves nothing outstanding: {residue:?}"
+        );
+        assert!(
+            read_task_record(&control, "task-stubborn")
+                .expect("read")
+                .is_none(),
+            "the terminal record is removed"
+        );
+        assert_eq!(
+            TASK_CONFIRM_READS.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "one entry confirmation plus one post-wait recheck — the ladder never reaches a second (-KILL) round"
+        );
+
+        let _ = force_terminate_record_job(Some(&job_name), child.id(), "-KILL");
+        let _ = child.wait();
+        drop(job);
+        let _ = fs::remove_dir_all(control);
+    }
+
     /// `force=true` skips every wait, so a racing admission can never land
     /// through the `task_wait`/`session_wait` callbacks the non-force rescan
     /// tests above use. `rescan_owned_tasks` is exercised directly instead,
@@ -4415,14 +4964,16 @@ mod tests {
     /// as residue.
     #[test]
     fn rescan_force_terminates_and_removes_a_racing_task_record() {
+        let _guard = serialize_forks_and_locks();
         let control = temp_control("rescan-force-racer");
         let (mut child, job, job_name) = spawn_live_task_child(&control, "task-racer");
         let racer = live_task_record("svc-1", "task-racer", child.id(), Some(job_name));
         write_task_record(&control, &racer).expect("write racing task");
 
-        let admission = AdmissionGuard::acquire(&control).expect("admission lock");
+        let mut admission = AdmissionGuard::acquire(&control).expect("admission lock");
         let mut residue = Vec::new();
-        rescan_owned_tasks(&admission, "svc-1", true, &mut residue)
+        let handled = std::collections::HashSet::new();
+        rescan_owned_tasks(&mut admission, "svc-1", true, &handled, &mut residue)
             .expect("force rescan_owned_tasks");
         drop(admission);
 
