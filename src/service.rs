@@ -5,7 +5,7 @@
 //! integration that launches it directly inherits the daemon as a child of its
 //! own process tree, and `setsid`/`disown` only detach a process group — an
 //! external agent/tool runner that reaps that tree takes the daemon with it.
-//! `baton service run --control <dir>` is the missing owner: a long-lived
+//! `baton service run [--control <dir>]` is the missing owner: a long-lived
 //! foreground process (meant to be kept alive by an OS service manager, e.g.
 //! the systemd user-service unit under `packaging/systemd/`) that spawns each
 //! `baton serve` session as its own direct child, detached into its own
@@ -14,7 +14,8 @@
 //!
 //! ## Control surface
 //!
-//! `--control <dir>` holds:
+//! The selected control directory holds (the default is the per-user
+//! `<BATON_HOME>/service` or `$HOME/.baton/service` path):
 //! - `service.lock` — the exclusive single-instance advisory lock, taken by
 //!   [`ServiceCommand::Run`] for as long as it runs. Mirrors
 //!   [`mailbox::Mailbox`]'s `serve.lock`.
@@ -115,13 +116,15 @@ pub enum ServiceCommand {
     /// Run the long-lived supervisor loop, holding the control lock until a
     /// cooperative stop (see `Teardown`).
     Run {
-        /// The `--control <dir>` root.
-        control: String,
+        /// The optional `--control <dir>` root; `None` uses the per-user
+        /// default `BATON_HOME/service` or `home/.baton/service`.
+        control: Option<String>,
     },
     /// Submit a session spec to a live `Run` and return its session id.
     Start {
-        /// The `--control <dir>` root.
-        control: String,
+        /// The optional `--control <dir>` root; `None` uses the per-user
+        /// default `BATON_HOME/service` or `home/.baton/service`.
+        control: Option<String>,
         /// The session to start. Boxed: `SessionSpec` is by far the largest
         /// field of any `ServiceCommand` variant, and boxing it keeps the
         /// enum itself small regardless of how many optional agent flags it
@@ -131,8 +134,9 @@ pub enum ServiceCommand {
     /// Report the service's own liveness plus every managed session's (or
     /// just `session`'s, when given).
     Status {
-        /// The `--control <dir>` root.
-        control: String,
+        /// The optional `--control <dir>` root; `None` uses the per-user
+        /// default `BATON_HOME/service` or `home/.baton/service`.
+        control: Option<String>,
         /// `--session <id>`; `None` reports every known session.
         session: Option<String>,
     },
@@ -140,8 +144,9 @@ pub enum ServiceCommand {
     /// process-group escalation. Idempotent. `force` permits cleanup when
     /// process identity cannot be corroborated.
     Stop {
-        /// The `--control <dir>` root.
-        control: String,
+        /// The optional `--control <dir>` root; `None` uses the per-user
+        /// default `BATON_HOME/service` or `home/.baton/service`.
+        control: Option<String>,
         /// The session id to stop.
         session: String,
         /// Signal and remove a record whose identity is unresolved.
@@ -150,8 +155,9 @@ pub enum ServiceCommand {
     /// Stop every managed session, then request `Run`'s own cooperative stop.
     /// Idempotent, and independent of whether `Run` is currently alive.
     Teardown {
-        /// The `--control <dir>` root.
-        control: String,
+        /// The optional `--control <dir>` root; `None` uses the per-user
+        /// default `BATON_HOME/service` or `home/.baton/service`.
+        control: Option<String>,
         /// Signal and remove records whose identities are unresolved.
         force: bool,
     },
@@ -723,21 +729,30 @@ mod imp {
     /// Dispatches one parsed [`ServiceCommand`].
     pub(super) fn dispatch(cmd: ServiceCommand, mut out: impl Write) -> Result<()> {
         match cmd {
-            ServiceCommand::Run { control } => run_service(Path::new(&control), out),
+            ServiceCommand::Run { control } => {
+                let control = crate::roles::resolve_control_dir(control)?;
+                run_service(&control, out)
+            }
             ServiceCommand::Start { control, spec } => {
-                let session_id = submit_start_request(Path::new(&control), &spec)?;
+                let control = crate::roles::resolve_control_dir(control)?;
+                let session_id = submit_start_request(&control, &spec)?;
                 writeln!(out, "{session_id}").map_err(io_err)
             }
             ServiceCommand::Status { control, session } => {
-                execute_status(Path::new(&control), session.as_deref(), out)
+                let control = crate::roles::resolve_control_dir(control)?;
+                execute_status(&control, session.as_deref(), out)
             }
             ServiceCommand::Stop {
                 control,
                 session,
                 force,
-            } => execute_stop(Path::new(&control), &session, force, out),
+            } => {
+                let control = crate::roles::resolve_control_dir(control)?;
+                execute_stop(&control, &session, force, out)
+            }
             ServiceCommand::Teardown { control, force } => {
-                execute_teardown(Path::new(&control), force, out)
+                let control = crate::roles::resolve_control_dir(control)?;
+                execute_teardown(&control, force, out)
             }
         }
     }
@@ -746,14 +761,17 @@ mod imp {
     pub(super) fn dispatch_task(cmd: TaskCommand, mut out: impl Write) -> Result<()> {
         match cmd {
             TaskCommand::Start { control, spec } => {
-                let task_id = submit_task_start_request(Path::new(&control), &spec)?;
+                let control = crate::roles::resolve_control_dir(control)?;
+                let task_id = submit_task_start_request(&control, &spec)?;
                 writeln!(out, "{task_id}").map_err(io_err)
             }
             TaskCommand::Status { control, task } => {
-                execute_task_status(Path::new(&control), task.as_deref(), out)
+                let control = crate::roles::resolve_control_dir(control)?;
+                execute_task_status(&control, task.as_deref(), out)
             }
             TaskCommand::Cancel { control, task } => {
-                execute_task_cancel(Path::new(&control), &task, out)
+                let control = crate::roles::resolve_control_dir(control)?;
+                execute_task_cancel(&control, &task, out)
             }
         }
     }
@@ -1213,7 +1231,7 @@ mod imp {
             |control| Ok(probe_control(control)? == ControlLiveness::Live),
             |control| {
                 format!(
-                    "no live baton service on {control:?}; start one with `baton service run --control <dir>` first"
+                    "no live baton service on {control:?}; start one with `baton service run [--control <dir>]` first"
                 )
             },
             "session spec",
@@ -1593,7 +1611,7 @@ mod imp {
             |control| Ok(probe_control(control)? == ControlLiveness::Live),
             |control| {
                 format!(
-                    "no live baton service on {control:?}; start one with `baton service run --control <dir>` first"
+                    "no live baton service on {control:?}; start one with `baton service run [--control <dir>]` first"
                 )
             },
             "task spec",

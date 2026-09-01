@@ -9,7 +9,7 @@
 # Install (per-user, no root required):
 #   mkdir -p ~/.config/systemd/user
 #   cp packaging/systemd/baton.service ~/.config/systemd/user/
-#   # edit ExecStart's --control path and BATON_HOME below for your host
+#   # set BATON_HOME in the unit only when the default home is not suitable
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now baton.service
 #
@@ -22,8 +22,8 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.cargo/bin/baton service run --control %h/.baton/service
-ExecStop=%h/.cargo/bin/baton service teardown --control %h/.baton/service
+ExecStart=%h/.cargo/bin/baton service run
+ExecStop=%h/.cargo/bin/baton service teardown
 Restart=on-failure
 RestartSec=2
 

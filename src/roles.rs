@@ -200,7 +200,8 @@ impl RolesHome {
                     .or_else(|| non_empty(lookup("USERPROFILE")))
                     .ok_or_else(|| {
                         BatonError::Config(
-                            "cannot resolve the baton home: set BATON_HOME, or HOME".to_string(),
+                            "cannot resolve the baton home: set BATON_HOME, HOME, or USERPROFILE"
+                                .to_string(),
                         )
                     })?;
                 PathBuf::from(home).join(".baton")
@@ -217,6 +218,12 @@ impl RolesHome {
     /// The home root directory.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The shared control-plane directory used by `baton service` and
+    /// `baton task` when no explicit `--control` path is supplied.
+    pub fn service_control_dir(&self) -> PathBuf {
+        self.root.join("service")
     }
 
     /// The `roles/` directory holding one subdirectory per role.
@@ -301,6 +308,25 @@ impl RolesHome {
         Ok(build_identity(
             &role_dir, &self.root, &role_cfg, &defaults, &lookup,
         ))
+    }
+}
+
+/// Resolves the shared service/task control directory.
+///
+/// An explicit path is preserved exactly, including relative paths. When the
+/// flag is omitted, the existing per-user Baton home resolution supplies the
+/// stable default `<home>/service`.
+pub fn resolve_control_dir(control: Option<String>) -> Result<PathBuf> {
+    resolve_control_dir_with(control, |key| std::env::var(key).ok())
+}
+
+fn resolve_control_dir_with(
+    control: Option<String>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<PathBuf> {
+    match control {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => Ok(RolesHome::resolve(lookup)?.service_control_dir()),
     }
 }
 
@@ -670,9 +696,54 @@ mod tests {
     }
 
     #[test]
+    fn resolve_control_dir_uses_shared_home_and_preserves_explicit_path() {
+        let baton_home = resolve_control_dir_with(
+            None,
+            lookup_from(&[("BATON_HOME", "/custom/home"), ("HOME", "/ignored")]),
+        )
+        .expect("resolves BATON_HOME default");
+        assert_eq!(baton_home, Path::new("/custom/home/service"));
+
+        let user_home = resolve_control_dir_with(None, lookup_from(&[("HOME", "/home/alice")]))
+            .expect("resolves HOME default");
+        assert_eq!(user_home, Path::new("/home/alice/.baton/service"));
+
+        let profile_root = temp_home("user-profile");
+        let user_profile = resolve_control_dir_with(
+            None,
+            lookup_from(&[("USERPROFILE", profile_root.to_str().unwrap())]),
+        )
+        .expect("resolves USERPROFILE default");
+        assert_eq!(user_profile, profile_root.join(".baton").join("service"));
+
+        let explicit =
+            resolve_control_dir_with(Some("relative/control".to_string()), lookup_from(&[]))
+                .expect("preserves explicit path without a home");
+        assert_eq!(explicit, Path::new("relative/control"));
+
+        let missing = resolve_control_dir_with(None, lookup_from(&[]))
+            .expect_err("omitted control requires a resolvable home");
+        match missing {
+            BatonError::Config(message) => {
+                assert!(message.contains("BATON_HOME"));
+                assert!(message.contains("HOME"));
+                assert!(message.contains("USERPROFILE"));
+            }
+            other => panic!("expected config error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn resolve_without_any_home_is_config_error() {
         let err = RolesHome::resolve(lookup_from(&[])).unwrap_err();
-        assert!(matches!(err, BatonError::Config(_)));
+        match err {
+            BatonError::Config(message) => {
+                assert!(message.contains("BATON_HOME"));
+                assert!(message.contains("HOME"));
+                assert!(message.contains("USERPROFILE"));
+            }
+            other => panic!("expected config error, got {other:?}"),
+        }
     }
 
     #[test]
