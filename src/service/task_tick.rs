@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Child;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -25,6 +26,15 @@ const KILL_GRACE_MS: u64 = 2_000;
 /// Linux `/proc` table scan, non-Linux `ps` probe, and Windows Job Object
 /// probe are each allowed at most twice per second in the steady state.
 pub(super) const REHYDRATED_LIVENESS_CACHE_MS: u64 = 500;
+
+/// Whether a `(checked_ms, _, checked_at)` liveness sample is still within
+/// [`REHYDRATED_LIVENESS_CACHE_MS`] of both the tick's software clock and
+/// the wall clock. Shared by every platform arm of `task_liveness_for_tick`
+/// so the dual-clock staleness rule isn't hand-mirrored per platform.
+pub(super) fn liveness_sample_is_fresh(checked_ms: u64, checked_at: Instant, now_ms: u64) -> bool {
+    now_ms.saturating_sub(checked_ms) < REHYDRATED_LIVENESS_CACHE_MS
+        && checked_at.elapsed() < Duration::from_millis(REHYDRATED_LIVENESS_CACHE_MS)
+}
 
 /// Result of corroborating a durable PID against the process currently
 /// occupying it. `Unresolved` is deliberately distinct from `Dead`: the

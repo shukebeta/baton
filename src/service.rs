@@ -237,7 +237,7 @@ mod imp {
     use super::task_tick::{
         self, Liveness, REHYDRATED_LIVENESS_CACHE_MS, RunningTask as SharedRunningTask,
         ServicePlatform, TaskLivenessMode, TaskLivenessRefresh, TerminationSignal,
-        task_cancel_sentinel_path,
+        liveness_sample_is_fresh, task_cancel_sentinel_path,
     };
     #[cfg(test)]
     use super::task_tick::{deliver_task_event, finalize_task, tick_one_task};
@@ -448,9 +448,7 @@ mod imp {
                 let (cached_group, refresh_group) = match cache.group {
                     Some((checked_ms, _, checked_at))
                         if !force_refresh
-                            && now_ms.saturating_sub(checked_ms) < REHYDRATED_LIVENESS_CACHE_MS
-                            && checked_at.elapsed()
-                                < Duration::from_millis(REHYDRATED_LIVENESS_CACHE_MS) =>
+                            && liveness_sample_is_fresh(checked_ms, checked_at, now_ms) =>
                     {
                         (
                             Some(cache.group.expect("group liveness cache populated").1),
@@ -481,14 +479,12 @@ mod imp {
                 let _ = mode;
                 let force_refresh = matches!(refresh, TaskLivenessRefresh::Forced);
                 let refresh_sample = force_refresh
-                    || cache
+                    || !cache
                         .rehydrated
                         .map(|(checked_ms, _, checked_at)| {
-                            now_ms.saturating_sub(checked_ms) >= REHYDRATED_LIVENESS_CACHE_MS
-                                || checked_at.elapsed()
-                                    >= Duration::from_millis(REHYDRATED_LIVENESS_CACHE_MS)
+                            liveness_sample_is_fresh(checked_ms, checked_at, now_ms)
                         })
-                        .unwrap_or(true);
+                        .unwrap_or(false);
                 if refresh_sample {
                     cache.rehydrated =
                         Some((now_ms, task_execution_liveness(record), Instant::now()));
