@@ -558,10 +558,16 @@ the generic `task` namespace.
 ```bash
 mkdir -p ~/.config/systemd/user
 cp packaging/systemd/baton.service ~/.config/systemd/user/
-# edit ExecStart's --control path for your host
+# set BATON_HOME in the unit only when the default home is not suitable
 systemctl --user daemon-reload
 systemctl --user enable --now baton.service
 ```
+
+Neither `ExecStart` nor `ExecStop` passes `--control`, so the copied unit
+needs no path editing on a default host: both use the per-user default
+`<BATON_HOME>/service`. Set `BATON_HOME` in the unit when the default home is
+not suitable, or add the same explicit `--control <dir>` to both `ExecStart`
+and `ExecStop` for an isolated control plane.
 
 `ExecStart` runs `service run`; `ExecStop` runs `service teardown` so a
 `systemctl --user stop`/`restart` tears every managed session down instead of
