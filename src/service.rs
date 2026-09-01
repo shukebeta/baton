@@ -221,6 +221,29 @@ mod control_plane {
         responses: PathBuf,
     }
 
+    pub(super) struct AwaitConfig {
+        await_ms: u64,
+        poll_ms: u64,
+        no_live_error: String,
+        timeout_subject: &'static str,
+    }
+
+    impl AwaitConfig {
+        pub(super) fn new(
+            await_ms: u64,
+            poll_ms: u64,
+            no_live_error: String,
+            timeout_subject: &'static str,
+        ) -> Self {
+            Self {
+                await_ms,
+                poll_ms,
+                no_live_error,
+                timeout_subject,
+            }
+        }
+    }
+
     impl<'a> RequestChannel<'a> {
         pub(super) fn new(
             control: &'a Path,
@@ -258,22 +281,20 @@ mod control_plane {
             await_response()
         }
 
-        pub(super) fn await_response<Response, Take, OnNotRunning>(
+        pub(super) fn await_response<Response, Take, IsRunning, OnNotRunning>(
             &self,
             request_id: &str,
-            await_ms: u64,
-            poll_ms: u64,
+            config: AwaitConfig,
             mut take: Take,
-            is_running: impl Fn(&Path) -> Result<bool>,
+            is_running: IsRunning,
             mut on_not_running: OnNotRunning,
-            no_live_error: impl Fn(&Path) -> String,
-            timeout_error: impl Fn(&str) -> String,
         ) -> Result<Response>
         where
             Take: FnMut() -> Result<Option<Response>>,
+            IsRunning: Fn(&Path) -> Result<bool>,
             OnNotRunning: FnMut() -> Result<Option<Response>>,
         {
-            let deadline = Instant::now() + Duration::from_millis(await_ms);
+            let deadline = Instant::now() + Duration::from_millis(config.await_ms);
             loop {
                 if let Some(response) = take()? {
                     return Ok(response);
@@ -282,12 +303,15 @@ mod control_plane {
                     if let Some(response) = on_not_running()? {
                         return Ok(response);
                     }
-                    return Err(BatonError::Io(no_live_error(self.control)));
+                    return Err(BatonError::Io(config.no_live_error.clone()));
                 }
                 if Instant::now() >= deadline {
-                    return Err(BatonError::Io(timeout_error(request_id)));
+                    return Err(BatonError::Io(format!(
+                        "timed out waiting for baton service to start the {} ({request_id})",
+                        config.timeout_subject
+                    )));
                 }
-                std::thread::sleep(Duration::from_millis(poll_ms));
+                std::thread::sleep(Duration::from_millis(config.poll_ms));
             }
         }
 
@@ -493,7 +517,7 @@ mod control_plane {
 
 #[cfg(unix)]
 mod imp {
-    use super::control_plane::{RecordStore, RequestChannel};
+    use super::control_plane::{AwaitConfig, RecordStore, RequestChannel};
     use super::*;
     #[cfg(test)]
     use std::cell::Cell;
@@ -1201,8 +1225,14 @@ mod imp {
         let path = responses_dir(control).join(mailbox::file_name(request_id));
         start_channel(control).await_response(
             request_id,
-            START_AWAIT_MS,
-            POLL_INTERVAL_MS,
+            AwaitConfig::new(
+                START_AWAIT_MS,
+                POLL_INTERVAL_MS,
+                format!(
+                    "no live baton service on {control:?}; start request was not admitted"
+                ),
+                "session",
+            ),
             || {
                 if let Ok(data) = fs::read_to_string(&path) {
                     let _ = fs::remove_file(&path);
@@ -1227,10 +1257,6 @@ mod imp {
             },
             |control| Ok(probe_control(control)? == ControlLiveness::Live),
             || Ok(None),
-            |control| format!("no live baton service on {control:?}; start request was not admitted"),
-            |request_id| {
-                format!("timed out waiting for baton service to start the session ({request_id})")
-            },
         )
     }
 
@@ -1578,8 +1604,14 @@ mod imp {
     fn await_task_start_response(control: &Path, request_id: &str) -> Result<String> {
         task_channel(control).await_response(
             request_id,
-            START_AWAIT_MS,
-            POLL_INTERVAL_MS,
+            AwaitConfig::new(
+                START_AWAIT_MS,
+                POLL_INTERVAL_MS,
+                format!(
+                    "no live baton service on {control:?}; task start request was not admitted"
+                ),
+                "task",
+            ),
             || {
                 take_task_start_response(control, request_id).and_then(|response| {
                     response.map_or(Ok(None), |response| {
@@ -1609,12 +1641,6 @@ mod imp {
                 Err(BatonError::Io(format!(
                     "no live baton service on {control:?}; task start request was not admitted"
                 )))
-            },
-            |control| {
-                format!("no live baton service on {control:?}; task start request was not admitted")
-            },
-            |request_id| {
-                format!("timed out waiting for baton service to start the task ({request_id})")
             },
         )
     }

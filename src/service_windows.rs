@@ -1,4 +1,4 @@
-use super::control_plane::{RecordStore, RequestChannel};
+use super::control_plane::{AwaitConfig, RecordStore, RequestChannel};
 use super::*;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -687,8 +687,12 @@ fn await_start_response(control: &Path, request_id: &str) -> Result<String> {
     let path = responses_dir(control).join(mailbox::file_name(request_id));
     start_channel(control).await_response(
         request_id,
-        START_AWAIT_MS,
-        POLL_INTERVAL_MS,
+        AwaitConfig::new(
+            START_AWAIT_MS,
+            POLL_INTERVAL_MS,
+            format!("no live baton service on {control:?}; start request was not admitted"),
+            "session",
+        ),
         || {
             if let Ok(data) = fs::read_to_string(&path) {
                 let _ = fs::remove_file(&path);
@@ -711,10 +715,6 @@ fn await_start_response(control: &Path, request_id: &str) -> Result<String> {
         },
         |control| Ok(probe_control(control)? == ControlLiveness::Live),
         || Ok(None),
-        |control| format!("no live baton service on {control:?}; start request was not admitted"),
-        |request_id| {
-            format!("timed out waiting for baton service to start the session ({request_id})")
-        },
     )
 }
 
@@ -1054,8 +1054,12 @@ fn submit_task_start_request(control: &Path, spec: &TaskSpec) -> Result<String> 
 fn await_task_start_response(control: &Path, request_id: &str) -> Result<String> {
     task_channel(control).await_response(
         request_id,
-        START_AWAIT_MS,
-        POLL_INTERVAL_MS,
+        AwaitConfig::new(
+            START_AWAIT_MS,
+            POLL_INTERVAL_MS,
+            format!("no live baton service on {control:?}; task start request was not admitted"),
+            "task",
+        ),
         || {
             take_task_start_response(control, request_id).and_then(|response| {
                 response.map_or(Ok(None), |response| {
@@ -1085,12 +1089,6 @@ fn await_task_start_response(control: &Path, request_id: &str) -> Result<String>
             Err(BatonError::Io(format!(
                 "no live baton service on {control:?}; task start request was not admitted"
             )))
-        },
-        |control| {
-            format!("no live baton service on {control:?}; task start request was not admitted")
-        },
-        |request_id| {
-            format!("timed out waiting for baton service to start the task ({request_id})")
         },
     )
 }
@@ -3032,11 +3030,6 @@ fn sessions_dir(control: &Path) -> std::path::PathBuf {
 
 fn session_records(control: &Path) -> RecordStore {
     RecordStore::new(sessions_dir(control), "session")
-}
-
-#[cfg(test)]
-fn session_record_path(control: &Path, id: &str) -> Result<std::path::PathBuf> {
-    session_records(control).path(id)
 }
 
 fn write_session_record(control: &Path, record: &SessionRecord) -> Result<()> {
