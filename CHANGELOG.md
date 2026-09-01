@@ -10,7 +10,7 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.4.11 … v0.3.51 (2026-09-01)
+## v0.4.12 … v0.3.51 (2026-09-01)
 
 ### Features
 - feat(cli): default service control directory (#295)
@@ -28,6 +28,7 @@ _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 - refactor(log): share session outcome pairing (#287)
 - refactor(service): share record and channel helpers (#299)
 - refactor(service): share task tick liveness (#303)
+- refactor(service): extract shared task_liveness_for_tick freshness predicate (#316)
 
 ### Docs
 - docs(mailbox): correct agent stderr persistence dichotomy (#304)
