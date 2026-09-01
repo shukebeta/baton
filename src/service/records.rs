@@ -371,6 +371,30 @@ impl RecordStore {
         }
         Ok(records)
     }
+
+    /// Filenames only, with no read/parse of any record. Used to discover
+    /// newly admitted ids cheaply, without re-decoding records already
+    /// known to a caller-held cache.
+    pub(super) fn list_ids(&self) -> Result<Vec<String>> {
+        let entries = match fs::read_dir(&self.directory) {
+            Ok(rd) => rd,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => {
+                return Err(BatonError::Io(format!(
+                    "could not read {:?}: {err}",
+                    self.directory
+                )));
+            }
+        };
+        let mut ids = Vec::new();
+        for entry in entries {
+            let path = mailbox::dir_entry(entry, &self.directory)?.path();
+            if let Some(key) = mailbox::json_key(&path) {
+                ids.push(key);
+            }
+        }
+        Ok(ids)
+    }
 }
 
 // -- Control-plane paths and identifiers --------------------------------
@@ -518,6 +542,10 @@ pub(super) fn remove_task_record(control: &Path, id: &str) -> Result<()> {
 
 pub(super) fn list_task_records(control: &Path) -> Result<Vec<TaskRecord>> {
     task_records(control).list()
+}
+
+pub(super) fn list_task_record_ids(control: &Path) -> Result<Vec<String>> {
+    task_records(control).list_ids()
 }
 
 pub(super) fn session_records(control: &Path) -> RecordStore {
