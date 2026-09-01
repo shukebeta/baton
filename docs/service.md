@@ -139,7 +139,10 @@ baton service teardown [--control <dir>] [--force]
   failure to deliver a response at all leaves the request unanswered; `run`
   warns and keeps polling, and the client falls back to the await timeout.
 - **`service status`** reports the service's own liveness plus every session's
-  (or just `--session <id>`'s). Each record retains the compatibility boolean
+  (or just `--session <id>`'s). A session record that fails to parse as JSON
+  (e.g. truncated by a crash mid-write) is skipped with a `warning: skipping
+  malformed session record ...` line on stderr; the remaining healthy records
+  are still reported. Each record retains the compatibility boolean
   `live` (`true` only for `liveness: "live"`) and exposes the full
   `liveness` state plus `stderr_path`, the path to the Unix session daemon's
   captured stderr log (`sessions/<id>/stderr.log`). Per-session liveness
@@ -386,7 +389,9 @@ baton task cancel [--control <dir>] --task <id>
   under `task-logs/<task-id>/`.
   These fields are present for both running and terminal tasks. Reads the
   durable `TaskRecord` directly by PID, so it works whether or not `run` is
-  currently alive.
+  currently alive. Listing every task skips, rather than fails on, a task
+  record that fails to parse as JSON — the same skip-and-warn posture as
+  `service status`.
 - **`task cancel`** is idempotent: after dropping a cooperative cancel sentinel
   into `task-cancel/`, it terminates the task's Job Object on Windows or
   process group on Unix, so the
@@ -402,7 +407,10 @@ baton task cancel [--control <dir>] --task <id>
 
 ### Supervisor restart reconciliation
 
-`service run` scans durable task records before it accepts new requests. Each
+`service run` scans durable task records before it accepts new requests. A
+record that fails to parse as JSON — e.g. truncated by a crash mid-write — is
+skipped with a stderr warning naming the file rather than aborting startup; the
+remaining tasks are rehydrated and supervised normally. Each
 new running record stores the task's spawn time as Unix epoch milliseconds, so
 milestone and max-duration decisions continue from the original task start
 after a restart. Linux requires a recorded `/proc/<pid>/stat` start key to

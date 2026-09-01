@@ -355,8 +355,13 @@ impl RecordStore {
             let Some(key) = mailbox::json_key(&path) else {
                 continue;
             };
-            if let Some(record) = self.read(&key)? {
-                records.push(record);
+            match self.read(&key) {
+                Ok(Some(record)) => records.push(record),
+                Ok(None) => {}
+                Err(BatonError::Decode(message)) => {
+                    eprintln!("warning: skipping {message}");
+                }
+                Err(err) => return Err(err),
             }
         }
         Ok(records)
@@ -503,7 +508,7 @@ pub(super) fn session_records(control: &Path) -> RecordStore {
     RecordStore::new(sessions_dir(control), "session")
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(super) fn session_record_path(control: &Path, id: &str) -> Result<PathBuf> {
     session_records(control).path(id)
 }
