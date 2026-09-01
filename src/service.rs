@@ -4136,6 +4136,34 @@ mod imp {
             assert_eq!(ids, vec!["svc-0", "svc-1", "svc-2"]);
         }
 
+        /// A single corrupt session record is skipped with a warning; the
+        /// remaining healthy records are still returned.
+        #[test]
+        fn list_session_records_skips_malformed_record_and_warns() {
+            let dir = TempDir::new("list-session-malformed");
+            for i in 0..2 {
+                let record = SessionRecord {
+                    id: format!("svc-{i}"),
+                    spec: spec("/tmp/in", "/tmp/out"),
+                    pid: 1000 + i,
+                    started_at: None,
+                    start_epoch_secs: None,
+                    stderr_path: String::new(),
+                };
+                write_session_record(&dir.path, &record).expect("write");
+            }
+            let path = session_record_path(&dir.path, "svc-bad").expect("session record path");
+            fs::write(path, "not json").expect("write malformed session record");
+
+            let mut ids: Vec<String> = list_session_records(&dir.path)
+                .expect("list")
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            ids.sort();
+            assert_eq!(ids, vec!["svc-0", "svc-1"]);
+        }
+
         /// A removed record is gone from a subsequent list/read, and removing
         /// an already-absent record is a no-op success (idempotent).
         #[test]
@@ -4715,6 +4743,44 @@ mod imp {
                 .collect();
             ids.sort();
             assert_eq!(ids, vec!["task-0", "task-1", "task-2"]);
+        }
+
+        /// A single corrupt task record is skipped with a warning; the
+        /// remaining healthy records are still returned.
+        #[test]
+        fn list_task_records_skips_malformed_record_and_warns() {
+            let dir = TempDir::new("task-list-malformed");
+            for i in 0..2 {
+                let record = TaskRecord {
+                    id: format!("task-{i}"),
+                    request_id: None,
+                    admission: TaskAdmissionPhase::Committed,
+                    spec: task_spec("svc-1", "true", vec![], vec![], 1_000, "/tmp/cb"),
+                    pid: 1000 + i,
+                    started_at: None,
+                    start_epoch_secs: None,
+                    job: None,
+                    started_ms: None,
+                    state: TaskState::Running,
+                    exit_code: None,
+                    elapsed_ms: None,
+                    stdout_path: String::new(),
+                    stderr_path: String::new(),
+                    delivered_milestones: 0,
+                    terminal_delivered_at_ms: None,
+                };
+                write_task_record(&dir.path, &record).expect("write");
+            }
+            let path = task_record_path(&dir.path, "task-bad").expect("task record path");
+            fs::write(path, "not json").expect("write malformed task record");
+
+            let mut ids: Vec<String> = list_task_records(&dir.path)
+                .expect("list")
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            ids.sort();
+            assert_eq!(ids, vec!["task-0", "task-1"]);
         }
 
         /// An absent response returns without waiting on the admission lock,

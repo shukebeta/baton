@@ -14,7 +14,7 @@ use super::records::{
     write_session_record, write_start_response, write_task_record, write_task_start_response,
 };
 #[cfg(test)]
-use super::records::{mark_task_start_ack, task_record_path};
+use super::records::{mark_task_start_ack, session_record_path, task_record_path};
 use super::task_tick::{
     self, Liveness, RunningTask as SharedRunningTask, ServicePlatform, TaskLivenessMode,
     TaskLivenessRefresh, TerminationSignal, liveness_sample_is_fresh, remove_reaped_task_record,
@@ -2641,6 +2641,52 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("create test control directory");
         path
+    }
+
+    /// A single corrupt session record is skipped with a warning; the
+    /// remaining healthy records are still returned. Mirrors the Unix-side
+    /// `list_session_records_skips_malformed_record_and_warns`.
+    #[test]
+    fn list_session_records_skips_malformed_record_and_warns() {
+        let control = temp_control("list-session-malformed");
+        for i in 0..2 {
+            let mut record = session_record(1000 + i, None, None);
+            record.id = format!("svc-{i}");
+            write_session_record(&control, &record).expect("write");
+        }
+        let path = session_record_path(&control, "svc-bad").expect("session record path");
+        fs::write(path, "not json").expect("write malformed session record");
+
+        let mut ids: Vec<String> = list_session_records(&control)
+            .expect("list")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["svc-0", "svc-1"]);
+    }
+
+    /// A single corrupt task record is skipped with a warning; the
+    /// remaining healthy records are still returned. Mirrors the Unix-side
+    /// `list_task_records_skips_malformed_record_and_warns`.
+    #[test]
+    fn list_task_records_skips_malformed_record_and_warns() {
+        let control = temp_control("list-task-malformed");
+        for i in 0..2 {
+            let mut record = task_record("svc-1", 1000 + i, None, None);
+            record.id = format!("task-{i}");
+            write_task_record(&control, &record).expect("write");
+        }
+        let path = task_record_path(&control, "task-bad").expect("task record path");
+        fs::write(path, "not json").expect("write malformed task record");
+
+        let mut ids: Vec<String> = list_task_records(&control)
+            .expect("list")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["task-0", "task-1"]);
     }
 
     #[test]
