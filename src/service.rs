@@ -198,8 +198,326 @@ pub fn execute_task(cmd: TaskCommand, _out: impl Write) -> Result<()> {
     ))
 }
 
+#[cfg(any(unix, windows))]
+mod control_plane {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    use serde::Serialize;
+    use serde::de::DeserializeOwned;
+
+    use super::{BatonError, Result};
+    use crate::mailbox;
+
+    /// The filesystem plumbing shared by the session and task start channels.
+    /// The response consumer may add a stronger transaction boundary (the
+    /// task acknowledgement/rollback protocol does); this type owns only the
+    /// common request claim and response publication mechanics.
+    pub(super) struct RequestChannel<'a> {
+        control: &'a Path,
+        requests: PathBuf,
+        processing: PathBuf,
+        responses: PathBuf,
+    }
+
+    pub(super) struct AwaitConfig {
+        await_ms: u64,
+        poll_ms: u64,
+        no_live_error: String,
+        timeout_subject: &'static str,
+    }
+
+    impl AwaitConfig {
+        pub(super) fn new(
+            await_ms: u64,
+            poll_ms: u64,
+            no_live_error: String,
+            timeout_subject: &'static str,
+        ) -> Self {
+            Self {
+                await_ms,
+                poll_ms,
+                no_live_error,
+                timeout_subject,
+            }
+        }
+    }
+
+    impl<'a> RequestChannel<'a> {
+        pub(super) fn new(
+            control: &'a Path,
+            requests: PathBuf,
+            processing: PathBuf,
+            responses: PathBuf,
+        ) -> Self {
+            Self {
+                control,
+                requests,
+                processing,
+                responses,
+            }
+        }
+
+        pub(super) fn submit<Req, Response>(
+            &self,
+            request_id: &str,
+            request: &Req,
+            is_running: impl Fn(&Path) -> Result<bool>,
+            no_live_error: impl Fn(&Path) -> String,
+            request_name: &str,
+            await_response: impl FnOnce() -> Result<Response>,
+        ) -> Result<Response>
+        where
+            Req: Serialize,
+        {
+            if !is_running(self.control)? {
+                return Err(BatonError::Io(no_live_error(self.control)));
+            }
+            let json = serde_json::to_string(request).map_err(|err| {
+                BatonError::Io(format!("could not serialize {request_name}: {err}"))
+            })?;
+            mailbox::atomic_write(&self.requests, &mailbox::file_name(request_id), &json)?;
+            await_response()
+        }
+
+        pub(super) fn await_response<Response, Take, IsRunning, OnNotRunning>(
+            &self,
+            request_id: &str,
+            config: AwaitConfig,
+            mut take: Take,
+            is_running: IsRunning,
+            mut on_not_running: OnNotRunning,
+        ) -> Result<Response>
+        where
+            Take: FnMut() -> Result<Option<Response>>,
+            IsRunning: Fn(&Path) -> Result<bool>,
+            OnNotRunning: FnMut() -> Result<Option<Response>>,
+        {
+            let deadline = Instant::now() + Duration::from_millis(config.await_ms);
+            loop {
+                if let Some(response) = take()? {
+                    return Ok(response);
+                }
+                if !is_running(self.control)? {
+                    if let Some(response) = on_not_running()? {
+                        return Ok(response);
+                    }
+                    return Err(BatonError::Io(config.no_live_error.clone()));
+                }
+                if Instant::now() >= deadline {
+                    return Err(BatonError::Io(format!(
+                        "timed out waiting for baton service to start the {} ({request_id})",
+                        config.timeout_subject
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(config.poll_ms));
+            }
+        }
+
+        /// Returns any processing entry a crash left mid-request to its
+        /// pending directory. The caller must already hold the service lock.
+        pub(super) fn reclaim_stale(&self) -> Result<()> {
+            let entries = match fs::read_dir(&self.processing) {
+                Ok(rd) => rd,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err) => {
+                    return Err(BatonError::Io(format!(
+                        "could not read {:?}: {err}",
+                        self.processing
+                    )));
+                }
+            };
+            fs::create_dir_all(&self.requests).map_err(|err| {
+                BatonError::Io(format!("could not create {:?}: {err}", self.requests))
+            })?;
+            for entry in entries {
+                let path = mailbox::dir_entry(entry, &self.processing)?.path();
+                let Some(key) = mailbox::json_key(&path) else {
+                    continue;
+                };
+                let dest = self.requests.join(mailbox::file_name(&key));
+                fs::rename(&path, &dest)
+                    .map_err(|err| BatonError::Io(format!("could not reclaim {path:?}: {err}")))?;
+            }
+            Ok(())
+        }
+
+        /// Claims the next pending request and lets the caller handle the
+        /// claimed file. Handler-specific admission and lifecycle behavior
+        /// remains outside this shared filesystem loop.
+        pub(super) fn process_one<Response>(
+            &self,
+            mut handle: impl FnMut(&str, &Path) -> Result<Option<Response>>,
+        ) -> Result<Option<Response>> {
+            fs::create_dir_all(&self.requests).map_err(|err| {
+                BatonError::Io(format!("could not create {:?}: {err}", self.requests))
+            })?;
+            let entries = match fs::read_dir(&self.requests) {
+                Ok(rd) => rd,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(err) => {
+                    return Err(BatonError::Io(format!(
+                        "could not read {:?}: {err}",
+                        self.requests
+                    )));
+                }
+            };
+            for entry in entries {
+                let path = mailbox::dir_entry(entry, &self.requests)?.path();
+                let Some(key) = mailbox::json_key(&path) else {
+                    continue;
+                };
+                fs::create_dir_all(&self.processing).map_err(|err| {
+                    BatonError::Io(format!("could not create {:?}: {err}", self.processing))
+                })?;
+                let claimed_path = self.processing.join(mailbox::file_name(&key));
+                match fs::rename(&path, &claimed_path) {
+                    Ok(()) => {
+                        let outcome = handle(&key, &claimed_path);
+                        let _ = fs::remove_file(&claimed_path);
+                        return outcome;
+                    }
+                    // Lost a claim race: move on to the next entry.
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => {
+                        return Err(BatonError::Io(format!("could not claim {path:?}: {err}")));
+                    }
+                }
+            }
+            Ok(None)
+        }
+
+        pub(super) fn write_response<Body: Serialize>(
+            &self,
+            request_id: &str,
+            response: &Body,
+            response_name: &str,
+        ) -> Result<()> {
+            let json = serde_json::to_string(response).map_err(|err| {
+                BatonError::Io(format!("could not serialize {response_name}: {err}"))
+            })?;
+            fs::create_dir_all(&self.responses).map_err(|err| {
+                BatonError::Io(format!("could not create {:?}: {err}", self.responses))
+            })?;
+            mailbox::atomic_write(&self.responses, &mailbox::file_name(request_id), &json)
+        }
+
+        pub(super) fn reject<Body: Serialize, Response>(
+            &self,
+            request_id: &str,
+            response: &Body,
+            response_name: &str,
+        ) -> Result<Option<Response>> {
+            self.write_response(request_id, response, response_name)?;
+            Ok(None)
+        }
+    }
+
+    /// Shared persistence for the two durable control-plane record kinds.
+    /// `noun` keeps the existing kind-specific diagnostics intact.
+    pub(super) struct RecordStore {
+        directory: PathBuf,
+        noun: &'static str,
+    }
+
+    impl RecordStore {
+        pub(super) fn new(directory: impl Into<PathBuf>, noun: &'static str) -> Self {
+            Self {
+                directory: directory.into(),
+                noun,
+            }
+        }
+
+        pub(super) fn path(&self, id: &str) -> Result<PathBuf> {
+            if !mailbox::is_safe_key(id) {
+                return Err(BatonError::Io(format!(
+                    "{} id is not usable as a filename: {id:?}",
+                    self.noun
+                )));
+            }
+            Ok(self.directory.join(mailbox::file_name(id)))
+        }
+
+        pub(super) fn write<Record: Serialize>(&self, id: &str, record: &Record) -> Result<()> {
+            fs::create_dir_all(&self.directory).map_err(|err| {
+                BatonError::Io(format!("could not create {:?}: {err}", self.directory))
+            })?;
+            let json = serde_json::to_string(record).map_err(|err| {
+                BatonError::Io(format!("could not serialize {} record: {err}", self.noun))
+            })?;
+            mailbox::atomic_write(&self.directory, &mailbox::file_name(id), &json)
+        }
+
+        pub(super) fn read<Record: DeserializeOwned>(&self, id: &str) -> Result<Option<Record>> {
+            let path = self.path(id)?;
+            match fs::read_to_string(&path) {
+                Ok(data) => serde_json::from_str(&data).map(Some).map_err(|err| {
+                    BatonError::Decode(format!("malformed {} record {path:?}: {err}", self.noun))
+                }),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(err) => Err(BatonError::Io(format!("could not read {path:?}: {err}"))),
+            }
+        }
+
+        pub(super) fn exists(&self, id: &str) -> Result<bool> {
+            let path = self.path(id)?;
+            match path.try_exists() {
+                Ok(true) => Ok(true),
+                Ok(false) => match fs::metadata(&self.directory) {
+                    Ok(metadata) if metadata.is_dir() => Ok(false),
+                    Ok(_) => Err(BatonError::Io(format!(
+                        "could not probe {} record {path:?}: parent {:?} is not a directory",
+                        self.noun, self.directory
+                    ))),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                    Err(err) => Err(BatonError::Io(format!(
+                        "could not probe {} record parent {:?}: {err}",
+                        self.noun, self.directory
+                    ))),
+                },
+                Err(err) => Err(BatonError::Io(format!("could not probe {path:?}: {err}"))),
+            }
+        }
+
+        pub(super) fn remove(&self, id: &str) -> Result<()> {
+            let path = self.path(id)?;
+            match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(BatonError::Io(format!("could not remove {path:?}: {err}"))),
+            }
+        }
+
+        pub(super) fn list<Record: DeserializeOwned>(&self) -> Result<Vec<Record>> {
+            let entries = match fs::read_dir(&self.directory) {
+                Ok(rd) => rd,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(err) => {
+                    return Err(BatonError::Io(format!(
+                        "could not read {:?}: {err}",
+                        self.directory
+                    )));
+                }
+            };
+            let mut records = Vec::new();
+            for entry in entries {
+                let path = mailbox::dir_entry(entry, &self.directory)?.path();
+                let Some(key) = mailbox::json_key(&path) else {
+                    continue;
+                };
+                if let Some(record) = self.read(&key)? {
+                    records.push(record);
+                }
+            }
+            Ok(records)
+        }
+    }
+}
+
 #[cfg(unix)]
 mod imp {
+    use super::control_plane::{AwaitConfig, RecordStore, RequestChannel};
     use super::*;
     #[cfg(test)]
     use std::cell::Cell;
@@ -855,6 +1173,15 @@ mod imp {
         control.join("responses")
     }
 
+    fn start_channel(control: &Path) -> RequestChannel<'_> {
+        RequestChannel::new(
+            control,
+            requests_dir(control),
+            processing_dir(control),
+            responses_dir(control),
+        )
+    }
+
     fn fresh_request_id() -> String {
         format!(
             "req-{}-{}-{}",
@@ -879,118 +1206,76 @@ mod imp {
     /// lock, rather than waiting out the full await bound against a service
     /// that was never started.
     fn submit_start_request(control: &Path, spec: &SessionSpec) -> Result<String> {
-        if probe_control(control)? == ControlLiveness::NotRunning {
-            return Err(BatonError::Io(format!(
-                "no live baton service on {control:?}; start one with `baton service run --control <dir>` first"
-            )));
-        }
         let request_id = fresh_request_id();
-        let json = serde_json::to_string(spec)
-            .map_err(|err| BatonError::Io(format!("could not serialize session spec: {err}")))?;
-        mailbox::atomic_write(
-            &requests_dir(control),
-            &mailbox::file_name(&request_id),
-            &json,
-        )?;
-        await_start_response(control, &request_id)
+        start_channel(control).submit(
+            &request_id,
+            spec,
+            |control| Ok(probe_control(control)? == ControlLiveness::Live),
+            |control| {
+                format!(
+                    "no live baton service on {control:?}; start one with `baton service run --control <dir>` first"
+                )
+            },
+            "session spec",
+            || await_start_response(control, &request_id),
+        )
     }
 
     fn await_start_response(control: &Path, request_id: &str) -> Result<String> {
         let path = responses_dir(control).join(mailbox::file_name(request_id));
-        let deadline = Instant::now() + Duration::from_millis(START_AWAIT_MS);
-        loop {
-            if let Ok(data) = fs::read_to_string(&path) {
-                let _ = fs::remove_file(&path);
-                let resp: StartResponse = serde_json::from_str(&data).map_err(|err| {
-                    BatonError::Decode(format!("malformed service response {path:?}: {err}"))
-                })?;
-                if let Some(error) = resp.error {
-                    return Err(BatonError::Io(error));
-                }
-                return resp.session_id.ok_or_else(|| {
-                    BatonError::Decode(format!(
-                        "service response {path:?} contained neither a session id nor an error"
-                    ))
-                });
-            }
-            if probe_control(control)? == ControlLiveness::NotRunning {
-                return Err(BatonError::Io(format!(
+        start_channel(control).await_response(
+            request_id,
+            AwaitConfig::new(
+                START_AWAIT_MS,
+                POLL_INTERVAL_MS,
+                format!(
                     "no live baton service on {control:?}; start request was not admitted"
-                )));
-            }
-            if Instant::now() >= deadline {
-                return Err(BatonError::Io(format!(
-                    "timed out waiting for baton service to start the session ({request_id})"
-                )));
-            }
-            std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
-        }
+                ),
+                "session",
+            ),
+            || {
+                if let Ok(data) = fs::read_to_string(&path) {
+                    let _ = fs::remove_file(&path);
+                    let resp: StartResponse = serde_json::from_str(&data).map_err(|err| {
+                        BatonError::Decode(format!(
+                            "malformed service response {path:?}: {err}"
+                        ))
+                    })?;
+                    if let Some(error) = resp.error {
+                        return Err(BatonError::Io(error));
+                    }
+                    return resp
+                        .session_id
+                        .ok_or_else(|| {
+                            BatonError::Decode(format!(
+                                "service response {path:?} contained neither a session id nor an error"
+                            ))
+                        })
+                        .map(Some);
+                }
+                Ok(None)
+            },
+            |control| Ok(probe_control(control)? == ControlLiveness::Live),
+            || Ok(None),
+        )
     }
 
     /// Returns any `processing/` entry a crash left mid-request to
     /// `requests/`, safe only because the caller already holds the control
     /// lock (mirrors [`mailbox::Mailbox::reclaim_stale`]).
     fn reclaim_stale_requests(control: &Path) -> Result<()> {
-        let processing = processing_dir(control);
-        let entries = match fs::read_dir(&processing) {
-            Ok(rd) => rd,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => {
-                return Err(BatonError::Io(format!(
-                    "could not read {processing:?}: {err}"
-                )));
-            }
-        };
-        let requests = requests_dir(control);
-        fs::create_dir_all(&requests)
-            .map_err(|err| BatonError::Io(format!("could not create {requests:?}: {err}")))?;
-        for entry in entries {
-            let path = mailbox::dir_entry(entry, &processing)?.path();
-            let Some(key) = mailbox::json_key(&path) else {
-                continue;
-            };
-            let dest = requests.join(mailbox::file_name(&key));
-            fs::rename(&path, &dest)
-                .map_err(|err| BatonError::Io(format!("could not reclaim {path:?}: {err}")))?;
-        }
-        Ok(())
+        start_channel(control).reclaim_stale()
     }
 
     /// Claims and handles the next pending start request, if any.
     fn process_one_request(control: &Path) -> Result<Option<(String, Child)>> {
-        let dir = requests_dir(control);
-        fs::create_dir_all(&dir)
-            .map_err(|err| BatonError::Io(format!("could not create {dir:?}: {err}")))?;
-        let entries = match fs::read_dir(&dir) {
-            Ok(rd) => rd,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(BatonError::Io(format!("could not read {dir:?}: {err}"))),
-        };
-        for entry in entries {
-            let path = mailbox::dir_entry(entry, &dir)?.path();
-            let Some(key) = mailbox::json_key(&path) else {
-                continue;
+        start_channel(control).process_one(|request_id, claimed_path| {
+            let outcome = handle_start_request(control, request_id, claimed_path)?;
+            let Some((record, child)) = outcome else {
+                return Ok(None);
             };
-            let processing = processing_dir(control);
-            fs::create_dir_all(&processing)
-                .map_err(|err| BatonError::Io(format!("could not create {processing:?}: {err}")))?;
-            let claimed_path = processing.join(mailbox::file_name(&key));
-            match fs::rename(&path, &claimed_path) {
-                Ok(()) => {
-                    let outcome = handle_start_request(control, &key, &claimed_path);
-                    let _ = fs::remove_file(&claimed_path);
-                    let Some((record, child)) = outcome? else {
-                        return Ok(None);
-                    };
-                    return Ok(Some((record.id, child)));
-                }
-                // Lost a claim race (shouldn't happen — `Run` is the sole
-                // reader — but harmless if it ever did): move on.
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(BatonError::Io(format!("could not claim {path:?}: {err}"))),
-            }
-        }
-        Ok(None)
+            Ok(Some((record.id, child)))
+        })
     }
 
     /// Renders `err` for a start-response `error` field. The client re-wraps
@@ -1009,12 +1294,7 @@ mod imp {
         request_id: &str,
         response: &StartResponse,
     ) -> Result<()> {
-        let json = serde_json::to_string(response)
-            .map_err(|err| BatonError::Io(format!("could not serialize start response: {err}")))?;
-        let responses = responses_dir(control);
-        fs::create_dir_all(&responses)
-            .map_err(|err| BatonError::Io(format!("could not create {responses:?}: {err}")))?;
-        mailbox::atomic_write(&responses, &mailbox::file_name(request_id), &json)
+        start_channel(control).write_response(request_id, response, "start response")
     }
 
     /// Answers a claimed start request with an admission failure the
@@ -1026,15 +1306,14 @@ mod imp {
         request_id: &str,
         error: String,
     ) -> Result<Option<(SessionRecord, Child)>> {
-        write_start_response(
-            control,
+        start_channel(control).reject(
             request_id,
             &StartResponse {
                 session_id: None,
                 error: Some(error),
             },
-        )?;
-        Ok(None)
+            "start response",
+        )
     }
 
     /// Spawns the requested session, persists its [`SessionRecord`], and
@@ -1224,6 +1503,15 @@ mod imp {
         control.join("task-responses")
     }
 
+    fn task_channel(control: &Path) -> RequestChannel<'_> {
+        RequestChannel::new(
+            control,
+            task_requests_dir(control),
+            task_processing_dir(control),
+            task_responses_dir(control),
+        )
+    }
+
     fn task_start_ack_dir(control: &Path) -> std::path::PathBuf {
         control.join("task-start-ack")
     }
@@ -1294,33 +1582,45 @@ mod imp {
         Ok(task_start_ack_dir(control).join(mailbox::file_name(request_id)))
     }
 
-    /// Submits `spec` to a live `Run` and awaits its task id. Mirrors
-    /// [`submit_start_request`] exactly, against the task request
-    /// directories instead.
+    /// Submits `spec` through the shared request channel and awaits its task
+    /// id. The task response claim and rollback transaction remain specific
+    /// to this caller.
     fn submit_task_start_request(control: &Path, spec: &TaskSpec) -> Result<String> {
-        if probe_control(control)? == ControlLiveness::NotRunning {
-            return Err(BatonError::Io(format!(
-                "no live baton service on {control:?}; start one with `baton service run --control <dir>` first"
-            )));
-        }
         let request_id = fresh_request_id();
-        let json = serde_json::to_string(spec)
-            .map_err(|err| BatonError::Io(format!("could not serialize task spec: {err}")))?;
-        mailbox::atomic_write(
-            &task_requests_dir(control),
-            &mailbox::file_name(&request_id),
-            &json,
-        )?;
-        await_task_start_response(control, &request_id)
+        task_channel(control).submit(
+            &request_id,
+            spec,
+            |control| Ok(probe_control(control)? == ControlLiveness::Live),
+            |control| {
+                format!(
+                    "no live baton service on {control:?}; start one with `baton service run --control <dir>` first"
+                )
+            },
+            "task spec",
+            || await_task_start_response(control, &request_id),
+        )
     }
 
     fn await_task_start_response(control: &Path, request_id: &str) -> Result<String> {
-        let deadline = Instant::now() + Duration::from_millis(START_AWAIT_MS);
-        loop {
-            if let Some(response) = take_task_start_response(control, request_id)? {
-                return task_start_response_id(control, request_id, response);
-            }
-            if probe_control(control)? == ControlLiveness::NotRunning {
+        task_channel(control).await_response(
+            request_id,
+            AwaitConfig::new(
+                START_AWAIT_MS,
+                POLL_INTERVAL_MS,
+                format!(
+                    "no live baton service on {control:?}; task start request was not admitted"
+                ),
+                "task",
+            ),
+            || {
+                take_task_start_response(control, request_id).and_then(|response| {
+                    response.map_or(Ok(None), |response| {
+                        task_start_response_id(control, request_id, response).map(Some)
+                    })
+                })
+            },
+            |control| Ok(probe_control(control)? == ControlLiveness::Live),
+            || {
                 // The supervisor can write its response just before dropping
                 // the control lock. Re-check the response after observing the
                 // released lock so a successful admission wins this race. The
@@ -1329,7 +1629,7 @@ mod imp {
                 // marker.
                 let _admission = acquire_admission_lock(control)?;
                 if let Some(response) = take_task_start_response_locked(control, request_id)? {
-                    return task_start_response_id(control, request_id, response);
+                    return task_start_response_id(control, request_id, response).map(Some);
                 }
                 if task_start_ack_exists(control, request_id)? {
                     return Err(BatonError::Io(format!(
@@ -1338,17 +1638,11 @@ mod imp {
                 }
                 mark_task_start_rollback(control, request_id)?;
                 discard_pending_task_start_request(control, request_id)?;
-                return Err(BatonError::Io(format!(
+                Err(BatonError::Io(format!(
                     "no live baton service on {control:?}; task start request was not admitted"
-                )));
-            }
-            if Instant::now() >= deadline {
-                return Err(BatonError::Io(format!(
-                    "timed out waiting for baton service to start the task ({request_id})"
-                )));
-            }
-            std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
-        }
+                )))
+            },
+        )
     }
 
     /// Takes a task-start response if the supervisor has written one.
@@ -1824,31 +2118,9 @@ mod imp {
     }
 
     /// Returns any `task-processing/` entry a crash left mid-request to
-    /// `task-requests/`. Mirrors [`reclaim_stale_requests`].
+    /// `task-requests/` through the shared request channel.
     fn reclaim_stale_task_requests(control: &Path) -> Result<()> {
-        let processing = task_processing_dir(control);
-        let entries = match fs::read_dir(&processing) {
-            Ok(rd) => rd,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => {
-                return Err(BatonError::Io(format!(
-                    "could not read {processing:?}: {err}"
-                )));
-            }
-        };
-        let requests = task_requests_dir(control);
-        fs::create_dir_all(&requests)
-            .map_err(|err| BatonError::Io(format!("could not create {requests:?}: {err}")))?;
-        for entry in entries {
-            let path = mailbox::dir_entry(entry, &processing)?.path();
-            let Some(key) = mailbox::json_key(&path) else {
-                continue;
-            };
-            let dest = requests.join(mailbox::file_name(&key));
-            fs::rename(&path, &dest)
-                .map_err(|err| BatonError::Io(format!("could not reclaim {path:?}: {err}")))?;
-        }
-        Ok(())
+        task_channel(control).reclaim_stale()
     }
 
     /// One task the `Run` loop is currently tracking: its durable
@@ -1977,76 +2249,50 @@ mod imp {
         },
     }
 
-    /// Claims and handles the next pending task-start request, if any.
-    /// Mirrors [`process_one_request`].
+    /// Claims the next task-start request through the shared request channel,
+    /// then applies task-specific admission and lifecycle handling.
     fn process_one_task_request(
         control: &Path,
         clock: &dyn Clock,
     ) -> Result<Option<(String, RunningTask)>> {
-        let dir = task_requests_dir(control);
-        fs::create_dir_all(&dir)
-            .map_err(|err| BatonError::Io(format!("could not create {dir:?}: {err}")))?;
-        let entries = match fs::read_dir(&dir) {
-            Ok(rd) => rd,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(BatonError::Io(format!("could not read {dir:?}: {err}"))),
-        };
-        for entry in entries {
-            let path = mailbox::dir_entry(entry, &dir)?.path();
-            let Some(key) = mailbox::json_key(&path) else {
-                continue;
-            };
-            let processing = task_processing_dir(control);
-            fs::create_dir_all(&processing)
-                .map_err(|err| BatonError::Io(format!("could not create {processing:?}: {err}")))?;
-            let claimed_path = processing.join(mailbox::file_name(&key));
-            match fs::rename(&path, &claimed_path) {
-                Ok(()) => {
-                    // The lock is intentionally acquired after the request is
-                    // claimed but before owner validation and spawn. If
-                    // session cleanup wins the race, validation observes the
-                    // removed/dead owner; if admission wins, cleanup waits
-                    // and reaps the newly recorded task.
-                    let outcome = acquire_admission_lock(control).and_then(|_admission| {
-                        if task_start_rollback_exists(control, &key)? {
-                            discard_pending_task_start_request(control, &key)?;
-                            wait_for_test_task_rollback_cleanup_barrier(
-                                TEST_TASK_ROLLBACK_REQUEST_BARRIER,
-                            );
-                            remove_task_start_rollback(control, &key)?;
-                            return Ok(None);
-                        }
-                        handle_task_start_request(control, &key, &claimed_path, clock)
-                    });
-                    let _ = fs::remove_file(&claimed_path);
-                    let Some((record, child, started_ms)) = outcome? else {
-                        return Ok(None);
-                    };
-                    let id = record.id.clone();
-                    let running = RunningTask {
-                        record,
-                        child: Some(child),
-                        #[cfg(target_os = "linux")]
-                        group_liveness: None,
-                        #[cfg(not(target_os = "linux"))]
-                        rehydrated_liveness: None,
-                        started_ms,
-                        term_sent_at_ms: None,
-                        kill_sent: false,
-                        terminal_delivery_attempts: 0,
-                        next_terminal_retry_ms: None,
-                        terminal_retry_delay_ms: 0,
-                        milestone_delivery_attempts: 0,
-                        next_milestone_retry_ms: None,
-                        milestone_retry_delay_ms: 0,
-                    };
-                    return Ok(Some((id, running)));
+        task_channel(control).process_one(|request_id, claimed_path| {
+            // The lock is intentionally acquired after the request is
+            // claimed but before owner validation and spawn. If session
+            // cleanup wins the race, validation observes the removed/dead
+            // owner; if admission wins, cleanup waits and reaps the newly
+            // recorded task.
+            let outcome = acquire_admission_lock(control).and_then(|_admission| {
+                if task_start_rollback_exists(control, request_id)? {
+                    discard_pending_task_start_request(control, request_id)?;
+                    wait_for_test_task_rollback_cleanup_barrier(TEST_TASK_ROLLBACK_REQUEST_BARRIER);
+                    remove_task_start_rollback(control, request_id)?;
+                    return Ok(None);
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(BatonError::Io(format!("could not claim {path:?}: {err}"))),
-            }
-        }
-        Ok(None)
+                handle_task_start_request(control, request_id, claimed_path, clock)
+            });
+            let Some((record, child, started_ms)) = outcome? else {
+                return Ok(None);
+            };
+            let id = record.id.clone();
+            let running = RunningTask {
+                record,
+                child: Some(child),
+                #[cfg(target_os = "linux")]
+                group_liveness: None,
+                #[cfg(not(target_os = "linux"))]
+                rehydrated_liveness: None,
+                started_ms,
+                term_sent_at_ms: None,
+                kill_sent: false,
+                terminal_delivery_attempts: 0,
+                next_terminal_retry_ms: None,
+                terminal_retry_delay_ms: 0,
+                milestone_delivery_attempts: 0,
+                next_milestone_retry_ms: None,
+                milestone_retry_delay_ms: 0,
+            };
+            Ok(Some((id, running)))
+        })
     }
 
     /// Answers a claimed task-start request with an admission failure the
@@ -2056,20 +2302,20 @@ mod imp {
         request_id: &str,
         error: String,
     ) -> Result<Option<(TaskRecord, Child, u64)>> {
-        write_task_start_response(
-            control,
+        task_channel(control).reject(
             request_id,
             &TaskStartResponse {
                 task_id: None,
                 error: Some(error),
             },
-        )?;
-        Ok(None)
+            "task start response",
+        )
     }
 
     /// Validates the requested owner, then spawns the task, persists its
-    /// [`TaskRecord`], and answers the request with its task id. Mirrors
-    /// [`handle_start_request`]'s
+    /// [`TaskRecord`], and answers the request with its task id. It shares the
+    /// session handler's admission failure discipline while retaining the
+    /// task-only transaction phases.
     /// kill-and-unwind-on-any-later-failure discipline until the committed
     /// record is durable. After that point the task remains tracked when
     /// response delivery or phase persistence fails, so restart reconciliation
@@ -2326,13 +2572,7 @@ mod imp {
                 }
             }
         }
-        let json = serde_json::to_string(response).map_err(|err| {
-            BatonError::Io(format!("could not serialize task start response: {err}"))
-        })?;
-        let responses = task_responses_dir(control);
-        fs::create_dir_all(&responses)
-            .map_err(|err| BatonError::Io(format!("could not create {responses:?}: {err}")))?;
-        mailbox::atomic_write(&responses, &mailbox::file_name(request_id), &json)
+        task_channel(control).write_response(request_id, response, "task start response")
     }
 
     /// Spawns `spec`'s command as its own process-group leader, stdout/stderr
@@ -2910,83 +3150,33 @@ mod imp {
 
     // -- Task records -------------------------------------------------------
 
+    fn task_records(control: &Path) -> RecordStore {
+        RecordStore::new(tasks_dir(control), "task")
+    }
+
+    #[cfg(test)]
     fn task_record_path(control: &Path, id: &str) -> Result<std::path::PathBuf> {
-        if !mailbox::is_safe_key(id) {
-            return Err(BatonError::Io(format!(
-                "task id is not usable as a filename: {id:?}"
-            )));
-        }
-        Ok(tasks_dir(control).join(mailbox::file_name(id)))
+        task_records(control).path(id)
     }
 
     fn write_task_record(control: &Path, record: &TaskRecord) -> Result<()> {
-        let dir = tasks_dir(control);
-        fs::create_dir_all(&dir)
-            .map_err(|err| BatonError::Io(format!("could not create {dir:?}: {err}")))?;
-        let json = serde_json::to_string(record)
-            .map_err(|err| BatonError::Io(format!("could not serialize task record: {err}")))?;
-        mailbox::atomic_write(&dir, &mailbox::file_name(&record.id), &json)
+        task_records(control).write(&record.id, record)
     }
 
     fn read_task_record(control: &Path, id: &str) -> Result<Option<TaskRecord>> {
-        let path = task_record_path(control, id)?;
-        match fs::read_to_string(&path) {
-            Ok(data) => serde_json::from_str(&data).map(Some).map_err(|err| {
-                BatonError::Decode(format!("malformed task record {path:?}: {err}"))
-            }),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(BatonError::Io(format!("could not read {path:?}: {err}"))),
-        }
+        task_records(control).read(id)
     }
 
     fn task_record_exists(control: &Path, id: &str) -> Result<bool> {
-        let path = task_record_path(control, id)?;
-        match path.try_exists() {
-            Ok(true) => Ok(true),
-            Ok(false) => {
-                let parent = tasks_dir(control);
-                match fs::metadata(&parent) {
-                    Ok(metadata) if metadata.is_dir() => Ok(false),
-                    Ok(_) => Err(BatonError::Io(format!(
-                        "could not probe task record {path:?}: parent {parent:?} is not a directory"
-                    ))),
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-                    Err(err) => Err(BatonError::Io(format!(
-                        "could not probe task record parent {parent:?}: {err}"
-                    ))),
-                }
-            }
-            Err(err) => Err(BatonError::Io(format!("could not probe {path:?}: {err}"))),
-        }
+        task_records(control).exists(id)
     }
 
     fn remove_task_record(control: &Path, id: &str) -> Result<()> {
-        let path = task_record_path(control, id)?;
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(BatonError::Io(format!("could not remove {path:?}: {err}"))),
-        }
+        task_records(control).remove(id)
     }
 
     fn list_task_records(control: &Path) -> Result<Vec<TaskRecord>> {
-        let dir = tasks_dir(control);
-        let entries = match fs::read_dir(&dir) {
-            Ok(rd) => rd,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(BatonError::Io(format!("could not read {dir:?}: {err}"))),
-        };
-        let mut records = Vec::new();
-        for entry in entries {
-            let path = mailbox::dir_entry(entry, &dir)?.path();
-            let Some(key) = mailbox::json_key(&path) else {
-                continue;
-            };
-            if let Some(record) = read_task_record(control, &key)? {
-                records.push(record);
-            }
-        }
-        Ok(records)
+        task_records(control).list()
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -4268,66 +4458,33 @@ mod imp {
         control.join("sessions")
     }
 
+    fn session_records(control: &Path) -> RecordStore {
+        RecordStore::new(sessions_dir(control), "session")
+    }
+
     fn session_logs_dir(control: &Path, session_id: &str) -> std::path::PathBuf {
         sessions_dir(control).join(session_id)
     }
 
+    #[cfg(test)]
     fn session_record_path(control: &Path, id: &str) -> Result<std::path::PathBuf> {
-        if !mailbox::is_safe_key(id) {
-            return Err(BatonError::Io(format!(
-                "session id is not usable as a filename: {id:?}"
-            )));
-        }
-        Ok(sessions_dir(control).join(mailbox::file_name(id)))
+        session_records(control).path(id)
     }
 
     fn write_session_record(control: &Path, record: &SessionRecord) -> Result<()> {
-        let dir = sessions_dir(control);
-        fs::create_dir_all(&dir)
-            .map_err(|err| BatonError::Io(format!("could not create {dir:?}: {err}")))?;
-        let json = serde_json::to_string(record)
-            .map_err(|err| BatonError::Io(format!("could not serialize session record: {err}")))?;
-        mailbox::atomic_write(&dir, &mailbox::file_name(&record.id), &json)
+        session_records(control).write(&record.id, record)
     }
 
     fn read_session_record(control: &Path, id: &str) -> Result<Option<SessionRecord>> {
-        let path = session_record_path(control, id)?;
-        match fs::read_to_string(&path) {
-            Ok(data) => serde_json::from_str(&data).map(Some).map_err(|err| {
-                BatonError::Decode(format!("malformed session record {path:?}: {err}"))
-            }),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(BatonError::Io(format!("could not read {path:?}: {err}"))),
-        }
+        session_records(control).read(id)
     }
 
     fn remove_session_record(control: &Path, id: &str) -> Result<()> {
-        let path = session_record_path(control, id)?;
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(BatonError::Io(format!("could not remove {path:?}: {err}"))),
-        }
+        session_records(control).remove(id)
     }
 
     fn list_session_records(control: &Path) -> Result<Vec<SessionRecord>> {
-        let dir = sessions_dir(control);
-        let entries = match fs::read_dir(&dir) {
-            Ok(rd) => rd,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(BatonError::Io(format!("could not read {dir:?}: {err}"))),
-        };
-        let mut records = Vec::new();
-        for entry in entries {
-            let path = mailbox::dir_entry(entry, &dir)?.path();
-            let Some(key) = mailbox::json_key(&path) else {
-                continue;
-            };
-            if let Some(record) = read_session_record(control, &key)? {
-                records.push(record);
-            }
-        }
-        Ok(records)
+        session_records(control).list()
     }
 
     // -- CLI-facing operations ---------------------------------------------
