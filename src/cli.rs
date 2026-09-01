@@ -2579,6 +2579,153 @@ fn parse_roster(raw: Option<&str>) -> Result<Vec<String>> {
     Ok(names)
 }
 
+#[derive(Default)]
+struct SessionSpecFlags {
+    inbox: Option<String>,
+    outbox: Option<String>,
+    poll_ms: Option<u64>,
+    agent_cmd: Option<String>,
+    agent_args: Vec<String>,
+    agent_cwd: Option<String>,
+    agent_timeout_ms: Option<u64>,
+    agent_output: Option<String>,
+    agent_result_key: Option<String>,
+    role: Option<String>,
+}
+
+impl SessionSpecFlags {
+    /// Parses one of the flags shared by `serve` and `service start`.
+    /// Returns `false` when `arg` belongs to the command-specific surface.
+    fn parse_flag<'a>(
+        &mut self,
+        arg: &str,
+        iter: &mut impl Iterator<Item = &'a String>,
+    ) -> Result<bool> {
+        let mut take = |flag: &str| -> Result<String> {
+            iter.next()
+                .cloned()
+                .ok_or_else(|| usage(&format!("{flag} requires a value")))
+        };
+        match arg {
+            "--inbox" => {
+                self.inbox = Some(take("--inbox")?);
+                Ok(true)
+            }
+            other if other.starts_with("--inbox=") => {
+                self.inbox = Some(other["--inbox=".len()..].to_string());
+                Ok(true)
+            }
+            "--outbox" => {
+                self.outbox = Some(take("--outbox")?);
+                Ok(true)
+            }
+            other if other.starts_with("--outbox=") => {
+                self.outbox = Some(other["--outbox=".len()..].to_string());
+                Ok(true)
+            }
+            "--poll-ms" => {
+                self.poll_ms = Some(parse_poll_ms(&take("--poll-ms")?)?);
+                Ok(true)
+            }
+            other if other.starts_with("--poll-ms=") => {
+                self.poll_ms = Some(parse_poll_ms(&other["--poll-ms=".len()..])?);
+                Ok(true)
+            }
+            "--agent-cmd" => {
+                self.agent_cmd = Some(take("--agent-cmd")?);
+                Ok(true)
+            }
+            other if other.starts_with("--agent-cmd=") => {
+                self.agent_cmd = Some(other["--agent-cmd=".len()..].to_string());
+                Ok(true)
+            }
+            "--agent-arg" => {
+                self.agent_args.push(take("--agent-arg")?);
+                Ok(true)
+            }
+            other if other.starts_with("--agent-arg=") => {
+                self.agent_args
+                    .push(other["--agent-arg=".len()..].to_string());
+                Ok(true)
+            }
+            "--agent-cwd" => {
+                self.agent_cwd = Some(take("--agent-cwd")?);
+                Ok(true)
+            }
+            other if other.starts_with("--agent-cwd=") => {
+                self.agent_cwd = Some(other["--agent-cwd=".len()..].to_string());
+                Ok(true)
+            }
+            "--agent-timeout-ms" => {
+                self.agent_timeout_ms = Some(parse_positive_ms(
+                    &take("--agent-timeout-ms")?,
+                    "--agent-timeout-ms",
+                )?);
+                Ok(true)
+            }
+            other if other.starts_with("--agent-timeout-ms=") => {
+                self.agent_timeout_ms = Some(parse_positive_ms(
+                    &other["--agent-timeout-ms=".len()..],
+                    "--agent-timeout-ms",
+                )?);
+                Ok(true)
+            }
+            "--agent-output" => {
+                self.agent_output = Some(take("--agent-output")?);
+                Ok(true)
+            }
+            other if other.starts_with("--agent-output=") => {
+                self.agent_output = Some(other["--agent-output=".len()..].to_string());
+                Ok(true)
+            }
+            "--agent-result-key" => {
+                self.agent_result_key = Some(take("--agent-result-key")?);
+                Ok(true)
+            }
+            other if other.starts_with("--agent-result-key=") => {
+                self.agent_result_key = Some(other["--agent-result-key=".len()..].to_string());
+                Ok(true)
+            }
+            "--role" => {
+                self.role = Some(take("--role")?);
+                Ok(true)
+            }
+            other if other.starts_with("--role=") => {
+                self.role = Some(other["--role=".len()..].to_string());
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn has_agent_run_flags(&self) -> bool {
+        !self.agent_args.is_empty()
+            || self.agent_cwd.is_some()
+            || self.agent_timeout_ms.is_some()
+            || self.agent_output.is_some()
+            || self.agent_result_key.is_some()
+    }
+
+    /// Validates the shared agent-run flag relationships.
+    fn validate(&self) -> Result<()> {
+        // The agent-run flags only qualify `--agent-cmd`; without it they
+        // would be silently ignored, so reject them rather than mislead.
+        if self.agent_cmd.is_none() && self.has_agent_run_flags() {
+            return Err(usage(
+                "--agent-arg/--agent-cwd/--agent-timeout-ms/--agent-output/--agent-result-key require --agent-cmd",
+            ));
+        }
+
+        // `--agent-result-key` names a field the `json` adapter reads; under
+        // `raw` (the default) it has no effect, so reject it rather than
+        // silently ignore.
+        if self.agent_result_key.is_some() && self.agent_output.as_deref() != Some("json") {
+            return Err(usage("--agent-result-key requires --agent-output json"));
+        }
+        Ok(())
+    }
+}
+
 /// Parses the arguments following the `serve` subcommand.
 ///
 /// The daemon form requires `--inbox <dir>` and `--outbox <dir>` (both
@@ -2589,121 +2736,53 @@ fn parse_roster(raw: Option<&str>) -> Result<Vec<String>> {
 /// `--flag=value` form. A flag without a value, a blank/missing required dir, a
 /// non-positive `--poll-ms`, or any other token is a usage error.
 fn parse_serve<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
-    let mut inbox: Option<String> = None;
-    let mut outbox: Option<String> = None;
-    let mut poll_ms: Option<u64> = None;
+    let mut flags = SessionSpecFlags::default();
     let mut once = false;
     let mut stop = false;
-    let mut agent_cmd: Option<String> = None;
-    let mut agent_args: Vec<String> = Vec::new();
-    let mut agent_cwd: Option<String> = None;
-    let mut agent_timeout_ms: Option<u64> = None;
-    let mut agent_output: Option<String> = None;
-    let mut agent_result_key: Option<String> = None;
-    let mut role: Option<String> = None;
 
     while let Some(arg) = iter.next() {
-        let mut take = |flag: &str| -> Result<String> {
-            iter.next()
-                .cloned()
-                .ok_or_else(|| usage(&format!("{flag} requires a value")))
-        };
         match arg.as_str() {
-            "--inbox" => inbox = Some(take("--inbox")?),
-            other if other.starts_with("--inbox=") => {
-                inbox = Some(other["--inbox=".len()..].to_string());
-            }
-            "--outbox" => outbox = Some(take("--outbox")?),
-            other if other.starts_with("--outbox=") => {
-                outbox = Some(other["--outbox=".len()..].to_string());
-            }
-            "--poll-ms" => poll_ms = Some(parse_poll_ms(&take("--poll-ms")?)?),
-            other if other.starts_with("--poll-ms=") => {
-                poll_ms = Some(parse_poll_ms(&other["--poll-ms=".len()..])?);
-            }
             "--once" => once = true,
             "--stop" => stop = true,
-            "--agent-cmd" => agent_cmd = Some(take("--agent-cmd")?),
-            other if other.starts_with("--agent-cmd=") => {
-                agent_cmd = Some(other["--agent-cmd=".len()..].to_string());
+            other => {
+                if !flags.parse_flag(other, &mut iter)? {
+                    return Err(usage(&format!("unexpected argument {other:?}")));
+                }
             }
-            "--agent-arg" => agent_args.push(take("--agent-arg")?),
-            other if other.starts_with("--agent-arg=") => {
-                agent_args.push(other["--agent-arg=".len()..].to_string());
-            }
-            "--agent-cwd" => agent_cwd = Some(take("--agent-cwd")?),
-            other if other.starts_with("--agent-cwd=") => {
-                agent_cwd = Some(other["--agent-cwd=".len()..].to_string());
-            }
-            "--agent-timeout-ms" => {
-                agent_timeout_ms = Some(parse_positive_ms(
-                    &take("--agent-timeout-ms")?,
-                    "--agent-timeout-ms",
-                )?)
-            }
-            other if other.starts_with("--agent-timeout-ms=") => {
-                agent_timeout_ms = Some(parse_positive_ms(
-                    &other["--agent-timeout-ms=".len()..],
-                    "--agent-timeout-ms",
-                )?);
-            }
-            "--agent-output" => agent_output = Some(take("--agent-output")?),
-            other if other.starts_with("--agent-output=") => {
-                agent_output = Some(other["--agent-output=".len()..].to_string());
-            }
-            "--agent-result-key" => agent_result_key = Some(take("--agent-result-key")?),
-            other if other.starts_with("--agent-result-key=") => {
-                agent_result_key = Some(other["--agent-result-key=".len()..].to_string());
-            }
-            "--role" => role = Some(take("--role")?),
-            other if other.starts_with("--role=") => {
-                role = Some(other["--role=".len()..].to_string());
-            }
-            other => return Err(usage(&format!("unexpected argument {other:?}"))),
         }
     }
 
     // Cooperative-stop client: only `--inbox` is meaningful; the daemon-only
     // flags have no effect here, so reject them rather than silently ignore.
     if stop {
-        if outbox.is_some()
-            || poll_ms.is_some()
+        if flags.outbox.is_some()
+            || flags.poll_ms.is_some()
             || once
-            || agent_cmd.is_some()
-            || !agent_args.is_empty()
-            || agent_cwd.is_some()
-            || agent_timeout_ms.is_some()
-            || agent_output.is_some()
-            || agent_result_key.is_some()
-            || role.is_some()
+            || flags.agent_cmd.is_some()
+            || flags.has_agent_run_flags()
+            || flags.role.is_some()
         {
             return Err(usage(
                 "--stop takes only --inbox (not --outbox/--poll-ms/--once/--agent-*/--role)",
             ));
         }
-        let inbox = require_dir(inbox, "--inbox")?;
+        let inbox = require_dir(flags.inbox, "--inbox")?;
         return Ok(Command::ServeStop { inbox });
     }
 
-    // The agent-run flags only qualify `--agent-cmd`; without it they would be
-    // silently ignored, so reject them rather than mislead.
-    if agent_cmd.is_none()
-        && (!agent_args.is_empty()
-            || agent_cwd.is_some()
-            || agent_timeout_ms.is_some()
-            || agent_output.is_some()
-            || agent_result_key.is_some())
-    {
-        return Err(usage(
-            "--agent-arg/--agent-cwd/--agent-timeout-ms/--agent-output/--agent-result-key require --agent-cmd",
-        ));
-    }
-
-    // `--agent-result-key` names a field the `json` adapter reads; under `raw`
-    // (the default) it has no effect, so reject it rather than silently ignore.
-    if agent_result_key.is_some() && agent_output.as_deref() != Some("json") {
-        return Err(usage("--agent-result-key requires --agent-output json"));
-    }
+    flags.validate()?;
+    let SessionSpecFlags {
+        inbox,
+        outbox,
+        poll_ms,
+        agent_cmd,
+        agent_args,
+        agent_cwd,
+        agent_timeout_ms,
+        agent_output,
+        agent_result_key,
+        role,
+    } = flags;
 
     let inbox = require_dir(inbox, "--inbox")?;
     let outbox = require_dir(outbox, "--outbox")?;
@@ -2774,16 +2853,7 @@ fn parse_service_run<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<C
 /// rather than translating through a second flag surface.
 fn parse_service_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
     let mut control: Option<String> = None;
-    let mut inbox: Option<String> = None;
-    let mut outbox: Option<String> = None;
-    let mut poll_ms: Option<u64> = None;
-    let mut agent_cmd: Option<String> = None;
-    let mut agent_args: Vec<String> = Vec::new();
-    let mut agent_cwd: Option<String> = None;
-    let mut agent_timeout_ms: Option<u64> = None;
-    let mut agent_output: Option<String> = None;
-    let mut agent_result_key: Option<String> = None;
-    let mut role: Option<String> = None;
+    let mut flags = SessionSpecFlags::default();
 
     while let Some(arg) = iter.next() {
         let mut take = |flag: &str| -> Result<String> {
@@ -2796,75 +2866,27 @@ fn parse_service_start<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result
             other if other.starts_with("--control=") => {
                 control = Some(other["--control=".len()..].to_string());
             }
-            "--inbox" => inbox = Some(take("--inbox")?),
-            other if other.starts_with("--inbox=") => {
-                inbox = Some(other["--inbox=".len()..].to_string());
+            other => {
+                if !flags.parse_flag(other, &mut iter)? {
+                    return Err(usage(&format!("unexpected argument {other:?}")));
+                }
             }
-            "--outbox" => outbox = Some(take("--outbox")?),
-            other if other.starts_with("--outbox=") => {
-                outbox = Some(other["--outbox=".len()..].to_string());
-            }
-            "--poll-ms" => poll_ms = Some(parse_poll_ms(&take("--poll-ms")?)?),
-            other if other.starts_with("--poll-ms=") => {
-                poll_ms = Some(parse_poll_ms(&other["--poll-ms=".len()..])?);
-            }
-            "--agent-cmd" => agent_cmd = Some(take("--agent-cmd")?),
-            other if other.starts_with("--agent-cmd=") => {
-                agent_cmd = Some(other["--agent-cmd=".len()..].to_string());
-            }
-            "--agent-arg" => agent_args.push(take("--agent-arg")?),
-            other if other.starts_with("--agent-arg=") => {
-                agent_args.push(other["--agent-arg=".len()..].to_string());
-            }
-            "--agent-cwd" => agent_cwd = Some(take("--agent-cwd")?),
-            other if other.starts_with("--agent-cwd=") => {
-                agent_cwd = Some(other["--agent-cwd=".len()..].to_string());
-            }
-            "--agent-timeout-ms" => {
-                agent_timeout_ms = Some(parse_positive_ms(
-                    &take("--agent-timeout-ms")?,
-                    "--agent-timeout-ms",
-                )?)
-            }
-            other if other.starts_with("--agent-timeout-ms=") => {
-                agent_timeout_ms = Some(parse_positive_ms(
-                    &other["--agent-timeout-ms=".len()..],
-                    "--agent-timeout-ms",
-                )?);
-            }
-            "--agent-output" => agent_output = Some(take("--agent-output")?),
-            other if other.starts_with("--agent-output=") => {
-                agent_output = Some(other["--agent-output=".len()..].to_string());
-            }
-            "--agent-result-key" => agent_result_key = Some(take("--agent-result-key")?),
-            other if other.starts_with("--agent-result-key=") => {
-                agent_result_key = Some(other["--agent-result-key=".len()..].to_string());
-            }
-            "--role" => role = Some(take("--role")?),
-            other if other.starts_with("--role=") => {
-                role = Some(other["--role=".len()..].to_string());
-            }
-            other => return Err(usage(&format!("unexpected argument {other:?}"))),
         }
     }
 
-    // Same two guards as `parse_serve`: the agent-run flags only qualify
-    // `--agent-cmd`, and `--agent-result-key` only qualifies `--agent-output
-    // json`.
-    if agent_cmd.is_none()
-        && (!agent_args.is_empty()
-            || agent_cwd.is_some()
-            || agent_timeout_ms.is_some()
-            || agent_output.is_some()
-            || agent_result_key.is_some())
-    {
-        return Err(usage(
-            "--agent-arg/--agent-cwd/--agent-timeout-ms/--agent-output/--agent-result-key require --agent-cmd",
-        ));
-    }
-    if agent_result_key.is_some() && agent_output.as_deref() != Some("json") {
-        return Err(usage("--agent-result-key requires --agent-output json"));
-    }
+    flags.validate()?;
+    let SessionSpecFlags {
+        inbox,
+        outbox,
+        poll_ms,
+        agent_cmd,
+        agent_args,
+        agent_cwd,
+        agent_timeout_ms,
+        agent_output,
+        agent_result_key,
+        role,
+    } = flags;
 
     let control = require_dir(control, "--control")?;
     let start_cwd = std::env::current_dir().map_err(|err| {
