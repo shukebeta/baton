@@ -10,11 +10,17 @@ use super::records::{
     remove_task_start_response_files, remove_task_start_rollback, remove_task_start_transaction,
     responses_dir, restore_task_start_response_claim, start_channel,
     take_task_start_response_locked, task_cancel_dir, task_channel, task_logs_dir,
-    task_record_exists, task_start_ack_exists, task_start_response_boundary_exists,
-    task_start_response_claim_path, task_start_response_id, task_start_response_path,
-    task_start_rollback_exists, wait_for_test_task_admission_barrier,
-    wait_for_test_task_response_phase_barrier, wait_for_test_task_rollback_cleanup_barrier,
-    write_session_record, write_start_response, write_task_record, write_task_start_response,
+    task_start_ack_exists, task_start_response_boundary_exists, task_start_response_claim_path,
+    task_start_response_id, task_start_response_path, task_start_rollback_exists,
+    wait_for_test_task_admission_barrier, wait_for_test_task_response_phase_barrier,
+    wait_for_test_task_rollback_cleanup_barrier, write_session_record, write_start_response,
+    write_task_record, write_task_start_response,
+};
+#[cfg(test)]
+use super::task_tick::tick_one_task;
+use super::task_tick::{
+    self, Liveness, RunningTask as SharedRunningTask, ServicePlatform, TaskLivenessMode,
+    TaskLivenessRefresh, TerminationSignal, task_cancel_sentinel_path,
 };
 use super::*;
 use std::collections::HashMap;
@@ -27,11 +33,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::mailbox;
-use crate::message::{MessageEnvelope, MessageKind};
 use crate::task::{
-    Clock, SystemClock, TaskAdmissionPhase, TaskEventBody, TaskEventKind, TaskRecord, TaskSpec,
-    TaskState, first_non_ascending_milestone, max_duration_exceeded, milestones_due, task_event_id,
+    Clock, SystemClock, TaskAdmissionPhase, TaskRecord, TaskSpec, TaskState,
+    first_non_ascending_milestone,
 };
+
+type RunningTask = SharedRunningTask<WindowsServicePlatform>;
+#[cfg(test)]
+type TaskTick = task_tick::TaskTick;
 use windows_sys::Win32::Foundation::{
     CloseHandle, FALSE, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
@@ -233,12 +242,15 @@ const POLL_INTERVAL_MS: u64 = 100;
 /// Initial delay before retrying a failed task-event callback delivery.
 /// Governs both milestone and terminal delivery — the same bounded
 /// exponential backoff policy applies to every task event.
+#[cfg(test)]
 const EVENT_RETRY_INITIAL_DELAY_MS: u64 = 1_000;
 /// Longest delay between task-event callback delivery attempts.
+#[cfg(test)]
 const EVENT_RETRY_MAX_DELAY_MS: u64 = 60_000;
 /// Total callback delivery attempts for a single task event before it is
 /// dropped (a terminal event drops the tracker entry; a milestone is
 /// skipped so supervision continues).
+#[cfg(test)]
 const MAX_EVENT_DELIVERY_ATTEMPTS: u32 = 10;
 /// Bound on how long `Start` waits for a live `Run` to answer.
 const START_AWAIT_MS: u64 = 10_000;
@@ -271,24 +283,6 @@ enum ControlLiveness {
     NotRunning,
 }
 
-/// Result of corroborating a durable PID against the process currently
-/// occupying it. `Unresolved` is deliberately distinct from `Dead`: the
-/// former means the PID exists but baton cannot prove its identity, so it
-/// is never signalled or removed without an explicit operator override.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum Liveness {
-    Live,
-    Dead,
-    Unresolved,
-}
-
-impl Liveness {
-    fn is_live(self) -> bool {
-        self == Self::Live
-    }
-}
-
 /// A process probe can positively report absence, fail to read the
 /// process, or return a sample. The distinction is the safety boundary of
 /// the liveness ladder.
@@ -297,92 +291,6 @@ enum ProbeResult<T> {
     Gone,
     Unreadable,
     Present(T),
-}
-
-/// The lifecycle operation requested from a future platform adapter.
-/// Windows maps both operations to Job Object termination while retaining
-/// the phase text used by its PID fallback warnings.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TerminationSignal {
-    Term,
-    Kill,
-}
-
-#[allow(dead_code)]
-impl TerminationSignal {
-    fn phase(self) -> &'static str {
-        match self {
-            Self::Term => "-TERM",
-            Self::Kill => "-KILL",
-        }
-    }
-}
-
-/// Identifies the two task paths whose liveness control flow differs:
-/// an owned task can use its Child as the direct-leader identity, while a
-/// rehydrated task must corroborate the durable PID on every observation.
-/// `leader_exited` additionally identifies the descendant-boundary probe
-/// after the direct child has been reaped.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TaskLivenessMode {
-    Owned { leader_exited: bool },
-    Rehydrated,
-}
-
-/// Controls whether a platform may use a bounded liveness sample or must
-/// take a fresh observation before authorizing termination/reaping.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TaskLivenessRefresh {
-    Cached,
-    Forced,
-}
-
-/// Private platform boundary for the later service extraction tickets. The
-/// current supervisor deliberately continues to call its existing free
-/// functions; this adapter only makes the intended seam concrete.
-#[allow(dead_code)]
-trait ServicePlatform {
-    type SessionHandle;
-    type TaskHandle;
-    type TaskLivenessCache: Default;
-
-    fn spawn_session(
-        spec: &SessionSpec,
-        stderr_path: &Path,
-    ) -> Result<(Child, Self::SessionHandle)>;
-    fn spawn_task(
-        spec: &TaskSpec,
-        stdout_path: &Path,
-        stderr_path: &Path,
-    ) -> Result<(Child, Self::TaskHandle)>;
-    fn recorded_start_identity(pid: u32) -> (Option<String>, Option<i64>);
-    fn start_identity_is_valid(started_at: &Option<String>, start_epoch_secs: &Option<i64>)
-    -> bool;
-    fn session_liveness(record: &SessionRecord) -> Liveness;
-    fn task_liveness(record: &TaskRecord) -> Liveness;
-    fn task_liveness_for_tick(
-        record: &TaskRecord,
-        mode: TaskLivenessMode,
-        cache: &mut Self::TaskLivenessCache,
-        now_ms: u64,
-        refresh: TaskLivenessRefresh,
-    ) -> Liveness;
-    fn terminate_session(
-        record: &SessionRecord,
-        signal: TerminationSignal,
-        force: bool,
-    ) -> Result<()>;
-    fn terminate_task(record: &TaskRecord, signal: TerminationSignal, force: bool) -> Result<()>;
-    fn terminate_owned_task(
-        owner: Option<&Self::TaskHandle>,
-        record: &TaskRecord,
-        signal: TerminationSignal,
-        force: bool,
-    ) -> Result<()>;
-    fn pid_is_gone(pid: u32) -> bool;
 }
 
 /// Job Object ownership returned by the future platform spawn seam. The
@@ -400,7 +308,7 @@ struct WindowsServicePlatform;
 #[allow(dead_code)]
 impl ServicePlatform for WindowsServicePlatform {
     type SessionHandle = WindowsProcessOwner;
-    type TaskHandle = WindowsProcessOwner;
+    type TaskHandle = JobHandle;
     // Windows currently recomputes its Job Object/PID observation each tick;
     // the shared API still carries cache state so a later migration can make
     // that policy explicit without changing the consumer shape.
@@ -441,8 +349,8 @@ impl ServicePlatform for WindowsServicePlatform {
         stdout_path: &Path,
         stderr_path: &Path,
     ) -> Result<(Child, Self::TaskHandle)> {
-        let (child, job, name) = spawn_task_child(spec, stdout_path, stderr_path)?;
-        Ok((child, WindowsProcessOwner { job, name }))
+        let (child, job, _name) = spawn_task_child(spec, stdout_path, stderr_path)?;
+        Ok((child, job))
     }
 
     fn recorded_start_identity(pid: u32) -> (Option<String>, Option<i64>) {
@@ -466,6 +374,7 @@ impl ServicePlatform for WindowsServicePlatform {
 
     fn task_liveness_for_tick(
         record: &TaskRecord,
+        owner: Option<&Self::TaskHandle>,
         mode: TaskLivenessMode,
         cache: &mut Self::TaskLivenessCache,
         now_ms: u64,
@@ -475,7 +384,22 @@ impl ServicePlatform for WindowsServicePlatform {
         // ownership, clock, and refresh inputs in the seam even though this
         // implementation intentionally follows its current recomputed path.
         let _ = (mode, cache, now_ms, refresh);
-        is_task_alive(record)
+        match process_probe(record.pid) {
+            ProbeResult::Gone => match owner {
+                Some(job) => match active_job_processes(job) {
+                    Ok(0) => Liveness::Dead,
+                    Ok(_) => Liveness::Live,
+                    Err(_) => Liveness::Unresolved,
+                },
+                None => job_tree_liveness(record.job.as_deref()).unwrap_or(Liveness::Dead),
+            },
+            ProbeResult::Unreadable => Liveness::Unresolved,
+            ProbeResult::Present(current) => match &record.started_at {
+                Some(expected) if expected == &current => Liveness::Live,
+                Some(_) => Liveness::Unresolved,
+                None => Liveness::Unresolved,
+            },
+        }
     }
 
     fn terminate_session(
@@ -505,7 +429,7 @@ impl ServicePlatform for WindowsServicePlatform {
         force: bool,
     ) -> Result<()> {
         match owner {
-            Some(owner) => terminate_job(&owner.job),
+            Some(owner) => terminate_job(owner),
             None if force => {
                 force_terminate_record_job(record.job.as_deref(), record.pid, signal.phase())
             }
@@ -515,6 +439,44 @@ impl ServicePlatform for WindowsServicePlatform {
 
     fn pid_is_gone(pid: u32) -> bool {
         recorded_pid_is_gone(pid)
+    }
+
+    fn unresolved_task_is_gone(
+        control: &Path,
+        id: &str,
+        record: &TaskRecord,
+        term_sent_at_ms: Option<u64>,
+    ) -> Result<bool> {
+        let controlled =
+            term_sent_at_ms.is_some() || task_cancel_sentinel_path(control, id).is_file();
+        Ok(controlled && Self::pid_is_gone(record.pid))
+    }
+
+    fn rehydrate_task(record: &TaskRecord) -> Result<Option<Self::TaskHandle>> {
+        record
+            .job
+            .as_deref()
+            .map(open_job)
+            .transpose()
+            .map(|job| job.flatten())
+    }
+
+    fn persist_terminal_task(
+        control: &Path,
+        record: &mut TaskRecord,
+        state: TaskState,
+        exit_code: Option<i32>,
+        elapsed_ms: u64,
+    ) -> Result<bool> {
+        record.state = state;
+        record.exit_code = exit_code;
+        record.elapsed_ms = Some(elapsed_ms);
+        write_task_record(control, record)?;
+        Ok(true)
+    }
+
+    fn keep_child_handle_while_draining() -> bool {
+        false
     }
 }
 
@@ -608,7 +570,7 @@ fn run_service(control: &Path, mut out: impl Write) -> Result<()> {
     drop(_admission);
     let clock = SystemClock;
     let mut sessions = rehydrate_sessions(control)?;
-    let mut tasks = rehydrate_tasks(control, &clock)?;
+    let mut tasks = task_tick::rehydrate_tasks::<WindowsServicePlatform>(control, &clock)?;
     writeln!(out, "baton service running on {}", control.display()).map_err(io_err)?;
 
     loop {
@@ -624,7 +586,7 @@ fn run_service(control: &Path, mut out: impl Write) -> Result<()> {
             }
         }
         reap_exited(&mut sessions);
-        tick_tasks(control, &mut tasks, &clock);
+        task_tick::tick_tasks::<WindowsServicePlatform>(control, &mut tasks, &clock);
 
         // One request's failure (a malformed spec, a transient spawn
         // error) must not crash the loop out from under every other
@@ -1377,140 +1339,6 @@ fn reclaim_stale_task_requests(control: &Path) -> Result<()> {
     task_channel(control).reclaim_stale()
 }
 
-/// Exit outcome of a task's direct child, retained across the descendant
-/// drain so the eventual terminal state reflects the command's own result
-/// instead of defaulting to a code-less failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ChildExit {
-    /// `ExitStatus::success()` of the direct child.
-    succeeded: bool,
-    /// `ExitStatus::code()` of the direct child.
-    code: Option<i32>,
-}
-
-/// One task the `Run` loop is currently tracking: its durable
-/// [`TaskRecord`] (kept in sync as milestones fire and it goes terminal),
-/// either the live [`Child`] handle owned by this supervisor or a
-/// rehydrated PID identity, and the injected-clock timestamps driving
-/// milestone/max-duration decisions.
-struct RunningTask {
-    record: TaskRecord,
-    /// `Some` while this `Run` instance owns the child handle. A task
-    /// restored after a supervisor restart has already been reparented to
-    /// init, so it is represented by `None` and polled by corroborated
-    /// PID liveness instead of `Child::try_wait`.
-    child: Option<Child>,
-    /// Best-effort Job Object re-adoption. A missing handle does not change
-    /// a corroborated PID's identity; signaling falls back to that PID and
-    /// makes no descendant-reachability claim.
-    job: Option<JobHandle>,
-    started_ms: u64,
-    /// Set once this task's max duration has been exceeded and a first Job
-    /// Object termination was sent, so a later tick knows to escalate after
-    /// `KILL_GRACE_MS`, and a successful reap after this is set is
-    /// attributed to `timeout`, not `completed`/`failed`.
-    term_sent_at_ms: Option<u64>,
-    /// Set once the second Job Object termination has been sent, so it is
-    /// only ever sent once.
-    kill_sent: bool,
-    /// Number of failed terminal callback delivery attempts. These are
-    /// deliberately in-memory: a terminal record is replayed once after
-    /// restart, then follows the same bounded retry policy.
-    terminal_delivery_attempts: u32,
-    /// Clock deadline at which the next terminal callback delivery may be
-    /// attempted.
-    next_terminal_retry_ms: Option<u64>,
-    /// Delay used for the most recent failed terminal delivery, so the next
-    /// failure can double it without a wall-clock dependency.
-    terminal_retry_delay_ms: u64,
-    /// Number of failed delivery attempts for the current lowest undelivered
-    /// milestone. Reset once that milestone is delivered or dropped. In-memory
-    /// only, like the terminal counters: a rehydrated task re-attempts a due
-    /// milestone with a fresh backoff.
-    milestone_delivery_attempts: u32,
-    /// Clock deadline at which the next milestone callback delivery may be
-    /// attempted; `None` when no milestone delivery is currently backed off.
-    next_milestone_retry_ms: Option<u64>,
-    /// Delay used for the most recent failed milestone delivery, so the next
-    /// failure can double it without a wall-clock dependency.
-    milestone_retry_delay_ms: u64,
-    /// Exit outcome of the direct child, stashed when the task parks to
-    /// drain surviving Job Object descendants (which clears `child`).
-    /// `None` for a task that never owned a child handle (rehydrated after
-    /// a supervisor restart) or whose child has not exited yet.
-    child_exit: Option<ChildExit>,
-}
-
-/// Restores every durable task before the request loop accepts new work.
-/// Running records are rehydrated for PID-based tracking; terminal
-/// records are retained for one deterministic callback replay in case the
-/// previous supervisor persisted state immediately before it exited. The
-/// child process was reparented when the previous supervisor exited, so
-/// the new tracker deliberately carries no `Child` handle and lets
-/// `tick_one_task` use the record's corroborated PID identity instead.
-/// Prepared admission records are intentionally excluded: they have not
-/// crossed the durable admission boundary, so an unresolved one is
-/// retained for reconciliation rather than treated as active work.
-fn rehydrate_tasks(control: &Path, clock: &dyn Clock) -> Result<HashMap<String, RunningTask>> {
-    let mut tasks = HashMap::new();
-    for mut record in list_task_records(control)? {
-        if record.admission == TaskAdmissionPhase::Prepared {
-            continue;
-        }
-        let started_ms = match record.started_ms {
-            Some(started_ms) => started_ms,
-            None if record.state == TaskState::Running => {
-                // Older records have no durable wall-clock origin. They
-                // cannot be assigned a trustworthy historical elapsed
-                // time, so preserve the task and start timing from this
-                // restart while upgrading the record for future restarts.
-                let started_ms = clock.now_ms();
-                record.started_ms = Some(started_ms);
-                write_task_record(control, &record)?;
-                started_ms
-            }
-            None => clock.now_ms(),
-        };
-        let id = record.id.clone();
-        let job = record.job.as_deref().map(open_job).transpose()?.flatten();
-        tasks.insert(
-            id,
-            RunningTask {
-                record,
-                child: None,
-                job,
-                started_ms,
-                term_sent_at_ms: None,
-                kill_sent: false,
-                terminal_delivery_attempts: 0,
-                next_terminal_retry_ms: None,
-                terminal_retry_delay_ms: 0,
-                milestone_delivery_attempts: 0,
-                next_milestone_retry_ms: None,
-                milestone_retry_delay_ms: 0,
-                child_exit: None,
-            },
-        );
-    }
-    Ok(tasks)
-}
-
-/// Outcome of one [`tick_one_task`] call.
-#[derive(Debug)]
-enum TaskTick {
-    StillRunning,
-    Finished,
-    TerminalDeliveryRetry {
-        error: String,
-        attempt: u32,
-        delay_ms: u64,
-    },
-    TerminalDeliveryDropped {
-        error: String,
-        attempts: u32,
-    },
-}
-
 /// Claims the next task-start request through the shared request channel, then
 /// applies task-specific admission and lifecycle handling.
 fn process_one_task_request(
@@ -1535,21 +1363,7 @@ fn process_one_task_request(
             return Ok(None);
         };
         let id = record.id.clone();
-        let running = RunningTask {
-            record,
-            child: Some(child),
-            job: Some(job),
-            started_ms,
-            term_sent_at_ms: None,
-            kill_sent: false,
-            terminal_delivery_attempts: 0,
-            next_terminal_retry_ms: None,
-            terminal_retry_delay_ms: 0,
-            milestone_delivery_attempts: 0,
-            next_milestone_retry_ms: None,
-            milestone_retry_delay_ms: 0,
-            child_exit: None,
-        };
+        let running = RunningTask::new(record, Some(child), Some(job), started_ms);
         Ok(Some((id, running)))
     })
 }
@@ -1807,407 +1621,6 @@ fn spawn_task_child(
     Ok((child, job, job_name))
 }
 
-/// Advances one tracked task by one loop tick: delivers any
-/// newly-due milestone events, escalates Job Object termination past
-/// `max_duration_ms`, and — once the process has actually exited —
-/// persists its terminal state and delivers its terminal event.
-///
-/// Pure with respect to wall-clock time: every timing decision reads
-/// `clock.now_ms()`, so a test can drive milestone/max-duration/terminal
-/// behavior deterministically with a `FakeClock` and no real sleep.
-fn tick_one_task(
-    control: &Path,
-    id: &str,
-    running: &mut RunningTask,
-    clock: &dyn Clock,
-) -> Result<TaskTick> {
-    // A terminal record can remain in the tracker when callback delivery
-    // failed after state persistence. Retry the deterministic event before
-    // dropping it, including after startup reconciliation.
-    if !task_record_exists(control, id)? {
-        return Ok(TaskTick::Finished);
-    }
-    if running.record.state != TaskState::Running {
-        return deliver_terminal_event(running, clock);
-    }
-
-    let elapsed_ms = clock.now_ms().saturating_sub(running.started_ms);
-
-    // Deliver due milestones best-effort: a failing or backed-off callback
-    // inbox must not abort the tick before the liveness/timeout/reap handling
-    // below, or an unreachable inbox would keep a task un-reapable forever and
-    // re-fire the same milestone at loop rate.
-    deliver_due_milestones(control, id, running, elapsed_ms, clock)?;
-
-    // A rehydrated task has no Child handle. Check its identity before
-    // any timeout signal so a gone or PID-reused process is never
-    // accidentally signalled as this task. An unresolved identity is
-    // retained and retried on a later tick.
-    if running.child.is_none() {
-        match is_task_alive(&running.record) {
-            Liveness::Dead => {
-                let cancelled = consume_task_cancel_sentinel(control, id)?;
-                let (state, exit_code) = parked_terminal(running, cancelled);
-                return finalize_task(control, running, state, exit_code, elapsed_ms, clock);
-            }
-            Liveness::Live => {}
-            Liveness::Unresolved if controlled_task_pid_is_gone(control, id, running)? => {
-                let cancelled = consume_task_cancel_sentinel(control, id)?;
-                let (state, exit_code) = parked_terminal(running, cancelled);
-                return finalize_task(control, running, state, exit_code, elapsed_ms, clock);
-            }
-            Liveness::Unresolved => return Ok(TaskTick::StillRunning),
-        }
-    }
-
-    if running.term_sent_at_ms.is_none()
-        && max_duration_exceeded(elapsed_ms, running.record.spec.max_duration_ms)
-    {
-        let _ = terminate_running_task(running, "-TERM");
-        running.term_sent_at_ms = Some(clock.now_ms());
-    } else if let Some(term_at) = running.term_sent_at_ms
-        && !running.kill_sent
-        && clock.now_ms().saturating_sub(term_at) >= KILL_GRACE_MS
-    {
-        if running.child.is_none() {
-            match is_task_alive(&running.record) {
-                Liveness::Dead => {
-                    let cancelled = consume_task_cancel_sentinel(control, id)?;
-                    let (state, exit_code) = parked_terminal(running, cancelled);
-                    return finalize_task(control, running, state, exit_code, elapsed_ms, clock);
-                }
-                Liveness::Live => {}
-                Liveness::Unresolved if controlled_task_pid_is_gone(control, id, running)? => {
-                    let cancelled = consume_task_cancel_sentinel(control, id)?;
-                    let (state, exit_code) = parked_terminal(running, cancelled);
-                    return finalize_task(control, running, state, exit_code, elapsed_ms, clock);
-                }
-                Liveness::Unresolved => return Ok(TaskTick::StillRunning),
-            }
-        }
-        let _ = terminate_running_task(running, "-KILL");
-        running.kill_sent = true;
-    }
-
-    match running.child.as_mut() {
-        None => match is_task_alive(&running.record) {
-            Liveness::Live => Ok(TaskTick::StillRunning),
-            Liveness::Unresolved if controlled_task_pid_is_gone(control, id, running)? => {
-                let cancelled = consume_task_cancel_sentinel(control, id)?;
-                let (state, exit_code) = parked_terminal(running, cancelled);
-                finalize_task(control, running, state, exit_code, elapsed_ms, clock)
-            }
-            Liveness::Unresolved => Ok(TaskTick::StillRunning),
-            Liveness::Dead => {
-                let cancelled = consume_task_cancel_sentinel(control, id)?;
-                let (state, exit_code) = parked_terminal(running, cancelled);
-                finalize_task(control, running, state, exit_code, elapsed_ms, clock)
-            }
-        },
-        Some(child) => match child.try_wait() {
-            Ok(Some(status)) => {
-                if let Some(job) = running.job.as_ref() {
-                    match active_job_processes(job) {
-                        Ok(0) => {}
-                        Ok(_) | Err(_) => {
-                            // The direct command may have exited while a
-                            // descendant remains. Keep the Job Object handle
-                            // and continue tracking the tree until it drains,
-                            // stashing the direct child's outcome so the
-                            // eventual terminal state reflects the command's
-                            // own result instead of a code-less failure.
-                            running.child_exit = Some(ChildExit {
-                                succeeded: status.success(),
-                                code: status.code(),
-                            });
-                            running.child = None;
-                            return Ok(TaskTick::StillRunning);
-                        }
-                    }
-                }
-                // An external `Stop`/`Teardown`/`Cancel` may already have
-                // finalized and removed this task's record (they act
-                // directly on the durable PID, independent of this `Run`
-                // loop being alive) — if so, this reap is a no-op besides
-                // dropping our own in-memory tracking below, so a race with
-                // an external reaper never resurrects a torn-down record.
-                if read_task_record(control, id)?.is_none() {
-                    return Ok(TaskTick::Finished);
-                }
-                let cancelled = consume_task_cancel_sentinel(control, id)?;
-                let state = if cancelled {
-                    TaskState::Cancelled
-                } else if running.term_sent_at_ms.is_some() {
-                    TaskState::Timeout
-                } else if status.success() {
-                    TaskState::Completed
-                } else {
-                    TaskState::Failed
-                };
-                finalize_task(control, running, state, status.code(), elapsed_ms, clock)
-            }
-            Ok(None) => Ok(TaskTick::StillRunning),
-            Err(err) => Err(BatonError::Io(format!("could not poll task {id}: {err}"))),
-        },
-    }
-}
-
-/// Resolves the terminal state and exit code for a task whose `Child`
-/// handle is gone. Cancel and timeout sentinels win over the direct
-/// child's stashed exit outcome (which is `None` for a rehydrated task
-/// that never owned a child handle); otherwise the stashed outcome
-/// decides `completed`/`failed` and supplies the real exit code.
-fn parked_terminal(running: &RunningTask, cancelled: bool) -> (TaskState, Option<i32>) {
-    if cancelled {
-        (TaskState::Cancelled, None)
-    } else if running.term_sent_at_ms.is_some() {
-        (TaskState::Timeout, None)
-    } else if running.child_exit.is_some_and(|exit| exit.succeeded) {
-        (
-            TaskState::Completed,
-            running.child_exit.and_then(|exit| exit.code),
-        )
-    } else {
-        (
-            TaskState::Failed,
-            running.child_exit.and_then(|exit| exit.code),
-        )
-    }
-}
-
-/// Delivers every milestone newly due at `elapsed_ms`, best-effort.
-///
-/// A callback inbox that is unavailable is handled by the same bounded
-/// exponential backoff [`deliver_terminal_event`] applies: the lowest
-/// undelivered milestone is retried on a doubling delay (from
-/// [`EVENT_RETRY_INITIAL_DELAY_MS`], capped at [`EVENT_RETRY_MAX_DELAY_MS`]) and
-/// dropped after [`MAX_EVENT_DELIVERY_ATTEMPTS`], so a stuck inbox never
-/// re-fires a milestone at loop rate. Unlike the terminal outcome, milestone
-/// retry/drop warnings are emitted here rather than routed up through
-/// [`TaskTick`], because the caller's tick must continue past them to reap,
-/// time out, and cancel the task regardless.
-///
-/// Only a control-dir *write* failure propagates (mirroring [`finalize_task`]);
-/// a callback-delivery failure is absorbed into the backoff so supervision is
-/// never blocked by an unreachable inbox.
-fn deliver_due_milestones(
-    control: &Path,
-    id: &str,
-    running: &mut RunningTask,
-    elapsed_ms: u64,
-    clock: &dyn Clock,
-) -> Result<()> {
-    let now_ms = clock.now_ms();
-    if let Some(next_retry_ms) = running.next_milestone_retry_ms
-        && now_ms < next_retry_ms
-    {
-        return Ok(());
-    }
-
-    for index in milestones_due(
-        elapsed_ms,
-        &running.record.spec.milestones_ms,
-        running.record.delivered_milestones,
-    ) {
-        match deliver_task_event(&running.record, TaskEventKind::Milestone { index }) {
-            Ok(()) => {
-                running.record.delivered_milestones = index + 1;
-                if let Err(err) = write_task_record(control, &running.record) {
-                    running.record.delivered_milestones = index;
-                    return Err(err);
-                }
-                // A milestone delivered clears any backoff left by an earlier
-                // failure, so the next milestone starts fresh.
-                running.milestone_delivery_attempts = 0;
-                running.next_milestone_retry_ms = None;
-                running.milestone_retry_delay_ms = 0;
-            }
-            Err(err) => {
-                let attempt = running.milestone_delivery_attempts.saturating_add(1);
-                running.milestone_delivery_attempts = attempt;
-                if attempt >= MAX_EVENT_DELIVERY_ATTEMPTS {
-                    eprintln!(
-                        "warning: baton service dropped milestone {index} for task {id} after {attempt} failed deliveries to callback inbox {:?}: {err}",
-                        running.record.spec.callback.inbox
-                    );
-                    // Advance past the dropped milestone and persist it, so a
-                    // supervisor restart does not re-enter the same stuck
-                    // milestone via `rehydrate_tasks`.
-                    running.record.delivered_milestones = index + 1;
-                    if let Err(write_err) = write_task_record(control, &running.record) {
-                        running.record.delivered_milestones = index;
-                        return Err(write_err);
-                    }
-                    running.milestone_delivery_attempts = 0;
-                    running.next_milestone_retry_ms = None;
-                    running.milestone_retry_delay_ms = 0;
-                    // Let the next tick handle any further due milestones, each
-                    // with its own fresh backoff, rather than hammering the same
-                    // unavailable inbox for the whole batch now.
-                    break;
-                }
-
-                let delay_ms = if attempt == 1 {
-                    EVENT_RETRY_INITIAL_DELAY_MS
-                } else {
-                    running
-                        .milestone_retry_delay_ms
-                        .saturating_mul(2)
-                        .min(EVENT_RETRY_MAX_DELAY_MS)
-                };
-                running.milestone_retry_delay_ms = delay_ms;
-                running.next_milestone_retry_ms = Some(now_ms.saturating_add(delay_ms));
-                eprintln!(
-                    "warning: baton service failed to deliver milestone {index} for task {id} to callback inbox {:?} (attempt {attempt}/{MAX_EVENT_DELIVERY_ATTEMPTS}; retrying in {delay_ms} ms): {err}",
-                    running.record.spec.callback.inbox
-                );
-                // Milestones are delivered in order; stop the batch until this
-                // one is delivered or dropped.
-                break;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Delivers a terminal event, applying bounded exponential backoff when the
-/// callback inbox is unavailable.
-fn deliver_terminal_event(running: &mut RunningTask, clock: &dyn Clock) -> Result<TaskTick> {
-    let now_ms = clock.now_ms();
-    if let Some(next_retry_ms) = running.next_terminal_retry_ms
-        && now_ms < next_retry_ms
-    {
-        return Ok(TaskTick::StillRunning);
-    }
-
-    match deliver_task_event(&running.record, TaskEventKind::Terminal) {
-        Ok(()) => Ok(TaskTick::Finished),
-        Err(err) => {
-            let attempt = running.terminal_delivery_attempts.saturating_add(1);
-            running.terminal_delivery_attempts = attempt;
-            let error = err.to_string();
-            if attempt >= MAX_EVENT_DELIVERY_ATTEMPTS {
-                return Ok(TaskTick::TerminalDeliveryDropped {
-                    error,
-                    attempts: attempt,
-                });
-            }
-
-            let delay_ms = if attempt == 1 {
-                EVENT_RETRY_INITIAL_DELAY_MS
-            } else {
-                running
-                    .terminal_retry_delay_ms
-                    .saturating_mul(2)
-                    .min(EVENT_RETRY_MAX_DELAY_MS)
-            };
-            running.terminal_retry_delay_ms = delay_ms;
-            running.next_terminal_retry_ms = Some(now_ms.saturating_add(delay_ms));
-            Ok(TaskTick::TerminalDeliveryRetry {
-                error,
-                attempt,
-                delay_ms,
-            })
-        }
-    }
-}
-
-/// Persists a terminal task state before delivering its deterministic
-/// terminal event. If delivery fails, the terminal record remains in the
-/// tracker and the next tick retries the same event id.
-fn finalize_task(
-    control: &Path,
-    running: &mut RunningTask,
-    state: TaskState,
-    exit_code: Option<i32>,
-    elapsed_ms: u64,
-    clock: &dyn Clock,
-) -> Result<TaskTick> {
-    let previous = running.record.clone();
-    running.record.state = state;
-    running.record.exit_code = exit_code;
-    running.record.elapsed_ms = Some(elapsed_ms);
-    if let Err(err) = write_task_record(control, &running.record) {
-        running.record = previous;
-        return Err(err);
-    }
-    deliver_terminal_event(running, clock)
-}
-
-/// Ticks every tracked task once, dropping any that finished. One task's
-/// tick failure is warned and leaves it tracked for the next tick — the
-/// same "one bad thing can't wedge the daemon" posture the rest of
-/// `Run`'s loop takes.
-fn tick_tasks(control: &Path, tasks: &mut HashMap<String, RunningTask>, clock: &dyn Clock) {
-    let mut finished = Vec::new();
-    for (id, running) in tasks.iter_mut() {
-        match tick_one_task(control, id, running, clock) {
-            Ok(TaskTick::Finished) => finished.push(id.clone()),
-            Ok(TaskTick::StillRunning) => {}
-            Ok(TaskTick::TerminalDeliveryRetry {
-                error,
-                attempt,
-                delay_ms,
-            }) => {
-                eprintln!(
-                    "warning: baton service failed to deliver terminal event for task {id} to callback inbox {:?} (attempt {attempt}/{MAX_EVENT_DELIVERY_ATTEMPTS}; retrying in {delay_ms} ms): {error}",
-                    running.record.spec.callback.inbox
-                );
-            }
-            Ok(TaskTick::TerminalDeliveryDropped { error, attempts }) => {
-                eprintln!(
-                    "warning: baton service dropped task {id} after {attempts} failed terminal-event deliveries to callback inbox {:?}: {error}",
-                    running.record.spec.callback.inbox
-                );
-                finished.push(id.clone());
-            }
-            Err(err) => {
-                eprintln!("warning: baton service failed to tick task {id}: {err}");
-            }
-        }
-    }
-    for id in finished {
-        tasks.remove(&id);
-    }
-}
-
-/// Delivers one task lifecycle event to `record.spec.callback.inbox`,
-/// keyed by its deterministic [`task_event_id`] so the mailbox's own
-/// `done/`-membership dedup recognizes an exact redelivery.
-fn deliver_task_event(record: &TaskRecord, kind: TaskEventKind) -> Result<()> {
-    let event_id = task_event_id(&record.id, kind);
-    let body = match kind {
-        TaskEventKind::Milestone { index } => TaskEventBody::milestone(&record.id, index),
-        TaskEventKind::Terminal => TaskEventBody::terminal(
-            &record.id,
-            record.state,
-            record.exit_code,
-            record.elapsed_ms.unwrap_or(0),
-        ),
-    };
-    let body_json = serde_json::to_string(&body)
-        .map_err(|err| BatonError::Io(format!("could not serialize task event body: {err}")))?;
-    // `to` is a delivery-target-agnostic identity tag only — the actual
-    // routing is `record.spec.callback.inbox`, a mailbox root, exactly
-    // like `SessionSpec::role` never resolves anything by itself.
-    let to = record
-        .spec
-        .callback
-        .role
-        .clone()
-        .unwrap_or_else(|| record.id.clone());
-    let envelope = MessageEnvelope::new(
-        event_id,
-        record.id.clone(),
-        "baton-task",
-        to,
-        MessageKind::Notify,
-        body_json,
-        crate::events::now_ms(),
-    );
-    mailbox::deliver_to(&record.spec.callback.inbox, &envelope)
-}
-
 // -- Task records -------------------------------------------------------
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2333,25 +1746,11 @@ fn reap_session_tasks_with_wait(
 // writer of terminal state — can attribute the reap it later observes to
 // `cancelled` rather than misreading a forced exit as `failed`.
 
-fn task_cancel_sentinel_path(control: &Path, task_id: &str) -> std::path::PathBuf {
-    task_cancel_dir(control).join(mailbox::file_name(task_id))
-}
-
 fn request_task_cancel_sentinel(control: &Path, task_id: &str) -> Result<()> {
     let dir = task_cancel_dir(control);
     fs::create_dir_all(&dir)
         .map_err(|err| BatonError::Io(format!("could not create {dir:?}: {err}")))?;
     mailbox::atomic_write(&dir, &mailbox::file_name(task_id), "")
-}
-
-fn consume_task_cancel_sentinel(control: &Path, task_id: &str) -> Result<bool> {
-    match fs::remove_file(task_cancel_sentinel_path(control, task_id)) {
-        Ok(()) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(BatonError::Io(format!(
-            "could not consume task cancel sentinel: {err}"
-        ))),
-    }
 }
 
 // -- Liveness ---------------------------------------------------------
@@ -2566,28 +1965,6 @@ fn force_terminate_record_job(job_name: Option<&str>, pid: u32, phase: &str) -> 
         Ok(false) => terminate_record_pid(pid, phase),
         Err(_) => terminate_record_pid(pid, phase),
     }
-}
-
-fn terminate_running_task(running: &RunningTask, phase: &str) -> Result<()> {
-    if let Some(job) = running.job.as_ref() {
-        terminate_job(job)
-    } else {
-        eprintln!(
-            "warning: Windows Job Object unavailable for task {}; terminating only recorded pid {}; descendants may survive",
-            running.record.id, running.record.pid
-        );
-        terminate_record_pid(running.record.pid, phase)
-    }
-}
-
-/// A PID-only cancel/timeout may leave an unknown descendant after the
-/// supervisor's Job Object handle was lost. Once the corroborated recorded
-/// PID is gone, a controlled outcome can still be finalized without claiming
-/// that an unresolvable descendant tree is gone.
-fn controlled_task_pid_is_gone(control: &Path, id: &str, running: &RunningTask) -> Result<bool> {
-    let controlled =
-        running.term_sent_at_ms.is_some() || task_cancel_sentinel_path(control, id).is_file();
-    Ok(controlled && recorded_pid_is_gone(running.record.pid))
 }
 
 fn recorded_pid_is_gone(pid: u32) -> bool {
@@ -3137,21 +2514,7 @@ mod tests {
         record.exit_code = Some(0);
         record.elapsed_ms = Some(10);
         write_task_record(control, &record).expect("write terminal task record");
-        RunningTask {
-            record,
-            child: None,
-            job: None,
-            started_ms: clock.now_ms(),
-            term_sent_at_ms: None,
-            kill_sent: false,
-            terminal_delivery_attempts: 0,
-            next_terminal_retry_ms: None,
-            terminal_retry_delay_ms: 0,
-            milestone_delivery_attempts: 0,
-            next_milestone_retry_ms: None,
-            milestone_retry_delay_ms: 0,
-            child_exit: None,
-        }
+        RunningTask::new(record, None, None, clock.now_ms())
     }
 
     #[test]
@@ -3334,21 +2697,7 @@ mod tests {
         record.started_ms = Some(clock.now_ms());
         record.state = TaskState::Running;
         write_task_record(control, &record).expect("write running task record");
-        RunningTask {
-            record,
-            child: None,
-            job: None,
-            started_ms: clock.now_ms(),
-            term_sent_at_ms: None,
-            kill_sent: false,
-            terminal_delivery_attempts: 0,
-            next_terminal_retry_ms: None,
-            terminal_retry_delay_ms: 0,
-            milestone_delivery_attempts: 0,
-            next_milestone_retry_ms: None,
-            milestone_retry_delay_ms: 0,
-            child_exit: None,
-        }
+        RunningTask::new(record, None, None, clock.now_ms())
     }
 
     /// Spawns `spec` under `control` inside a private Job Object and wraps it
@@ -3390,21 +2739,7 @@ mod tests {
             delivered_milestones: 0,
         };
         write_task_record(control, &record).expect("write task record");
-        RunningTask {
-            record,
-            child: Some(child),
-            job: Some(job),
-            started_ms,
-            term_sent_at_ms: None,
-            kill_sent: false,
-            terminal_delivery_attempts: 0,
-            next_terminal_retry_ms: None,
-            terminal_retry_delay_ms: 0,
-            milestone_delivery_attempts: 0,
-            next_milestone_retry_ms: None,
-            milestone_retry_delay_ms: 0,
-            child_exit: None,
-        }
+        RunningTask::new(record, Some(child), Some(job), started_ms)
     }
 
     /// Failed milestone callback delivery backs off from one second on the
@@ -3780,8 +3115,9 @@ mod tests {
         )
         .expect("write task record");
         let clock = SystemClock;
-        let tasks = rehydrate_tasks(&control, &clock).expect("rehydrate tasks");
-        assert!(tasks["task-test"].job.is_some());
+        let tasks = task_tick::rehydrate_tasks::<WindowsServicePlatform>(&control, &clock)
+            .expect("rehydrate tasks");
+        assert!(tasks["task-test"].task_handle.is_some());
 
         drop(tasks);
         drop(sessions);

@@ -206,6 +206,8 @@ pub fn execute_task(cmd: TaskCommand, _out: impl Write) -> Result<()> {
 
 #[cfg(any(unix, windows))]
 mod records;
+#[cfg(any(unix, windows))]
+mod task_tick;
 
 #[cfg(unix)]
 mod imp {
@@ -221,18 +223,23 @@ mod imp {
         remove_task_start_response_files, remove_task_start_rollback,
         remove_task_start_transaction, responses_dir, restore_task_start_response_claim,
         sessions_dir, start_channel, take_task_start_response_locked, task_cancel_dir,
-        task_channel, task_logs_dir, task_record_exists, task_start_ack_exists,
-        task_start_response_boundary_exists, task_start_response_claim_path,
-        task_start_response_id, task_start_response_path, task_start_rollback_exists,
-        wait_for_test_task_admission_barrier, wait_for_test_task_response_phase_barrier,
-        wait_for_test_task_rollback_cleanup_barrier, write_session_record, write_start_response,
-        write_task_record, write_task_start_response,
+        task_channel, task_logs_dir, task_start_ack_exists, task_start_response_boundary_exists,
+        task_start_response_claim_path, task_start_response_id, task_start_response_path,
+        task_start_rollback_exists, wait_for_test_task_admission_barrier,
+        wait_for_test_task_response_phase_barrier, wait_for_test_task_rollback_cleanup_barrier,
+        write_session_record, write_start_response, write_task_record, write_task_start_response,
     };
     #[cfg(test)]
     use super::records::{
         session_record_path, task_processing_dir, task_record_path, task_requests_dir,
         task_responses_dir, task_start_ack_path, task_start_rollback_dir,
     };
+    use super::task_tick::{
+        self, Liveness, RunningTask as SharedRunningTask, ServicePlatform, TaskLivenessMode,
+        TaskLivenessRefresh, TerminationSignal, task_cancel_sentinel_path,
+    };
+    #[cfg(test)]
+    use super::task_tick::{deliver_task_event, finalize_task, tick_one_task};
     use super::*;
     #[cfg(test)]
     use std::cell::Cell;
@@ -244,14 +251,12 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use crate::mailbox;
-    use crate::message::{MessageEnvelope, MessageKind};
     use crate::task::{
-        Clock, SystemClock, TaskAdmissionPhase, TaskEventBody, TaskEventKind, TaskRecord, TaskSpec,
-        TaskState, first_non_ascending_milestone, max_duration_exceeded, milestones_due,
-        task_event_id,
+        Clock, SystemClock, TaskAdmissionPhase, TaskRecord, TaskSpec, TaskState,
+        first_non_ascending_milestone,
     };
     #[cfg(test)]
-    use crate::task::{FakeClock, TaskCallback};
+    use crate::task::{FakeClock, TaskCallback, TaskEventKind};
 
     /// Name of the control-plane lockfile at the control root, mirroring
     /// [`mailbox`]'s `serve.lock`.
@@ -286,12 +291,15 @@ mod imp {
     /// Initial delay before retrying a failed task-event callback delivery.
     /// Governs both milestone and terminal delivery — the same bounded
     /// exponential backoff policy applies to every task event.
+    #[cfg(test)]
     const EVENT_RETRY_INITIAL_DELAY_MS: u64 = 1_000;
     /// Longest delay between task-event callback delivery attempts.
+    #[cfg(test)]
     const EVENT_RETRY_MAX_DELAY_MS: u64 = 60_000;
     /// Total callback delivery attempts for a single task event before it is
     /// dropped (a terminal event drops the tracker entry; a milestone is
     /// skipped so supervision continues).
+    #[cfg(test)]
     const MAX_EVENT_DELIVERY_ATTEMPTS: u32 = 10;
     /// Bound on how long `Start` waits for a live `Run` to answer.
     const START_AWAIT_MS: u64 = 10_000;
@@ -366,24 +374,6 @@ mod imp {
         NotRunning,
     }
 
-    /// Result of corroborating a durable PID against the process currently
-    /// occupying it. `Unresolved` is deliberately distinct from `Dead`: the
-    /// former means the PID exists but baton cannot prove its identity, so it
-    /// is never signalled or removed without an explicit operator override.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-    #[serde(rename_all = "snake_case")]
-    enum Liveness {
-        Live,
-        Dead,
-        Unresolved,
-    }
-
-    impl Liveness {
-        fn is_live(self) -> bool {
-            self == Self::Live
-        }
-    }
-
     /// A process probe can positively report absence, fail to read the
     /// process, or return a sample. The distinction is the safety boundary of
     /// the liveness ladder.
@@ -392,55 +382,6 @@ mod imp {
         Gone,
         Unreadable,
         Present(T),
-    }
-
-    /// The lifecycle operation requested from a future platform adapter.
-    /// Unix maps these to signals; Windows maps them to Job Object
-    /// termination while retaining the phase text used by its fallback
-    /// warnings.
-    #[allow(dead_code)]
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum TerminationSignal {
-        Term,
-        Kill,
-    }
-
-    #[allow(dead_code)]
-    impl TerminationSignal {
-        fn phase(self) -> &'static str {
-            match self {
-                Self::Term => "-TERM",
-                Self::Kill => "-KILL",
-            }
-        }
-
-        fn unix_signal(self) -> libc::c_int {
-            match self {
-                Self::Term => libc::SIGTERM,
-                Self::Kill => libc::SIGKILL,
-            }
-        }
-    }
-
-    /// Identifies the two task paths whose liveness control flow differs:
-    /// an owned task can use its Child as the direct-leader identity, while a
-    /// rehydrated task must corroborate the durable PID on every observation.
-    /// `leader_exited` additionally lets a future consumer request the
-    /// descendant-boundary probe after the direct child has been reaped.
-    #[allow(dead_code)]
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum TaskLivenessMode {
-        Owned { leader_exited: bool },
-        Rehydrated,
-    }
-
-    /// Controls whether a platform may use its bounded liveness sample or
-    /// must take a fresh observation before authorizing termination/reaping.
-    #[allow(dead_code)]
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum TaskLivenessRefresh {
-        Cached,
-        Forced,
     }
 
     /// Platform-owned liveness state. Linux caches only its expensive group
@@ -452,57 +393,6 @@ mod imp {
         group: Option<(u64, Liveness, Instant)>,
         #[cfg(not(target_os = "linux"))]
         rehydrated: Option<(u64, Liveness, Instant)>,
-    }
-
-    /// Private platform boundary for the later service extraction tickets.
-    /// The current supervisor deliberately continues to call its existing
-    /// free functions; these adapters only make the intended seam concrete.
-    #[allow(dead_code)]
-    trait ServicePlatform {
-        type SessionHandle;
-        type TaskHandle;
-        type TaskLivenessCache: Default;
-
-        fn spawn_session(
-            spec: &SessionSpec,
-            stderr_path: &Path,
-        ) -> Result<(Child, Self::SessionHandle)>;
-        fn spawn_task(
-            spec: &TaskSpec,
-            stdout_path: &Path,
-            stderr_path: &Path,
-        ) -> Result<(Child, Self::TaskHandle)>;
-        fn recorded_start_identity(pid: u32) -> (Option<String>, Option<i64>);
-        fn start_identity_is_valid(
-            started_at: &Option<String>,
-            start_epoch_secs: &Option<i64>,
-        ) -> bool;
-        fn session_liveness(record: &SessionRecord) -> Liveness;
-        fn task_liveness(record: &TaskRecord) -> Liveness;
-        fn task_liveness_for_tick(
-            record: &TaskRecord,
-            mode: TaskLivenessMode,
-            cache: &mut Self::TaskLivenessCache,
-            now_ms: u64,
-            refresh: TaskLivenessRefresh,
-        ) -> Liveness;
-        fn terminate_session(
-            record: &SessionRecord,
-            signal: TerminationSignal,
-            force: bool,
-        ) -> Result<()>;
-        fn terminate_task(
-            record: &TaskRecord,
-            signal: TerminationSignal,
-            force: bool,
-        ) -> Result<()>;
-        fn terminate_owned_task(
-            owner: Option<&Self::TaskHandle>,
-            record: &TaskRecord,
-            signal: TerminationSignal,
-            force: bool,
-        ) -> Result<()>;
-        fn pid_is_gone(pid: u32) -> bool;
     }
 
     #[allow(dead_code)]
@@ -550,6 +440,7 @@ mod imp {
 
         fn task_liveness_for_tick(
             record: &TaskRecord,
+            _owner: Option<&Self::TaskHandle>,
             mode: TaskLivenessMode,
             cache: &mut Self::TaskLivenessCache,
             now_ms: u64,
@@ -622,7 +513,7 @@ mod imp {
             force: bool,
         ) -> Result<()> {
             let _ = force;
-            signal_group(record.pid, signal.unix_signal())
+            signal_group(record.pid, unix_signal(signal))
         }
 
         fn terminate_task(
@@ -631,7 +522,7 @@ mod imp {
             force: bool,
         ) -> Result<()> {
             let _ = force;
-            signal_group(record.pid, signal.unix_signal())
+            signal_group(record.pid, unix_signal(signal))
         }
 
         fn terminate_owned_task(
@@ -641,13 +532,59 @@ mod imp {
             force: bool,
         ) -> Result<()> {
             let _ = (owner, force);
-            signal_group(record.pid, signal.unix_signal())
+            signal_group(record.pid, unix_signal(signal))
         }
 
         fn pid_is_gone(pid: u32) -> bool {
             matches!(process_probe(pid), ProbeResult::Gone)
         }
+
+        fn unresolved_task_is_gone(
+            _control: &Path,
+            _id: &str,
+            _record: &TaskRecord,
+            _term_sent_at_ms: Option<u64>,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn rehydrate_task(_record: &TaskRecord) -> Result<Option<Self::TaskHandle>> {
+            Ok(None)
+        }
+
+        fn persist_terminal_task(
+            control: &Path,
+            record: &mut TaskRecord,
+            state: TaskState,
+            exit_code: Option<i32>,
+            elapsed_ms: u64,
+        ) -> Result<bool> {
+            let _admission = acquire_admission_lock(control)?;
+            if read_task_record(control, &record.id)?.is_none() {
+                return Ok(false);
+            }
+            record.state = state;
+            record.exit_code = exit_code;
+            record.elapsed_ms = Some(elapsed_ms);
+            write_task_record(control, record)?;
+            Ok(true)
+        }
+
+        fn keep_child_handle_while_draining() -> bool {
+            true
+        }
     }
+
+    fn unix_signal(signal: TerminationSignal) -> libc::c_int {
+        match signal {
+            TerminationSignal::Term => libc::SIGTERM,
+            TerminationSignal::Kill => libc::SIGKILL,
+        }
+    }
+
+    type RunningTask = SharedRunningTask<UnixServicePlatform>;
+    #[cfg(test)]
+    type TaskTick = task_tick::TaskTick;
 
     /// Dispatches one parsed [`ServiceCommand`].
     pub(super) fn dispatch(cmd: ServiceCommand, mut out: impl Write) -> Result<()> {
@@ -738,7 +675,7 @@ mod imp {
         reclaim_stale_task_requests(control)?;
         drop(_admission);
         let clock = SystemClock;
-        let mut tasks = rehydrate_tasks(control, &clock)?;
+        let mut tasks = task_tick::rehydrate_tasks::<UnixServicePlatform>(control, &clock)?;
         writeln!(out, "baton service running on {}", control.display()).map_err(io_err)?;
 
         let mut children: HashMap<String, Child> = HashMap::new();
@@ -755,7 +692,7 @@ mod imp {
                 }
             }
             reap_exited(&mut children);
-            tick_tasks(control, &mut tasks, &clock);
+            task_tick::tick_tasks::<UnixServicePlatform>(control, &mut tasks, &clock);
 
             // One request's failure (a malformed spec, a transient spawn
             // error) must not crash the loop out from under every other
@@ -1650,132 +1587,6 @@ mod imp {
         task_channel(control).reclaim_stale()
     }
 
-    /// One task the `Run` loop is currently tracking: its durable
-    /// [`TaskRecord`] (kept in sync as milestones fire and it goes terminal),
-    /// either the live [`Child`] handle owned by this supervisor or a
-    /// rehydrated PID identity, and the injected-clock timestamps driving
-    /// milestone/max-duration decisions.
-    struct RunningTask {
-        record: TaskRecord,
-        /// `Some` while this `Run` instance owns the child handle. A task
-        /// restored after a supervisor restart has already been reparented to
-        /// init, so it is represented by `None` and polled by corroborated
-        /// PID liveness instead of `Child::try_wait`.
-        child: Option<Child>,
-        /// Most recent Linux process-group liveness sample. Direct PID
-        /// identity is still probed on every rehydrated tick, while an owned
-        /// task uses its Child handle to check the direct leader; only the
-        /// table-wide group scan is rate-limited.
-        #[cfg(target_os = "linux")]
-        group_liveness: Option<(u64, Liveness, Instant)>,
-        /// Most recent non-Linux liveness sample for a rehydrated task, with
-        /// both injected-clock and monotonic wall-clock timestamps. The
-        /// sample is intentionally in-memory: a restart must corroborate the
-        /// durable PID again before making any decision about it.
-        #[cfg(not(target_os = "linux"))]
-        rehydrated_liveness: Option<(u64, Liveness, Instant)>,
-        started_ms: u64,
-        /// Set once this task's max duration has been exceeded and `SIGTERM`
-        /// sent, so a later tick knows to escalate to `SIGKILL` after
-        /// `KILL_GRACE_MS`, and a successful reap after this is set is
-        /// attributed to `timeout`, not `completed`/`failed`.
-        term_sent_at_ms: Option<u64>,
-        /// Set once `SIGKILL` has been sent, so it is only ever sent once.
-        kill_sent: bool,
-        /// Number of failed terminal callback delivery attempts. These are
-        /// deliberately in-memory: a terminal record is replayed once after
-        /// restart, then follows the same bounded retry policy.
-        terminal_delivery_attempts: u32,
-        /// Clock deadline at which the next terminal callback delivery may be
-        /// attempted.
-        next_terminal_retry_ms: Option<u64>,
-        /// Delay used for the most recent failed terminal delivery, so the
-        /// next failure can double it without a wall-clock dependency.
-        terminal_retry_delay_ms: u64,
-        /// Number of failed delivery attempts for the current lowest
-        /// undelivered milestone. Reset once that milestone is delivered or
-        /// dropped. In-memory only, like the terminal counters: a rehydrated
-        /// task re-attempts a due milestone with a fresh backoff.
-        milestone_delivery_attempts: u32,
-        /// Clock deadline at which the next milestone callback delivery may be
-        /// attempted; `None` when no milestone delivery is currently backed off.
-        next_milestone_retry_ms: Option<u64>,
-        /// Delay used for the most recent failed milestone delivery, so the
-        /// next failure can double it without a wall-clock dependency.
-        milestone_retry_delay_ms: u64,
-    }
-
-    /// Restores every durable task before the request loop accepts new work.
-    /// Running records are rehydrated for PID-based tracking; terminal
-    /// records are retained for one deterministic callback replay in case the
-    /// previous supervisor persisted state immediately before it exited. The
-    /// child process was reparented when the previous supervisor exited, so
-    /// the new tracker deliberately carries no `Child` handle and lets
-    /// `tick_one_task` use the record's corroborated PID identity instead.
-    /// Prepared admission records are intentionally excluded: they have not
-    /// crossed the durable admission boundary, so an unresolved one is
-    /// retained for reconciliation rather than treated as active work.
-    fn rehydrate_tasks(control: &Path, clock: &dyn Clock) -> Result<HashMap<String, RunningTask>> {
-        let mut tasks = HashMap::new();
-        for mut record in list_task_records(control)? {
-            if record.admission == TaskAdmissionPhase::Prepared {
-                continue;
-            }
-            let started_ms = match record.started_ms {
-                Some(started_ms) => started_ms,
-                None if record.state == TaskState::Running => {
-                    // Older records have no durable wall-clock origin. They
-                    // cannot be assigned a trustworthy historical elapsed
-                    // time, so preserve the task and start timing from this
-                    // restart while upgrading the record for future restarts.
-                    let started_ms = clock.now_ms();
-                    record.started_ms = Some(started_ms);
-                    write_task_record(control, &record)?;
-                    started_ms
-                }
-                None => clock.now_ms(),
-            };
-            let id = record.id.clone();
-            tasks.insert(
-                id,
-                RunningTask {
-                    record,
-                    child: None,
-                    #[cfg(target_os = "linux")]
-                    group_liveness: None,
-                    #[cfg(not(target_os = "linux"))]
-                    rehydrated_liveness: None,
-                    started_ms,
-                    term_sent_at_ms: None,
-                    kill_sent: false,
-                    terminal_delivery_attempts: 0,
-                    next_terminal_retry_ms: None,
-                    terminal_retry_delay_ms: 0,
-                    milestone_delivery_attempts: 0,
-                    next_milestone_retry_ms: None,
-                    milestone_retry_delay_ms: 0,
-                },
-            );
-        }
-        Ok(tasks)
-    }
-
-    /// Outcome of one [`tick_one_task`] call.
-    #[derive(Debug)]
-    enum TaskTick {
-        StillRunning,
-        Finished,
-        TerminalDeliveryRetry {
-            error: String,
-            attempt: u32,
-            delay_ms: u64,
-        },
-        TerminalDeliveryDropped {
-            error: String,
-            attempts: u32,
-        },
-    }
-
     /// Claims the next task-start request through the shared request channel,
     /// then applies task-specific admission and lifecycle handling.
     fn process_one_task_request(
@@ -1801,23 +1612,7 @@ mod imp {
                 return Ok(None);
             };
             let id = record.id.clone();
-            let running = RunningTask {
-                record,
-                child: Some(child),
-                #[cfg(target_os = "linux")]
-                group_liveness: None,
-                #[cfg(not(target_os = "linux"))]
-                rehydrated_liveness: None,
-                started_ms,
-                term_sent_at_ms: None,
-                kill_sent: false,
-                terminal_delivery_attempts: 0,
-                next_terminal_retry_ms: None,
-                terminal_retry_delay_ms: 0,
-                milestone_delivery_attempts: 0,
-                next_milestone_retry_ms: None,
-                milestone_retry_delay_ms: 0,
-            };
+            let running = RunningTask::new(record, Some(child), None, started_ms);
             Ok(Some((id, running)))
         })
     }
@@ -2019,547 +1814,6 @@ mod imp {
         })
     }
 
-    /// Returns the cached group sample and whether it needs refreshing. The
-    /// cache is shared by owned and rehydrated tasks; callers decide whether
-    /// their direct-leader check requires a group sample at all.
-    #[cfg(target_os = "linux")]
-    fn group_liveness_cache(
-        running: &RunningTask,
-        now_ms: u64,
-        force_refresh: bool,
-    ) -> (Option<Liveness>, bool) {
-        let refresh = force_refresh
-            || running
-                .group_liveness
-                .map(|(checked_ms, _, checked_at)| {
-                    now_ms.saturating_sub(checked_ms) >= REHYDRATED_LIVENESS_CACHE_MS
-                        || checked_at.elapsed()
-                            >= Duration::from_millis(REHYDRATED_LIVENESS_CACHE_MS)
-                })
-                .unwrap_or(true);
-        let cached = if refresh {
-            None
-        } else {
-            Some(
-                running
-                    .group_liveness
-                    .expect("group liveness cache populated")
-                    .1,
-            )
-        };
-        (cached, refresh)
-    }
-
-    #[cfg(target_os = "linux")]
-    fn remember_group_liveness(
-        running: &mut RunningTask,
-        now_ms: u64,
-        refresh: bool,
-        liveness: Liveness,
-    ) {
-        if refresh {
-            running.group_liveness = Some((now_ms, liveness, Instant::now()));
-        }
-    }
-
-    /// Returns one cached liveness sample for a PID-identified task. Linux
-    /// always checks direct PID identity, but rate-limits the table-wide group
-    /// scan. A forced refresh is used immediately before timeout escalation.
-    #[cfg(target_os = "linux")]
-    fn cached_task_execution_liveness(
-        running: &mut RunningTask,
-        now_ms: u64,
-        force_refresh: bool,
-    ) -> Liveness {
-        let direct_probe = process_probe(running.record.pid);
-        let (cached_group_liveness, refresh) = group_liveness_cache(running, now_ms, force_refresh);
-        let (liveness, used_group_liveness) = task_execution_liveness_from_probe(
-            &running.record,
-            &direct_probe,
-            cached_group_liveness,
-        );
-        if used_group_liveness {
-            remember_group_liveness(running, now_ms, refresh, liveness);
-        }
-        liveness
-    }
-
-    /// Returns one cached group sample after an owned Child has reported the
-    /// direct leader exited. The Child handle is the direct-leader identity
-    /// check on this path, so no PID probe is needed here.
-    #[cfg(target_os = "linux")]
-    fn owned_task_group_liveness(
-        running: &mut RunningTask,
-        now_ms: u64,
-        force_refresh: bool,
-    ) -> Liveness {
-        let (cached_group_liveness, refresh) = group_liveness_cache(running, now_ms, force_refresh);
-        let liveness =
-            cached_group_liveness.unwrap_or_else(|| task_group_liveness(running.record.pid));
-        remember_group_liveness(running, now_ms, refresh, liveness);
-        liveness
-    }
-
-    #[cfg(target_os = "linux")]
-    fn rehydrated_task_liveness(
-        running: &mut RunningTask,
-        now_ms: u64,
-        force_refresh: bool,
-    ) -> Liveness {
-        cached_task_execution_liveness(running, now_ms, force_refresh)
-    }
-
-    fn owned_task_execution_liveness(
-        running: &mut RunningTask,
-        now_ms: u64,
-        force_refresh: bool,
-    ) -> Liveness {
-        #[cfg(target_os = "linux")]
-        {
-            cached_task_execution_liveness(running, now_ms, force_refresh)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (now_ms, force_refresh);
-            task_execution_liveness(&running.record)
-        }
-    }
-
-    /// Returns one cached liveness sample for a rehydrated task. The injected
-    /// clock makes cadence tests deterministic; the monotonic timestamp also
-    /// expires a sample when an external process change occurs while that
-    /// clock is paused. A forced refresh is used immediately before timeout
-    /// escalation so a stale live sample can never authorize signalling a
-    /// reused PID. The caller must thread the returned value through the rest
-    /// of the tick.
-    #[cfg(not(target_os = "linux"))]
-    fn rehydrated_task_liveness(
-        running: &mut RunningTask,
-        now_ms: u64,
-        force_refresh: bool,
-    ) -> Liveness {
-        let refresh = force_refresh
-            || running
-                .rehydrated_liveness
-                .map(|(checked_ms, _, checked_at)| {
-                    now_ms.saturating_sub(checked_ms) >= REHYDRATED_LIVENESS_CACHE_MS
-                        || checked_at.elapsed()
-                            >= Duration::from_millis(REHYDRATED_LIVENESS_CACHE_MS)
-                })
-                .unwrap_or(true);
-        if refresh {
-            running.rehydrated_liveness = Some((
-                now_ms,
-                task_execution_liveness(&running.record),
-                Instant::now(),
-            ));
-        }
-        running
-            .rehydrated_liveness
-            .expect("rehydrated liveness cache populated")
-            .1
-    }
-
-    /// Advances one tracked task by one loop tick: delivers any
-    /// newly-due milestone events, escalates `SIGTERM`→`SIGKILL` past
-    /// `max_duration_ms`, and — once the process has actually exited —
-    /// persists its terminal state and delivers its terminal event.
-    ///
-    /// Pure with respect to wall-clock time: every timing decision reads
-    /// `clock.now_ms()`, so a test can drive milestone/max-duration/terminal
-    /// behavior deterministically with a `FakeClock` and no real sleep.
-    fn tick_one_task(
-        control: &Path,
-        id: &str,
-        running: &mut RunningTask,
-        clock: &dyn Clock,
-    ) -> Result<TaskTick> {
-        // A terminal record can remain in the tracker when callback delivery
-        // failed after state persistence. Retry the deterministic event before
-        // dropping it, including after startup reconciliation.
-        if !task_record_exists(control, id)? {
-            return Ok(TaskTick::Finished);
-        }
-        if running.record.state != TaskState::Running {
-            return deliver_terminal_event(running, clock);
-        }
-
-        let now_ms = clock.now_ms();
-        let elapsed_ms = now_ms.saturating_sub(running.started_ms);
-
-        // Deliver due milestones best-effort: a failing or backed-off callback
-        // inbox must not abort the tick before the liveness/timeout/reap
-        // handling below, or an unreachable inbox would keep a task
-        // un-reapable forever and re-fire the same milestone at loop rate.
-        deliver_due_milestones(control, id, running, elapsed_ms, clock)?;
-
-        // A rehydrated task has no Child handle. Check its identity before
-        // any timeout signal so a gone or PID-reused process is never
-        // accidentally signalled as this task. An unresolved identity is
-        // retained and retried on a later tick.
-        let rehydrated_liveness = if running.child.is_none() {
-            let signal_due = (running.term_sent_at_ms.is_none()
-                && max_duration_exceeded(elapsed_ms, running.record.spec.max_duration_ms))
-                || (running.term_sent_at_ms.is_some()
-                    && !running.kill_sent
-                    && now_ms.saturating_sub(running.term_sent_at_ms.unwrap()) >= KILL_GRACE_MS);
-            let liveness = rehydrated_task_liveness(running, now_ms, signal_due);
-            match liveness {
-                Liveness::Dead => {
-                    let cancelled = consume_task_cancel_sentinel(control, id)?;
-                    let state = if cancelled {
-                        TaskState::Cancelled
-                    } else if running.term_sent_at_ms.is_some() {
-                        TaskState::Timeout
-                    } else {
-                        TaskState::Failed
-                    };
-                    return finalize_task(control, running, state, None, elapsed_ms, clock);
-                }
-                Liveness::Live => {}
-                Liveness::Unresolved => return Ok(TaskTick::StillRunning),
-            }
-            Some(liveness)
-        } else {
-            None
-        };
-
-        if running.term_sent_at_ms.is_none()
-            && max_duration_exceeded(elapsed_ms, running.record.spec.max_duration_ms)
-        {
-            let liveness = rehydrated_liveness
-                .unwrap_or_else(|| owned_task_execution_liveness(running, now_ms, true));
-            match liveness {
-                Liveness::Unresolved => return Ok(TaskTick::StillRunning),
-                Liveness::Live => {
-                    let _ = signal_group(running.record.pid, libc::SIGTERM);
-                    running.term_sent_at_ms = Some(clock.now_ms());
-                }
-                Liveness::Dead => {}
-            }
-        } else if let Some(term_at) = running.term_sent_at_ms
-            && !running.kill_sent
-            && clock.now_ms().saturating_sub(term_at) >= KILL_GRACE_MS
-        {
-            let liveness = rehydrated_liveness
-                .unwrap_or_else(|| owned_task_execution_liveness(running, now_ms, true));
-            match liveness {
-                Liveness::Unresolved => return Ok(TaskTick::StillRunning),
-                Liveness::Live => {
-                    let _ = signal_group(running.record.pid, libc::SIGKILL);
-                    running.kill_sent = true;
-                }
-                Liveness::Dead => {}
-            }
-        }
-
-        let child_status = match running.child.as_mut() {
-            Some(child) => Some(
-                child
-                    .try_wait()
-                    .map_err(|err| BatonError::Io(format!("could not poll task {id}: {err}")))?,
-            ),
-            None => None,
-        };
-        match child_status {
-            None => match rehydrated_liveness.expect("rehydrated liveness cached above") {
-                Liveness::Live | Liveness::Unresolved => Ok(TaskTick::StillRunning),
-                Liveness::Dead => {
-                    let cancelled = consume_task_cancel_sentinel(control, id)?;
-                    let state = if cancelled {
-                        TaskState::Cancelled
-                    } else if running.term_sent_at_ms.is_some() {
-                        TaskState::Timeout
-                    } else {
-                        TaskState::Failed
-                    };
-                    finalize_task(control, running, state, None, elapsed_ms, clock)
-                }
-            },
-            Some(None) => Ok(TaskTick::StillRunning),
-            Some(Some(status)) => {
-                // Reaping the direct leader does not end a Unix task while a
-                // descendant still occupies its process group. Keep the
-                // Child handle so its exit status remains available for
-                // finalization after the group drains. The Child handle is
-                // the direct-leader identity check for owned tasks.
-                #[cfg(target_os = "linux")]
-                let liveness = owned_task_group_liveness(running, now_ms, false);
-                #[cfg(not(target_os = "linux"))]
-                let liveness = task_execution_liveness(&running.record);
-                match liveness {
-                    Liveness::Live | Liveness::Unresolved => {
-                        return Ok(TaskTick::StillRunning);
-                    }
-                    Liveness::Dead => {}
-                }
-                // An external `Stop`/`Teardown`/`Cancel` may already have
-                // finalized and removed this task's record (they act
-                // directly on the durable PID, independent of this `Run`
-                // loop being alive) — if so, this reap is a no-op besides
-                // dropping our own in-memory tracking below, so a race with
-                // an external reaper never resurrects a torn-down record.
-                if read_task_record(control, id)?.is_none() {
-                    return Ok(TaskTick::Finished);
-                }
-                let cancelled = consume_task_cancel_sentinel(control, id)?;
-                let state = if cancelled {
-                    TaskState::Cancelled
-                } else if running.term_sent_at_ms.is_some() {
-                    TaskState::Timeout
-                } else if status.success() {
-                    TaskState::Completed
-                } else {
-                    TaskState::Failed
-                };
-                finalize_task(control, running, state, status.code(), elapsed_ms, clock)
-            }
-        }
-    }
-
-    /// Delivers every milestone newly due at `elapsed_ms`, best-effort.
-    ///
-    /// A callback inbox that is unavailable is handled by the same bounded
-    /// exponential backoff [`deliver_terminal_event`] applies: the lowest
-    /// undelivered milestone is retried on a doubling delay (from
-    /// [`EVENT_RETRY_INITIAL_DELAY_MS`], capped at [`EVENT_RETRY_MAX_DELAY_MS`])
-    /// and dropped after [`MAX_EVENT_DELIVERY_ATTEMPTS`], so a stuck inbox never
-    /// re-fires a milestone at loop rate. Unlike the terminal outcome, milestone
-    /// retry/drop warnings are emitted here rather than routed up through
-    /// [`TaskTick`], because the caller's tick must continue past them to reap,
-    /// time out, and cancel the task regardless.
-    ///
-    /// Only a control-dir *write* failure propagates (mirroring
-    /// [`finalize_task`]); a callback-delivery failure is absorbed into the
-    /// backoff so supervision is never blocked by an unreachable inbox.
-    fn deliver_due_milestones(
-        control: &Path,
-        id: &str,
-        running: &mut RunningTask,
-        elapsed_ms: u64,
-        clock: &dyn Clock,
-    ) -> Result<()> {
-        let now_ms = clock.now_ms();
-        if let Some(next_retry_ms) = running.next_milestone_retry_ms
-            && now_ms < next_retry_ms
-        {
-            return Ok(());
-        }
-
-        for index in milestones_due(
-            elapsed_ms,
-            &running.record.spec.milestones_ms,
-            running.record.delivered_milestones,
-        ) {
-            match deliver_task_event(&running.record, TaskEventKind::Milestone { index }) {
-                Ok(()) => {
-                    running.record.delivered_milestones = index + 1;
-                    if let Err(err) = write_task_record(control, &running.record) {
-                        running.record.delivered_milestones = index;
-                        return Err(err);
-                    }
-                    // A milestone delivered clears any backoff left by an
-                    // earlier failure, so the next milestone starts fresh.
-                    running.milestone_delivery_attempts = 0;
-                    running.next_milestone_retry_ms = None;
-                    running.milestone_retry_delay_ms = 0;
-                }
-                Err(err) => {
-                    let attempt = running.milestone_delivery_attempts.saturating_add(1);
-                    running.milestone_delivery_attempts = attempt;
-                    if attempt >= MAX_EVENT_DELIVERY_ATTEMPTS {
-                        eprintln!(
-                            "warning: baton service dropped milestone {index} for task {id} after {attempt} failed deliveries to callback inbox {:?}: {err}",
-                            running.record.spec.callback.inbox
-                        );
-                        // Advance past the dropped milestone and persist it, so
-                        // a supervisor restart does not re-enter the same stuck
-                        // milestone via `rehydrate_tasks`.
-                        running.record.delivered_milestones = index + 1;
-                        if let Err(write_err) = write_task_record(control, &running.record) {
-                            running.record.delivered_milestones = index;
-                            return Err(write_err);
-                        }
-                        running.milestone_delivery_attempts = 0;
-                        running.next_milestone_retry_ms = None;
-                        running.milestone_retry_delay_ms = 0;
-                        // Let the next tick handle any further due milestones,
-                        // each with its own fresh backoff, rather than hammering
-                        // the same unavailable inbox for the whole batch now.
-                        break;
-                    }
-
-                    let delay_ms = if attempt == 1 {
-                        EVENT_RETRY_INITIAL_DELAY_MS
-                    } else {
-                        running
-                            .milestone_retry_delay_ms
-                            .saturating_mul(2)
-                            .min(EVENT_RETRY_MAX_DELAY_MS)
-                    };
-                    running.milestone_retry_delay_ms = delay_ms;
-                    running.next_milestone_retry_ms = Some(now_ms.saturating_add(delay_ms));
-                    eprintln!(
-                        "warning: baton service failed to deliver milestone {index} for task {id} to callback inbox {:?} (attempt {attempt}/{MAX_EVENT_DELIVERY_ATTEMPTS}; retrying in {delay_ms} ms): {err}",
-                        running.record.spec.callback.inbox
-                    );
-                    // Milestones are delivered in order; stop the batch until
-                    // this one is delivered or dropped.
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Delivers a terminal event, applying bounded exponential backoff when
-    /// the callback inbox is unavailable.
-    fn deliver_terminal_event(running: &mut RunningTask, clock: &dyn Clock) -> Result<TaskTick> {
-        let now_ms = clock.now_ms();
-        if let Some(next_retry_ms) = running.next_terminal_retry_ms
-            && now_ms < next_retry_ms
-        {
-            return Ok(TaskTick::StillRunning);
-        }
-
-        match deliver_task_event(&running.record, TaskEventKind::Terminal) {
-            Ok(()) => Ok(TaskTick::Finished),
-            Err(err) => {
-                let attempt = running.terminal_delivery_attempts.saturating_add(1);
-                running.terminal_delivery_attempts = attempt;
-                let error = err.to_string();
-                if attempt >= MAX_EVENT_DELIVERY_ATTEMPTS {
-                    return Ok(TaskTick::TerminalDeliveryDropped {
-                        error,
-                        attempts: attempt,
-                    });
-                }
-
-                let delay_ms = if attempt == 1 {
-                    EVENT_RETRY_INITIAL_DELAY_MS
-                } else {
-                    running
-                        .terminal_retry_delay_ms
-                        .saturating_mul(2)
-                        .min(EVENT_RETRY_MAX_DELAY_MS)
-                };
-                running.terminal_retry_delay_ms = delay_ms;
-                running.next_terminal_retry_ms = Some(now_ms.saturating_add(delay_ms));
-                Ok(TaskTick::TerminalDeliveryRetry {
-                    error,
-                    attempt,
-                    delay_ms,
-                })
-            }
-        }
-    }
-
-    /// Persists a terminal task state before delivering its deterministic
-    /// terminal event. If delivery fails, the terminal record remains in the
-    /// tracker and the next tick retries the same event id.
-    fn finalize_task(
-        control: &Path,
-        running: &mut RunningTask,
-        state: TaskState,
-        exit_code: Option<i32>,
-        elapsed_ms: u64,
-        clock: &dyn Clock,
-    ) -> Result<TaskTick> {
-        let previous = running.record.clone();
-        {
-            // External Stop/Teardown may remove a durable task while this
-            // supervisor still has its in-memory tracker. Serialize the
-            // existence check and terminal write with that cleanup so a
-            // concurrent tick cannot resurrect the removed record.
-            let _admission = acquire_admission_lock(control)?;
-            if read_task_record(control, &running.record.id)?.is_none() {
-                return Ok(TaskTick::Finished);
-            }
-            running.record.state = state;
-            running.record.exit_code = exit_code;
-            running.record.elapsed_ms = Some(elapsed_ms);
-            if let Err(err) = write_task_record(control, &running.record) {
-                running.record = previous;
-                return Err(err);
-            }
-        }
-        deliver_terminal_event(running, clock)
-    }
-
-    /// Ticks every tracked task once, dropping any that finished. One task's
-    /// tick failure is warned and leaves it tracked for the next tick — the
-    /// same "one bad thing can't wedge the daemon" posture the rest of
-    /// `Run`'s loop takes.
-    fn tick_tasks(control: &Path, tasks: &mut HashMap<String, RunningTask>, clock: &dyn Clock) {
-        let mut finished = Vec::new();
-        for (id, running) in tasks.iter_mut() {
-            match tick_one_task(control, id, running, clock) {
-                Ok(TaskTick::Finished) => finished.push(id.clone()),
-                Ok(TaskTick::StillRunning) => {}
-                Ok(TaskTick::TerminalDeliveryRetry {
-                    error,
-                    attempt,
-                    delay_ms,
-                }) => {
-                    eprintln!(
-                        "warning: baton service failed to deliver terminal event for task {id} to callback inbox {:?} (attempt {attempt}/{MAX_EVENT_DELIVERY_ATTEMPTS}; retrying in {delay_ms} ms): {error}",
-                        running.record.spec.callback.inbox
-                    );
-                }
-                Ok(TaskTick::TerminalDeliveryDropped { error, attempts }) => {
-                    eprintln!(
-                        "warning: baton service dropped task {id} after {attempts} failed terminal-event deliveries to callback inbox {:?}: {error}",
-                        running.record.spec.callback.inbox
-                    );
-                    finished.push(id.clone());
-                }
-                Err(err) => {
-                    eprintln!("warning: baton service failed to tick task {id}: {err}");
-                }
-            }
-        }
-        for id in finished {
-            tasks.remove(&id);
-        }
-    }
-
-    /// Delivers one task lifecycle event to `record.spec.callback.inbox`,
-    /// keyed by its deterministic [`task_event_id`] so the mailbox's own
-    /// `done/`-membership dedup recognizes an exact redelivery.
-    fn deliver_task_event(record: &TaskRecord, kind: TaskEventKind) -> Result<()> {
-        let event_id = task_event_id(&record.id, kind);
-        let body = match kind {
-            TaskEventKind::Milestone { index } => TaskEventBody::milestone(&record.id, index),
-            TaskEventKind::Terminal => TaskEventBody::terminal(
-                &record.id,
-                record.state,
-                record.exit_code,
-                record.elapsed_ms.unwrap_or(0),
-            ),
-        };
-        let body_json = serde_json::to_string(&body)
-            .map_err(|err| BatonError::Io(format!("could not serialize task event body: {err}")))?;
-        // `to` is a delivery-target-agnostic identity tag only — the actual
-        // routing is `record.spec.callback.inbox`, a mailbox root, exactly
-        // like `SessionSpec::role` never resolves anything by itself.
-        let to = record
-            .spec
-            .callback
-            .role
-            .clone()
-            .unwrap_or_else(|| record.id.clone());
-        let envelope = MessageEnvelope::new(
-            event_id,
-            record.id.clone(),
-            "baton-task",
-            to,
-            MessageKind::Notify,
-            body_json,
-            crate::events::now_ms(),
-        );
-        mailbox::deliver_to(&record.spec.callback.inbox, &envelope)
-    }
-
     // -- Task records -------------------------------------------------------
 
     #[derive(Debug, PartialEq, Eq)]
@@ -2747,25 +2001,11 @@ mod imp {
     // writer of terminal state — can attribute the reap it later observes to
     // `cancelled` rather than misreading a `SIGTERM` exit as `failed`.
 
-    fn task_cancel_sentinel_path(control: &Path, task_id: &str) -> std::path::PathBuf {
-        task_cancel_dir(control).join(mailbox::file_name(task_id))
-    }
-
     fn request_task_cancel_sentinel(control: &Path, task_id: &str) -> Result<()> {
         let dir = task_cancel_dir(control);
         fs::create_dir_all(&dir)
             .map_err(|err| BatonError::Io(format!("could not create {dir:?}: {err}")))?;
         mailbox::atomic_write(&dir, &mailbox::file_name(task_id), "")
-    }
-
-    fn consume_task_cancel_sentinel(control: &Path, task_id: &str) -> Result<bool> {
-        match fs::remove_file(task_cancel_sentinel_path(control, task_id)) {
-            Ok(()) => Ok(true),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(err) => Err(BatonError::Io(format!(
-                "could not consume task cancel sentinel: {err}"
-            ))),
-        }
     }
 
     // -- Liveness ---------------------------------------------------------
@@ -3439,13 +2679,13 @@ mod imp {
         let result = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
         match result {
             0 => (
-                cached_liveness.unwrap_or_else(|| group_scan_with_absence_recheck(pid)),
+                cached_liveness.unwrap_or_else(|| task_group_liveness(pid)),
                 true,
             ),
             _ => match std::io::Error::last_os_error().raw_os_error() {
                 Some(libc::ESRCH) => (Liveness::Dead, false),
                 Some(libc::EPERM) => (
-                    cached_liveness.unwrap_or_else(|| group_scan_with_absence_recheck(pid)),
+                    cached_liveness.unwrap_or_else(|| task_group_liveness(pid)),
                     true,
                 ),
                 _ => (Liveness::Unresolved, false),
@@ -4261,23 +3501,7 @@ mod imp {
                 delivered_milestones: 0,
             };
             write_task_record(dir, &record).expect("write task record");
-            RunningTask {
-                record,
-                child: Some(child),
-                #[cfg(target_os = "linux")]
-                group_liveness: None,
-                #[cfg(not(target_os = "linux"))]
-                rehydrated_liveness: None,
-                started_ms,
-                term_sent_at_ms: None,
-                kill_sent: false,
-                terminal_delivery_attempts: 0,
-                next_terminal_retry_ms: None,
-                terminal_retry_delay_ms: 0,
-                milestone_delivery_attempts: 0,
-                next_milestone_retry_ms: None,
-                milestone_retry_delay_ms: 0,
-            }
+            RunningTask::new(record, Some(child), None, started_ms)
         }
 
         /// Builds a terminal task without a live child so callback delivery
@@ -4314,23 +3538,7 @@ mod imp {
                 delivered_milestones: 0,
             };
             write_task_record(dir, &record).expect("write terminal task record");
-            RunningTask {
-                record,
-                child: None,
-                #[cfg(target_os = "linux")]
-                group_liveness: None,
-                #[cfg(not(target_os = "linux"))]
-                rehydrated_liveness: None,
-                started_ms: clock.now_ms(),
-                term_sent_at_ms: None,
-                kill_sent: false,
-                terminal_delivery_attempts: 0,
-                next_terminal_retry_ms: None,
-                terminal_retry_delay_ms: 0,
-                milestone_delivery_attempts: 0,
-                next_milestone_retry_ms: None,
-                milestone_retry_delay_ms: 0,
-            }
+            RunningTask::new(record, None, None, clock.now_ms())
         }
 
         #[test]
@@ -5782,7 +4990,7 @@ mod imp {
                 "rollback marker remains until cleanup succeeds"
             );
             assert!(
-                rehydrate_tasks(&dir.path, &FakeClock::new())
+                task_tick::rehydrate_tasks::<UnixServicePlatform>(&dir.path, &FakeClock::new())
                     .expect("rehydrate tasks")
                     .is_empty(),
                 "unresolved prepared record is not active work"
@@ -5851,7 +5059,8 @@ mod imp {
             };
             write_task_record(&dir.path, &record).expect("write task record");
 
-            let mut tasks = rehydrate_tasks(&dir.path, &clock).expect("rehydrate task");
+            let mut tasks = task_tick::rehydrate_tasks::<UnixServicePlatform>(&dir.path, &clock)
+                .expect("rehydrate task");
             let mut running = tasks.remove("task-reused").expect("rehydrated task");
             assert!(
                 running.child.is_none(),
@@ -5926,6 +5135,30 @@ mod imp {
                 task_execution_liveness(&record),
                 Liveness::Unresolved,
                 "a mismatched zombie remains unresolved"
+            );
+            let clock = FakeClock::new();
+            let mut tasks = task_tick::rehydrate_tasks::<UnixServicePlatform>(&dir.path, &clock)
+                .expect("rehydrate unresolved task");
+            let mut running = tasks
+                .remove(&record.id)
+                .expect("rehydrated unresolved task");
+            assert!(
+                running.child.is_none(),
+                "fixture follows the rehydrated tick path"
+            );
+            running.term_sent_at_ms = Some(clock.now_ms().saturating_sub(KILL_GRACE_MS));
+            assert!(matches!(
+                tick_one_task(&dir.path, &record.id, &mut running, &clock),
+                Ok(TaskTick::StillRunning)
+            ));
+            assert_eq!(running.record.state, TaskState::Running);
+            assert_eq!(
+                read_task_record(&dir.path, &record.id)
+                    .expect("read unresolved task after tick")
+                    .expect("unresolved task remains durable")
+                    .state,
+                TaskState::Running,
+                "an unresolved Unix group is not finalized by the shared tick"
             );
             let retry_grace_ms = POLL_INTERVAL_MS * 2;
             let started = Instant::now();
@@ -7231,22 +6464,8 @@ mod imp {
                 .expect("owned task child")
                 .wait()
                 .expect("wait for direct leader");
-            let mut rehydrated = RunningTask {
-                record: owned.record.clone(),
-                child: None,
-                group_liveness: None,
-                #[cfg(not(target_os = "linux"))]
-                rehydrated_liveness: None,
-                started_ms: owned.started_ms,
-                term_sent_at_ms: None,
-                kill_sent: false,
-                terminal_delivery_attempts: 0,
-                next_terminal_retry_ms: None,
-                terminal_retry_delay_ms: 0,
-                milestone_delivery_attempts: 0,
-                next_milestone_retry_ms: None,
-                milestone_retry_delay_ms: 0,
-            };
+            let mut rehydrated =
+                RunningTask::new(owned.record.clone(), None, None, owned.started_ms);
 
             reset_process_probe_count();
             reset_group_scan_count();
@@ -7690,23 +6909,8 @@ mod imp {
                 .expect("owned task child")
                 .wait()
                 .expect("wait for direct leader");
-            let mut rehydrated = RunningTask {
-                record: owned.record.clone(),
-                child: None,
-                #[cfg(target_os = "linux")]
-                group_liveness: None,
-                #[cfg(not(target_os = "linux"))]
-                rehydrated_liveness: None,
-                started_ms: owned.started_ms,
-                term_sent_at_ms: None,
-                kill_sent: false,
-                terminal_delivery_attempts: 0,
-                next_terminal_retry_ms: None,
-                terminal_retry_delay_ms: 0,
-                milestone_delivery_attempts: 0,
-                next_milestone_retry_ms: None,
-                milestone_retry_delay_ms: 0,
-            };
+            let mut rehydrated =
+                RunningTask::new(owned.record.clone(), None, None, owned.started_ms);
 
             let tick = tick_one_task(&dir.path, "task-rehydrated-group", &mut rehydrated, &clock)
                 .expect("rehydrated tick while group remains");
