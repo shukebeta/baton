@@ -176,7 +176,7 @@ baton service teardown [--control <dir>] [--force]
   grace windows. A task admitted while the lock was released is caught by a
   final rescan taken under the same uninterrupted lock hold that decides
   whether the session record may be removed — it is reaped, or reported as
-  residue with the session record retained, never silently dropped. On Unix, a
+  residue with the session record retained, never silently dropped. A
   session whose cleanup a live stop owns is not an admissible task owner even
   while its process is still live, so a start racing a released grace window
   fails fast with the owner rejection instead of being handed a task id for a
@@ -186,10 +186,7 @@ baton service teardown [--control <dir>] [--force]
   sentinel as soon as it observes it, long before the process exits. The marker
   records the stopping process's identity, so one orphaned by a killed
   `service stop` is discarded by the next reader rather than wedging
-  admission. Windows does not yet have this fast-rejection marker (tracked by
-  #294); a start racing a released grace window is instead admitted and then
-  caught by the rescan above, which reaps it or retains the session record
-  with it reported as residue.
+  admission.
   Idempotent — stopping an already-gone session is a no-op success.
 - **`service teardown`** first requests `run`'s cooperative stop, then waits
   up to ten seconds for `run` to release the control lock before taking its
