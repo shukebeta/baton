@@ -2662,6 +2662,8 @@ mod tests {
         }
         let path = session_record_path(&control, "svc-bad").expect("session record path");
         fs::write(path, "not json").expect("write malformed session record");
+        let path = session_record_path(&control, "svc-non-utf8").expect("session record path");
+        fs::write(path, b"\xff\xfe not utf8").expect("write non-UTF-8 session record");
 
         let mut ids: Vec<String> = list_session_records(&control)
             .expect("list")
@@ -2685,6 +2687,8 @@ mod tests {
         }
         let path = task_record_path(&control, "task-bad").expect("task record path");
         fs::write(path, "not json").expect("write malformed task record");
+        let path = task_record_path(&control, "task-non-utf8").expect("task record path");
+        fs::write(path, b"\xff\xfe not utf8").expect("write non-UTF-8 task record");
 
         let mut ids: Vec<String> = list_task_records(&control)
             .expect("list")

@@ -300,10 +300,15 @@ impl RecordStore {
 
     pub(super) fn read<Record: DeserializeOwned>(&self, id: &str) -> Result<Option<Record>> {
         let path = self.path(id)?;
-        match fs::read_to_string(&path) {
-            Ok(data) => serde_json::from_str(&data).map(Some).map_err(|err| {
-                BatonError::Decode(format!("malformed {} record {path:?}: {err}", self.noun))
-            }),
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let data = String::from_utf8(bytes).map_err(|err| {
+                    BatonError::Decode(format!("malformed {} record {path:?}: {err}", self.noun))
+                })?;
+                serde_json::from_str(&data).map(Some).map_err(|err| {
+                    BatonError::Decode(format!("malformed {} record {path:?}: {err}", self.noun))
+                })
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(BatonError::Io(format!("could not read {path:?}: {err}"))),
         }
