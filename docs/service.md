@@ -92,7 +92,7 @@ or isolated control planes. The selected control directory holds:
 ## Lifecycle contract
 
 ```
-baton service run [--control <dir>]
+baton service run [--control <dir>] [--task-retention <duration>]
 baton service start [--control <dir>] --inbox <dir> --outbox <dir> [--poll-ms <n>]
                     [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>]
                      [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]]
@@ -108,6 +108,12 @@ baton service teardown [--control <dir>] [--force]
   response to the waiting client, and any remaining failure — a malformed
   spec, an unexpected fault, a response it could not deliver — logs a warning
   and never crashes the loop for the sessions it already owns.
+  **`--task-retention <duration>`** overrides how long a terminal task record
+  is kept after its callback is delivered before `run` reaps it; see
+  "Terminal record retention" below. It accepts the same duration syntax as
+  `mailbox prune --older-than` (e.g. `30m`, `6h`, `2d`) and is rejected as a
+  usage error if given as `0` — the window must be strictly positive. Omitted,
+  it defaults to 24 hours.
 - **`service start`** accepts the session-shaping subset of `baton serve`'s
   flags shown in the synopsis above (`--poll-ms`, `--agent-*`, and `--role`),
   alongside its required `--inbox` and `--outbox` options. The optional
@@ -422,9 +428,14 @@ termination from tree-wide to PID-only, with a descendants-may-survive
 warning. State is persisted before the deterministic terminal callback is
 delivered, and a delivery failure leaves the tracker in place to retry the
 same event id under the bounded backoff described in "Event delivery and
-dedup contract" below. A terminal record is replayed once on the next startup
+dedup contract" below. A terminal record whose delivery has not yet
+succeeded (`terminal_delivered_at_ms: null`) is replayed on the next startup
 for the same reason; the mailbox's done ledger drops it if delivery already
-completed.
+completed elsewhere. Once delivery succeeds, `run` persists
+`terminal_delivered_at_ms` before continuing, so a record that survives a
+restart with that field already set is never redelivered — rehydration reads
+it back and goes straight to the retention check described in "Terminal
+record retention" below.
 
 Milestone delivery is decoupled from supervision: a milestone whose callback
 inbox is unavailable is retried on the same bounded backoff, but its failure
@@ -505,6 +516,24 @@ does not re-enter it) and leaves the task supervised. A milestone that
 succeeds on retry is still delivered exactly once — `delivered_milestones`
 only advances on a delivered or dropped index, never regressing, so an earlier
 delivered milestone is never redelivered when a later one recovers.
+
+### Terminal record retention
+
+A task's durable record is not removed the moment its terminal callback is
+delivered. `run` stamps `terminal_delivered_at_ms` on the `TaskRecord` when
+delivery succeeds and keeps the record — so `task status` can still report a
+finished task's exit code, elapsed time, and log paths — until
+`--task-retention <duration>` (default 24 hours, see `DEFAULT_TASK_RETENTION_MS`
+in [`src/service/task_tick.rs`](../src/service/task_tick.rs)) has elapsed
+since that stamp. Once the window elapses, the next tick reaps the record —
+removing `tasks/<id>.json`, its task-start transaction files, and its cancel
+sentinel — the same way a task with no configured retention grace was reaped
+before this contract existed. It does not remove the task's `stdout`/`stderr`
+logs under `task-logs/<task-id>/`, and `task status` reports an empty result
+for a reaped id exactly as it does for one that never existed. This retention
+window applies only to the tick-driven reap on delivery; `service stop`/
+`service teardown` still remove a task's terminal record immediately as part
+of reaping its owning session, described next.
 
 ### Ownership vs. callback
 

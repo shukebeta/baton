@@ -54,7 +54,7 @@ use crate::transport::claude::ClaudeClient;
 pub const EVENT_LOG_ENV: &str = "BATON_EVENT_LOG";
 
 /// One-line usage summary, appended to argument errors.
-pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session [--role <name>] [--resume <file> [--session <id>]] | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton serve --stop --inbox <dir> | baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]] | baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>] | baton mailbox prune --mailbox <root> --older-than <duration> | baton log show [--file <path>] | baton log replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>... | baton roles | baton role show <name> | baton service run [--control <dir>] | baton service start [--control <dir>] --inbox <dir> --outbox <dir> [--poll-ms <n>] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton service status [--control <dir>] [--session <id>] | baton service stop [--control <dir>] --session <id> [--force] | baton service teardown [--control <dir>] [--force] | baton task start [--control <dir>] --session <id> --command <program> [--arg <arg>]... [--cwd <dir>] [--env KEY=VALUE]... [--milestone-ms <n>]... --max-duration-ms <n> --callback-inbox <dir> [--callback-role <name>] | baton task status [--control <dir>] [--task <id>] | baton task cancel [--control <dir>] --task <id>";
+pub const USAGE: &str = "usage: baton ask -p|--prompt <text> | baton session [--role <name>] [--resume <file> [--session <id>]] | baton exchange [--in <path>] [--out <path>] | baton converse [--a-system <path>] [--b-system <path>] [--a-model <id>] [--b-model <id>] [--b-mailbox --b-inbox <dir> --b-outbox <dir> [--b-await-ms <n>]] (--seed <text> | --seed-file <path>) [--out <path>] | baton converse-ring --registry <path> --roster <a,b,c> (--seed <text> | --seed-file <path>) [--await-ms <n>] [--out <path>] | baton serve --inbox <dir> --outbox <dir> [--poll-ms <n>] [--once] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton serve --stop --inbox <dir> | baton send (--inbox <dir> | --registry <path>) (--body <text> [--to <role>] | --in <path>) [--from <id>] [--conversation <id>] [--await [--outbox <dir>] [--timeout-ms <n>]] | baton status (--mailbox <root> | --registry <path> --role <role>) [--max-runtime-ms <n>] | baton mailbox prune --mailbox <root> --older-than <duration> | baton log show [--file <path>] | baton log replay [--file <path>] [--index <N>] | baton log merge --conversation <id> <trail>... | baton roles | baton role show <name> | baton service run [--control <dir>] [--task-retention <duration>] | baton service start [--control <dir>] --inbox <dir> --outbox <dir> [--poll-ms <n>] [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>] [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]] [--role <name>] | baton service status [--control <dir>] [--session <id>] | baton service stop [--control <dir>] --session <id> [--force] | baton service teardown [--control <dir>] [--force] | baton task start [--control <dir>] --session <id> --command <program> [--arg <arg>]... [--cwd <dir>] [--env KEY=VALUE]... [--milestone-ms <n>]... --max-duration-ms <n> --callback-inbox <dir> [--callback-role <name>] | baton task status [--control <dir>] [--task <id>] | baton task cancel [--control <dir>] --task <id>";
 
 /// Default `baton serve` inbox poll interval, in milliseconds, when `--poll-ms`
 /// is unset.
@@ -2825,9 +2825,10 @@ fn parse_service<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comma
     }
 }
 
-/// Parses `baton service run [--control <dir>]`.
+/// Parses `baton service run [--control <dir>] [--task-retention <duration>]`.
 fn parse_service_run<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Command> {
     let mut control: Option<String> = None;
+    let mut task_retention_ms: Option<u64> = None;
     while let Some(arg) = iter.next() {
         let mut take = |flag: &str| -> Result<String> {
             iter.next()
@@ -2839,11 +2840,26 @@ fn parse_service_run<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<C
             other if other.starts_with("--control=") => {
                 control = Some(other["--control=".len()..].to_string());
             }
+            "--task-retention" => {
+                task_retention_ms = Some(parse_duration_ms(
+                    "--task-retention",
+                    &take("--task-retention")?,
+                )?)
+            }
+            other if other.starts_with("--task-retention=") => {
+                task_retention_ms = Some(parse_duration_ms(
+                    "--task-retention",
+                    &other["--task-retention=".len()..],
+                )?);
+            }
             other => return Err(usage(&format!("unexpected argument {other:?}"))),
         }
     }
     let control = optional_dir(control, "--control")?;
-    Ok(Command::Service(service::ServiceCommand::Run { control }))
+    Ok(Command::Service(service::ServiceCommand::Run {
+        control,
+        task_retention_ms,
+    }))
 }
 
 /// Parses `baton service start [--control <dir>] --inbox <dir> --outbox <dir>
@@ -3456,9 +3472,14 @@ fn parse_mailbox<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comma
             other if other.starts_with("--mailbox=") => {
                 mailbox = Some(other["--mailbox=".len()..].to_string());
             }
-            "--older-than" => older_than_ms = Some(parse_duration_ms(&take("--older-than")?)?),
+            "--older-than" => {
+                older_than_ms = Some(parse_duration_ms("--older-than", &take("--older-than")?)?)
+            }
             other if other.starts_with("--older-than=") => {
-                older_than_ms = Some(parse_duration_ms(&other["--older-than=".len()..])?);
+                older_than_ms = Some(parse_duration_ms(
+                    "--older-than",
+                    &other["--older-than=".len()..],
+                )?);
             }
             other => return Err(usage(&format!("unexpected argument {other:?}"))),
         }
@@ -3480,11 +3501,11 @@ fn parse_mailbox<'a>(mut iter: impl Iterator<Item = &'a String>) -> Result<Comma
 /// window matches every entry — including a future-dated one, whose age clamps to
 /// zero — and would silently wipe the ledger on a typo. An overflowing value is a
 /// usage error too, never a wrapped or panicking multiplication.
-fn parse_duration_ms(raw: &str) -> Result<u64> {
+fn parse_duration_ms(flag: &str, raw: &str) -> Result<u64> {
     let text = raw.trim();
     let reject = || {
         usage(&format!(
-            "--older-than must be a positive duration such as 500ms, 30s, 15m, 6h or 7d, got {raw:?}"
+            "{flag} must be a positive duration such as 500ms, 30s, 15m, 6h or 7d, got {raw:?}"
         ))
     };
     let split = text
@@ -5938,7 +5959,10 @@ mod tests {
     fn parse_service_run_allows_omitted_control() {
         assert_eq!(
             parse_args(&argv(&["service", "run"])).expect("parses"),
-            Command::Service(service::ServiceCommand::Run { control: None })
+            Command::Service(service::ServiceCommand::Run {
+                control: None,
+                task_retention_ms: None
+            })
         );
     }
 
@@ -5947,9 +5971,29 @@ mod tests {
         assert_eq!(
             parse_args(&argv(&["service", "run", "--control", "/tmp/ctl"])).expect("parses"),
             Command::Service(service::ServiceCommand::Run {
-                control: Some("/tmp/ctl".to_string())
+                control: Some("/tmp/ctl".to_string()),
+                task_retention_ms: None
             })
         );
+    }
+
+    #[test]
+    fn parse_service_run_parses_task_retention() {
+        assert_eq!(
+            parse_args(&argv(&["service", "run", "--task-retention", "6h"])).expect("parses"),
+            Command::Service(service::ServiceCommand::Run {
+                control: None,
+                task_retention_ms: Some(6 * 60 * 60 * 1_000)
+            })
+        );
+    }
+
+    #[test]
+    fn parse_service_run_rejects_zero_task_retention() {
+        assert!(matches!(
+            parse_args(&argv(&["service", "run", "--task-retention", "0"])).unwrap_err(),
+            BatonError::Usage(_)
+        ));
     }
 
     #[test]

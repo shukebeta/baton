@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use super::records::{
-    SessionRecord, list_task_records, read_task_record, task_cancel_dir, task_record_exists,
-    write_task_record,
+    SessionRecord, list_task_records, read_task_record, remove_task_record,
+    remove_task_start_transaction, task_cancel_dir, task_record_exists, write_task_record,
 };
 use super::{BatonError, Result, SessionSpec};
 use crate::mailbox;
@@ -26,6 +26,10 @@ const KILL_GRACE_MS: u64 = 2_000;
 /// Linux `/proc` table scan, non-Linux `ps` probe, and Windows Job Object
 /// probe are each allowed at most twice per second in the steady state.
 pub(super) const REHYDRATED_LIVENESS_CACHE_MS: u64 = 500;
+/// Default milliseconds a delivered terminal task record is kept before
+/// automatic runtime reaping, when `baton service run` omits
+/// `--task-retention`.
+pub(super) const DEFAULT_TASK_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
 
 /// Whether a `(checked_ms, _, checked_at)` liveness sample is still within
 /// [`REHYDRATED_LIVENESS_CACHE_MS`] of both the tick's software clock and
@@ -171,6 +175,12 @@ pub(super) struct RunningTask<P: ServicePlatform> {
     pub(super) next_milestone_retry_ms: Option<u64>,
     pub(super) milestone_retry_delay_ms: u64,
     pub(super) child_exit: Option<ChildExit>,
+    /// Milliseconds a delivered terminal record is retained before
+    /// [`deliver_terminal_event`] reaps it. Defaults to
+    /// [`DEFAULT_TASK_RETENTION_MS`]; overridden via [`Self::with_retention_ms`]
+    /// at the two sites that know the configured `--task-retention` value
+    /// (fresh spawn and boot rehydration).
+    pub(super) retention_ms: u64,
 }
 
 impl<P: ServicePlatform> RunningTask<P> {
@@ -195,17 +205,35 @@ impl<P: ServicePlatform> RunningTask<P> {
             next_milestone_retry_ms: None,
             milestone_retry_delay_ms: 0,
             child_exit: None,
+            retention_ms: DEFAULT_TASK_RETENTION_MS,
         }
+    }
+
+    pub(super) fn with_retention_ms(mut self, retention_ms: u64) -> Self {
+        self.retention_ms = retention_ms;
+        self
     }
 }
 
 /// Restores every durable task before the request loop accepts new work.
+///
+/// `records`, when given, is reused as the post-reconciliation `tasks/`
+/// snapshot instead of re-listing the directory — safe only when the caller
+/// knows nothing wrote to `tasks/` since that snapshot was taken (the
+/// steady-state boot path, once admission reconciliation reports no
+/// mutation). `None` always re-lists.
 pub(super) fn rehydrate_tasks<P: ServicePlatform>(
     control: &Path,
     clock: &dyn Clock,
+    retention_ms: u64,
+    records: Option<Vec<TaskRecord>>,
 ) -> Result<HashMap<String, RunningTask<P>>> {
     let mut tasks = HashMap::new();
-    for mut record in list_task_records(control)? {
+    let records = match records {
+        Some(records) => records,
+        None => list_task_records(control)?,
+    };
+    for mut record in records {
         if record.admission == TaskAdmissionPhase::Prepared {
             continue;
         }
@@ -221,7 +249,10 @@ pub(super) fn rehydrate_tasks<P: ServicePlatform>(
         };
         let id = record.id.clone();
         let task_handle = P::rehydrate_task(&record)?;
-        tasks.insert(id, RunningTask::new(record, None, task_handle, started_ms));
+        tasks.insert(
+            id,
+            RunningTask::new(record, None, task_handle, started_ms).with_retention_ms(retention_ms),
+        );
     }
     Ok(tasks)
 }
@@ -256,7 +287,7 @@ pub(super) fn tick_one_task<P: ServicePlatform>(
         return Ok(TaskTick::Finished);
     }
     if running.record.state != TaskState::Running {
-        return deliver_terminal_event(running, clock);
+        return deliver_terminal_event(control, running, clock);
     }
 
     let now_ms = clock.now_ms();
@@ -519,45 +550,70 @@ fn deliver_due_milestones<P: ServicePlatform>(
     Ok(())
 }
 
+/// Delivers a task's terminal callback exactly once, then retains its
+/// record for [`RunningTask::retention_ms`] before reaping it. A record
+/// whose `terminal_delivered_at_ms` is already set (delivered earlier this
+/// run, or before a restart) skips straight to the retention check —
+/// delivery is never repeated once it has succeeded.
 fn deliver_terminal_event<P: ServicePlatform>(
+    control: &Path,
     running: &mut RunningTask<P>,
     clock: &dyn Clock,
 ) -> Result<TaskTick> {
     let now_ms = clock.now_ms();
-    if let Some(next_retry_ms) = running.next_terminal_retry_ms
-        && now_ms < next_retry_ms
-    {
-        return Ok(TaskTick::StillRunning);
-    }
+    if running.record.terminal_delivered_at_ms.is_none() {
+        if let Some(next_retry_ms) = running.next_terminal_retry_ms
+            && now_ms < next_retry_ms
+        {
+            return Ok(TaskTick::StillRunning);
+        }
 
-    match deliver_task_event(&running.record, TaskEventKind::Terminal) {
-        Ok(()) => Ok(TaskTick::Finished),
-        Err(err) => {
-            let attempt = running.terminal_delivery_attempts.saturating_add(1);
-            running.terminal_delivery_attempts = attempt;
-            let error = err.to_string();
-            if attempt >= MAX_EVENT_DELIVERY_ATTEMPTS {
-                return Ok(TaskTick::TerminalDeliveryDropped {
+        match deliver_task_event(&running.record, TaskEventKind::Terminal) {
+            Ok(()) => {
+                running.record.terminal_delivered_at_ms = Some(now_ms);
+                if let Err(err) = write_task_record(control, &running.record) {
+                    running.record.terminal_delivered_at_ms = None;
+                    return Err(err);
+                }
+            }
+            Err(err) => {
+                let attempt = running.terminal_delivery_attempts.saturating_add(1);
+                running.terminal_delivery_attempts = attempt;
+                let error = err.to_string();
+                if attempt >= MAX_EVENT_DELIVERY_ATTEMPTS {
+                    return Ok(TaskTick::TerminalDeliveryDropped {
+                        error,
+                        attempts: attempt,
+                    });
+                }
+                let delay_ms = if attempt == 1 {
+                    EVENT_RETRY_INITIAL_DELAY_MS
+                } else {
+                    running
+                        .terminal_retry_delay_ms
+                        .saturating_mul(2)
+                        .min(EVENT_RETRY_MAX_DELAY_MS)
+                };
+                running.terminal_retry_delay_ms = delay_ms;
+                running.next_terminal_retry_ms = Some(now_ms.saturating_add(delay_ms));
+                return Ok(TaskTick::TerminalDeliveryRetry {
                     error,
-                    attempts: attempt,
+                    attempt,
+                    delay_ms,
                 });
             }
-            let delay_ms = if attempt == 1 {
-                EVENT_RETRY_INITIAL_DELAY_MS
-            } else {
-                running
-                    .terminal_retry_delay_ms
-                    .saturating_mul(2)
-                    .min(EVENT_RETRY_MAX_DELAY_MS)
-            };
-            running.terminal_retry_delay_ms = delay_ms;
-            running.next_terminal_retry_ms = Some(now_ms.saturating_add(delay_ms));
-            Ok(TaskTick::TerminalDeliveryRetry {
-                error,
-                attempt,
-                delay_ms,
-            })
         }
+    }
+
+    let delivered_at_ms = running
+        .record
+        .terminal_delivered_at_ms
+        .expect("just delivered or already recorded above");
+    if now_ms.saturating_sub(delivered_at_ms) >= running.retention_ms {
+        remove_reaped_task_record(control, &running.record)?;
+        Ok(TaskTick::Finished)
+    } else {
+        Ok(TaskTick::StillRunning)
     }
 }
 
@@ -587,7 +643,7 @@ pub(super) fn finalize_task<P: ServicePlatform>(
         running.record = previous;
         return Ok(TaskTick::Finished);
     }
-    deliver_terminal_event(running, clock)
+    deliver_terminal_event(control, running, clock)
 }
 
 /// Ticks every tracked task once, dropping any that finished.
@@ -659,6 +715,17 @@ pub(super) fn deliver_task_event(record: &TaskRecord, kind: TaskEventKind) -> Re
 
 pub(super) fn task_cancel_sentinel_path(control: &Path, task_id: &str) -> std::path::PathBuf {
     task_cancel_dir(control).join(mailbox::file_name(task_id))
+}
+
+/// Remove every durable trace of a task whose record is being reaped:
+/// its start transaction, its `tasks/` record, and any lingering cancel
+/// sentinel. Shared by both platforms' stop/teardown paths and by the
+/// runtime terminal-record reaper.
+pub(super) fn remove_reaped_task_record(control: &Path, record: &TaskRecord) -> Result<()> {
+    remove_task_start_transaction(control, record)?;
+    remove_task_record(control, &record.id)?;
+    let _ = std::fs::remove_file(task_cancel_sentinel_path(control, &record.id));
+    Ok(())
 }
 
 pub(super) fn consume_task_cancel_sentinel(control: &Path, task_id: &str) -> Result<bool> {
