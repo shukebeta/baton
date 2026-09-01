@@ -10,8 +10,6 @@
         <string>/Users/YOUR_USER/.cargo/bin/baton</string>
         <string>service</string>
         <string>run</string>
-        <string>--control</string>
-        <string>/Users/YOUR_USER/.baton/service</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

@@ -5,7 +5,7 @@ daemon (see [`src/mailbox.rs`](../src/mailbox.rs)), but nothing durable *owns*
 it: launch it directly from a client or tool-runner process and the daemon
 inherits that process's own tree as its parent. `setsid`/`disown` only detach
 a process *group* — an external agent/tool runner that reaps its process tree
-still takes the daemon down with it. `baton service run --control <dir>` is
+still takes the daemon down with it. `baton service run [--control <dir>]` is
 the missing owner: a long-lived process, meant to be kept alive by an OS
 service manager, that spawns each `baton serve` session as its own direct
 child so a short-lived client can start, inspect, stop, or tear one down
@@ -41,7 +41,11 @@ without ever sharing a process tree with it.
 
 ## Control surface
 
-`--control <dir>` holds:
+All service and task commands accept an optional `--control <dir>`. When it is
+omitted, Baton uses the per-user default `<BATON_HOME>/service`, or
+`$HOME/.baton/service` (and `%USERPROFILE%/.baton/service` on Windows) when
+`BATON_HOME` is unset. The explicit flag remains the escape hatch for parallel
+or isolated control planes. The selected control directory holds:
 
 - `service.lock` — the exclusive single-instance advisory lock, held by
   `service run` for as long as it runs (mirrors `serve`'s own `serve.lock`).
@@ -88,14 +92,14 @@ without ever sharing a process tree with it.
 ## Lifecycle contract
 
 ```
-baton service run --control <dir>
-baton service start --control <dir> --inbox <dir> --outbox <dir> [--poll-ms <n>]
+baton service run [--control <dir>]
+baton service start [--control <dir>] --inbox <dir> --outbox <dir> [--poll-ms <n>]
                     [--agent-cmd <program> [--agent-arg <arg>]... [--agent-cwd <dir>]
                      [--agent-timeout-ms <n>] [--agent-output raw|json [--agent-result-key <key>]]]
                     [--role <name>]
-baton service status --control <dir> [--session <id>]
-baton service stop --control <dir> --session <id> [--force]
-baton service teardown --control <dir> [--force]
+baton service status [--control <dir>] [--session <id>]
+baton service stop [--control <dir>] --session <id> [--force]
+baton service teardown [--control <dir>] [--force]
 ```
 
 - **`service run`** acquires the control lock and blocks, spawning and
@@ -106,7 +110,9 @@ baton service teardown --control <dir> [--force]
   and never crashes the loop for the sessions it already owns.
 - **`service start`** accepts the session-shaping subset of `baton serve`'s
   flags shown in the synopsis above (`--poll-ms`, `--agent-*`, and `--role`),
-  alongside its required `--control`, `--inbox`, and `--outbox` options. The
+  alongside its required `--inbox` and `--outbox` options. The optional
+  `--control` selects an explicit control directory; when omitted, the shared
+  per-user default described above is used. The
   session-shaping flags become the session's `SessionSpec`, reconstructed into
   an equivalent `baton serve` argv by `run`. Direct `baton serve` lifecycle
   flags such as `--once` and `--stop` are not accepted; service-managed
@@ -301,12 +307,12 @@ message and has no resident place to wait on a slow command; a task is that
 missing place, owned by the same `service run` process that owns sessions.
 
 ```
-baton task start --control <dir> --session <id> --command <program>
+baton task start [--control <dir>] --session <id> --command <program>
                  [--arg <arg>]... [--cwd <dir>] [--env KEY=VALUE]...
                  [--milestone-ms <n>]... --max-duration-ms <n>
                  --callback-inbox <dir> [--callback-role <name>]
-baton task status --control <dir> [--task <id>]
-baton task cancel --control <dir> --task <id>
+baton task status [--control <dir>] [--task <id>]
+baton task cancel [--control <dir>] --task <id>
 ```
 
 - **`task start`** submits a `TaskSpec` (schema `baton.task-spec/v1`) and

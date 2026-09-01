@@ -317,21 +317,30 @@ enum ProbeResult<T> {
 /// Dispatches one parsed [`ServiceCommand`].
 pub(super) fn dispatch(cmd: ServiceCommand, mut out: impl Write) -> Result<()> {
     match cmd {
-        ServiceCommand::Run { control } => run_service(Path::new(&control), out),
+        ServiceCommand::Run { control } => {
+            let control = crate::roles::resolve_control_dir(control)?;
+            run_service(&control, out)
+        }
         ServiceCommand::Start { control, spec } => {
-            let session_id = submit_start_request(Path::new(&control), &spec)?;
+            let control = crate::roles::resolve_control_dir(control)?;
+            let session_id = submit_start_request(&control, &spec)?;
             writeln!(out, "{session_id}").map_err(io_err)
         }
         ServiceCommand::Status { control, session } => {
-            execute_status(Path::new(&control), session.as_deref(), out)
+            let control = crate::roles::resolve_control_dir(control)?;
+            execute_status(&control, session.as_deref(), out)
         }
         ServiceCommand::Stop {
             control,
             session,
             force,
-        } => execute_stop(Path::new(&control), &session, force, out),
+        } => {
+            let control = crate::roles::resolve_control_dir(control)?;
+            execute_stop(&control, &session, force, out)
+        }
         ServiceCommand::Teardown { control, force } => {
-            execute_teardown(Path::new(&control), force, out)
+            let control = crate::roles::resolve_control_dir(control)?;
+            execute_teardown(&control, force, out)
         }
     }
 }
@@ -340,14 +349,17 @@ pub(super) fn dispatch(cmd: ServiceCommand, mut out: impl Write) -> Result<()> {
 pub(super) fn dispatch_task(cmd: TaskCommand, mut out: impl Write) -> Result<()> {
     match cmd {
         TaskCommand::Start { control, spec } => {
-            let task_id = submit_task_start_request(Path::new(&control), &spec)?;
+            let control = crate::roles::resolve_control_dir(control)?;
+            let task_id = submit_task_start_request(&control, &spec)?;
             writeln!(out, "{task_id}").map_err(io_err)
         }
         TaskCommand::Status { control, task } => {
-            execute_task_status(Path::new(&control), task.as_deref(), out)
+            let control = crate::roles::resolve_control_dir(control)?;
+            execute_task_status(&control, task.as_deref(), out)
         }
         TaskCommand::Cancel { control, task } => {
-            execute_task_cancel(Path::new(&control), &task, out)
+            let control = crate::roles::resolve_control_dir(control)?;
+            execute_task_cancel(&control, &task, out)
         }
     }
 }
@@ -673,11 +685,11 @@ fn submit_start_request(control: &Path, spec: &SessionSpec) -> Result<String> {
         &request_id,
         spec,
         |control| Ok(probe_control(control)? == ControlLiveness::Live),
-        |control| {
-            format!(
-                "no live baton service on {control:?}; start one with `baton service run --control <dir>` first"
-            )
-        },
+            |control| {
+                format!(
+                    "no live baton service on {control:?}; start one with `baton service run [--control <dir>]` first"
+                )
+            },
         "session spec",
         || await_start_response(control, &request_id),
     )
@@ -1043,7 +1055,7 @@ fn submit_task_start_request(control: &Path, spec: &TaskSpec) -> Result<String> 
         |control| Ok(probe_control(control)? == ControlLiveness::Live),
         |control| {
             format!(
-                "no live baton service on {control:?}; start one with `baton service run --control <dir>` first"
+                    "no live baton service on {control:?}; start one with `baton service run [--control <dir>]` first"
             )
         },
         "task spec",

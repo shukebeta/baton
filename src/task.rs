@@ -85,23 +85,26 @@ pub struct TaskSpec {
 pub enum TaskCommand {
     /// Submit a task spec to a live `baton service run` and return its task id.
     Start {
-        /// The `--control <dir>` root.
-        control: String,
+        /// The optional `--control <dir>` root; `None` uses the per-user
+        /// default `BATON_HOME/service` or `home/.baton/service`.
+        control: Option<String>,
         /// The task to start.
         spec: Box<TaskSpec>,
     },
     /// Report one task's (or every known task's) status.
     Status {
-        /// The `--control <dir>` root.
-        control: String,
+        /// The optional `--control <dir>` root; `None` uses the per-user
+        /// default `BATON_HOME/service` or `home/.baton/service`.
+        control: Option<String>,
         /// `--task <id>`; `None` reports every known task.
         task: Option<String>,
     },
     /// Cancel a task: idempotent. Kills the whole process group if still
     /// running, so a later reap delivers a `cancelled` terminal event.
     Cancel {
-        /// The `--control <dir>` root.
-        control: String,
+        /// The optional `--control <dir>` root; `None` uses the per-user
+        /// default `BATON_HOME/service` or `home/.baton/service`.
+        control: Option<String>,
         /// The task id to cancel.
         task: String,
     },
