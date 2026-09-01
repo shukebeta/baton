@@ -10,7 +10,7 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.4.3 … v0.3.51 (2026-09-01)
+## v0.4.4 … v0.3.51 (2026-09-01)
 
 ### Features
 - feat(cli): default service control directory (#295)
@@ -23,6 +23,7 @@ _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
 ### Docs
 - docs(mailbox): correct agent stderr persistence dichotomy (#304)
+- docs(service): match systemd snippet to the shipped unit (#305)
 
 ### Other Changes
 - design(service): add platform process seam (#297)
