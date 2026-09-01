@@ -4,7 +4,7 @@ use super::records::{
     fresh_request_id, fresh_session_id, fresh_task_id, list_session_records, list_task_records,
     list_task_start_acks, list_task_start_response_claims, list_task_start_rollbacks,
     mark_task_start_rollback, read_session_record, read_task_record, reclaim_stale_requests,
-    remove_session_record, remove_task_record, remove_task_start_ack,
+    remove_session_record, remove_task_logs_dir, remove_task_record, remove_task_start_ack,
     remove_task_start_response_files, remove_task_start_rollback, responses_dir,
     restore_task_start_response_claim, start_channel, take_task_start_response_locked,
     task_cancel_dir, task_channel, task_logs_dir, task_start_ack_exists,
@@ -1465,7 +1465,12 @@ fn abort_task_admission(control: &Path, record: &TaskRecord) -> Result<bool> {
             return Ok(false);
         }
     }
-    remove_task_record(control, &record.id).map(|()| true)
+    remove_task_record(control, &record.id)?;
+    // The aborted admission is the last reference to this task's captured
+    // output, so its log tree goes with the record rather than becoming
+    // unidentifiable garbage under `task-logs/`.
+    remove_task_logs_dir(control, &record.id);
+    Ok(true)
 }
 
 /// Returns any `task-processing/` entry a crash left mid-request to
@@ -1631,6 +1636,7 @@ fn handle_task_start_request(
         let _ = terminate_job(&job);
         let _ = child.wait();
         let _ = remove_task_record(control, &record.id);
+        remove_task_logs_dir(control, &record.id);
         return reject_task_start_request(control, request_id, admission_error_text(&err));
     }
     let respond = write_task_start_response(

@@ -223,7 +223,7 @@ mod imp {
         fresh_request_id, fresh_session_id, fresh_task_id, list_session_records, list_task_records,
         list_task_start_acks, list_task_start_response_claims, list_task_start_rollbacks,
         mark_task_start_rollback, read_session_record, read_task_record, reclaim_stale_requests,
-        remove_session_record, remove_task_record, remove_task_start_ack,
+        remove_session_record, remove_task_logs_dir, remove_task_record, remove_task_start_ack,
         remove_task_start_response_files, remove_task_start_rollback, responses_dir,
         restore_task_start_response_claim, sessions_dir, start_channel,
         take_task_start_response_locked, task_cancel_dir, task_channel, task_logs_dir,
@@ -1613,7 +1613,12 @@ mod imp {
                 return Ok(false);
             }
         }
-        remove_task_record(control, &record.id).map(|()| true)
+        remove_task_record(control, &record.id)?;
+        // The aborted admission is the last reference to this task's captured
+        // output, so its log tree goes with the record rather than becoming
+        // unidentifiable garbage under `task-logs/`.
+        remove_task_logs_dir(control, &record.id);
+        Ok(true)
     }
 
     /// Returns any `task-processing/` entry a crash left mid-request to
@@ -1789,6 +1794,7 @@ mod imp {
             let _ = signal_group(pid, libc::SIGKILL);
             let _ = child.wait();
             let _ = remove_task_record(control, &record.id);
+            remove_task_logs_dir(control, &record.id);
             return reject_task_start_request(control, request_id, admission_error_text(&err));
         }
         let respond = write_task_start_response(
@@ -3092,6 +3098,10 @@ mod imp {
         rescan_owned_tasks(admission, &record.id, force, &mut residue)?;
         if liveness == Liveness::Dead && residue.is_empty() {
             remove_session_record(control, &record.id)?;
+            // The record was the only pointer to this session's captured
+            // stderr, so the log tree is reclaimed with it. A session left as
+            // residue keeps both, so the operator can still read why.
+            let _ = fs::remove_dir_all(session_logs_dir(control, &record.id));
         } else if liveness != Liveness::Dead {
             residue.push(CleanupResidue {
                 kind: "session",
@@ -5148,6 +5158,10 @@ mod imp {
             running.record.terminal_delivered_at_ms = Some(clock.now_ms());
             write_task_record(&dir.path, &running.record).expect("write delivered task record");
 
+            let log_dir = task_logs_dir(&dir.path, "task-delivered");
+            fs::create_dir_all(&log_dir).expect("create task logs");
+            fs::write(log_dir.join("stdout.log"), b"out").expect("write captured stdout");
+
             let retention_ms = 1_000;
             let mut tasks = task_tick::rehydrate_tasks::<UnixServicePlatform>(
                 &dir.path,
@@ -5174,6 +5188,10 @@ mod imp {
                     .is_some(),
                 "the record survives while retention has not yet elapsed"
             );
+            assert!(
+                log_dir.join("stdout.log").is_file(),
+                "the captured output stays readable while the record is retained"
+            );
 
             clock.advance(1);
             assert!(matches!(
@@ -5186,6 +5204,10 @@ mod imp {
                     .expect("read reaped task")
                     .is_none(),
                 "the record is reaped exactly once retention elapses"
+            );
+            assert!(
+                !log_dir.exists(),
+                "the captured output is reclaimed with the record it belonged to"
             );
         }
 
@@ -7944,6 +7966,145 @@ mod imp {
             reaped_child
                 .wait()
                 .expect("reap the terminated fixture task");
+        }
+
+        /// A session that stops cleanly — dead, with nothing outstanding —
+        /// has its captured `stderr.log` reclaimed along with the record that
+        /// was the only pointer to it.
+        #[test]
+        fn stop_session_reclaims_the_session_log_dir() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("stop-session-logs");
+            let session_record = SessionRecord {
+                id: "svc-1".to_string(),
+                spec: spec("/tmp/in", "/tmp/out"),
+                pid: u32::MAX - 1,
+                started_at: None,
+                start_epoch_secs: None,
+                stderr_path: String::new(),
+            };
+            write_session_record(&dir.path, &session_record).expect("write session");
+            let log_dir = session_logs_dir(&dir.path, "svc-1");
+            fs::create_dir_all(&log_dir).expect("create session logs");
+            fs::write(log_dir.join("stderr.log"), b"boom").expect("write captured stderr");
+
+            let mut admission = AdmissionGuard::acquire(&dir.path).expect("admission lock");
+            let residue = stop_session_record_with_wait(
+                &mut admission,
+                &session_record,
+                false,
+                |_, _| {},
+                |_, _| {},
+            )
+            .expect("stop session");
+            drop(admission);
+
+            assert!(residue.is_empty(), "nothing is outstanding: {residue:?}");
+            assert!(
+                read_session_record(&dir.path, "svc-1")
+                    .expect("read")
+                    .is_none(),
+                "the session record is removed"
+            );
+            assert!(
+                !log_dir.exists(),
+                "the session log directory is reclaimed with its record"
+            );
+        }
+
+        /// A session whose cleanup leaves residue keeps its record, so it
+        /// keeps its logs too — the operator can still read why the cleanup
+        /// did not finish.
+        #[test]
+        fn stop_session_keeps_the_log_dir_when_cleanup_leaves_residue() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("stop-session-logs-residue");
+            let session_record = SessionRecord {
+                id: "svc-1".to_string(),
+                spec: spec("/tmp/in", "/tmp/out"),
+                pid: u32::MAX - 1,
+                started_at: None,
+                start_epoch_secs: None,
+                stderr_path: String::new(),
+            };
+            write_session_record(&dir.path, &session_record).expect("write session");
+            let log_dir = session_logs_dir(&dir.path, "svc-1");
+            fs::create_dir_all(&log_dir).expect("create session logs");
+            fs::write(log_dir.join("stderr.log"), b"boom").expect("write captured stderr");
+
+            // A live record the reaper does see, so it reaches its grace wait
+            // — the point at which the racing admission lands and becomes the
+            // outstanding task that keeps the session record alive.
+            let mut reaped_child = spawn_live_task_child(&dir.path, "task-reaped");
+            let reaped = live_task_record("svc-1", "task-reaped", reaped_child.id());
+            write_task_record(&dir.path, &reaped).expect("write reaped task");
+            let mut child = spawn_live_task_child(&dir.path, "task-racer");
+            let racer = live_task_record("svc-1", "task-racer", child.id());
+
+            let mut admission = AdmissionGuard::acquire(&dir.path).expect("admission lock");
+            let residue = stop_session_record_with_wait(
+                &mut admission,
+                &session_record,
+                false,
+                |_, _| {},
+                |_, _| {
+                    write_task_record(&dir.path, &racer).expect("admit racing task");
+                },
+            )
+            .expect("stop session");
+            drop(admission);
+
+            assert!(
+                residue.iter().any(|entry| entry.id == "task-racer"),
+                "the racing task is outstanding: {residue:?}"
+            );
+            assert!(
+                read_session_record(&dir.path, "svc-1")
+                    .expect("read")
+                    .is_some(),
+                "the session record is retained while an owned task is outstanding"
+            );
+            assert!(
+                log_dir.join("stderr.log").is_file(),
+                "its captured stderr is retained with it"
+            );
+
+            signal_group(child.id(), libc::SIGKILL).expect("kill racer");
+            child.wait().expect("reap racer");
+            reaped_child
+                .wait()
+                .expect("reap the terminated fixture task");
+        }
+
+        /// Aborting an admission is the last reference to the task's captured
+        /// output, so the log tree goes with the record rather than being
+        /// orphaned under `task-logs/`.
+        #[test]
+        fn abort_task_admission_reclaims_the_task_log_dir() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("abort-task-logs");
+            let mut record = live_task_record("svc-1", "task-aborted", std::process::id());
+            record.state = TaskState::Completed;
+            record.exit_code = Some(0);
+            write_task_record(&dir.path, &record).expect("write task record");
+            let log_dir = task_logs_dir(&dir.path, "task-aborted");
+            fs::create_dir_all(&log_dir).expect("create task logs");
+            fs::write(log_dir.join("stdout.log"), b"out").expect("write captured stdout");
+
+            assert!(
+                abort_task_admission(&dir.path, &record).expect("abort admission"),
+                "a terminal record is removed outright"
+            );
+            assert!(
+                read_task_record(&dir.path, "task-aborted")
+                    .expect("read")
+                    .is_none(),
+                "the task record is removed"
+            );
+            assert!(
+                !log_dir.exists(),
+                "the task log directory is reclaimed with its record"
+            );
         }
 
         /// `force=true` skips every wait, so a racing admission can never

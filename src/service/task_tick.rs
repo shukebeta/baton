@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use super::records::{
-    SessionRecord, list_task_records, read_task_record, remove_task_record,
+    SessionRecord, list_task_records, read_task_record, remove_task_logs_dir, remove_task_record,
     remove_task_start_transaction, task_cancel_dir, task_record_exists, write_task_record,
 };
 use super::{BatonError, Result, SessionSpec};
@@ -718,13 +718,15 @@ pub(super) fn task_cancel_sentinel_path(control: &Path, task_id: &str) -> std::p
 }
 
 /// Remove every durable trace of a task whose record is being reaped:
-/// its start transaction, its `tasks/` record, and any lingering cancel
-/// sentinel. Shared by both platforms' stop/teardown paths and by the
-/// runtime terminal-record reaper.
+/// its start transaction, its `tasks/` record, any lingering cancel sentinel,
+/// and its captured `task-logs/<task-id>/` output. Shared by both platforms'
+/// stop/teardown paths and by the runtime terminal-record reaper, so the logs
+/// live exactly as long as the record that names them.
 pub(super) fn remove_reaped_task_record(control: &Path, record: &TaskRecord) -> Result<()> {
     remove_task_start_transaction(control, record)?;
     remove_task_record(control, &record.id)?;
     let _ = std::fs::remove_file(task_cancel_sentinel_path(control, &record.id));
+    remove_task_logs_dir(control, &record.id);
     Ok(())
 }
 
