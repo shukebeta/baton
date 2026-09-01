@@ -119,6 +119,10 @@ pub enum ServiceCommand {
         /// The optional `--control <dir>` root; `None` uses the per-user
         /// default `BATON_HOME/service` or `home/.baton/service`.
         control: Option<String>,
+        /// The optional `--task-retention <duration>` milliseconds a
+        /// delivered terminal task record is kept before automatic runtime
+        /// reaping; `None` uses [`task_tick::DEFAULT_TASK_RETENTION_MS`].
+        task_retention_ms: Option<u64>,
     },
     /// Submit a session spec to a live `Run` and return its session id.
     Start {
@@ -220,27 +224,31 @@ mod imp {
         list_task_start_acks, list_task_start_response_claims, list_task_start_rollbacks,
         mark_task_start_rollback, read_session_record, read_task_record, reclaim_stale_requests,
         remove_session_record, remove_task_record, remove_task_start_ack,
-        remove_task_start_response_files, remove_task_start_rollback,
-        remove_task_start_transaction, responses_dir, restore_task_start_response_claim,
-        sessions_dir, start_channel, take_task_start_response_locked, task_cancel_dir,
-        task_channel, task_logs_dir, task_start_ack_exists, task_start_response_boundary_exists,
-        task_start_response_claim_path, task_start_response_id, task_start_response_path,
-        task_start_rollback_exists, wait_for_test_task_admission_barrier,
-        wait_for_test_task_response_phase_barrier, wait_for_test_task_rollback_cleanup_barrier,
-        write_session_record, write_start_response, write_task_record, write_task_start_response,
+        remove_task_start_response_files, remove_task_start_rollback, responses_dir,
+        restore_task_start_response_claim, sessions_dir, start_channel,
+        take_task_start_response_locked, task_cancel_dir, task_channel, task_logs_dir,
+        task_start_ack_exists, task_start_response_boundary_exists, task_start_response_claim_path,
+        task_start_response_id, task_start_response_path, task_start_rollback_exists,
+        wait_for_test_task_admission_barrier, wait_for_test_task_response_phase_barrier,
+        wait_for_test_task_rollback_cleanup_barrier, write_session_record, write_start_response,
+        write_task_record, write_task_start_response,
     };
     #[cfg(test)]
     use super::records::{
         session_record_path, task_processing_dir, task_record_path, task_requests_dir,
         task_responses_dir, task_start_ack_path, task_start_rollback_dir,
     };
+    #[cfg(all(test, target_os = "linux"))]
+    use super::task_tick::task_cancel_sentinel_path;
     use super::task_tick::{
         self, Liveness, REHYDRATED_LIVENESS_CACHE_MS, RunningTask as SharedRunningTask,
         ServicePlatform, TaskLivenessMode, TaskLivenessRefresh, TerminationSignal,
-        liveness_sample_is_fresh, task_cancel_sentinel_path,
+        liveness_sample_is_fresh, remove_reaped_task_record,
     };
     #[cfg(test)]
-    use super::task_tick::{deliver_task_event, finalize_task, tick_one_task};
+    use super::task_tick::{
+        DEFAULT_TASK_RETENTION_MS, deliver_task_event, finalize_task, tick_one_task,
+    };
     use super::*;
     #[cfg(test)]
     use std::cell::Cell;
@@ -578,9 +586,14 @@ mod imp {
     /// Dispatches one parsed [`ServiceCommand`].
     pub(super) fn dispatch(cmd: ServiceCommand, mut out: impl Write) -> Result<()> {
         match cmd {
-            ServiceCommand::Run { control } => {
+            ServiceCommand::Run {
+                control,
+                task_retention_ms,
+            } => {
                 let control = crate::roles::resolve_control_dir(control)?;
-                run_service(&control, out)
+                let task_retention_ms =
+                    task_retention_ms.unwrap_or(task_tick::DEFAULT_TASK_RETENTION_MS);
+                run_service(&control, task_retention_ms, out)
             }
             ServiceCommand::Start { control, spec } => {
                 let control = crate::roles::resolve_control_dir(control)?;
@@ -636,7 +649,7 @@ mod imp {
     /// Runs the supervisor loop: holds the control lock, drains `requests/`
     /// into spawned sessions, reaps exited children, and exits cooperatively
     /// once `Teardown` drops the stop sentinel.
-    fn run_service(control: &Path, mut out: impl Write) -> Result<()> {
+    fn run_service(control: &Path, task_retention_ms: u64, mut out: impl Write) -> Result<()> {
         fs::create_dir_all(control).map_err(|err| {
             BatonError::Io(format!(
                 "could not create control directory {control:?}: {err}"
@@ -651,7 +664,7 @@ mod imp {
         // this pass with a submitting client writing a rollback marker after
         // observing the previous supervisor disappear.
         let _admission = acquire_admission_lock(control)?;
-        reconcile_task_admissions(control)?;
+        let (reconciled_records, reconcile_mutated) = reconcile_task_admissions(control)?;
         // A request left mid-`processing/` by a crash between claim and
         // response is returned to `requests/`, mirroring
         // `Mailbox::reclaim_stale` — reprocessed harmlessly under a fresh
@@ -664,7 +677,20 @@ mod imp {
         reclaim_stale_task_requests(control)?;
         drop(_admission);
         let clock = SystemClock;
-        let mut tasks = task_tick::rehydrate_tasks::<UnixServicePlatform>(control, &clock)?;
+        // Reuse reconciliation's own `tasks/` listing when it changed
+        // nothing, so the common (nothing-to-reconcile) restart parses each
+        // record exactly once instead of walking `tasks/` twice.
+        let records = if reconcile_mutated {
+            None
+        } else {
+            Some(reconciled_records)
+        };
+        let mut tasks = task_tick::rehydrate_tasks::<UnixServicePlatform>(
+            control,
+            &clock,
+            task_retention_ms,
+            records,
+        )?;
         writeln!(out, "baton service running on {}", control.display()).map_err(io_err)?;
 
         let mut children: HashMap<String, Child> = HashMap::new();
@@ -704,7 +730,7 @@ mod imp {
             }
             match process_one_task_request(control, &clock) {
                 Ok(Some((task_id, running))) => {
-                    tasks.insert(task_id, running);
+                    tasks.insert(task_id, running.with_retention_ms(task_retention_ms));
                     did_work = true;
                 }
                 Ok(None) => {}
@@ -1394,16 +1420,23 @@ mod imp {
     /// idempotent across interrupted startup passes. An unresolved prepared
     /// record remains durable cleanup residue, including its rollback marker,
     /// until a later liveness probe can prove that its process is dead.
-    fn reconcile_task_admissions(control: &Path) -> Result<()> {
+    /// Returns the `tasks/` records observed at the start of the pass,
+    /// alongside whether the pass mutated any of them (removed one via
+    /// [`abort_task_admission`] or promoted `Committed` to `Responded`). A
+    /// caller that finds `mutated == false` may reuse the returned records
+    /// as an accurate post-reconciliation snapshot instead of re-listing
+    /// `tasks/`.
+    fn reconcile_task_admissions(control: &Path) -> Result<(Vec<TaskRecord>, bool)> {
         let rollback_ids = list_task_start_rollbacks(control)?;
         let ack_ids = list_task_start_acks(control)?;
         let claim_ids = list_task_start_response_claims(control)?;
         let records = list_task_records(control)?;
+        let mut mutated = false;
         let mut seen_rollbacks = std::collections::HashSet::new();
         let mut retained_rollbacks = std::collections::HashSet::new();
         let mut seen_acks = std::collections::HashSet::new();
 
-        for record in records {
+        for record in &records {
             if record.admission == TaskAdmissionPhase::Prepared {
                 let request_id = record.request_id.as_deref();
                 let rollback = request_id
@@ -1415,7 +1448,13 @@ mod imp {
                 if let Some(request_id) = request_id {
                     discard_pending_task_start_request(control, request_id)?;
                 }
-                if !abort_task_admission(control, &record)? {
+                // `abort_task_admission` may durably rewrite the record (e.g.
+                // a macOS legacy-record epoch upgrade) even when it reports
+                // the admission unresolved, so it counts as a mutation
+                // regardless of its return value.
+                let removed = abort_task_admission(control, record)?;
+                mutated = true;
+                if !removed {
                     if rollback && let Some(request_id) = request_id {
                         retained_rollbacks.insert(request_id.to_string());
                     }
@@ -1445,7 +1484,11 @@ mod imp {
                 seen_rollbacks.insert(request_id.to_string());
             }
             if rollback {
-                if !abort_task_admission(control, &record)? {
+                // See the Prepared-admission arm above: this call may
+                // durably rewrite the record even on an unresolved outcome.
+                let removed = abort_task_admission(control, record)?;
+                mutated = true;
+                if !removed {
                     retained_rollbacks.insert(request_id.to_string());
                     eprintln!(
                         "warning: task {} rollback remains unresolved; preserving its record",
@@ -1475,6 +1518,7 @@ mod imp {
                         );
                         continue;
                     }
+                    mutated = true;
                 }
                 remove_task_start_ack(control, request_id)?;
                 continue;
@@ -1506,6 +1550,8 @@ mod imp {
                         "warning: task {} restored response was written but responded phase could not be persisted: {err}",
                         record.id
                     );
+                } else {
+                    mutated = true;
                 }
             }
         }
@@ -1542,7 +1588,7 @@ mod imp {
                 remove_task_start_rollback(control, &request_id)?;
             }
         }
-        Ok(())
+        Ok((records, mutated))
     }
 
     fn abort_task_admission(control: &Path, record: &TaskRecord) -> Result<bool> {
@@ -1730,6 +1776,7 @@ mod imp {
             stdout_path: stdout_path.display().to_string(),
             stderr_path: stderr_path.display().to_string(),
             delivered_milestones: 0,
+            terminal_delivered_at_ms: None,
         };
         if let Err(err) = write_task_record(control, &record) {
             let _ = signal_group(pid, libc::SIGKILL);
@@ -1829,13 +1876,6 @@ mod imp {
     /// admission artifact that refers to it. Shared by the reaper's two
     /// removal branches (terminal state, and corroborated-dead process) and
     /// by [`rescan_owned_tasks`], so the three cannot drift apart.
-    fn remove_reaped_task_record(control: &Path, record: &TaskRecord) -> Result<()> {
-        remove_task_start_transaction(control, record)?;
-        remove_task_record(control, &record.id)?;
-        let _ = fs::remove_file(task_cancel_sentinel_path(control, &record.id));
-        Ok(())
-    }
-
     fn task_residue(record: &TaskRecord, liveness: Liveness) -> CleanupResidue {
         CleanupResidue {
             kind: "task",
@@ -3457,7 +3497,12 @@ mod imp {
         /// [`RunningTask`], mirroring what `handle_task_start_request` does
         /// inside the real request protocol — but callable directly, so a
         /// test can drive [`tick_one_task`] without going through the
-        /// request-file dance or the infinite `run_service` loop.
+        /// request-file dance or the infinite `run_service` loop. Retention
+        /// is zeroed so callers exercising `reap_task_until_finished`'s
+        /// bounded real-time loop see an immediate reap on terminal
+        /// delivery, as tests unrelated to retention expect; tests that
+        /// exercise retention itself build their own `RunningTask` with an
+        /// explicit `.with_retention_ms(...)`.
         fn spawn_running_task(
             dir: &Path,
             id: &str,
@@ -3488,9 +3533,10 @@ mod imp {
                 stdout_path: stdout_path.display().to_string(),
                 stderr_path: stderr_path.display().to_string(),
                 delivered_milestones: 0,
+                terminal_delivered_at_ms: None,
             };
             write_task_record(dir, &record).expect("write task record");
-            RunningTask::new(record, Some(child), None, started_ms)
+            RunningTask::new(record, Some(child), None, started_ms).with_retention_ms(0)
         }
 
         /// Builds a terminal task without a live child so callback delivery
@@ -3525,6 +3571,7 @@ mod imp {
                 stdout_path: String::new(),
                 stderr_path: String::new(),
                 delivered_milestones: 0,
+                terminal_delivered_at_ms: None,
             };
             write_task_record(dir, &record).expect("write terminal task record");
             RunningTask::new(record, None, None, clock.now_ms())
@@ -3562,7 +3609,7 @@ mod imp {
             assert!(matches!(
                 tick_one_task(&dir.path, "task-record-malformed", &mut running, &clock)
                     .expect("tick malformed task"),
-                TaskTick::Finished
+                TaskTick::StillRunning
             ));
         }
 
@@ -3725,6 +3772,7 @@ mod imp {
                 stdout_path: log_dir.join("stdout.log").display().to_string(),
                 stderr_path: log_dir.join("stderr.log").display().to_string(),
                 delivered_milestones: 0,
+                terminal_delivered_at_ms: None,
             };
             write_task_record(&dir.path, &task_record).expect("write legacy task");
             let mut upgraded_task = task_record.clone();
@@ -4538,6 +4586,7 @@ mod imp {
                 stdout_path: stdout_path.display().to_string(),
                 stderr_path: stderr_path.display().to_string(),
                 delivered_milestones: 0,
+                terminal_delivered_at_ms: None,
             };
             write_task_record(&dir.path, &task_record).expect("write terminal task record");
             request_task_cancel_sentinel(&dir.path, task_id).expect("write cancel sentinel");
@@ -4609,6 +4658,7 @@ mod imp {
                 stdout_path: "/tmp/out.log".to_string(),
                 stderr_path: "/tmp/err.log".to_string(),
                 delivered_milestones: 0,
+                terminal_delivered_at_ms: None,
             };
             write_task_record(&dir.path, &record).expect("write");
             let read = read_task_record(&dir.path, "task-1")
@@ -4654,6 +4704,7 @@ mod imp {
                     stdout_path: String::new(),
                     stderr_path: String::new(),
                     delivered_milestones: 0,
+                    terminal_delivered_at_ms: None,
                 };
                 write_task_record(&dir.path, &record).expect("write");
             }
@@ -4780,6 +4831,7 @@ mod imp {
                     stdout_path: String::new(),
                     stderr_path: String::new(),
                     delivered_milestones: 0,
+                    terminal_delivered_at_ms: None,
                 };
                 write_task_record(&dir.path, &record).expect("write task record");
                 let response = TaskStartResponse {
@@ -4861,6 +4913,7 @@ mod imp {
                     stdout_path: String::new(),
                     stderr_path: String::new(),
                     delivered_milestones: 0,
+                    terminal_delivered_at_ms: None,
                 };
                 write_task_record(&dir.path, &record).expect("write task record");
 
@@ -4943,6 +4996,7 @@ mod imp {
                 stdout_path: stdout_path.display().to_string(),
                 stderr_path: stderr_path.display().to_string(),
                 delivered_milestones: 0,
+                terminal_delivered_at_ms: None,
             };
             write_task_record(&dir.path, &record).expect("write prepared task");
             write_task_start_response(
@@ -4979,9 +5033,14 @@ mod imp {
                 "rollback marker remains until cleanup succeeds"
             );
             assert!(
-                task_tick::rehydrate_tasks::<UnixServicePlatform>(&dir.path, &FakeClock::new())
-                    .expect("rehydrate tasks")
-                    .is_empty(),
+                task_tick::rehydrate_tasks::<UnixServicePlatform>(
+                    &dir.path,
+                    &FakeClock::new(),
+                    DEFAULT_TASK_RETENTION_MS,
+                    None,
+                )
+                .expect("rehydrate tasks")
+                .is_empty(),
                 "unresolved prepared record is not active work"
             );
 
@@ -5045,11 +5104,13 @@ mod imp {
                 stdout_path: stdout_path.display().to_string(),
                 stderr_path: stderr_path.display().to_string(),
                 delivered_milestones: 0,
+                terminal_delivered_at_ms: None,
             };
             write_task_record(&dir.path, &record).expect("write task record");
 
-            let mut tasks = task_tick::rehydrate_tasks::<UnixServicePlatform>(&dir.path, &clock)
-                .expect("rehydrate task");
+            let mut tasks =
+                task_tick::rehydrate_tasks::<UnixServicePlatform>(&dir.path, &clock, 0, None)
+                    .expect("rehydrate task");
             let mut running = tasks.remove("task-reused").expect("rehydrated task");
             assert!(
                 running.child.is_none(),
@@ -5071,6 +5132,203 @@ mod imp {
 
             let _ = signal_group(child.id(), libc::SIGKILL);
             let _ = child.wait();
+        }
+
+        /// A terminal record already delivered before a restart is rehydrated
+        /// with its `terminal_delivered_at_ms` intact, is never redelivered,
+        /// and is reaped exactly once retention elapses.
+        #[test]
+        fn rehydrated_delivered_task_reaps_at_retention_boundary_without_redelivery() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("rehydrate-retention");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let mut running =
+                terminal_running_task(&dir.path, "task-delivered", &callback_inbox, &clock);
+            running.record.terminal_delivered_at_ms = Some(clock.now_ms());
+            write_task_record(&dir.path, &running.record).expect("write delivered task record");
+
+            let retention_ms = 1_000;
+            let mut tasks = task_tick::rehydrate_tasks::<UnixServicePlatform>(
+                &dir.path,
+                &clock,
+                retention_ms,
+                None,
+            )
+            .expect("rehydrate tasks");
+            let mut running = tasks.remove("task-delivered").expect("rehydrated task");
+
+            clock.advance(retention_ms - 1);
+            assert!(matches!(
+                tick_one_task(&dir.path, "task-delivered", &mut running, &clock)
+                    .expect("tick within retention window"),
+                TaskTick::StillRunning
+            ));
+            assert!(
+                !callback_inbox.exists(),
+                "an already-delivered record is never redelivered after a restart"
+            );
+            assert!(
+                read_task_record(&dir.path, "task-delivered")
+                    .expect("read retained task")
+                    .is_some(),
+                "the record survives while retention has not yet elapsed"
+            );
+
+            clock.advance(1);
+            assert!(matches!(
+                tick_one_task(&dir.path, "task-delivered", &mut running, &clock)
+                    .expect("tick at retention boundary"),
+                TaskTick::Finished
+            ));
+            assert!(
+                read_task_record(&dir.path, "task-delivered")
+                    .expect("read reaped task")
+                    .is_none(),
+                "the record is reaped exactly once retention elapses"
+            );
+        }
+
+        /// A terminal record whose delivery had not yet succeeded before a
+        /// restart still redelivers on the next tick, and persists
+        /// `terminal_delivered_at_ms` so a later restart does not redeliver
+        /// again.
+        #[test]
+        fn rehydrated_undelivered_terminal_task_still_redelivers() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("rehydrate-undelivered");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let running =
+                terminal_running_task(&dir.path, "task-undelivered", &callback_inbox, &clock);
+            write_task_record(&dir.path, &running.record).expect("write undelivered task record");
+
+            let mut tasks = task_tick::rehydrate_tasks::<UnixServicePlatform>(
+                &dir.path,
+                &clock,
+                DEFAULT_TASK_RETENTION_MS,
+                None,
+            )
+            .expect("rehydrate tasks");
+            let mut running = tasks.remove("task-undelivered").expect("rehydrated task");
+
+            assert!(matches!(
+                tick_one_task(&dir.path, "task-undelivered", &mut running, &clock)
+                    .expect("redeliver after restart"),
+                TaskTick::StillRunning
+            ));
+            assert_terminal_task_event(&callback_inbox, "task-undelivered");
+            let record = read_task_record(&dir.path, "task-undelivered")
+                .expect("read redelivered task")
+                .expect("record still present");
+            assert!(
+                record.terminal_delivered_at_ms.is_some(),
+                "delivery is persisted so a later restart does not redeliver again"
+            );
+        }
+
+        /// A missing (already reaped, or never written) task record answers
+        /// `task status` with an empty task list, exactly like any other
+        /// unknown id.
+        #[test]
+        fn task_status_reports_nothing_for_a_reaped_task() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("status-reaped");
+            let mut out = Vec::new();
+            execute_task_status(&dir.path, Some("task-gone"), &mut out)
+                .expect("status for missing task");
+            let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
+            assert_eq!(json["tasks"].as_array().unwrap().len(), 0);
+        }
+
+        /// When `reconcile_task_admissions` reports no mutation, boot reuses
+        /// its returned snapshot instead of walking `tasks/` a second time:
+        /// proven by replacing `tasks/` with a plain file afterward and
+        /// showing `rehydrate_tasks` still succeeds when given the reused
+        /// snapshot, but fails (as a control) when forced to re-list.
+        #[test]
+        fn rehydrate_reuses_reconciled_records_without_a_second_directory_walk() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("boot-reuse-records");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+            let running = terminal_running_task(&dir.path, "task-settled", &callback_inbox, &clock);
+            write_task_record(&dir.path, &running.record).expect("write task record");
+
+            let (records, mutated) =
+                reconcile_task_admissions(&dir.path).expect("reconcile clean boot");
+            assert!(!mutated, "a clean tasks/ directory reports no mutation");
+
+            fs::remove_dir_all(dir.path.join("tasks")).expect("remove tasks directory");
+            fs::write(dir.path.join("tasks"), "not a directory")
+                .expect("replace tasks directory with a file");
+
+            let system_clock = SystemClock;
+            let reused = task_tick::rehydrate_tasks::<UnixServicePlatform>(
+                &dir.path,
+                &system_clock,
+                DEFAULT_TASK_RETENTION_MS,
+                Some(records),
+            )
+            .expect("rehydrate reuses the reconciled snapshot without re-listing tasks/");
+            assert_eq!(reused.len(), 1);
+
+            let relisted = task_tick::rehydrate_tasks::<UnixServicePlatform>(
+                &dir.path,
+                &system_clock,
+                DEFAULT_TASK_RETENTION_MS,
+                None,
+            );
+            assert!(
+                relisted.is_err(),
+                "control: without the reused snapshot, rehydrate_tasks re-lists tasks/ and fails \
+                 against the broken directory"
+            );
+        }
+
+        /// A mutating reconciliation pass (here, aborting a `Prepared`
+        /// admission) is never reused: boot re-lists `tasks/` and observes
+        /// the removal, rather than trusting the stale pre-reconciliation
+        /// snapshot.
+        #[test]
+        fn rehydrate_relists_when_reconciliation_mutated_tasks() {
+            let _guard = serialize_forks_and_locks();
+            let dir = TempDir::new("boot-reuse-mutated");
+            let clock = FakeClock::new();
+            let callback_inbox = dir.path.join("callback");
+
+            let mut prepared =
+                terminal_running_task(&dir.path, "task-prepared", &callback_inbox, &clock).record;
+            prepared.admission = TaskAdmissionPhase::Prepared;
+            write_task_record(&dir.path, &prepared).expect("write prepared task record");
+
+            let settled =
+                terminal_running_task(&dir.path, "task-settled", &callback_inbox, &clock).record;
+            write_task_record(&dir.path, &settled).expect("write settled task record");
+
+            let (records, mutated) =
+                reconcile_task_admissions(&dir.path).expect("reconcile mutated boot");
+            assert!(mutated, "aborting the prepared admission is a mutation");
+            assert_eq!(
+                records.len(),
+                2,
+                "the pre-reconciliation snapshot still lists both records"
+            );
+
+            let system_clock = SystemClock;
+            let tasks = task_tick::rehydrate_tasks::<UnixServicePlatform>(
+                &dir.path,
+                &system_clock,
+                DEFAULT_TASK_RETENTION_MS,
+                if mutated { None } else { Some(records) },
+            )
+            .expect("rehydrate re-lists after a mutation");
+            assert_eq!(
+                tasks.len(),
+                1,
+                "re-listing reflects the prepared record's removal; reusing the stale snapshot would not"
+            );
+            assert!(tasks.contains_key("task-settled"));
         }
 
         /// A reused PID can still be a zombie while the original task's
@@ -5116,6 +5374,7 @@ mod imp {
                 stdout_path: stdout_path.display().to_string(),
                 stderr_path: stderr_path.display().to_string(),
                 delivered_milestones: 0,
+                terminal_delivered_at_ms: None,
             };
 
             wait_for_zombie_group_descendant(&child);
@@ -5126,8 +5385,13 @@ mod imp {
                 "a mismatched zombie remains unresolved"
             );
             let clock = FakeClock::new();
-            let mut tasks = task_tick::rehydrate_tasks::<UnixServicePlatform>(&dir.path, &clock)
-                .expect("rehydrate unresolved task");
+            let mut tasks = task_tick::rehydrate_tasks::<UnixServicePlatform>(
+                &dir.path,
+                &clock,
+                DEFAULT_TASK_RETENTION_MS,
+                None,
+            )
+            .expect("rehydrate unresolved task");
             let mut running = tasks
                 .remove(&record.id)
                 .expect("rehydrated unresolved task");
@@ -5266,6 +5530,7 @@ mod imp {
                 stdout_path: stdout_path.display().to_string(),
                 stderr_path: stderr_path.display().to_string(),
                 delivered_milestones: 0,
+                terminal_delivered_at_ms: None,
             };
             let deadline = Instant::now() + Duration::from_secs(10);
             let liveness = loop {
@@ -5350,6 +5615,7 @@ mod imp {
                 stdout_path: String::new(),
                 stderr_path: String::new(),
                 delivered_milestones: 0,
+                terminal_delivered_at_ms: None,
             };
 
             deliver_task_event(&record, TaskEventKind::Terminal).expect("deliver");
@@ -5670,12 +5936,47 @@ mod imp {
             fs::remove_file(&callback_inbox).expect("remove unavailable callback marker");
 
             clock.advance(1);
+            assert!(
+                matches!(
+                    tick_one_task(&dir.path, "task-terminal-retry", &mut running, &clock)
+                        .expect("recovered terminal delivery"),
+                    TaskTick::StillRunning
+                ),
+                "delivery succeeds but the record is retained until it ages out"
+            );
+            assert_terminal_task_event(&callback_inbox, "task-terminal-retry");
+
+            // Re-ticking before retention elapses neither redelivers nor reaps.
+            clock.advance(running.retention_ms - 1);
             assert!(matches!(
                 tick_one_task(&dir.path, "task-terminal-retry", &mut running, &clock)
-                    .expect("recovered terminal delivery"),
+                    .expect("terminal tick within retention window"),
+                TaskTick::StillRunning
+            ));
+            let mailbox = mailbox::Mailbox::open(&callback_inbox).expect("reopen callback mailbox");
+            assert!(
+                mailbox
+                    .claim_next()
+                    .expect("check for redelivered terminal event")
+                    .is_none(),
+                "a retained terminal record is not redelivered"
+            );
+            drop(mailbox);
+            assert_durable_task_state(&dir.path, "task-terminal-retry", TaskState::Completed);
+
+            // Once retention elapses the record is reaped.
+            clock.advance(1);
+            assert!(matches!(
+                tick_one_task(&dir.path, "task-terminal-retry", &mut running, &clock)
+                    .expect("terminal tick at retention boundary"),
                 TaskTick::Finished
             ));
-            assert_terminal_task_event(&callback_inbox, "task-terminal-retry");
+            assert!(
+                read_task_record(&dir.path, "task-terminal-retry")
+                    .expect("read reaped task")
+                    .is_none(),
+                "the retained record is removed once retention elapses"
+            );
         }
 
         /// Persistent terminal callback failure is retried at most the
@@ -6113,9 +6414,11 @@ mod imp {
 
             signal_group(running.record.pid, libc::SIGKILL).expect("kill group descendant");
             reap_task_until_finished(&dir.path, "task-group-drain", &mut running, &clock, tick);
-            let record =
-                assert_durable_task_state(&dir.path, "task-group-drain", TaskState::Completed);
-            assert_eq!(record.exit_code, Some(0));
+            // Zero retention reaps the durable record on this same tick, so
+            // the terminal state can only be checked against the in-memory
+            // record `finalize_task` updates before reaping, not by re-reading it.
+            assert_eq!(running.record.state, TaskState::Completed);
+            assert_eq!(running.record.exit_code, Some(0));
             assert_terminal_task_event(&callback_inbox, "task-group-drain");
         }
 
@@ -6146,8 +6449,9 @@ mod imp {
             execute_task_cancel(&dir.path, "task-cancel-group", &mut Vec::new())
                 .expect("cancel task");
             reap_task_until_finished(&dir.path, "task-cancel-group", &mut running, &clock, tick);
+            // Zero retention already reaped the durable record by this
+            // point; the in-memory record is the only place left to check it.
             assert_eq!(running.record.state, TaskState::Cancelled);
-            assert_durable_task_state(&dir.path, "task-cancel-group", TaskState::Cancelled);
             assert_eq!(task_group_liveness(running.record.pid), Liveness::Dead);
             assert_terminal_task_event(&callback_inbox, "task-cancel-group");
         }
@@ -6317,8 +6621,9 @@ mod imp {
                 &clock,
                 kill_tick,
             );
+            // Zero retention already reaped the durable record by this
+            // point; the in-memory record is the only place left to check it.
             assert_eq!(running.record.state, TaskState::Timeout);
-            assert_durable_task_state(&dir.path, "task-timeout-group", TaskState::Timeout);
             assert_eq!(task_group_liveness(running.record.pid), Liveness::Dead);
             assert_terminal_task_event(&callback_inbox, "task-timeout-group");
         }
@@ -6417,8 +6722,9 @@ mod imp {
                 &clock,
                 kill_tick,
             );
+            // Zero retention already reaped the durable record by this
+            // point; the in-memory record is the only place left to check it.
             assert_eq!(running.record.state, TaskState::Timeout);
-            assert_durable_task_state(&dir.path, "task-owned-linux-cache", TaskState::Timeout);
             assert_terminal_task_event(&callback_inbox, "task-owned-linux-cache");
         }
 
@@ -6454,7 +6760,8 @@ mod imp {
                 .wait()
                 .expect("wait for direct leader");
             let mut rehydrated =
-                RunningTask::new(owned.record.clone(), None, None, owned.started_ms);
+                RunningTask::new(owned.record.clone(), None, None, owned.started_ms)
+                    .with_retention_ms(0);
 
             reset_process_probe_count();
             reset_group_scan_count();
@@ -6988,7 +7295,8 @@ mod imp {
                 .wait()
                 .expect("wait for direct leader");
             let mut rehydrated =
-                RunningTask::new(owned.record.clone(), None, None, owned.started_ms);
+                RunningTask::new(owned.record.clone(), None, None, owned.started_ms)
+                    .with_retention_ms(0);
 
             let tick = tick_one_task(&dir.path, "task-rehydrated-group", &mut rehydrated, &clock)
                 .expect("rehydrated tick while group remains");
@@ -7003,9 +7311,11 @@ mod imp {
                 &clock,
                 tick,
             );
-            let record =
-                assert_durable_task_state(&dir.path, "task-rehydrated-group", TaskState::Failed);
-            assert_eq!(record.exit_code, None);
+            // Zero retention reaps the durable record on this same tick, so
+            // the terminal state can only be checked against the in-memory
+            // record `finalize_task` updates before reaping, not by re-reading it.
+            assert_eq!(rehydrated.record.state, TaskState::Failed);
+            assert_eq!(rehydrated.record.exit_code, None);
             assert_terminal_task_event(&callback_inbox, "task-rehydrated-group");
         }
 
@@ -7033,6 +7343,7 @@ mod imp {
                 stdout_path: String::new(),
                 stderr_path: String::new(),
                 delivered_milestones: 0,
+                terminal_delivered_at_ms: None,
             };
             let other = TaskRecord {
                 id: "task-other".to_string(),
@@ -7050,6 +7361,7 @@ mod imp {
                 stdout_path: String::new(),
                 stderr_path: String::new(),
                 delivered_milestones: 0,
+                terminal_delivered_at_ms: None,
             };
             write_task_record(&dir.path, &owned).expect("write owned");
             write_task_record(&dir.path, &other).expect("write other");
@@ -7114,6 +7426,7 @@ mod imp {
                 stdout_path: String::new(),
                 stderr_path: String::new(),
                 delivered_milestones: 0,
+                terminal_delivered_at_ms: None,
             };
             write_task_record(&dir.path, &task_record).expect("write task");
 
@@ -7181,6 +7494,7 @@ mod imp {
                 stdout_path: String::new(),
                 stderr_path: String::new(),
                 delivered_milestones: 0,
+                terminal_delivered_at_ms: None,
             }
         }
 
@@ -7588,6 +7902,7 @@ mod imp {
                 stdout_path: String::new(),
                 stderr_path: String::new(),
                 delivered_milestones: 0,
+                terminal_delivered_at_ms: None,
             };
 
             let mut admission = AdmissionGuard::acquire(&dir.path).expect("admission lock");
@@ -7720,6 +8035,7 @@ mod imp {
                     stdout_path: stdout_path.display().to_string(),
                     stderr_path: stderr_path.display().to_string(),
                     delivered_milestones: 0,
+                    terminal_delivered_at_ms: None,
                 };
                 write_task_record(&dir.path, &task_record).expect("write unresolved task");
 
@@ -7822,6 +8138,7 @@ mod imp {
                 stdout_path: stdout_path.display().to_string(),
                 stderr_path: stderr_path.display().to_string(),
                 delivered_milestones: 0,
+                terminal_delivered_at_ms: None,
             };
             write_session_record(&dir.path, &session_record).expect("write session");
             write_task_record(&dir.path, &task_record).expect("write unresolved task");
@@ -7918,6 +8235,7 @@ mod imp {
                 stdout_path: String::new(),
                 stderr_path: String::new(),
                 delivered_milestones: 0,
+                terminal_delivered_at_ms: None,
             };
             write_task_record(&dir.path, &record).expect("write");
 

@@ -5,23 +5,25 @@ use super::records::{
     list_task_start_acks, list_task_start_response_claims, list_task_start_rollbacks,
     mark_task_start_rollback, read_session_record, read_task_record, reclaim_stale_requests,
     remove_session_record, remove_task_record, remove_task_start_ack,
-    remove_task_start_response_files, remove_task_start_rollback, remove_task_start_transaction,
-    responses_dir, restore_task_start_response_claim, start_channel,
-    take_task_start_response_locked, task_cancel_dir, task_channel, task_logs_dir,
-    task_start_ack_exists, task_start_response_boundary_exists, task_start_response_claim_path,
-    task_start_response_id, task_start_response_path, task_start_rollback_exists,
-    wait_for_test_task_admission_barrier, wait_for_test_task_response_phase_barrier,
-    wait_for_test_task_rollback_cleanup_barrier, write_session_record, write_start_response,
-    write_task_record, write_task_start_response,
+    remove_task_start_response_files, remove_task_start_rollback, responses_dir,
+    restore_task_start_response_claim, start_channel, take_task_start_response_locked,
+    task_cancel_dir, task_channel, task_logs_dir, task_start_ack_exists,
+    task_start_response_boundary_exists, task_start_response_claim_path, task_start_response_id,
+    task_start_response_path, task_start_rollback_exists, wait_for_test_task_admission_barrier,
+    wait_for_test_task_response_phase_barrier, wait_for_test_task_rollback_cleanup_barrier,
+    write_session_record, write_start_response, write_task_record, write_task_start_response,
 };
 #[cfg(test)]
 use super::records::{mark_task_start_ack, task_record_path};
 use super::task_tick::{
     self, Liveness, RunningTask as SharedRunningTask, ServicePlatform, TaskLivenessMode,
-    TaskLivenessRefresh, TerminationSignal, liveness_sample_is_fresh, task_cancel_sentinel_path,
+    TaskLivenessRefresh, TerminationSignal, liveness_sample_is_fresh, remove_reaped_task_record,
+    task_cancel_sentinel_path,
 };
 #[cfg(test)]
-use super::task_tick::{REHYDRATED_LIVENESS_CACHE_MS, finalize_task, tick_one_task};
+use super::task_tick::{
+    DEFAULT_TASK_RETENTION_MS, REHYDRATED_LIVENESS_CACHE_MS, finalize_task, tick_one_task,
+};
 use super::*;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -524,9 +526,14 @@ impl ServicePlatform for WindowsServicePlatform {
 /// Dispatches one parsed [`ServiceCommand`].
 pub(super) fn dispatch(cmd: ServiceCommand, mut out: impl Write) -> Result<()> {
     match cmd {
-        ServiceCommand::Run { control } => {
+        ServiceCommand::Run {
+            control,
+            task_retention_ms,
+        } => {
             let control = crate::roles::resolve_control_dir(control)?;
-            run_service(&control, out)
+            let task_retention_ms =
+                task_retention_ms.unwrap_or(task_tick::DEFAULT_TASK_RETENTION_MS);
+            run_service(&control, task_retention_ms, out)
         }
         ServiceCommand::Start { control, spec } => {
             let control = crate::roles::resolve_control_dir(control)?;
@@ -582,7 +589,7 @@ fn io_err(err: std::io::Error) -> BatonError {
 /// Runs the supervisor loop: holds the control lock, drains `requests/`
 /// into spawned sessions, reaps exited children, and exits cooperatively
 /// once `Teardown` drops the stop sentinel.
-fn run_service(control: &Path, mut out: impl Write) -> Result<()> {
+fn run_service(control: &Path, task_retention_ms: u64, mut out: impl Write) -> Result<()> {
     fs::create_dir_all(control).map_err(|err| {
         BatonError::Io(format!(
             "could not create control directory {control:?}: {err}"
@@ -597,7 +604,7 @@ fn run_service(control: &Path, mut out: impl Write) -> Result<()> {
     // this pass with a submitting client writing a rollback marker after
     // observing the previous supervisor disappear.
     let _admission = acquire_admission_lock(control)?;
-    reconcile_task_admissions(control)?;
+    let (reconciled_records, reconcile_mutated) = reconcile_task_admissions(control)?;
     // A request left mid-`processing/` by a crash between claim and
     // response is returned to `requests/`, mirroring
     // `Mailbox::reclaim_stale` — reprocessed harmlessly under a fresh
@@ -611,7 +618,20 @@ fn run_service(control: &Path, mut out: impl Write) -> Result<()> {
     drop(_admission);
     let clock = SystemClock;
     let mut sessions = rehydrate_sessions(control)?;
-    let mut tasks = task_tick::rehydrate_tasks::<WindowsServicePlatform>(control, &clock)?;
+    // Reuse reconciliation's own `tasks/` listing when it changed nothing,
+    // so the common (nothing-to-reconcile) restart parses each record
+    // exactly once instead of walking `tasks/` twice.
+    let records = if reconcile_mutated {
+        None
+    } else {
+        Some(reconciled_records)
+    };
+    let mut tasks = task_tick::rehydrate_tasks::<WindowsServicePlatform>(
+        control,
+        &clock,
+        task_retention_ms,
+        records,
+    )?;
     writeln!(out, "baton service running on {}", control.display()).map_err(io_err)?;
 
     loop {
@@ -650,7 +670,7 @@ fn run_service(control: &Path, mut out: impl Write) -> Result<()> {
         }
         match process_one_task_request(control, &clock) {
             Ok(Some((task_id, running))) => {
-                tasks.insert(task_id, running);
+                tasks.insert(task_id, running.with_retention_ms(task_retention_ms));
                 did_work = true;
             }
             Ok(None) => {}
@@ -1254,16 +1274,22 @@ fn take_task_start_response(control: &Path, request_id: &str) -> Result<Option<T
 /// idempotent across interrupted startup passes. An unresolved prepared
 /// record remains durable cleanup residue, including its rollback marker,
 /// until a later liveness probe can prove that its process is dead.
-fn reconcile_task_admissions(control: &Path) -> Result<()> {
+/// Returns the `tasks/` records observed at the start of the pass,
+/// alongside whether the pass mutated any of them (removed one via
+/// [`abort_task_admission`] or promoted `Committed` to `Responded`). A
+/// caller that finds `mutated == false` may reuse the returned records as an
+/// accurate post-reconciliation snapshot instead of re-listing `tasks/`.
+fn reconcile_task_admissions(control: &Path) -> Result<(Vec<TaskRecord>, bool)> {
     let rollback_ids = list_task_start_rollbacks(control)?;
     let ack_ids = list_task_start_acks(control)?;
     let claim_ids = list_task_start_response_claims(control)?;
     let records = list_task_records(control)?;
+    let mut mutated = false;
     let mut seen_rollbacks = std::collections::HashSet::new();
     let mut retained_rollbacks = std::collections::HashSet::new();
     let mut seen_acks = std::collections::HashSet::new();
 
-    for record in records {
+    for record in records.clone() {
         if record.admission == TaskAdmissionPhase::Prepared {
             let request_id = record.request_id.as_deref();
             let rollback = request_id
@@ -1275,7 +1301,12 @@ fn reconcile_task_admissions(control: &Path) -> Result<()> {
             if let Some(request_id) = request_id {
                 discard_pending_task_start_request(control, request_id)?;
             }
-            if !abort_task_admission(control, &record)? {
+            // `abort_task_admission` may durably rewrite the record even
+            // when it reports the admission unresolved, so it counts as a
+            // mutation regardless of its return value.
+            let removed = abort_task_admission(control, &record)?;
+            mutated = true;
+            if !removed {
                 if rollback && let Some(request_id) = request_id {
                     retained_rollbacks.insert(request_id.to_string());
                 }
@@ -1305,7 +1336,11 @@ fn reconcile_task_admissions(control: &Path) -> Result<()> {
             seen_rollbacks.insert(request_id.to_string());
         }
         if rollback {
-            if !abort_task_admission(control, &record)? {
+            // See the Prepared-admission arm above: this call may durably
+            // rewrite the record even on an unresolved outcome.
+            let removed = abort_task_admission(control, &record)?;
+            mutated = true;
+            if !removed {
                 retained_rollbacks.insert(request_id.to_string());
                 eprintln!(
                     "warning: task {} rollback remains unresolved; preserving its record",
@@ -1335,6 +1370,7 @@ fn reconcile_task_admissions(control: &Path) -> Result<()> {
                     );
                     continue;
                 }
+                mutated = true;
             }
             remove_task_start_ack(control, request_id)?;
             continue;
@@ -1366,6 +1402,8 @@ fn reconcile_task_admissions(control: &Path) -> Result<()> {
                     "warning: task {} restored response was written but responded phase could not be persisted: {err}",
                     record.id
                 );
+            } else {
+                mutated = true;
             }
         }
     }
@@ -1402,7 +1440,7 @@ fn reconcile_task_admissions(control: &Path) -> Result<()> {
             remove_task_start_rollback(control, &request_id)?;
         }
     }
-    Ok(())
+    Ok((records, mutated))
 }
 
 fn abort_task_admission(control: &Path, record: &TaskRecord) -> Result<bool> {
@@ -1580,6 +1618,7 @@ fn handle_task_start_request(
         stdout_path: stdout_path.display().to_string(),
         stderr_path: stderr_path.display().to_string(),
         delivered_milestones: 0,
+        terminal_delivered_at_ms: None,
     };
     if let Err(err) = write_task_record(control, &record) {
         let _ = terminate_job(&job);
@@ -1744,13 +1783,6 @@ fn session_recorded_argv(record: &SessionRecord) -> String {
 /// admission artifact that refers to it. Shared by the reaper's two
 /// removal branches (terminal state, and corroborated-dead process) and
 /// by [`rescan_owned_tasks`], so the three cannot drift apart.
-fn remove_reaped_task_record(control: &Path, record: &TaskRecord) -> Result<()> {
-    remove_task_start_transaction(control, record)?;
-    remove_task_record(control, &record.id)?;
-    let _ = fs::remove_file(task_cancel_sentinel_path(control, &record.id));
-    Ok(())
-}
-
 fn task_residue(record: &TaskRecord, liveness: Liveness) -> CleanupResidue {
     CleanupResidue {
         kind: "task",
@@ -2596,6 +2628,7 @@ mod tests {
             stdout_path: "stdout.log".to_string(),
             stderr_path: "stderr.log".to_string(),
             delivered_milestones: 0,
+            terminal_delivered_at_ms: None,
         }
     }
 
@@ -2765,7 +2798,7 @@ mod tests {
         assert!(matches!(
             tick_one_task(&control, "task-record-malformed", &mut running, &clock)
                 .expect("tick malformed task"),
-            TaskTick::Finished
+            TaskTick::StillRunning
         ));
     }
 
@@ -2818,11 +2851,14 @@ mod tests {
         fs::remove_file(&callback_inbox).expect("remove unavailable callback marker");
 
         clock.advance(1);
-        assert!(matches!(
-            tick_one_task(&control, "task-terminal-retry", &mut running, &clock)
-                .expect("recovered terminal delivery"),
-            TaskTick::Finished
-        ));
+        assert!(
+            matches!(
+                tick_one_task(&control, "task-terminal-retry", &mut running, &clock)
+                    .expect("recovered terminal delivery"),
+                TaskTick::StillRunning
+            ),
+            "delivery succeeds but the record is retained until it ages out"
+        );
         let mailbox = mailbox::Mailbox::open(&callback_inbox).expect("open callback mailbox");
         assert_eq!(
             mailbox
@@ -2833,6 +2869,37 @@ mod tests {
             "task-terminal-retry-terminal"
         );
         drop(mailbox);
+
+        // Re-ticking before retention elapses neither redelivers nor reaps.
+        clock.advance(running.retention_ms - 1);
+        assert!(matches!(
+            tick_one_task(&control, "task-terminal-retry", &mut running, &clock)
+                .expect("terminal tick within retention window"),
+            TaskTick::StillRunning
+        ));
+        let mailbox = mailbox::Mailbox::open(&callback_inbox).expect("reopen callback mailbox");
+        assert!(
+            mailbox
+                .claim_next()
+                .expect("check for redelivered terminal event")
+                .is_none(),
+            "a retained terminal record is not redelivered"
+        );
+        drop(mailbox);
+
+        // Once retention elapses the record is reaped.
+        clock.advance(1);
+        assert!(matches!(
+            tick_one_task(&control, "task-terminal-retry", &mut running, &clock)
+                .expect("terminal tick at retention boundary"),
+            TaskTick::Finished
+        ));
+        assert!(
+            read_task_record(&control, "task-terminal-retry")
+                .expect("read reaped task")
+                .is_none(),
+            "the retained record is removed once retention elapses"
+        );
         let _ = fs::remove_dir_all(control);
     }
 
@@ -2956,6 +3023,7 @@ mod tests {
             stdout_path: stdout_path.display().to_string(),
             stderr_path: stderr_path.display().to_string(),
             delivered_milestones: 0,
+            terminal_delivered_at_ms: None,
         };
         write_task_record(control, &record).expect("write task record");
         RunningTask::new(record, Some(child), Some(job), started_ms)
@@ -3412,14 +3480,230 @@ mod tests {
         )
         .expect("write task record");
         let clock = SystemClock;
-        let tasks = task_tick::rehydrate_tasks::<WindowsServicePlatform>(&control, &clock)
-            .expect("rehydrate tasks");
+        let tasks = task_tick::rehydrate_tasks::<WindowsServicePlatform>(
+            &control,
+            &clock,
+            DEFAULT_TASK_RETENTION_MS,
+            None,
+        )
+        .expect("rehydrate tasks");
         assert!(tasks["task-test"].task_handle.is_some());
 
         drop(tasks);
         drop(sessions);
         drop(task_job);
         drop(session_job);
+        let _ = fs::remove_dir_all(control);
+    }
+
+    /// A terminal record already delivered before a restart is rehydrated
+    /// with its `terminal_delivered_at_ms` intact, is never redelivered, and
+    /// is reaped exactly once retention elapses.
+    #[test]
+    fn rehydrated_delivered_task_reaps_at_retention_boundary_without_redelivery() {
+        let control = temp_control("rehydrate-retention");
+        let clock = FakeClock::new();
+        let callback_inbox = control.join("callback");
+        let mut record = task_record("svc-test", std::process::id(), None, None);
+        record.id = "task-delivered".to_string();
+        record.spec.callback.inbox = callback_inbox.display().to_string();
+        record.state = TaskState::Completed;
+        record.exit_code = Some(0);
+        record.elapsed_ms = Some(10);
+        record.terminal_delivered_at_ms = Some(clock.now_ms());
+        write_task_record(&control, &record).expect("write delivered terminal record");
+
+        let retention_ms = 1_000;
+        let mut tasks = task_tick::rehydrate_tasks::<WindowsServicePlatform>(
+            &control,
+            &clock,
+            retention_ms,
+            None,
+        )
+        .expect("rehydrate tasks");
+        let mut running = tasks.remove("task-delivered").expect("rehydrated task");
+
+        clock.advance(retention_ms - 1);
+        assert!(matches!(
+            tick_one_task(&control, "task-delivered", &mut running, &clock)
+                .expect("tick within retention window"),
+            TaskTick::StillRunning
+        ));
+        assert!(
+            !callback_inbox.exists(),
+            "an already-delivered record is never redelivered after a restart"
+        );
+        assert!(
+            read_task_record(&control, "task-delivered")
+                .expect("read retained task")
+                .is_some(),
+            "the record survives while retention has not yet elapsed"
+        );
+
+        clock.advance(1);
+        assert!(matches!(
+            tick_one_task(&control, "task-delivered", &mut running, &clock)
+                .expect("tick at retention boundary"),
+            TaskTick::Finished
+        ));
+        assert!(
+            read_task_record(&control, "task-delivered")
+                .expect("read reaped task")
+                .is_none(),
+            "the record is reaped exactly once retention elapses"
+        );
+        let _ = fs::remove_dir_all(control);
+    }
+
+    /// A terminal record whose delivery had not yet succeeded before a
+    /// restart still redelivers on the next tick, and persists
+    /// `terminal_delivered_at_ms` so a later restart does not redeliver
+    /// again.
+    #[test]
+    fn rehydrated_undelivered_terminal_task_still_redelivers() {
+        let control = temp_control("rehydrate-undelivered");
+        let clock = FakeClock::new();
+        let callback_inbox = control.join("callback");
+        let mut record = task_record("svc-test", std::process::id(), None, None);
+        record.id = "task-undelivered".to_string();
+        record.spec.callback.inbox = callback_inbox.display().to_string();
+        record.state = TaskState::Completed;
+        record.exit_code = Some(0);
+        record.elapsed_ms = Some(10);
+        write_task_record(&control, &record).expect("write undelivered terminal record");
+
+        let mut tasks = task_tick::rehydrate_tasks::<WindowsServicePlatform>(
+            &control,
+            &clock,
+            DEFAULT_TASK_RETENTION_MS,
+            None,
+        )
+        .expect("rehydrate tasks");
+        let mut running = tasks.remove("task-undelivered").expect("rehydrated task");
+
+        assert!(matches!(
+            tick_one_task(&control, "task-undelivered", &mut running, &clock)
+                .expect("redeliver after restart"),
+            TaskTick::StillRunning
+        ));
+        let mailbox = mailbox::Mailbox::open(&callback_inbox).expect("open callback mailbox");
+        assert_eq!(
+            mailbox
+                .claim_next()
+                .expect("claim terminal event")
+                .expect("terminal event present")
+                .key,
+            "task-undelivered-terminal"
+        );
+        drop(mailbox);
+        let record = read_task_record(&control, "task-undelivered")
+            .expect("read redelivered task")
+            .expect("record still present");
+        assert!(
+            record.terminal_delivered_at_ms.is_some(),
+            "delivery is persisted so a later restart does not redeliver again"
+        );
+        let _ = fs::remove_dir_all(control);
+    }
+
+    /// A missing (already reaped, or never written) task record answers
+    /// `task status` with an empty task list, exactly like any other
+    /// unknown id.
+    #[test]
+    fn task_status_reports_nothing_for_a_reaped_task() {
+        let control = temp_control("status-reaped");
+        let mut out = Vec::new();
+        execute_task_status(&control, Some("task-gone"), &mut out)
+            .expect("status for missing task");
+        let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
+        assert_eq!(json["tasks"].as_array().unwrap().len(), 0);
+        let _ = fs::remove_dir_all(control);
+    }
+
+    /// When `reconcile_task_admissions` reports no mutation, boot reuses its
+    /// returned snapshot instead of walking `tasks/` a second time: proven by
+    /// replacing `tasks/` with a plain file afterward and showing
+    /// `rehydrate_tasks` still succeeds when given the reused snapshot, but
+    /// fails (as a control) when forced to re-list.
+    #[test]
+    fn rehydrate_reuses_reconciled_records_without_a_second_directory_walk() {
+        let control = temp_control("boot-reuse-records");
+        let record = task_record("svc-test", std::process::id(), None, None);
+        write_task_record(&control, &record).expect("write task record");
+
+        let (records, mutated) = reconcile_task_admissions(&control).expect("reconcile clean boot");
+        assert!(!mutated, "a clean tasks/ directory reports no mutation");
+
+        fs::remove_dir_all(control.join("tasks")).expect("remove tasks directory");
+        fs::write(control.join("tasks"), "not a directory")
+            .expect("replace tasks directory with a file");
+
+        let clock = SystemClock;
+        let reused = task_tick::rehydrate_tasks::<WindowsServicePlatform>(
+            &control,
+            &clock,
+            DEFAULT_TASK_RETENTION_MS,
+            Some(records),
+        )
+        .expect("rehydrate reuses the reconciled snapshot without re-listing tasks/");
+        assert_eq!(reused.len(), 1);
+
+        let relisted = task_tick::rehydrate_tasks::<WindowsServicePlatform>(
+            &control,
+            &clock,
+            DEFAULT_TASK_RETENTION_MS,
+            None,
+        );
+        assert!(
+            relisted.is_err(),
+            "control: without the reused snapshot, rehydrate_tasks re-lists tasks/ and fails \
+             against the broken directory"
+        );
+
+        let _ = fs::remove_file(control.join("tasks"));
+        let _ = fs::remove_dir_all(control);
+    }
+
+    /// A mutating reconciliation pass (here, aborting a `Prepared`
+    /// admission) is never reused: boot re-lists `tasks/` and observes the
+    /// removal, rather than trusting the stale pre-reconciliation snapshot.
+    #[test]
+    fn rehydrate_relists_when_reconciliation_mutated_tasks() {
+        let control = temp_control("boot-reuse-mutated");
+        let mut prepared = task_record("svc-test", std::process::id(), None, None);
+        prepared.id = "task-prepared".to_string();
+        prepared.admission = TaskAdmissionPhase::Prepared;
+        prepared.state = TaskState::Completed;
+        write_task_record(&control, &prepared).expect("write prepared task record");
+
+        let mut settled = task_record("svc-test", std::process::id(), None, None);
+        settled.id = "task-settled".to_string();
+        write_task_record(&control, &settled).expect("write settled task record");
+
+        let (records, mutated) =
+            reconcile_task_admissions(&control).expect("reconcile mutated boot");
+        assert!(mutated, "aborting the prepared admission is a mutation");
+        assert_eq!(
+            records.len(),
+            2,
+            "the pre-reconciliation snapshot still lists both records"
+        );
+
+        let clock = SystemClock;
+        let tasks = task_tick::rehydrate_tasks::<WindowsServicePlatform>(
+            &control,
+            &clock,
+            DEFAULT_TASK_RETENTION_MS,
+            if mutated { None } else { Some(records) },
+        )
+        .expect("rehydrate re-lists after a mutation");
+        assert_eq!(
+            tasks.len(),
+            1,
+            "re-listing reflects the prepared record's removal; reusing the stale snapshot would not"
+        );
+        assert!(tasks.contains_key("task-settled"));
+
         let _ = fs::remove_dir_all(control);
     }
 
@@ -3501,6 +3785,7 @@ mod tests {
             stdout_path: String::new(),
             stderr_path: String::new(),
             delivered_milestones: 0,
+            terminal_delivered_at_ms: None,
         }
     }
 

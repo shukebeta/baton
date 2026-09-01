@@ -197,6 +197,11 @@ pub struct TaskRecord {
     /// Highest milestone index already delivered (exclusive upper bound);
     /// `0` means none yet.
     pub delivered_milestones: usize,
+    /// Unix epoch milliseconds when the terminal callback was first
+    /// successfully delivered; `None` means terminal delivery has not yet
+    /// succeeded (or the task has not reached a terminal state).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_delivered_at_ms: Option<u64>,
 }
 
 /// What a task lifecycle event reports.
