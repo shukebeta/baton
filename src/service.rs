@@ -4985,20 +4985,11 @@ mod imp {
             let dir = TempDir::new("prepared-unresolved");
             let request_id = "prepared-unresolved-request";
             let task_id = "prepared-unresolved-task";
-            let spec = task_spec(
-                "svc-1",
-                "bash",
-                vec!["-c".to_string(), "exec sleep 30".to_string()],
-                vec![],
-                60_000,
-                "/tmp/callback",
-            );
             let log_dir = task_logs_dir(&dir.path, task_id);
             fs::create_dir_all(&log_dir).expect("create task logs");
             let stdout_path = log_dir.join("stdout.log");
             let stderr_path = log_dir.join("stderr.log");
-            let mut child =
-                spawn_task_child(&spec, &stdout_path, &stderr_path).expect("spawn unresolved task");
+            let (mut child, spec) = spawn_unresolved_identity_child(&stdout_path, &stderr_path);
             let record = TaskRecord {
                 id: task_id.to_string(),
                 request_id: Some(request_id.to_string()),
@@ -5030,14 +5021,10 @@ mod imp {
             mark_task_start_ack(&dir.path, request_id).expect("write task acknowledgement");
             mark_task_start_rollback(&dir.path, request_id).expect("write rollback marker");
 
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while is_task_alive(&record) != Liveness::Unresolved && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
-            }
             assert_eq!(
                 is_task_alive(&record),
                 Liveness::Unresolved,
-                "fixture reaches the unresolved identity state"
+                "fixture is in the unresolved identity state"
             );
 
             admission::reconcile_task_admissions::<UnixServicePlatform>(&dir.path)
@@ -7496,6 +7483,40 @@ mod imp {
             .expect("spawn live task child")
         }
 
+        /// A live child whose recorded argv can never corroborate its pid:
+        /// the process runs the already-exec'd `sleep 30` while its record
+        /// claims `bash -c 'exec sleep 30'`. That is the same unresolved
+        /// identity state the fixtures previously reached by spawning `bash`
+        /// and polling until it exec-replaced its own argv, except it holds
+        /// from the first probe instead of depending on how promptly the
+        /// runner schedules a shell startup. Returns the child and the spec
+        /// to record for it.
+        #[cfg(target_os = "linux")]
+        fn spawn_unresolved_identity_child(
+            stdout_path: &Path,
+            stderr_path: &Path,
+        ) -> (Child, TaskSpec) {
+            let recorded = task_spec(
+                "svc-1",
+                "bash",
+                vec!["-c".to_string(), "exec sleep 30".to_string()],
+                vec![],
+                60_000,
+                "/tmp/callback",
+            );
+            let spawned = task_spec(
+                "svc-1",
+                "sleep",
+                vec!["30".to_string()],
+                vec![],
+                60_000,
+                "/tmp/callback",
+            );
+            let child = spawn_task_child(&spawned, stdout_path, stderr_path)
+                .expect("spawn unresolved-identity task");
+            (child, recorded)
+        }
+
         #[cfg(target_os = "linux")]
         fn live_task_spec(session: &str) -> TaskSpec {
             task_spec(
@@ -8056,9 +8077,14 @@ mod imp {
                 false,
                 |_, _| {},
                 // Stands in for a task admitted for a session this
-                // teardown loop has not reached yet.
-                |_, _| {
+                // teardown loop has not reached yet, then performs the
+                // production grace wait: the ladder re-probes liveness as
+                // soon as this returns, and signal delivery plus child
+                // reaping are asynchronous, so a wait that returns
+                // immediately would report the still-living task as residue.
+                |record, grace_ms| {
                     write_task_record(&dir.path, &racer).expect("admit racing task for svc-k");
+                    wait_while_task_alive(record, grace_ms);
                 },
             )
             .expect("stop svc-j");
@@ -8464,20 +8490,12 @@ mod imp {
 
             for index in 0..3 {
                 let task_id = format!("task-unresolved-{index}");
-                let task_specification = task_spec(
-                    "svc-1",
-                    "bash",
-                    vec!["-c".to_string(), "exec sleep 30".to_string()],
-                    vec![],
-                    60_000,
-                    "/tmp/callback",
-                );
                 let log_dir = task_logs_dir(&dir.path, &task_id);
                 fs::create_dir_all(&log_dir).expect("create task log dir");
                 let stdout_path = log_dir.join("stdout.log");
                 let stderr_path = log_dir.join("stderr.log");
-                let child = spawn_task_child(&task_specification, &stdout_path, &stderr_path)
-                    .expect("spawn task");
+                let (child, task_specification) =
+                    spawn_unresolved_identity_child(&stdout_path, &stderr_path);
                 let task_record = TaskRecord {
                     id: task_id.clone(),
                     request_id: None,
@@ -8498,18 +8516,10 @@ mod imp {
                 };
                 write_task_record(&dir.path, &task_record).expect("write unresolved task");
 
-                // Wait only for bash to exec-replace its argv so the fixture
-                // reaches the intended unresolved identity state.
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while is_task_alive(&task_record) != Liveness::Unresolved
-                    && Instant::now() < deadline
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
                 assert_eq!(
                     is_task_alive(&task_record),
                     Liveness::Unresolved,
-                    "fixture reaches the unresolved identity state"
+                    "fixture is in the unresolved identity state"
                 );
 
                 task_ids.push(task_id);
@@ -8560,20 +8570,12 @@ mod imp {
             let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("teardown-unresolved");
             let request_id = "task-unresolved-request";
-            let task_specification = task_spec(
-                "svc-1",
-                "bash",
-                vec!["-c".to_string(), "exec sleep 30".to_string()],
-                vec![],
-                60_000,
-                "/tmp/callback",
-            );
             let log_dir = task_logs_dir(&dir.path, "task-unresolved");
             fs::create_dir_all(&log_dir).expect("create log dir");
             let stdout_path = log_dir.join("stdout.log");
             let stderr_path = log_dir.join("stderr.log");
-            let mut child = spawn_task_child(&task_specification, &stdout_path, &stderr_path)
-                .expect("spawn task");
+            let (mut child, task_specification) =
+                spawn_unresolved_identity_child(&stdout_path, &stderr_path);
             let session_record = SessionRecord {
                 id: "svc-1".to_string(),
                 spec: spec("/tmp/in", "/tmp/out"),
@@ -8615,10 +8617,6 @@ mod imp {
             mark_task_start_rollback(&dir.path, request_id)
                 .expect("write unresolved task rollback");
 
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while is_task_alive(&task_record) != Liveness::Unresolved && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
-            }
             assert_eq!(is_task_alive(&task_record), Liveness::Unresolved);
 
             let mut status = Vec::new();
