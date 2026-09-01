@@ -1,5 +1,3 @@
-#[cfg(test)]
-use super::records::task_record_path;
 use super::records::{
     AwaitConfig, SessionRecord, StartResponse, TEST_TASK_ROLLBACK_RECONCILE_BARRIER,
     TEST_TASK_ROLLBACK_REQUEST_BARRIER, TaskStartResponse, discard_pending_task_start_request,
@@ -16,6 +14,8 @@ use super::records::{
     wait_for_test_task_rollback_cleanup_barrier, write_session_record, write_start_response,
     write_task_record, write_task_start_response,
 };
+#[cfg(test)]
+use super::records::{mark_task_start_ack, task_record_path};
 #[cfg(test)]
 use super::task_tick::tick_one_task;
 use super::task_tick::{
@@ -733,6 +733,62 @@ fn acquire_admission_lock(control: &Path) -> Result<File> {
         ))
     })?;
     Ok(lock)
+}
+
+/// Owns the admission lock for a cleanup pass, and can lend it back for
+/// the duration of a wall-clock grace wait.
+///
+/// The discipline is: every record read, signal, and record mutation runs
+/// under the lock; only the sleeps of [`wait_while_alive`] /
+/// [`wait_while_task_alive`] run outside it, and liveness is re-probed
+/// after each re-acquisition. Holding the lock across those waits froze
+/// the supervisor's request admission and every task-start client for up
+/// to the sum of the grace windows.
+///
+/// Releasing it mid-cleanup is safe because of two facts:
+///
+/// 1. Task admission is gated on a *live* owner, and the whole request —
+///    owner check, spawn, record write — runs inside one hold of this
+///    lock. So while we hold it and observe the session `Dead`, no
+///    admission can be part-way through: a racer either finished its
+///    record write before we took the lock, or runs its owner check after
+///    we release and is rejected. `Dead` is stable, since the record pins
+///    a start identity rather than a bare PID.
+/// 2. The session escalation ladder runs *before* task reaping, so on the
+///    success path every task wait happens after the session was observed
+///    `Dead` — a state in which nothing new can be admitted for it.
+///
+/// A racing record can therefore only appear on a path that already
+/// fails, and [`rescan_owned_tasks`] accounts for it before the session
+/// record is removed.
+struct AdmissionGuard<'a> {
+    control: &'a Path,
+    /// `Some` whenever the lock is held; `None` only inside
+    /// [`AdmissionGuard::unlocked_wait`]. Dropping the `File` unlocks.
+    lock: Option<File>,
+}
+
+impl<'a> AdmissionGuard<'a> {
+    fn acquire(control: &'a Path) -> Result<Self> {
+        Ok(Self {
+            control,
+            lock: Some(acquire_admission_lock(control)?),
+        })
+    }
+
+    fn control(&self) -> &'a Path {
+        self.control
+    }
+
+    /// Runs `wait` with the admission lock released, then re-acquires it
+    /// before returning. Callers must re-probe any liveness they decided
+    /// on before the wait.
+    fn unlocked_wait<T>(&mut self, wait: impl FnOnce() -> T) -> Result<T> {
+        self.lock = None;
+        let value = wait();
+        self.lock = Some(acquire_admission_lock(self.control)?);
+        Ok(value)
+    }
 }
 
 /// Checks for and consumes the cooperative-stop sentinel in one atomic
@@ -1643,35 +1699,52 @@ fn session_recorded_argv(record: &SessionRecord) -> String {
     serve_argv(&record.spec).join(" ")
 }
 
+/// Removes a task record that cleanup is done with, together with every
+/// admission artifact that refers to it. Shared by the reaper's two
+/// removal branches (terminal state, and corroborated-dead process) and
+/// by [`rescan_owned_tasks`], so the three cannot drift apart.
+fn remove_reaped_task_record(control: &Path, record: &TaskRecord) -> Result<()> {
+    remove_task_start_transaction(control, record)?;
+    remove_task_record(control, &record.id)?;
+    let _ = fs::remove_file(task_cancel_sentinel_path(control, &record.id));
+    Ok(())
+}
+
+fn task_residue(record: &TaskRecord, liveness: Liveness) -> CleanupResidue {
+    CleanupResidue {
+        kind: "task",
+        id: record.id.clone(),
+        pid: record.pid,
+        liveness,
+        argv: task_recorded_argv(record),
+    }
+}
+
 /// Cancels and reaps every task owned by `session_id`, regardless of
 /// each task's own callback target — the callback mailbox/role is a
 /// delivery target only, never the ownership or reaping boundary. Called
-/// from [`stop_session_record`], so this runs on both `Stop <session>`
-/// and `Teardown` (which stops every session). Unresolved records survive
-/// unless `force` is set.
-fn reap_session_tasks(
-    control: &Path,
-    session_id: &str,
-    force: bool,
-) -> Result<Vec<CleanupResidue>> {
-    reap_session_tasks_with_wait(control, session_id, force, wait_while_task_alive)
-}
-
+/// from [`stop_session_record_with_wait`], so this runs on both
+/// `Stop <session>` and `Teardown` (which stops every session).
+/// Unresolved records survive unless `force` is set.
+///
+/// `wait` is the grace-window sleep, injected so tests can drive the
+/// escalation ladder without the wall clock. It runs through
+/// [`AdmissionGuard::unlocked_wait`], so admission stays available for its
+/// duration; every mutation around it holds the lock.
 fn reap_session_tasks_with_wait(
-    control: &Path,
+    admission: &mut AdmissionGuard,
     session_id: &str,
     force: bool,
     wait: impl Fn(&TaskRecord, u64),
 ) -> Result<Vec<CleanupResidue>> {
+    let control = admission.control();
     let mut residue = Vec::new();
     for record in list_task_records(control)? {
         if record.spec.session != session_id {
             continue;
         }
         if record.state != TaskState::Running {
-            remove_task_start_transaction(control, &record)?;
-            remove_task_record(control, &record.id)?;
-            let _ = fs::remove_file(task_cancel_sentinel_path(control, &record.id));
+            remove_reaped_task_record(control, &record)?;
             continue;
         }
         let mut record = record;
@@ -1688,19 +1761,11 @@ fn reap_session_tasks_with_wait(
                 let _ = force_terminate_record_job(record.job.as_deref(), record.pid, "-TERM");
                 let _ = force_terminate_record_job(record.job.as_deref(), record.pid, "-KILL");
             }
-            remove_task_start_transaction(control, &record)?;
-            remove_task_record(control, &record.id)?;
-            let _ = fs::remove_file(task_cancel_sentinel_path(control, &record.id));
+            remove_reaped_task_record(control, &record)?;
             continue;
         }
         if liveness == Liveness::Unresolved {
-            residue.push(CleanupResidue {
-                kind: "task",
-                id: record.id.clone(),
-                pid: record.pid,
-                liveness,
-                argv: task_recorded_argv(&record),
-            });
+            residue.push(task_residue(&record, liveness));
             continue;
         }
         let mut term_sent = false;
@@ -1709,34 +1774,98 @@ fn reap_session_tasks_with_wait(
             term_sent = true;
         }
         if liveness != Liveness::Dead {
-            wait(&record, KILL_GRACE_MS);
-            liveness = cleanup_liveness_after_pid_signal(is_task_alive(&record), record.pid);
+            liveness = admission.unlocked_wait(|| {
+                wait(&record, KILL_GRACE_MS);
+                cleanup_liveness_after_pid_signal(is_task_alive(&record), record.pid)
+            })?;
         }
         if liveness == Liveness::Live && !term_sent {
             let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-TERM");
-            wait(&record, KILL_GRACE_MS);
-            liveness = cleanup_liveness_after_pid_signal(is_task_alive(&record), record.pid);
+            liveness = admission.unlocked_wait(|| {
+                wait(&record, KILL_GRACE_MS);
+                cleanup_liveness_after_pid_signal(is_task_alive(&record), record.pid)
+            })?;
         }
         if liveness == Liveness::Live {
             let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-KILL");
-            wait(&record, KILL_GRACE_MS);
-            liveness = cleanup_liveness_after_pid_signal(is_task_alive(&record), record.pid);
+            liveness = admission.unlocked_wait(|| {
+                wait(&record, KILL_GRACE_MS);
+                cleanup_liveness_after_pid_signal(is_task_alive(&record), record.pid)
+            })?;
         }
         if liveness == Liveness::Dead {
-            remove_task_start_transaction(control, &record)?;
-            remove_task_record(control, &record.id)?;
-            let _ = fs::remove_file(task_cancel_sentinel_path(control, &record.id));
+            remove_reaped_task_record(control, &record)?;
         } else {
-            residue.push(CleanupResidue {
-                kind: "task",
-                id: record.id.clone(),
-                pid: record.pid,
-                liveness,
-                argv: task_recorded_argv(&record),
-            });
+            residue.push(task_residue(&record, liveness));
         }
     }
     Ok(residue)
+}
+
+/// Accounts for every task record owned by `session_id` that the reaper's
+/// snapshot could have missed, without ever releasing the admission lock.
+///
+/// A task start admitted while [`AdmissionGuard::unlocked_wait`] had the
+/// lock released lands outside [`reap_session_tasks_with_wait`]'s listing.
+/// This pass re-lists under the still-held lock and closes that gap for
+/// every state such a record can be in by now — including a terminal one,
+/// since the supervisor can tick a racing task to
+/// `Completed`/`Failed`/`Cancelled`/`Timeout` before we look.
+///
+/// It performs no waits, so nothing can be admitted while it runs and one
+/// pass suffices. A record still `Running` and `Live`/`Unresolved` is
+/// reported rather than put through the grace ladder: granting it grace
+/// would mean releasing the lock again and reopening the race. That costs
+/// nothing, because such a record can only exist on a path that already
+/// fails (see [`AdmissionGuard`]), so the stop exits non-zero, the session
+/// record is retained, and the next stop applies the full ladder. Under
+/// `force` it mirrors the reaper's force branch instead, so `--force`
+/// still leaves nothing behind.
+fn rescan_owned_tasks(
+    admission: &AdmissionGuard,
+    session_id: &str,
+    force: bool,
+    residue: &mut Vec<CleanupResidue>,
+) -> Result<()> {
+    let control = admission.control();
+    for record in list_task_records(control)? {
+        if record.spec.session != session_id {
+            continue;
+        }
+        if residue.iter().any(|entry| entry.id == record.id) {
+            continue;
+        }
+        if record.state != TaskState::Running {
+            remove_reaped_task_record(control, &record)?;
+            continue;
+        }
+        let mut record = record;
+        upgrade_legacy_task_record(control, &mut record)?;
+        // The same probe the reaper's first pass uses, so a record that
+        // only this pass sees is judged identically. The non-retrying
+        // form: this pass must never sleep.
+        let liveness = is_task_alive(&record);
+        if force {
+            if liveness != Liveness::Dead {
+                if !record_job_available(record.job.as_deref()) {
+                    eprintln!(
+                        "warning: forced Windows cleanup of task {} reaches only recorded pid {}; descendants may survive",
+                        record.id, record.pid
+                    );
+                }
+                let _ = force_terminate_record_job(record.job.as_deref(), record.pid, "-TERM");
+                let _ = force_terminate_record_job(record.job.as_deref(), record.pid, "-KILL");
+            }
+            remove_reaped_task_record(control, &record)?;
+            continue;
+        }
+        if liveness == Liveness::Dead {
+            remove_reaped_task_record(control, &record)?;
+        } else {
+            residue.push(task_residue(&record, liveness));
+        }
+    }
+    Ok(())
 }
 
 // -- Task cancel sentinel -----------------------------------------------
@@ -2007,19 +2136,38 @@ fn wait_while_task_alive(record: &TaskRecord, grace_ms: u64) {
     }
 }
 
-/// Stops one session. The caller must hold the admission lock:
-/// cooperative `serve --stop` on its inbox first,
+/// Stops one session: cooperative `serve --stop` on its inbox first,
 /// bounded wait, then Job Object termination if still alive, then reaps
-/// every task this session owns
-/// ([`reap_session_tasks`]) and removes the session's own durable
-/// record. Idempotent — a session already gone just gets its (possibly
-/// already-absent) record, and its tasks', cleaned up. Returns any
-/// records retained because their identity remained unresolved.
+/// every task this session owns ([`reap_session_tasks_with_wait`]) and
+/// removes the session's own durable record. Idempotent — a session
+/// already gone just gets its (possibly already-absent) record, and its
+/// tasks', cleaned up. Returns any records retained because their
+/// identity remained unresolved.
 fn stop_session_record(
-    control: &Path,
+    admission: &mut AdmissionGuard,
     record: &SessionRecord,
     force: bool,
 ) -> Result<Vec<CleanupResidue>> {
+    stop_session_record_with_wait(
+        admission,
+        record,
+        force,
+        wait_while_alive,
+        wait_while_task_alive,
+    )
+}
+
+/// [`stop_session_record`] with both grace waits injectable, so tests can
+/// drive the racing-admission paths deterministically instead of against
+/// the wall clock. Production goes through the wrapper above.
+fn stop_session_record_with_wait(
+    admission: &mut AdmissionGuard,
+    record: &SessionRecord,
+    force: bool,
+    session_wait: impl Fn(&SessionRecord, u64),
+    task_wait: impl Fn(&TaskRecord, u64),
+) -> Result<Vec<CleanupResidue>> {
+    let control = admission.control();
     let mut record = record.clone();
     upgrade_legacy_session_record(control, &mut record)?;
     let _ = mailbox::request_stop(&record.spec.inbox);
@@ -2037,20 +2185,28 @@ fn stop_session_record(
         }
         liveness = Liveness::Dead;
     } else {
-        wait_while_alive(&record, STOP_GRACE_MS);
+        admission.unlocked_wait(|| session_wait(&record, STOP_GRACE_MS))?;
         liveness = is_session_alive(&record);
         if liveness == Liveness::Live {
             let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-TERM");
-            wait_while_alive(&record, KILL_GRACE_MS);
-            liveness = cleanup_liveness_after_pid_signal(is_session_alive(&record), record.pid);
+            liveness = admission.unlocked_wait(|| {
+                session_wait(&record, KILL_GRACE_MS);
+                cleanup_liveness_after_pid_signal(is_session_alive(&record), record.pid)
+            })?;
             if liveness == Liveness::Live {
                 let _ = terminate_record_job_or_pid(record.job.as_deref(), record.pid, "-KILL");
-                wait_while_alive(&record, KILL_GRACE_MS);
-                liveness = cleanup_liveness_after_pid_signal(is_session_alive(&record), record.pid);
+                liveness = admission.unlocked_wait(|| {
+                    session_wait(&record, KILL_GRACE_MS);
+                    cleanup_liveness_after_pid_signal(is_session_alive(&record), record.pid)
+                })?;
             }
         }
     }
-    let mut residue = reap_session_tasks(control, &record.id, force)?;
+    let mut residue = reap_session_tasks_with_wait(admission, &record.id, force, task_wait)?;
+    // From here to the session-record decision the admission lock is held
+    // without interruption, so nothing can be admitted between the rescan
+    // and `remove_session_record`.
+    rescan_owned_tasks(admission, &record.id, force, &mut residue)?;
     if liveness == Liveness::Dead && residue.is_empty() {
         remove_session_record(control, &record.id)?;
     } else if liveness != Liveness::Dead {
@@ -2129,10 +2285,10 @@ fn report_cleanup_residue(residue: &[CleanupResidue]) {
 }
 
 fn execute_stop(control: &Path, session: &str, force: bool, mut out: impl Write) -> Result<()> {
-    let _admission = acquire_admission_lock(control)?;
+    let mut admission = AdmissionGuard::acquire(control)?;
     match read_session_record(control, session)? {
         Some(record) => {
-            let residue = stop_session_record(control, &record, force)?;
+            let residue = stop_session_record(&mut admission, &record, force)?;
             if !residue.is_empty() {
                 report_cleanup_residue(&residue);
                 return Err(BatonError::Io(format!(
@@ -2267,10 +2423,10 @@ fn execute_teardown_with_timeout(
     if service_liveness == ControlLiveness::Live {
         wait_for_control_release_with_timeout(control, control_release_timeout, &mut warning)?;
     }
-    let _admission = acquire_admission_lock(control)?;
+    let mut admission = AdmissionGuard::acquire(control)?;
     let mut residue = Vec::new();
     for record in list_session_records(control)? {
-        residue.extend(stop_session_record(control, &record, force)?);
+        residue.extend(stop_session_record(&mut admission, &record, force)?);
     }
     let result = match service_liveness {
         ControlLiveness::Live => writeln!(
@@ -3137,7 +3293,8 @@ mod tests {
         );
         write_task_record(&control, &record).expect("write unresolved task");
 
-        let residue = reap_session_tasks_with_wait(&control, "svc-test", false, |_, _| {})
+        let mut admission = AdmissionGuard::acquire(&control).expect("admission lock");
+        let residue = reap_session_tasks_with_wait(&mut admission, "svc-test", false, |_, _| {})
             .expect("retain unresolved task");
         assert_eq!(residue.len(), 1);
         assert_eq!(residue[0].liveness, Liveness::Unresolved);
@@ -3147,7 +3304,7 @@ mod tests {
                 .is_some()
         );
 
-        let residue = reap_session_tasks_with_wait(&control, "svc-test", true, |_, _| {})
+        let residue = reap_session_tasks_with_wait(&mut admission, "svc-test", true, |_, _| {})
             .expect("force unresolved task cleanup");
         assert!(residue.is_empty());
         assert!(
@@ -3155,6 +3312,329 @@ mod tests {
                 .expect("read removed task")
                 .is_none()
         );
+        let _ = fs::remove_dir_all(control);
+    }
+
+    fn live_task_spec(session: &str) -> TaskSpec {
+        let mut spec = task_spec(session);
+        spec.command = "cmd.exe".to_string();
+        spec.args = vec![
+            "/D".to_string(),
+            "/C".to_string(),
+            "ping -n 60 127.0.0.1 > NUL".to_string(),
+        ];
+        spec
+    }
+
+    /// Spawns a real, long-lived Windows process standing in for a live
+    /// task/session record, so `is_task_alive`/`is_session_alive` resolve
+    /// it `Live` via a corroborated start identity and Job Object.
+    fn spawn_live_task_child(control: &Path, task_id: &str) -> (Child, JobHandle, String) {
+        let log_dir = task_logs_dir(control, task_id);
+        fs::create_dir_all(&log_dir).expect("create task log dir");
+        spawn_task_child(
+            &live_task_spec("svc-1"),
+            &log_dir.join("stdout.log"),
+            &log_dir.join("stderr.log"),
+        )
+        .expect("spawn live task child")
+    }
+
+    /// A `Running` record pinned to `pid`'s corroborated start identity and
+    /// `job`, so `is_task_alive` reports it `Live`.
+    fn live_task_record(session: &str, task_id: &str, pid: u32, job: Option<String>) -> TaskRecord {
+        let started_at = recorded_start_identity(pid).0;
+        TaskRecord {
+            id: task_id.to_string(),
+            request_id: None,
+            admission: TaskAdmissionPhase::Committed,
+            spec: live_task_spec(session),
+            pid,
+            started_at,
+            start_epoch_secs: None,
+            job,
+            started_ms: None,
+            state: TaskState::Running,
+            exit_code: None,
+            elapsed_ms: None,
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            delivered_milestones: 0,
+        }
+    }
+
+    /// Before #236, a non-force stop held the admission lock for its whole
+    /// `STOP_GRACE_MS` wait, freezing the supervisor's task admission and
+    /// every task-start client for up to the sum of the grace windows.
+    #[test]
+    fn stop_grace_does_not_hold_the_admission_lock() {
+        let control = temp_control("stop-grace-unlocked");
+        let inbox = control.join("inbox");
+        fs::create_dir_all(&inbox).expect("create session inbox");
+
+        // Hold the session mailbox lock, so the stop's cooperative
+        // `mailbox::request_stop` takes its "a daemon is live" branch and
+        // writes the `serve.stop` sentinel. That write happens under the
+        // admission lock, immediately before the grace wait — it is the
+        // barrier proving the stop already holds the lock.
+        let mailbox_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(inbox.join("serve.lock"))
+            .expect("open mailbox lock");
+        mailbox_lock.lock().expect("hold mailbox lock");
+
+        let log_dir = control.join("grace-session-logs");
+        fs::create_dir_all(&log_dir).expect("create log dir");
+        let (mut child, job, job_name) = spawn_task_child(
+            &live_task_spec("svc-grace"),
+            &log_dir.join("stdout.log"),
+            &log_dir.join("stderr.log"),
+        )
+        .expect("spawn session stand-in");
+        let started_at = recorded_start_identity(child.id()).0;
+        let session_record = SessionRecord {
+            id: "svc-grace".to_string(),
+            spec: SessionSpec {
+                inbox: inbox.display().to_string(),
+                outbox: control.join("outbox").display().to_string(),
+                ..session_spec()
+            },
+            pid: child.id(),
+            started_at,
+            start_epoch_secs: None,
+            job: Some(job_name),
+        };
+        assert_eq!(
+            is_session_alive(&session_record),
+            Liveness::Live,
+            "fixture session is live, so the stop enters its grace window"
+        );
+        write_session_record(&control, &session_record).expect("write session record");
+
+        let stop_control = control.clone();
+        let stopper = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            execute_stop(&stop_control, "svc-grace", false, &mut out)
+        });
+
+        let sentinel = inbox.join("serve.stop");
+        let barrier = Instant::now() + Duration::from_secs(10);
+        while !sentinel.exists() && Instant::now() < barrier {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            sentinel.exists(),
+            "the stop reached its cooperative request, so it holds the admission lock"
+        );
+
+        // Non-blocking on purpose: a blocking acquire would simply wait the
+        // grace out and pass against the old implementation too.
+        let probe = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(control.join(ADMISSION_LOCK_FILE))
+            .expect("open admission lock");
+        let deadline = Instant::now() + Duration::from_millis(STOP_GRACE_MS / 2);
+        let mut acquired = false;
+        while Instant::now() < deadline {
+            if probe.try_lock().is_ok() {
+                acquired = true;
+                probe.unlock().expect("release probe lock");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            acquired,
+            "admission stays available while the stop waits out its grace window"
+        );
+
+        stopper.join().expect("join stopper").expect("stop session");
+        assert!(
+            read_session_record(&control, "svc-grace")
+                .expect("read")
+                .is_none(),
+            "the session is still stopped and its record removed"
+        );
+        let _ = child.wait();
+        drop(job);
+        drop(mailbox_lock);
+        let _ = fs::remove_dir_all(control);
+    }
+
+    /// A task start admitted while a grace wait had the admission lock
+    /// released lands outside the reaper's snapshot. The final locked
+    /// rescan reports a still-live racer as residue instead of dropping it,
+    /// and the session record is retained.
+    #[test]
+    fn rescan_reports_a_task_admitted_during_a_released_grace_wait() {
+        let control = temp_control("rescan-live-racer");
+        let session_record = SessionRecord {
+            id: "svc-1".to_string(),
+            spec: session_spec(),
+            pid: u32::MAX - 1,
+            started_at: None,
+            start_epoch_secs: None,
+            job: None,
+        };
+        write_session_record(&control, &session_record).expect("write session");
+
+        // A live record the reaper does see, so it reaches its grace wait —
+        // the point at which the racing admission lands. Terminating its job
+        // ends this one, so it leaves no residue of its own.
+        let (mut reaped_child, reaped_job, reaped_job_name) =
+            spawn_live_task_child(&control, "task-reaped");
+        let reaped = live_task_record(
+            "svc-1",
+            "task-reaped",
+            reaped_child.id(),
+            Some(reaped_job_name),
+        );
+        write_task_record(&control, &reaped).expect("write reaped task");
+
+        let (mut child, racer_job, racer_job_name) = spawn_live_task_child(&control, "task-racer");
+        let racer = live_task_record(
+            "svc-1",
+            "task-racer",
+            child.id(),
+            Some(racer_job_name.clone()),
+        );
+
+        let mut admission = AdmissionGuard::acquire(&control).expect("admission lock");
+        let residue = stop_session_record_with_wait(
+            &mut admission,
+            &session_record,
+            false,
+            |_, _| {},
+            // Stands in for a task start admitted while this wait had the
+            // admission lock released. `TerminateJobObject` is asynchronous,
+            // so poll the terminated fixture task rather than trusting a
+            // single reprobe right after the write.
+            |record, grace_ms| {
+                write_task_record(&control, &racer).expect("admit racing task");
+                let deadline = Instant::now() + Duration::from_millis(grace_ms);
+                while is_task_alive(record) != Liveness::Dead && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            },
+        )
+        .expect("stop session");
+        drop(admission);
+
+        assert!(
+            residue.iter().any(|entry| entry.id == "task-racer"),
+            "the racing task is reported, not silently dropped: {residue:?}"
+        );
+        assert!(
+            read_task_record(&control, "task-racer")
+                .expect("read")
+                .is_some(),
+            "the racing task record is retained for a later cleanup attempt"
+        );
+        assert!(
+            read_session_record(&control, "svc-1")
+                .expect("read")
+                .is_some(),
+            "the session record is not removed while an owned task is outstanding"
+        );
+
+        let _ = force_terminate_record_job(Some(&racer_job_name), child.id(), "-KILL");
+        let _ = child.wait();
+        drop(racer_job);
+        let _ = reaped_child.wait();
+        drop(reaped_job);
+        let _ = fs::remove_dir_all(control);
+    }
+
+    /// The supervisor can tick a racing task to a terminal state before the
+    /// rescan looks. Such a record gets the same cleanup the reaper applies
+    /// to any terminal record — and, with nothing else outstanding, the
+    /// session record is still removed, so the rescan does not block the
+    /// success path.
+    #[test]
+    fn rescan_cleans_up_a_terminal_task_admitted_during_a_released_grace_wait() {
+        let control = temp_control("rescan-terminal-racer");
+        let session_record = SessionRecord {
+            id: "svc-1".to_string(),
+            spec: session_spec(),
+            pid: u32::MAX - 1,
+            started_at: None,
+            start_epoch_secs: None,
+            job: None,
+        };
+        write_session_record(&control, &session_record).expect("write session");
+
+        // A live record the reaper does see, so it reaches its grace wait —
+        // the point at which the racing admission lands. Terminating its job
+        // ends this one, so it leaves no residue of its own.
+        let (mut reaped_child, reaped_job, reaped_job_name) =
+            spawn_live_task_child(&control, "task-reaped");
+        let reaped = live_task_record(
+            "svc-1",
+            "task-reaped",
+            reaped_child.id(),
+            Some(reaped_job_name),
+        );
+        write_task_record(&control, &reaped).expect("write reaped task");
+
+        let request_id = "racer-request";
+        let mut racer = live_task_record("svc-1", "task-racer", u32::MAX - 1, None);
+        racer.request_id = Some(request_id.to_string());
+        racer.started_at = None;
+        racer.state = TaskState::Completed;
+        racer.exit_code = Some(0);
+        racer.elapsed_ms = Some(1);
+
+        let mut admission = AdmissionGuard::acquire(&control).expect("admission lock");
+        let residue = stop_session_record_with_wait(
+            &mut admission,
+            &session_record,
+            false,
+            |_, _| {},
+            // `TerminateJobObject` is asynchronous, so poll the terminated
+            // fixture task rather than trusting a single reprobe right
+            // after the writes.
+            |record, grace_ms| {
+                write_task_record(&control, &racer).expect("admit racing task");
+                mark_task_start_ack(&control, request_id).expect("write acknowledgement");
+                request_task_cancel_sentinel(&control, &racer.id).expect("write sentinel");
+                let deadline = Instant::now() + Duration::from_millis(grace_ms);
+                while is_task_alive(record) != Liveness::Dead && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            },
+        )
+        .expect("stop session");
+        drop(admission);
+
+        assert!(residue.is_empty(), "nothing is outstanding: {residue:?}");
+        assert!(
+            read_task_record(&control, "task-racer")
+                .expect("read")
+                .is_none(),
+            "the terminal racing record is removed"
+        );
+        assert!(
+            !task_start_ack_exists(&control, request_id).expect("probe acknowledgement"),
+            "its start transaction is removed too"
+        );
+        assert!(
+            !task_cancel_sentinel_path(&control, "task-racer").exists(),
+            "its cancel sentinel is removed too"
+        );
+        assert!(
+            read_session_record(&control, "svc-1")
+                .expect("read")
+                .is_none(),
+            "the rescan does not block the success path"
+        );
+        let _ = reaped_child.wait();
+        drop(reaped_job);
         let _ = fs::remove_dir_all(control);
     }
 }
