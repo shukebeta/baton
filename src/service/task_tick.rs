@@ -20,6 +20,11 @@ const EVENT_RETRY_INITIAL_DELAY_MS: u64 = 1_000;
 const EVENT_RETRY_MAX_DELAY_MS: u64 = 60_000;
 const MAX_EVENT_DELIVERY_ATTEMPTS: u32 = 10;
 const KILL_GRACE_MS: u64 = 2_000;
+/// Minimum interval between liveness samples for one rehydrated task's
+/// process group. The supervisor still ticks every 100 ms, but the costly
+/// Linux `/proc` table scan, non-Linux `ps` probe, and Windows Job Object
+/// probe are each allowed at most twice per second in the steady state.
+pub(super) const REHYDRATED_LIVENESS_CACHE_MS: u64 = 500;
 
 /// Result of corroborating a durable PID against the process currently
 /// occupying it. `Unresolved` is deliberately distinct from `Dead`: the
