@@ -10,7 +10,7 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.4.20 … v0.3.51 (2026-09-01)
+## v0.4.21 … v0.3.51 (2026-09-01)
 
 ### Features
 - feat(cli): default service control directory (#295)
@@ -27,6 +27,7 @@ _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 - fix(service): skip invalid UTF-8 durable records (#322) (#323)
 - fix(service/windows): port unix session-stop-marker admission protocol (#324)
 - fix(service): make linux liveness fixtures deterministic (#328)
+- fix(mailbox): retry atomic_write's temp-file create past transient NotFound (#329)
 
 ### Refactors
 - refactor(service): share session and task control plumbing (#285)
