@@ -1558,16 +1558,23 @@ fn handle_task_start_request(
             ),
         );
     }
+    // A session being stopped is not an admissible owner, even while its
+    // process is still live. `service stop` releases the admission lock
+    // across its grace windows (so it never freezes this loop), which
+    // leaves a window where the owner still probes `Live`; without this
+    // gate a start racing that window would be answered with a task id
+    // for a process the very same stop is about to kill.
     let owner_live = if mailbox::is_safe_key(&spec.session) {
         read_session_record(control, &spec.session)?
             .map(|record| is_session_alive(&record) == Liveness::Live)
             .unwrap_or(false)
+            && !session_stop_in_progress(control, &spec.session)?
     } else {
         false
     };
     if !owner_live {
         let error = format!(
-            "task start rejected: --session {:?} does not name a live managed session on {:?} (the session record is absent or its process is no longer live)",
+            "task start rejected: --session {:?} does not name a live managed session on {:?} (the session record is absent, its process is no longer live, or it is draining a stop request)",
             spec.session, control
         );
         return reject_task_start_request(control, request_id, error);
@@ -2191,6 +2198,113 @@ fn cleanup_liveness_after_pid_signal(liveness: Liveness, pid: u32) -> Liveness {
     }
 }
 
+/// A session being stopped is not an admissible task owner, even while its
+/// process is still live. `service stop` releases the admission lock across
+/// its grace windows (so it never freezes this loop), which leaves a window
+/// where the owner still probes `Live`; without this marker a start racing
+/// that window would be answered with a task id for a process the very same
+/// stop is about to kill.
+///
+/// This is distinct from the cooperative `serve.stop` sentinel, which the
+/// daemon consumes as soon as it observes it, long before the process exits
+/// — a start could otherwise land in the gap between sentinel consumption
+/// and process exit and see neither a sentinel nor a dead owner. This marker
+/// spans the whole cleanup instead.
+///
+/// It records the stopping process's own identity so a marker orphaned by
+/// a killed `service stop` cannot wedge admission forever: a reader whose
+/// identity no longer matches treats it as stale and removes it.
+#[derive(Serialize, Deserialize)]
+struct SessionStopMarker {
+    pid: u32,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    start_epoch_secs: Option<i64>,
+}
+
+fn session_stop_markers_dir(control: &Path) -> std::path::PathBuf {
+    control.join("session-stopping")
+}
+
+fn session_stop_marker_path(control: &Path, id: &str) -> Result<std::path::PathBuf> {
+    if !mailbox::is_safe_key(id) {
+        return Err(BatonError::Io(format!(
+            "session id is not usable as a filename: {id:?}"
+        )));
+    }
+    Ok(session_stop_markers_dir(control).join(mailbox::file_name(id)))
+}
+
+/// Whether some live `service stop`/`teardown` currently owns `id`'s
+/// cleanup. Removes a stale marker as a side effect, so one orphaned by a
+/// killed stop costs at most one rejected start.
+fn session_stop_in_progress(control: &Path, id: &str) -> Result<bool> {
+    let path = session_stop_marker_path(control, id)?;
+    let data = match fs::read_to_string(&path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(BatonError::Io(format!("could not read {path:?}: {err}"))),
+    };
+    // A malformed marker is not evidence of a live stop, and leaving it
+    // would wedge admission for good.
+    let Ok(marker) = serde_json::from_str::<SessionStopMarker>(&data) else {
+        let _ = fs::remove_file(&path);
+        return Ok(false);
+    };
+    let (started_at, start_epoch_secs) = recorded_start_identity(marker.pid);
+    if started_at == marker.started_at && start_epoch_secs == marker.start_epoch_secs {
+        return Ok(true);
+    }
+    let _ = fs::remove_file(&path);
+    Ok(false)
+}
+
+/// Owns a [`SessionStopMarker`] for the length of one session's cleanup,
+/// removing it on every exit path including an early `?`.
+struct SessionStopGuard {
+    path: std::path::PathBuf,
+    pid: u32,
+}
+
+impl SessionStopGuard {
+    fn claim(control: &Path, id: &str) -> Result<Self> {
+        let pid = std::process::id();
+        let (started_at, start_epoch_secs) = recorded_start_identity(pid);
+        let marker = SessionStopMarker {
+            pid,
+            started_at,
+            start_epoch_secs,
+        };
+        let json = serde_json::to_string(&marker).map_err(|err| {
+            BatonError::Io(format!("could not serialize session stop marker: {err}"))
+        })?;
+        let dir = session_stop_markers_dir(control);
+        fs::create_dir_all(&dir)
+            .map_err(|err| BatonError::Io(format!("could not create {dir:?}: {err}")))?;
+        mailbox::atomic_write(&dir, &mailbox::file_name(id), &json)?;
+        Ok(Self {
+            path: session_stop_marker_path(control, id)?,
+            pid,
+        })
+    }
+}
+
+impl Drop for SessionStopGuard {
+    fn drop(&mut self) {
+        // Only clear our own claim: a second stop of the same session
+        // overwrites the marker, and it still needs it after we finish.
+        let Ok(data) = fs::read_to_string(&self.path) else {
+            return;
+        };
+        if serde_json::from_str::<SessionStopMarker>(&data)
+            .is_ok_and(|marker| marker.pid == self.pid)
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
 fn wait_while_alive(record: &SessionRecord, grace_ms: u64) {
     let deadline = Instant::now() + Duration::from_millis(grace_ms);
     while {
@@ -2249,6 +2363,9 @@ fn stop_session_record_with_wait(
     let control = admission.control();
     let mut record = record.clone();
     upgrade_legacy_session_record(control, &mut record)?;
+    // Claimed before the first `unlocked_wait`, so admission can tell a
+    // still-live owner that is nonetheless committed to stopping.
+    let _stopping = SessionStopGuard::claim(control, &record.id)?;
     let _ = mailbox::request_stop(&record.spec.inbox);
     let mut liveness = is_session_alive(&record);
     if force {
@@ -4031,6 +4148,175 @@ mod tests {
         let _ = reaped_child.wait();
         drop(reaped_job);
         let _ = fs::remove_dir_all(control);
+    }
+
+    /// A session whose cleanup a live stop owns is not an admissible task
+    /// owner, even while its process still probes live **and its
+    /// cooperative `serve.stop` sentinel has already been consumed**.
+    /// That interleaving is the whole reason the marker is durable:
+    /// `poll_stop` removes the sentinel as soon as the daemon observes
+    /// it, long before the process exits, so a start landing in between
+    /// would otherwise see neither a sentinel nor a dead owner and be
+    /// handed a task id for a process the stop is about to kill.
+    ///
+    /// The rejection is driven from inside the stop's own released grace
+    /// window, so the interleaving is exercised as it really occurs
+    /// rather than simulated. Mirrors the Unix-side
+    /// `task_start_is_rejected_while_a_stop_owns_the_session`.
+    #[test]
+    fn task_start_is_rejected_while_a_stop_owns_the_session() {
+        let control = temp_control("admit-stopping");
+        let inbox = control.join("inbox");
+        fs::create_dir_all(&inbox).expect("create inbox");
+
+        // A real child stands in for the session, so admission's own
+        // liveness check keeps saying `Live` right up until the stop's
+        // escalation ladder ends it.
+        let (mut child, job, job_name) = spawn_live_task_child(&control, "svc-stopping");
+        let started_at = recorded_start_identity(child.id()).0;
+        let session_record = SessionRecord {
+            id: "svc-stopping".to_string(),
+            spec: SessionSpec {
+                inbox: inbox.display().to_string(),
+                outbox: control.join("outbox").display().to_string(),
+                ..session_spec()
+            },
+            pid: child.id(),
+            started_at,
+            start_epoch_secs: None,
+            job: Some(job_name),
+        };
+        assert_eq!(
+            is_session_alive(&session_record),
+            Liveness::Live,
+            "fixture session is live before the stop begins"
+        );
+        write_session_record(&control, &session_record).expect("write session");
+
+        let spec_path = control.join("racing-spec.json");
+        fs::write(
+            &spec_path,
+            serde_json::to_string(&task_spec("svc-stopping")).expect("serialize spec"),
+        )
+        .expect("write spec");
+
+        let mut admission = AdmissionGuard::acquire(&control).expect("admission lock");
+        let racing_outcome = std::cell::RefCell::new(None);
+        let _ = stop_session_record_with_wait(
+            &mut admission,
+            &session_record,
+            false,
+            |_, _| {
+                // Only the first grace window: later escalation rounds
+                // run after termination, when the owner is no longer live
+                // and the plain liveness check would reject on its own.
+                if racing_outcome.borrow().is_some() {
+                    return;
+                }
+                // Inside the released grace window. Consume the sentinel
+                // exactly as the daemon's `poll_stop` would, then let a
+                // start race: neither a sentinel nor a dead owner is
+                // observable at this instant.
+                let _ = fs::remove_file(inbox.join("serve.stop"));
+                assert!(
+                    !inbox.join("serve.stop").is_file(),
+                    "the cooperative sentinel is consumed, as poll_stop leaves it"
+                );
+                assert_eq!(
+                    is_session_alive(&session_record),
+                    Liveness::Live,
+                    "the owner process is still live at this instant"
+                );
+                *racing_outcome.borrow_mut() = Some(
+                    handle_task_start_request(&control, "racing-request", &spec_path, &SystemClock)
+                        .expect("handle racing start"),
+                );
+            },
+            |_, _| {},
+        )
+        .expect("stop session");
+        drop(admission);
+
+        assert!(
+            racing_outcome
+                .into_inner()
+                .expect("the racing start ran inside the grace window")
+                .is_none(),
+            "the racing start is rejected, not spawned"
+        );
+        let response: TaskStartResponse = serde_json::from_str(
+            &fs::read_to_string(
+                task_start_response_path(&control, "racing-request").expect("response path"),
+            )
+            .expect("task start response"),
+        )
+        .expect("decode task start response");
+        assert!(response.task_id.is_none(), "no task id is handed out");
+        assert!(
+            response
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("does not name a live managed session"),
+            "the rejection names the owner failure: {:?}",
+            response.error
+        );
+        assert!(
+            !session_stop_in_progress(&control, "svc-stopping").expect("probe"),
+            "the finished stop released its marker"
+        );
+        let _ = child.wait();
+        drop(job);
+        let _ = fs::remove_dir_all(control);
+    }
+
+    /// The stop marker is released when the stop finishes, and a marker
+    /// orphaned by a killed `service stop` cannot wedge admission: a
+    /// reader whose recorded identity no longer resolves discards it.
+    /// Mirrors the Unix-side `a_stale_session_stop_marker_does_not_wedge_admission`.
+    #[test]
+    fn a_stale_session_stop_marker_does_not_wedge_admission() {
+        let control = temp_control("stale-stop-marker");
+
+        {
+            let _claim = SessionStopGuard::claim(&control, "svc-1").expect("claim");
+            assert!(
+                session_stop_in_progress(&control, "svc-1").expect("probe"),
+                "a live stop owns the session"
+            );
+        }
+        assert!(
+            !session_stop_in_progress(&control, "svc-1").expect("probe"),
+            "finishing the stop releases the marker"
+        );
+
+        let dir_path = session_stop_markers_dir(&control);
+        fs::create_dir_all(&dir_path).expect("create marker dir");
+        let orphan = serde_json::to_string(&SessionStopMarker {
+            pid: u32::MAX - 1,
+            started_at: Some("never-resolves".to_string()),
+            start_epoch_secs: Some(1),
+        })
+        .expect("serialize orphan");
+        mailbox::atomic_write(&dir_path, &mailbox::file_name("svc-1"), &orphan)
+            .expect("write orphan marker");
+        assert!(
+            !session_stop_in_progress(&control, "svc-1").expect("probe"),
+            "a marker whose owner no longer resolves is stale"
+        );
+        assert!(
+            !session_stop_marker_path(&control, "svc-1")
+                .expect("marker path")
+                .exists(),
+            "and is cleared, so it costs at most one rejected start"
+        );
+
+        mailbox::atomic_write(&dir_path, &mailbox::file_name("svc-1"), "not json")
+            .expect("write malformed marker");
+        assert!(
+            !session_stop_in_progress(&control, "svc-1").expect("probe"),
+            "a malformed marker is not evidence of a live stop"
+        );
     }
 
     /// The supervisor can tick a racing task to a terminal state before the
