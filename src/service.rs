@@ -8014,7 +8014,9 @@ mod imp {
 
         /// A session whose cleanup leaves residue keeps its record, so it
         /// keeps its logs too — the operator can still read why the cleanup
-        /// did not finish.
+        /// did not finish. Linux-only for the same reason as the sibling
+        /// rescan tests: the racing admission needs a real live task child.
+        #[cfg(target_os = "linux")]
         #[test]
         fn stop_session_keeps_the_log_dir_when_cleanup_leaves_residue() {
             let _guard = serialize_forks_and_locks();
@@ -8083,9 +8085,26 @@ mod imp {
         fn abort_task_admission_reclaims_the_task_log_dir() {
             let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("abort-task-logs");
-            let mut record = live_task_record("svc-1", "task-aborted", std::process::id());
-            record.state = TaskState::Completed;
-            record.exit_code = Some(0);
+            // A terminal record needs no liveness probe, so this fixture stays
+            // portable: `abort_task_admission` removes it outright.
+            let record = TaskRecord {
+                id: "task-aborted".to_string(),
+                request_id: None,
+                admission: TaskAdmissionPhase::Committed,
+                spec: task_spec("svc-1", "true", Vec::new(), Vec::new(), 1_000, "/tmp/cb"),
+                pid: u32::MAX - 1,
+                started_at: None,
+                start_epoch_secs: None,
+                job: None,
+                started_ms: None,
+                state: TaskState::Completed,
+                exit_code: Some(0),
+                elapsed_ms: Some(1),
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                delivered_milestones: 0,
+                terminal_delivered_at_ms: None,
+            };
             write_task_record(&dir.path, &record).expect("write task record");
             let log_dir = task_logs_dir(&dir.path, "task-aborted");
             fs::create_dir_all(&log_dir).expect("create task logs");
