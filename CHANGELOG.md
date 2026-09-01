@@ -10,7 +10,7 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.4.7 … v0.3.51 (2026-09-01)
+## v0.4.8 … v0.3.51 (2026-09-01)
 
 ### Features
 - feat(cli): default service control directory (#295)
@@ -33,6 +33,7 @@ _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
 ### Other Changes
 - design(service): add platform process seam (#297)
+- test(service): cover rescan_owned_tasks' force=true branch on both platforms (#310)
 
 ## v0.3.50 … v0.3.45 (2026-08-31)
 
