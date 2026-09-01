@@ -1,4 +1,21 @@
-use super::control_plane::{AwaitConfig, RecordStore, RequestChannel};
+#[cfg(test)]
+use super::records::task_record_path;
+use super::records::{
+    AwaitConfig, SessionRecord, StartResponse, TEST_TASK_ROLLBACK_RECONCILE_BARRIER,
+    TEST_TASK_ROLLBACK_REQUEST_BARRIER, TaskStartResponse, discard_pending_task_start_request,
+    fresh_request_id, fresh_session_id, fresh_task_id, list_session_records, list_task_records,
+    list_task_start_acks, list_task_start_response_claims, list_task_start_rollbacks,
+    mark_task_start_rollback, read_session_record, read_task_record, reclaim_stale_requests,
+    remove_session_record, remove_task_record, remove_task_start_ack,
+    remove_task_start_response_files, remove_task_start_rollback, remove_task_start_transaction,
+    responses_dir, restore_task_start_response_claim, start_channel,
+    take_task_start_response_locked, task_cancel_dir, task_channel, task_logs_dir,
+    task_record_exists, task_start_ack_exists, task_start_response_boundary_exists,
+    task_start_response_claim_path, task_start_response_id, task_start_response_path,
+    task_start_rollback_exists, wait_for_test_task_admission_barrier,
+    wait_for_test_task_response_phase_barrier, wait_for_test_task_rollback_cleanup_barrier,
+    write_session_record, write_start_response, write_task_record, write_task_start_response,
+};
 use super::*;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -245,38 +262,6 @@ fn service_lock_options() -> OpenOptions {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     options
-}
-
-/// A durable on-disk record of one session `Run` has spawned: enough to
-/// find, corroborate, and signal the real OS process from any later,
-/// independent `Status`/`Stop`/`Teardown` invocation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SessionRecord {
-    id: String,
-    spec: SessionSpec,
-    pid: u32,
-    /// Windows process creation-time key from `GetProcessTimes`,
-    /// corroborating `pid` against reuse after a `Run` restart; `None`
-    /// where the platform probe could not be read or for a legacy record.
-    started_at: Option<String>,
-    /// Legacy Unix epoch field retained for cross-platform record decoding.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    start_epoch_secs: Option<i64>,
-    /// Named Job Object owned by the session's supervisor and serve child.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    job: Option<String>,
-}
-
-/// The `Start` response body, keyed by request id in `responses/`.
-/// An admitted request carries `session_id`; an admission failure the
-/// supervisor can name carries `error` and no session id. Both fields
-/// default, so a response persisted before `error` existed still parses.
-#[derive(Debug, Serialize, Deserialize)]
-struct StartResponse {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
 }
 
 /// Whether a live `Run` holds the control lock.
@@ -854,45 +839,6 @@ fn request_control_stop(control: &Path) -> Result<ControlLiveness> {
 
 // -- Start / control-plane request protocol --------------------------
 
-fn requests_dir(control: &Path) -> std::path::PathBuf {
-    control.join("requests")
-}
-
-fn processing_dir(control: &Path) -> std::path::PathBuf {
-    control.join("processing")
-}
-
-fn responses_dir(control: &Path) -> std::path::PathBuf {
-    control.join("responses")
-}
-
-fn start_channel(control: &Path) -> RequestChannel<'_> {
-    RequestChannel::new(
-        control,
-        requests_dir(control),
-        processing_dir(control),
-        responses_dir(control),
-    )
-}
-
-fn fresh_request_id() -> String {
-    format!(
-        "req-{}-{}-{}",
-        std::process::id(),
-        crate::events::now_ms(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
-fn fresh_session_id() -> String {
-    format!(
-        "svc-{}-{}-{}",
-        std::process::id(),
-        crate::events::now_ms(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
 /// Submits `spec` to a live `Run` and awaits its session id.
 ///
 /// Fails fast (before writing anything) when no `Run` holds the control
@@ -949,13 +895,6 @@ fn await_start_response(control: &Path, request_id: &str) -> Result<String> {
     )
 }
 
-/// Returns any `processing/` entry a crash left mid-request to
-/// `requests/`, safe only because the caller already holds the control
-/// lock (mirrors [`mailbox::Mailbox::reclaim_stale`]).
-fn reclaim_stale_requests(control: &Path) -> Result<()> {
-    start_channel(control).reclaim_stale()
-}
-
 /// Claims and handles the next pending start request, if any.
 fn process_one_request(control: &Path) -> Result<Option<(String, RunningSession)>> {
     start_channel(control).process_one(|request_id, claimed_path| {
@@ -975,11 +914,6 @@ fn admission_error_text(err: &BatonError) -> String {
         BatonError::Io(msg) => msg.clone(),
         other => other.to_string(),
     }
-}
-
-/// Writes a start response body keyed by `request_id`.
-fn write_start_response(control: &Path, request_id: &str, response: &StartResponse) -> Result<()> {
-    start_channel(control).write_response(request_id, response, "start response")
 }
 
 /// Answers a claimed start request with an admission failure the supervisor
@@ -1175,94 +1109,6 @@ fn spawn_serve_child(spec: &SessionSpec, job_name: &str) -> Result<Child> {
 // `TaskRecord`'s PID, exactly like `Stop` does for a session, so both
 // keep working even when `Run` itself is not currently alive.
 
-fn task_requests_dir(control: &Path) -> std::path::PathBuf {
-    control.join("task-requests")
-}
-
-fn task_processing_dir(control: &Path) -> std::path::PathBuf {
-    control.join("task-processing")
-}
-
-fn task_responses_dir(control: &Path) -> std::path::PathBuf {
-    control.join("task-responses")
-}
-
-fn task_channel(control: &Path) -> RequestChannel<'_> {
-    RequestChannel::new(
-        control,
-        task_requests_dir(control),
-        task_processing_dir(control),
-        task_responses_dir(control),
-    )
-}
-
-fn task_start_ack_dir(control: &Path) -> std::path::PathBuf {
-    control.join("task-start-ack")
-}
-
-fn tasks_dir(control: &Path) -> std::path::PathBuf {
-    control.join("tasks")
-}
-
-fn task_logs_dir(control: &Path, task_id: &str) -> std::path::PathBuf {
-    control.join("task-logs").join(task_id)
-}
-
-fn task_start_rollback_dir(control: &Path) -> std::path::PathBuf {
-    control.join("task-start-rollback")
-}
-
-fn task_cancel_dir(control: &Path) -> std::path::PathBuf {
-    control.join("task-cancel")
-}
-
-fn fresh_task_id() -> String {
-    format!(
-        "task-{}-{}-{}",
-        std::process::id(),
-        crate::events::now_ms(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
-/// The `Start` response body, keyed by request id in `task-responses/`.
-/// An admitted request carries `task_id`; an owner rejection carries
-/// `error` and no task id.
-#[derive(Debug, Serialize, Deserialize)]
-struct TaskStartResponse {
-    #[serde(default)]
-    task_id: Option<String>,
-    #[serde(default)]
-    error: Option<String>,
-}
-
-fn task_start_response_path(control: &Path, request_id: &str) -> Result<std::path::PathBuf> {
-    if !mailbox::is_safe_key(request_id) {
-        return Err(BatonError::Io(format!(
-            "task start request id is not usable as a filename: {request_id:?}"
-        )));
-    }
-    Ok(task_responses_dir(control).join(mailbox::file_name(request_id)))
-}
-
-fn task_start_response_claim_path(control: &Path, request_id: &str) -> Result<std::path::PathBuf> {
-    let response = task_start_response_path(control, request_id)?;
-    let file_name = response
-        .file_name()
-        .expect("task-start response path has a filename")
-        .to_string_lossy();
-    Ok(response.with_file_name(format!(".{file_name}.claimed")))
-}
-
-fn task_start_ack_path(control: &Path, request_id: &str) -> Result<std::path::PathBuf> {
-    if !mailbox::is_safe_key(request_id) {
-        return Err(BatonError::Io(format!(
-            "task start request id is not usable as a filename: {request_id:?}"
-        )));
-    }
-    Ok(task_start_ack_dir(control).join(mailbox::file_name(request_id)))
-}
-
 /// Submits `spec` through the shared request channel and awaits its task id.
 /// The task response claim and rollback transaction remain specific to this
 /// caller.
@@ -1335,274 +1181,6 @@ fn take_task_start_response(control: &Path, request_id: &str) -> Result<Option<T
     }
     let _admission = acquire_admission_lock(control)?;
     take_task_start_response_locked(control, request_id)
-}
-
-/// Lock-free hint used by the polling client. The result can change
-/// immediately after this check; the admission lock is acquired before
-/// any claim, acknowledgement, or cleanup operation.
-fn task_start_response_boundary_exists(control: &Path, request_id: &str) -> Result<bool> {
-    Ok(task_start_response_path(control, request_id)?.is_file()
-        || task_start_response_claim_path(control, request_id)?.is_file()
-        || task_start_ack_path(control, request_id)?.is_file())
-}
-
-fn take_task_start_response_locked(
-    control: &Path,
-    request_id: &str,
-) -> Result<Option<TaskStartResponse>> {
-    let response_path = task_start_response_path(control, request_id)?;
-    let claim_path = task_start_response_claim_path(control, request_id)?;
-
-    if task_start_ack_exists(control, request_id)? {
-        remove_task_start_response_files(control, request_id)?;
-        return Ok(None);
-    }
-    restore_task_start_response_claim(control, request_id)?;
-    match fs::rename(&response_path, &claim_path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(BatonError::Io(format!(
-                "could not claim task response {response_path:?}: {err}"
-            )));
-        }
-    }
-    let data = match fs::read_to_string(&claim_path) {
-        Ok(data) => data,
-        Err(err) => {
-            restore_task_start_response_claim(control, request_id)?;
-            return Err(BatonError::Io(format!(
-                "could not read claimed task response {claim_path:?}: {err}"
-            )));
-        }
-    };
-    let response = match serde_json::from_str(&data) {
-        Ok(response) => response,
-        Err(err) => {
-            restore_task_start_response_claim(control, request_id)?;
-            return Err(BatonError::Decode(format!(
-                "malformed task response {response_path:?}: {err}"
-            )));
-        }
-    };
-    mark_task_start_ack(control, request_id)?;
-    wait_for_test_task_start_ack_barrier();
-    let _ = fs::remove_file(&claim_path);
-    Ok(Some(response))
-}
-
-fn restore_task_start_response_claim(control: &Path, request_id: &str) -> Result<()> {
-    let response_path = task_start_response_path(control, request_id)?;
-    let claim_path = task_start_response_claim_path(control, request_id)?;
-    if !claim_path.is_file() {
-        return Ok(());
-    }
-    if response_path.is_file() {
-        return remove_file_if_present(&claim_path, "task response claim");
-    }
-    match fs::rename(&claim_path, &response_path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(BatonError::Io(format!(
-            "could not restore task response claim {claim_path:?}: {err}"
-        ))),
-    }
-}
-
-fn remove_task_start_response_files(control: &Path, request_id: &str) -> Result<()> {
-    let response_path = task_start_response_path(control, request_id)?;
-    let claim_path = task_start_response_claim_path(control, request_id)?;
-    remove_file_if_present(&response_path, "task response")?;
-    remove_file_if_present(&claim_path, "task response claim")
-}
-
-fn remove_file_if_present(path: &Path, description: &str) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(BatonError::Io(format!(
-            "could not remove {description} {path:?}: {err}"
-        ))),
-    }
-}
-
-fn mark_task_start_ack(control: &Path, request_id: &str) -> Result<()> {
-    let dir = task_start_ack_dir(control);
-    fs::create_dir_all(&dir)
-        .map_err(|err| BatonError::Io(format!("could not create {dir:?}: {err}")))?;
-    let path = mailbox::file_name(request_id);
-    mailbox::atomic_write(&dir, &path, "")
-}
-
-fn task_start_ack_exists(control: &Path, request_id: &str) -> Result<bool> {
-    Ok(task_start_ack_path(control, request_id)?.is_file())
-}
-
-fn remove_task_start_ack(control: &Path, request_id: &str) -> Result<()> {
-    let path = task_start_ack_path(control, request_id)?;
-    remove_file_if_present(&path, "task-start acknowledgement")
-}
-
-/// Removes every durable file belonging to a task-start transaction after
-/// the task record has reached a safe cleanup boundary. Explicit
-/// ownership teardown uses this after asserting the process identity;
-/// leaving an admission marker behind after a forced removal would make
-/// the next supervisor treat an already-removed task as rollback residue.
-fn remove_task_start_transaction(control: &Path, record: &TaskRecord) -> Result<()> {
-    let Some(request_id) = record.request_id.as_deref() else {
-        return Ok(());
-    };
-    discard_pending_task_start_request(control, request_id)?;
-    remove_task_start_response_files(control, request_id)?;
-    remove_task_start_ack(control, request_id)?;
-    remove_task_start_rollback(control, request_id)
-}
-
-fn list_task_start_acks(control: &Path) -> Result<Vec<String>> {
-    let dir = task_start_ack_dir(control);
-    let entries = match fs::read_dir(&dir) {
-        Ok(rd) => rd,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(BatonError::Io(format!(
-                "could not read task-start acknowledgement directory {dir:?}: {err}"
-            )));
-        }
-    };
-    let mut request_ids = Vec::new();
-    for entry in entries {
-        let path = mailbox::dir_entry(entry, &dir)?.path();
-        let Some(key) = mailbox::json_key(&path) else {
-            continue;
-        };
-        request_ids.push(key);
-    }
-    Ok(request_ids)
-}
-
-fn list_task_start_response_claims(control: &Path) -> Result<Vec<String>> {
-    let dir = task_responses_dir(control);
-    let entries = match fs::read_dir(&dir) {
-        Ok(rd) => rd,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(BatonError::Io(format!(
-                "could not read task response directory {dir:?}: {err}"
-            )));
-        }
-    };
-    let mut request_ids = Vec::new();
-    for entry in entries {
-        let path = mailbox::dir_entry(entry, &dir)?.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let Some(response_name) = name
-            .strip_prefix('.')
-            .and_then(|name| name.strip_suffix(".claimed"))
-        else {
-            continue;
-        };
-        let response_path = dir.join(response_name);
-        if let Some(request_id) = mailbox::json_key(&response_path) {
-            request_ids.push(request_id);
-        }
-    }
-    Ok(request_ids)
-}
-
-fn task_start_response_id(
-    control: &Path,
-    request_id: &str,
-    response: TaskStartResponse,
-) -> Result<String> {
-    if let Some(error) = response.error {
-        return Err(BatonError::Io(error));
-    }
-    response.task_id.ok_or_else(|| {
-        let path = task_responses_dir(control).join(mailbox::file_name(request_id));
-        BatonError::Decode(format!(
-            "task response {path:?} contained neither a task id nor an error"
-        ))
-    })
-}
-
-/// Discards a task-start request that has not been answered after the
-/// supervisor released the control lock. It may still be waiting in
-/// `task-requests/` or already claimed in `task-processing/`; removing
-/// both locations prevents a restarted supervisor from replaying a
-/// request whose client has been told admission failed.
-fn discard_pending_task_start_request(control: &Path, request_id: &str) -> Result<()> {
-    let file_name = mailbox::file_name(request_id);
-    for dir in [task_requests_dir(control), task_processing_dir(control)] {
-        let path = dir.join(&file_name);
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(BatonError::Io(format!(
-                    "could not discard pending task start request {path:?}: {err}"
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Records that the submitting client observed admission loss. The marker
-/// is durable before request files are removed, so a restart can reconcile
-/// a task record that was written before the response boundary.
-fn mark_task_start_rollback(control: &Path, request_id: &str) -> Result<()> {
-    let dir = task_start_rollback_dir(control);
-    fs::create_dir_all(&dir)
-        .map_err(|err| BatonError::Io(format!("could not create {dir:?}: {err}")))?;
-    mailbox::atomic_write(&dir, &mailbox::file_name(request_id), "")
-}
-
-fn task_start_rollback_path(control: &Path, request_id: &str) -> Result<std::path::PathBuf> {
-    if !mailbox::is_safe_key(request_id) {
-        return Err(BatonError::Io(format!(
-            "task start request id is not usable as a filename: {request_id:?}"
-        )));
-    }
-    Ok(task_start_rollback_dir(control).join(mailbox::file_name(request_id)))
-}
-
-fn task_start_rollback_exists(control: &Path, request_id: &str) -> Result<bool> {
-    Ok(task_start_rollback_path(control, request_id)?.is_file())
-}
-
-fn remove_task_start_rollback(control: &Path, request_id: &str) -> Result<()> {
-    let path = task_start_rollback_path(control, request_id)?;
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(BatonError::Io(format!(
-            "could not remove task start rollback marker {path:?}: {err}"
-        ))),
-    }
-}
-
-fn list_task_start_rollbacks(control: &Path) -> Result<Vec<String>> {
-    let dir = task_start_rollback_dir(control);
-    let entries = match fs::read_dir(&dir) {
-        Ok(rd) => rd,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(BatonError::Io(format!(
-                "could not read task start rollback directory {dir:?}: {err}"
-            )));
-        }
-    };
-    let mut request_ids = Vec::new();
-    for entry in entries {
-        let path = mailbox::dir_entry(entry, &dir)?.path();
-        let Some(key) = mailbox::json_key(&path) else {
-            continue;
-        };
-        request_ids.push(key);
-    }
-    Ok(request_ids)
 }
 
 /// Reconciles task-start transactions before the request loop can accept
@@ -2132,120 +1710,6 @@ fn handle_task_start_request(
     Ok(Some((record, child, job, started_ms)))
 }
 
-/// Test-only synchronization seam for the post-record/pre-response crash
-/// regression. A service launched with this environment variable waits
-/// after persisting the prepared record until the named path disappears;
-/// production callers never set it. This helper is compiled only with debug
-/// assertions; release builds use the no-op fallback below so the test seam
-/// cannot affect a shipped service.
-#[cfg(debug_assertions)]
-fn wait_for_test_task_admission_barrier() {
-    let Some(path) = std::env::var_os("BATON_TEST_TASK_ADMISSION_BARRIER") else {
-        return;
-    };
-    let path = std::path::PathBuf::from(path);
-    while path.exists() {
-        std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
-    }
-}
-
-#[cfg(not(debug_assertions))]
-fn wait_for_test_task_admission_barrier() {}
-
-/// Test-only synchronization seam for the response/phase boundary. A
-/// service launched with this environment variable waits after publishing
-/// the response while still holding the admission lock; production callers
-/// never set it. This helper is compiled only with debug assertions; the
-/// release fallback is a no-op.
-#[cfg(debug_assertions)]
-fn wait_for_test_task_response_phase_barrier() {
-    let Some(path) = std::env::var_os("BATON_TEST_TASK_RESPONSE_PHASE_BARRIER") else {
-        return;
-    };
-    let path = std::path::PathBuf::from(path);
-    while path.exists() {
-        std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
-    }
-}
-
-#[cfg(not(debug_assertions))]
-fn wait_for_test_task_response_phase_barrier() {}
-
-/// Test-only synchronization seam for the response claim/ack boundary. A
-/// task-start client waits after persisting its acknowledgement and before
-/// removing the private claim; production callers never set it. This helper
-/// is compiled only with debug assertions; the release fallback is a no-op.
-#[cfg(debug_assertions)]
-fn wait_for_test_task_start_ack_barrier() {
-    let Some(path) = std::env::var_os("BATON_TEST_TASK_START_ACK_BARRIER") else {
-        return;
-    };
-    let path = std::path::PathBuf::from(path);
-    while path.exists() {
-        std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
-    }
-}
-
-#[cfg(not(debug_assertions))]
-fn wait_for_test_task_start_ack_barrier() {}
-
-#[cfg(debug_assertions)]
-const TEST_TASK_ROLLBACK_RECONCILE_BARRIER: &str = "BATON_TEST_TASK_ROLLBACK_RECONCILE_BARRIER";
-#[cfg(not(debug_assertions))]
-const TEST_TASK_ROLLBACK_RECONCILE_BARRIER: &str = "";
-
-#[cfg(debug_assertions)]
-const TEST_TASK_ROLLBACK_REQUEST_BARRIER: &str = "BATON_TEST_TASK_ROLLBACK_REQUEST_BARRIER";
-#[cfg(not(debug_assertions))]
-const TEST_TASK_ROLLBACK_REQUEST_BARRIER: &str = "";
-
-/// Test-only synchronization seam for rollback cleanup ordering. A
-/// service launched with one of the named environment variables waits
-/// after request/record cleanup and before removing the rollback marker;
-/// production callers never set it. This helper is compiled only with debug
-/// assertions; the release fallback is a no-op.
-#[cfg(debug_assertions)]
-fn wait_for_test_task_rollback_cleanup_barrier(variable: &str) {
-    let Some(path) = std::env::var_os(variable) else {
-        return;
-    };
-    let path = std::path::PathBuf::from(path);
-    while path.exists() {
-        std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
-    }
-}
-
-#[cfg(not(debug_assertions))]
-fn wait_for_test_task_rollback_cleanup_barrier(_variable: &str) {}
-
-fn write_task_start_response(
-    control: &Path,
-    request_id: &str,
-    response: &TaskStartResponse,
-) -> Result<()> {
-    // This failure injection is needed by integration tests, whose
-    // test-built binary has debug assertions enabled. Keep the release
-    // binary free of the test environment seam.
-    #[cfg(debug_assertions)]
-    if let Some(path) = std::env::var_os("BATON_TEST_TASK_START_RESPONSE_WRITE_FAILURE") {
-        let path = std::path::PathBuf::from(path);
-        match fs::remove_file(&path) {
-            Ok(()) => {
-                return Err(BatonError::Io(format!(
-                    "test-injected task-start response write failure at {path:?}"
-                )));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(BatonError::Io(format!(
-                    "could not consume task-start response failure marker {path:?}: {err}"
-                )));
-            }
-        }
-    }
-    task_channel(control).write_response(request_id, response, "task start response")
-}
-
 fn resume_initial_thread(pid: u32) -> Result<()> {
     // SAFETY: the snapshot flags and process id are valid; the returned
     // snapshot is closed on every exit path below.
@@ -2746,35 +2210,6 @@ fn deliver_task_event(record: &TaskRecord, kind: TaskEventKind) -> Result<()> {
 
 // -- Task records -------------------------------------------------------
 
-fn task_records(control: &Path) -> RecordStore {
-    RecordStore::new(tasks_dir(control), "task")
-}
-
-#[cfg(test)]
-fn task_record_path(control: &Path, id: &str) -> Result<std::path::PathBuf> {
-    task_records(control).path(id)
-}
-
-fn write_task_record(control: &Path, record: &TaskRecord) -> Result<()> {
-    task_records(control).write(&record.id, record)
-}
-
-fn read_task_record(control: &Path, id: &str) -> Result<Option<TaskRecord>> {
-    task_records(control).read(id)
-}
-
-fn task_record_exists(control: &Path, id: &str) -> Result<bool> {
-    task_records(control).exists(id)
-}
-
-fn remove_task_record(control: &Path, id: &str) -> Result<()> {
-    task_records(control).remove(id)
-}
-
-fn list_task_records(control: &Path) -> Result<Vec<TaskRecord>> {
-    task_records(control).list()
-}
-
 #[derive(Debug, PartialEq, Eq)]
 struct CleanupResidue {
     kind: &'static str,
@@ -3254,30 +2689,6 @@ fn stop_session_record(
 }
 
 // -- Session records ---------------------------------------------------
-
-fn sessions_dir(control: &Path) -> std::path::PathBuf {
-    control.join("sessions")
-}
-
-fn session_records(control: &Path) -> RecordStore {
-    RecordStore::new(sessions_dir(control), "session")
-}
-
-fn write_session_record(control: &Path, record: &SessionRecord) -> Result<()> {
-    session_records(control).write(&record.id, record)
-}
-
-fn read_session_record(control: &Path, id: &str) -> Result<Option<SessionRecord>> {
-    session_records(control).read(id)
-}
-
-fn remove_session_record(control: &Path, id: &str) -> Result<()> {
-    session_records(control).remove(id)
-}
-
-fn list_session_records(control: &Path) -> Result<Vec<SessionRecord>> {
-    session_records(control).list()
-}
 
 // -- CLI-facing operations ---------------------------------------------
 
