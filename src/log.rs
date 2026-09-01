@@ -597,34 +597,16 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
             }
             Some("response_ok") => {
                 let ok: OkRecord = from_value(value, line_no, "response_ok")?;
-                let has_correlation = has_complete_correlation(&ok.session_id, ok.turn_index);
-                let has_message_id = ok.message_id.is_some();
-                let suppress_sessionless = pending_uncorrelated_sessionless;
-                pending_uncorrelated_sessionless = false;
-                let target = if has_correlation {
-                    match (ok.session_id, ok.turn_index) {
-                        (Some(session_id), Some(turn_index)) => {
-                            let target = pending_by_correlation.remove(&(session_id, turn_index));
-                            if target == pending_without_correlation {
-                                pending_without_correlation = None;
-                            }
-                            target
-                        }
-                        _ => unreachable!("complete correlation checked above"),
-                    }
-                } else if has_message_id {
-                    // Message-path outcomes are self-correlated and do not
-                    // participate in session fallback pairing.
-                    None
-                } else {
-                    take_uncorrelated_pending(
-                        &report.sessions,
-                        &mut pending_by_correlation,
-                        &mut pending_without_correlation,
-                    )
-                };
-                if !has_correlation && !has_message_id && target.is_none() && !suppress_sessionless
-                {
+                let (target, warn_dangling) = resolve_outcome_target(
+                    &report.sessions,
+                    ok.session_id,
+                    ok.turn_index,
+                    ok.message_id,
+                    &mut pending_by_correlation,
+                    &mut pending_without_correlation,
+                    &mut pending_uncorrelated_sessionless,
+                );
+                if warn_dangling {
                     report
                         .warnings
                         .push(dangling_outcome_warning(line_no, "response_ok"));
@@ -644,34 +626,16 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
             }
             Some("response_error") => {
                 let err: ErrRecord = from_value(value, line_no, "response_error")?;
-                let has_correlation = has_complete_correlation(&err.session_id, err.turn_index);
-                let has_message_id = err.message_id.is_some();
-                let suppress_sessionless = pending_uncorrelated_sessionless;
-                pending_uncorrelated_sessionless = false;
-                let target = if has_correlation {
-                    match (err.session_id, err.turn_index) {
-                        (Some(session_id), Some(turn_index)) => {
-                            let target = pending_by_correlation.remove(&(session_id, turn_index));
-                            if target == pending_without_correlation {
-                                pending_without_correlation = None;
-                            }
-                            target
-                        }
-                        _ => unreachable!("complete correlation checked above"),
-                    }
-                } else if has_message_id {
-                    // Message-path outcomes are self-correlated and do not
-                    // participate in session fallback pairing.
-                    None
-                } else {
-                    take_uncorrelated_pending(
-                        &report.sessions,
-                        &mut pending_by_correlation,
-                        &mut pending_without_correlation,
-                    )
-                };
-                if !has_correlation && !has_message_id && target.is_none() && !suppress_sessionless
-                {
+                let (target, warn_dangling) = resolve_outcome_target(
+                    &report.sessions,
+                    err.session_id,
+                    err.turn_index,
+                    err.message_id,
+                    &mut pending_by_correlation,
+                    &mut pending_without_correlation,
+                    &mut pending_uncorrelated_sessionless,
+                );
+                if warn_dangling {
                     report
                         .warnings
                         .push(dangling_outcome_warning(line_no, "response_error"));
@@ -700,6 +664,48 @@ pub fn parse_sessions<R: Read>(reader: R) -> Result<SessionParseReport> {
 /// lookup. A partially populated pair remains on the legacy fallback path.
 fn has_complete_correlation(session_id: &Option<String>, turn_index: Option<u64>) -> bool {
     session_id.is_some() && turn_index.is_some()
+}
+
+/// Resolves an outcome to its pending session turn and reports whether an
+/// unmatched legacy outcome should produce a dangling warning.
+fn resolve_outcome_target(
+    sessions: &[SessionRecord],
+    session_id: Option<String>,
+    turn_index: Option<u64>,
+    message_id: Option<String>,
+    pending_by_correlation: &mut HashMap<(String, u64), (usize, usize)>,
+    pending_without_correlation: &mut Option<(usize, usize)>,
+    pending_uncorrelated_sessionless: &mut bool,
+) -> (Option<(usize, usize)>, bool) {
+    let has_correlation = has_complete_correlation(&session_id, turn_index);
+    let has_message_id = message_id.is_some();
+    let suppress_sessionless = *pending_uncorrelated_sessionless;
+    *pending_uncorrelated_sessionless = false;
+    let target = if has_correlation {
+        match (session_id, turn_index) {
+            (Some(session_id), Some(turn_index)) => {
+                let target = pending_by_correlation.remove(&(session_id, turn_index));
+                if target == *pending_without_correlation {
+                    *pending_without_correlation = None;
+                }
+                target
+            }
+            _ => unreachable!("complete correlation checked above"),
+        }
+    } else if has_message_id {
+        // Message-path outcomes are self-correlated and do not participate in
+        // session fallback pairing.
+        None
+    } else {
+        take_uncorrelated_pending(
+            sessions,
+            pending_by_correlation,
+            pending_without_correlation,
+        )
+    };
+    let warn_dangling =
+        !has_correlation && !has_message_id && target.is_none() && !suppress_sessionless;
+    (target, warn_dangling)
 }
 
 /// Warning for a concurrent uncorrelated session request that replaces the
