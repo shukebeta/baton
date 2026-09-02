@@ -10,6 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
+## v0.4.22 (2026-09-02)
+
+### Refactors
+- refactor(service): extract client control-plane layer into src/service/control.rs (#331)
+
 ## v0.4.21 … v0.3.51 (2026-09-01)
 
 ### Features
