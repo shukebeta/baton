@@ -539,6 +539,72 @@ fn windows_rehydrated_descendant_drain_reaches_terminal_state() {
     assert_eq!(exit_code, None);
 }
 
+/// A task whose entire process tree exits while the supervisor is down
+/// must still finalize after restart. Unlike the surviving-descendant case
+/// above, nothing is left running: the Job Object is fully destroyed once
+/// every member process (and the last handle keeping it alive) is gone, so
+/// its name no longer resolves on restart. Before the fix underlying this
+/// test, that made the task permanently `running`/`unresolved`.
+#[test]
+fn windows_task_finished_during_downtime_finalizes_after_restart() {
+    let mut guard = start_service();
+    let session = start_session(&guard);
+    let control = guard.control.to_string_lossy().into_owned();
+    let callback = guard.root.join("callback");
+    let task = baton(&[
+        "task",
+        "start",
+        "--control",
+        &control,
+        "--session",
+        &session,
+        "--command",
+        "cmd.exe",
+        "--arg",
+        "/D",
+        "--arg",
+        "/C",
+        "--arg",
+        "ping -n 2 127.0.0.1 > NUL",
+        "--max-duration-ms",
+        "60000",
+        "--callback-inbox",
+        callback.to_str().unwrap(),
+    ]);
+    assert!(
+        task.status.success(),
+        "short-lived task start failed: {}",
+        String::from_utf8_lossy(&task.stderr)
+    );
+    let task_id = String::from_utf8_lossy(&task.stdout).trim().to_string();
+    assert!(!task_id.is_empty(), "short-lived task returned an id");
+
+    let mut old_run = guard.run.take().expect("initial service supervisor");
+    old_run.kill().expect("kill initial service supervisor");
+    let old_status = old_run.wait().expect("initial service supervisor exits");
+    assert!(!old_status.success(), "initial supervisor was interrupted");
+
+    // Let the whole tree (cmd.exe and the ping it waits on) exit while the
+    // supervisor is down, so the Job Object is fully destroyed before
+    // restart.
+    thread::sleep(Duration::from_millis(3000));
+
+    let mut restarted = Command::new(env!("CARGO_BIN_EXE_baton"));
+    restarted.args(["service", "run", "--control", &control]);
+    restarted.stdout(Stdio::null());
+    restarted.stderr(Stdio::null());
+    guard.run = Some(
+        restarted
+            .spawn()
+            .expect("spawn restarted service supervisor"),
+    );
+    wait_for_service(&control);
+
+    let (state, exit_code, _) = wait_for_terminal_task(&control, &task_id);
+    assert_eq!(state, "failed");
+    assert_eq!(exit_code, None);
+}
+
 /// Starts a task whose direct command spawns a short-lived descendant and
 /// then exits `0`. The descendant outlives the parent inside the shared Job
 /// Object, so the service must park the reap until the tree drains — and must
