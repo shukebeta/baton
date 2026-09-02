@@ -702,6 +702,13 @@ pub(super) fn record_job_available(name: Option<&str>) -> bool {
     name.is_some() && job_name_resolves(name)
 }
 
+/// Every call site invokes this only after the recorded PID has already
+/// been corroborated gone (`ProbeResult::Gone`). A Job Object that no
+/// longer resolves by name is therefore not ambiguous: the whole tracked
+/// tree, including the last handle that kept the object alive, has
+/// exited, so the object was destroyed. Treat it as `Dead`, not
+/// `Unresolved` — otherwise a task whose entire tree exits while the
+/// supervisor is down never finalizes after restart.
 #[cfg(windows)]
 fn job_tree_liveness(name: Option<&str>) -> Option<Liveness> {
     let name = name?;
@@ -711,7 +718,7 @@ fn job_tree_liveness(name: Option<&str>) -> Option<Liveness> {
             Ok(_) => Some(Liveness::Live),
             Err(_) => Some(Liveness::Unresolved),
         },
-        Ok(None) | Err(_) => Some(Liveness::Unresolved),
+        Ok(None) | Err(_) => Some(Liveness::Dead),
     }
 }
 
@@ -1872,15 +1879,20 @@ mod tests {
         assert_eq!(job_tree_liveness(Some(&job_name)), Some(Liveness::Dead));
         assert_eq!(
             job_tree_liveness(Some(&fresh_job_name("missing-tree"))),
-            Some(Liveness::Unresolved)
+            Some(Liveness::Dead)
         );
 
+        // A gone PID whose Job Object name no longer resolves finalizes as
+        // `Dead`: every call site already corroborated the PID gone, so a
+        // destroyed/renamed Job Object cannot mean the process is still
+        // running. Only a still-live PID with mismatched identity (PID
+        // reuse) or an unreadable probe stays fail-closed `Unresolved`.
         let gone = session_record(
             1,
             Some("stale-process".to_string()),
             Some(fresh_job_name("missing-gone")),
         );
-        assert_eq!(session_liveness(&gone).0, Liveness::Unresolved);
+        assert_eq!(session_liveness(&gone).0, Liveness::Dead);
         drop(job);
     }
 
@@ -2347,16 +2359,19 @@ mod tests {
         let _ = fs::remove_dir_all(control);
     }
 
+    /// A gone-PID record with an unresolvable Job Object name is no longer
+    /// this ladder's `Unresolved` case (see `job_tree_liveness`) — it now
+    /// finalizes as `Dead` on the first non-force pass. The genuinely
+    /// fail-closed case that must still retain-then-force is a live,
+    /// identity-mismatched PID (standing in for PID reuse), so this test
+    /// spawns a real child and records a mismatched `started_at` for it.
     #[test]
     fn unresolved_task_cleanup_retains_then_force_removes_record() {
         let _guard = serialize_forks_and_locks();
         let control = temp_control("unresolved-cleanup");
-        let record = task_record(
-            "svc-test",
-            1,
-            Some("stale-process".to_string()),
-            Some(fresh_job_name("missing-cleanup")),
-        );
+        let (mut child, job, job_name) = spawn_live_task_child(&control, "task-test");
+        let mut record = live_task_record("svc-test", "task-test", child.id(), Some(job_name));
+        record.started_at = Some("mismatched-identity".to_string());
         write_task_record(&control, &record).expect("write unresolved task");
 
         let mut admission = AdmissionGuard::acquire(&control).expect("admission lock");
@@ -2380,6 +2395,8 @@ mod tests {
                 .expect("read removed task")
                 .is_none()
         );
+        let _ = child.wait();
+        drop(job);
         let _ = fs::remove_dir_all(control);
     }
 

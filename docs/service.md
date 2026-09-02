@@ -427,10 +427,15 @@ treated as drained. Once the group is drained, no exit status can be
 recovered through this path, so the task is recorded as `failed` with
 `exit_code: null`; a timeout or cancellation remains `timeout` or `cancelled`
 when the supervisor initiated that outcome. On Windows, the equivalent Job
-Object active-process count continues to define the drain boundary. A missing
-Job Object no longer changes a matching PID to `unresolved`; it only changes
-termination from tree-wide to PID-only, with a descendants-may-survive
-warning. State is persisted before the deterministic terminal callback is
+Object active-process count continues to define the drain boundary while the
+recorded PID is still live. A missing Job Object no longer changes a matching
+*live* PID to `unresolved`; it only changes termination from tree-wide to
+PID-only, with a descendants-may-survive warning. Once the recorded PID is
+itself gone, a Job Object that no longer resolves means the whole tracked
+tree — including the last handle that kept the object alive — has already
+exited; that is recorded as `failed` with `exit_code: null`, the same as the
+Unix drained-group case, rather than left `unresolved`. State is persisted
+before the deterministic terminal callback is
 delivered, and a delivery failure leaves the tracker in place to retry the
 same event id under the bounded backoff described in "Event delivery and
 dedup contract" below. A terminal record whose delivery has not yet
