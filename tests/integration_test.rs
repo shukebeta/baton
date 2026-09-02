@@ -2681,6 +2681,361 @@ fn service_liveness_keys_ignore_supervisor_and_client_environment() {
     assert_eq!(session_records, 0, "teardown removes every session record");
 }
 
+/// Issue #335 regression: a Unix `service run` launched from an absolute
+/// executable path keeps accepting `service start` after that path's file is
+/// atomically replaced in place (e.g. `cargo install` or a systemd-managed
+/// upgrade) — `spawn_serve_child` retries with the process's own immutable
+/// launch identity (`argv[0]`) once `current_exe()` resolves to the
+/// since-deleted inode, and the fresh session is recorded and live.
+#[cfg(target_os = "linux")]
+#[test]
+fn service_start_recovers_after_absolute_path_binary_replacement() {
+    use baton::mailbox;
+    use baton::message::{MessageEnvelope, MessageKind};
+
+    let root = TempMailbox::new("service-exe-replace-absolute");
+    let control = root.path.join("control");
+    let inbox = root.path.join("inbox");
+    let outbox = root.path.join("outbox");
+    let agent_started = root.path.join("agent-started");
+    let control_str = control.to_str().unwrap().to_string();
+
+    let bin_path = root.path.join("baton-under-test");
+    std::fs::copy(env!("CARGO_BIN_EXE_baton"), &bin_path).expect("copy baton binary");
+
+    let wait_for_live = || {
+        let deadline = integration_test_deadline();
+        loop {
+            if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
+                .args(["service", "status", "--control", control_str.as_str()])
+                .output()
+                && out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains("\"service_running\":true")
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "baton service run did not report live in time"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    let mut run = Command::new(&bin_path);
+    run.args(["service", "run", "--control", control_str.as_str()]);
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::null());
+    let mut run_child = run
+        .spawn()
+        .expect("spawn baton service run from an absolute path");
+    wait_for_live();
+
+    // Atomically replace the running binary: copy to a sibling temp name,
+    // then rename over the original path. The resident process keeps its
+    // already-open executable alive, but a fresh `current_exe()` now
+    // resolves to the since-unlinked (deleted) inode.
+    let replacement = root.path.join("baton-under-test.replacement");
+    std::fs::copy(env!("CARGO_BIN_EXE_baton"), &replacement)
+        .expect("copy replacement baton binary");
+    std::fs::rename(&replacement, &bin_path).expect("atomically replace the running binary");
+
+    let start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str.as_str(),
+            "--inbox",
+            inbox.to_str().unwrap(),
+            "--outbox",
+            outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+            "--agent-cmd",
+            "sh",
+            "--agent-arg",
+            "-c",
+            "--agent-arg",
+            "cat >/dev/null; touch \"$1\"; sleep 30",
+            "--agent-arg",
+            "exe-replace-absolute-agent",
+            "--agent-arg",
+            agent_started.to_str().unwrap(),
+        ])
+        .output()
+        .expect("start session after binary replacement");
+    assert!(
+        start.status.success(),
+        "service start should exit 0 after the running binary was replaced; stderr: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let session_id = String::from_utf8_lossy(&start.stdout).trim().to_string();
+    assert!(!session_id.is_empty(), "service start prints a session id");
+
+    let request = MessageEnvelope::new(
+        "exe-replace-absolute-m1",
+        "exe-replace-absolute-conv",
+        "agent-a",
+        "agent-b",
+        MessageKind::Request,
+        "hold the post-replacement session",
+        1_700_000_000_000,
+    );
+    mailbox::deliver_to(&inbox, &request).expect("deliver post-replacement request");
+    let ready_deadline = integration_test_deadline();
+    while !agent_started.exists() && std::time::Instant::now() < ready_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        agent_started.exists(),
+        "the post-replacement session must reach its agent turn"
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "status",
+            "--control",
+            control_str.as_str(),
+            "--session",
+            session_id.as_str(),
+        ])
+        .output()
+        .expect("read post-replacement session status");
+    assert!(status.status.success(), "service status should exit 0");
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status is JSON");
+    assert_eq!(
+        status_json["sessions"][0]["live"], true,
+        "the post-replacement session is recorded and live"
+    );
+
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str.as_str()])
+        .output()
+        .expect("tear down after binary replacement");
+    assert!(
+        teardown.status.success(),
+        "teardown should exit 0; stderr: {}",
+        String::from_utf8_lossy(&teardown.stderr)
+    );
+    let run_status = run_child.wait().expect("service run exits");
+    assert!(run_status.success(), "service run exits 0 on teardown");
+}
+
+/// Issue #335 regression: a bare `baton service run` (resolved through the
+/// inherited `PATH` at launch — the non-managed-install counterpart of the
+/// absolute-path case above) recovers the same way through a fresh `PATH`
+/// lookup when its own binary is replaced, and reports the actionable
+/// diagnostic — naming the stale executable and the recovery command, with
+/// no session record created — when no resolution succeeds at all.
+#[cfg(target_os = "linux")]
+#[test]
+fn service_start_recovers_after_bare_invocation_binary_replacement() {
+    use baton::mailbox;
+    use baton::message::{MessageEnvelope, MessageKind};
+
+    let root = TempMailbox::new("service-exe-replace-bare");
+    let control = root.path.join("control");
+    let first_inbox = root.path.join("first-inbox");
+    let first_outbox = root.path.join("first-outbox");
+    let second_inbox = root.path.join("second-inbox");
+    let second_outbox = root.path.join("second-outbox");
+    let agent_started = root.path.join("agent-started");
+    let path_dir = root.path.join("bin");
+    std::fs::create_dir_all(&path_dir).expect("create PATH directory");
+    let bin_path = path_dir.join("baton");
+    std::fs::copy(env!("CARGO_BIN_EXE_baton"), &bin_path).expect("copy baton binary");
+    let control_str = control.to_str().unwrap().to_string();
+
+    // Deliberately not chaining onto the ambient `$PATH`: a dev machine or
+    // CI runner may have its own real `baton` install further down that
+    // path, which would mask the "nothing resolves" branch this test
+    // exercises once the local copy is removed.
+    let inherited_path = format!("{}:/usr/bin:/bin", path_dir.display());
+
+    let wait_for_live = || {
+        let deadline = integration_test_deadline();
+        loop {
+            if let Ok(out) = Command::new(env!("CARGO_BIN_EXE_baton"))
+                .args(["service", "status", "--control", control_str.as_str()])
+                .output()
+                && out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains("\"service_running\":true")
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "baton service run did not report live in time"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    let mut run = Command::new("baton");
+    run.env("PATH", &inherited_path);
+    run.args(["service", "run", "--control", control_str.as_str()]);
+    run.stdout(Stdio::null());
+    run.stderr(Stdio::null());
+    let mut run_child = run
+        .spawn()
+        .expect("spawn baton service run via a bare PATH lookup");
+    wait_for_live();
+
+    // Replace the PATH-resolved binary the same way as the absolute-path
+    // case. The resident process's own `argv[0]` is the bare name "baton",
+    // so recovery must go through a fresh `PATH` lookup at spawn time.
+    let replacement = path_dir.join("baton.replacement");
+    std::fs::copy(env!("CARGO_BIN_EXE_baton"), &replacement)
+        .expect("copy replacement baton binary");
+    std::fs::rename(&replacement, &bin_path).expect("atomically replace the PATH binary");
+
+    let start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str.as_str(),
+            "--inbox",
+            first_inbox.to_str().unwrap(),
+            "--outbox",
+            first_outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+            "--agent-cmd",
+            "sh",
+            "--agent-arg",
+            "-c",
+            "--agent-arg",
+            "cat >/dev/null; touch \"$1\"; sleep 30",
+            "--agent-arg",
+            "exe-replace-bare-agent",
+            "--agent-arg",
+            agent_started.to_str().unwrap(),
+        ])
+        .output()
+        .expect("start session after PATH binary replacement");
+    assert!(
+        start.status.success(),
+        "service start should exit 0 after the PATH-resolved binary was replaced; stderr: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let session_id = String::from_utf8_lossy(&start.stdout).trim().to_string();
+    assert!(!session_id.is_empty(), "service start prints a session id");
+
+    let request = MessageEnvelope::new(
+        "exe-replace-bare-m1",
+        "exe-replace-bare-conv",
+        "agent-a",
+        "agent-b",
+        MessageKind::Request,
+        "hold the PATH-recovered session",
+        1_700_000_000_000,
+    );
+    mailbox::deliver_to(&first_inbox, &request).expect("deliver PATH-recovered request");
+    let ready_deadline = integration_test_deadline();
+    while !agent_started.exists() && std::time::Instant::now() < ready_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        agent_started.exists(),
+        "the PATH-recovered session must reach its agent turn"
+    );
+
+    let first_status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "status",
+            "--control",
+            control_str.as_str(),
+            "--session",
+            session_id.as_str(),
+        ])
+        .output()
+        .expect("read PATH-recovered session status");
+    assert!(
+        first_status.status.success(),
+        "service status should exit 0"
+    );
+    let first_status_json: serde_json::Value =
+        serde_json::from_slice(&first_status.stdout).expect("status is JSON");
+    assert_eq!(
+        first_status_json["sessions"][0]["live"], true,
+        "the PATH-recovered session is recorded and live"
+    );
+
+    // Remove the PATH-resolved binary entirely: neither the stale
+    // `current_exe()` path nor a fresh `PATH` lookup for "baton" can resolve
+    // anything now.
+    std::fs::remove_file(&bin_path).expect("remove the PATH binary entirely");
+
+    let failed_start = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "start",
+            "--control",
+            control_str.as_str(),
+            "--inbox",
+            second_inbox.to_str().unwrap(),
+            "--outbox",
+            second_outbox.to_str().unwrap(),
+            "--poll-ms",
+            "20",
+            "--agent-cmd",
+            "sh",
+            "--agent-arg",
+            "-c",
+            "--agent-arg",
+            "cat >/dev/null; sleep 30",
+        ])
+        .output()
+        .expect("attempt a start with no resolvable executable");
+    assert!(
+        !failed_start.status.success(),
+        "service start must fail when no executable can be resolved"
+    );
+    let failed_message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&failed_start.stdout),
+        String::from_utf8_lossy(&failed_start.stderr)
+    );
+    assert!(
+        failed_message.contains(bin_path.to_str().unwrap()),
+        "failure names the stale executable path: {failed_message}"
+    );
+    assert!(
+        failed_message.contains("restart the baton service"),
+        "failure names the recovery command: {failed_message}"
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "status", "--control", control_str.as_str()])
+        .output()
+        .expect("read status after the failed start");
+    assert!(status.status.success(), "service status should exit 0");
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status is JSON");
+    assert_eq!(
+        status_json["sessions"].as_array().unwrap().len(),
+        1,
+        "the failed start request must not create a new session record"
+    );
+
+    let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["service", "teardown", "--control", control_str.as_str()])
+        .output()
+        .expect("tear down after the failed start");
+    assert!(
+        teardown.status.success(),
+        "teardown should exit 0; stderr: {}",
+        String::from_utf8_lossy(&teardown.stderr)
+    );
+    let run_status = run_child.wait().expect("service run exits");
+    assert!(run_status.success(), "service run exits 0 on teardown");
+}
+
 /// Issue #154 regression: v0.2.1-shaped macOS records remain live across a
 /// supervisor restart even when their time-zone-rendered `started_at` keys no
 /// longer match the canonical probe. Session liveness uses argv, task

@@ -679,3 +679,28 @@ rm -f "$HOME/Library/LaunchAgents/com.shukebeta.baton.service.plist"
 
 This LaunchAgent is login-scoped and is intentionally not a root-owned
 LaunchDaemon; it does not promise survival across logout.
+
+## Upgrading the `baton` binary under a live service (Unix)
+
+Replacing the `baton` executable on disk in place — a `cargo install` rerun,
+a package manager upgrade, a systemd-managed redeploy — while `service run`
+is still live does not require restarting it first. `service start` keeps
+working: a managed service definition that launches `run` by absolute path
+(the systemd unit above) recovers through that same absolute path once it
+points at the new file; a `run` launched by bare name (found on `PATH` at
+launch, e.g. an interactive `baton service run`) recovers through a fresh
+`PATH` lookup at spawn time. `service status`, already-running sessions, and
+`service teardown` are unaffected either way.
+
+If neither resolution succeeds — the replaced file is removed outright
+rather than replaced, or a bare-launched service's `PATH` no longer contains
+`baton` — `service start` fails with a diagnostic naming the stale
+executable path. Recover with:
+
+```bash
+baton service teardown --control <dir>   # then relaunch `service run`
+# or, for the packaged systemd unit:
+systemctl --user restart baton.service
+```
+
+This recovery path is Unix-specific; the fallback does not run on Windows.
