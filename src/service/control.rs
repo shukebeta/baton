@@ -1084,7 +1084,7 @@ pub(super) fn take_task_start_response(
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct CleanupResidue {
-    kind: &'static str,
+    pub(super) kind: &'static str,
     pub(super) id: String,
     pid: u32,
     pub(super) liveness: Liveness,

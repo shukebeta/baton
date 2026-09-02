@@ -219,14 +219,17 @@ mod task_tick;
 
 #[cfg(unix)]
 mod imp {
+    #[cfg(all(test, target_os = "linux"))]
+    use super::control::{
+        ADMISSION_LOCK_FILE, STOP_GRACE_MS, TASK_NEW_ID_PARSES, request_task_cancel_sentinel,
+        rescan_owned_tasks,
+    };
     #[cfg(test)]
     use super::control::{
-        ADMISSION_LOCK_FILE, AdmissionGuard, CONTROL_STOP_FILE, ControlLiveness, KILL_GRACE_MS,
-        START_AWAIT_MS, STOP_GRACE_MS, SessionStopGuard, SessionStopMarker, TASK_CONFIRM_READS,
-        TASK_FULL_LISTINGS, TASK_NEW_ID_PARSES, acquire_control_lock, await_start_response,
-        execute_teardown_with_timeout, handle_start_request, probe_control,
-        probe_or_signal_control, reap_session_tasks_with_wait, request_control_stop,
-        request_task_cancel_sentinel, rescan_owned_tasks, session_logs_dir,
+        AdmissionGuard, CONTROL_STOP_FILE, ControlLiveness, KILL_GRACE_MS, SessionStopGuard,
+        SessionStopMarker, TASK_CONFIRM_READS, TASK_FULL_LISTINGS, acquire_control_lock,
+        await_start_response, execute_teardown_with_timeout, handle_start_request, probe_control,
+        reap_session_tasks_with_wait, request_control_stop, session_logs_dir,
         stop_session_record_with_wait, take_task_start_response,
         wait_for_control_release_with_timeout,
     };
@@ -238,15 +241,19 @@ mod imp {
     #[cfg(all(test, target_os = "linux"))]
     use super::records::mark_task_start_ack;
     #[cfg(all(test, target_os = "linux"))]
+    use super::records::mark_task_start_rollback;
+    #[cfg(all(test, target_os = "linux"))]
+    use super::records::task_start_response_boundary_exists;
+    #[cfg(all(test, target_os = "linux"))]
     use super::records::task_start_rollback_exists;
-    use super::records::{
-        SessionRecord, read_task_record, write_session_record, write_task_record,
-    };
+    #[cfg(any(test, target_os = "macos"))]
+    use super::records::write_session_record;
+    use super::records::{SessionRecord, read_task_record, write_task_record};
     #[cfg(test)]
     use super::records::{
         StartResponse, TaskStartResponse, list_session_records, list_task_records,
-        mark_task_start_rollback, read_session_record, remove_session_record, responses_dir,
-        sessions_dir, task_start_ack_exists, task_start_response_boundary_exists,
+        read_session_record, remove_session_record, responses_dir, sessions_dir,
+        task_start_ack_exists,
     };
     #[cfg(test)]
     use super::records::{
@@ -269,16 +276,20 @@ mod imp {
     use super::*;
     #[cfg(test)]
     use std::cell::Cell;
-    use std::collections::HashMap;
-    use std::fs::{self, File};
+    #[cfg(any(test, target_os = "linux"))]
+    use std::fs;
+    use std::fs::File;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
+    #[cfg(test)]
     use crate::mailbox;
     #[cfg(test)]
-    use crate::task::{Clock, FakeClock, TaskAdmissionPhase, TaskCallback, TaskEventKind};
-    use crate::task::{SystemClock, TaskRecord, TaskSpec, TaskState};
+    use crate::task::{
+        Clock, FakeClock, SystemClock, TaskAdmissionPhase, TaskCallback, TaskEventKind,
+    };
+    use crate::task::{TaskRecord, TaskSpec, TaskState};
 
     /// Initial delay before retrying a failed task-event callback delivery.
     /// Governs both milestone and terminal delivery — the same bounded
@@ -3800,7 +3811,7 @@ mod imp {
             let _guard = serialize_forks_and_locks();
             let dir = TempDir::new("status-reaped");
             let mut out = Vec::new();
-            execute_task_status(&dir.path, Some("task-gone"), &mut out)
+            execute_task_status::<UnixServicePlatform>(&dir.path, Some("task-gone"), &mut out)
                 .expect("status for missing task");
             let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
             assert_eq!(json["tasks"].as_array().unwrap().len(), 0);
@@ -4967,8 +4978,12 @@ mod imp {
             assert_durable_task_state(&dir.path, "task-group-drain", TaskState::Running);
 
             let mut status = Vec::new();
-            execute_task_status(&dir.path, Some("task-group-drain"), &mut status)
-                .expect("status while group remains");
+            execute_task_status::<UnixServicePlatform>(
+                &dir.path,
+                Some("task-group-drain"),
+                &mut status,
+            )
+            .expect("status while group remains");
             let status: serde_json::Value = serde_json::from_slice(&status).expect("status JSON");
             assert_eq!(status["tasks"][0]["state"], "running");
             assert!(
@@ -7165,8 +7180,12 @@ mod imp {
             assert_eq!(is_task_alive(&task_record), Liveness::Unresolved);
 
             let mut status = Vec::new();
-            execute_task_status(&dir.path, Some("task-unresolved"), &mut status)
-                .expect("status unresolved task");
+            execute_task_status::<UnixServicePlatform>(
+                &dir.path,
+                Some("task-unresolved"),
+                &mut status,
+            )
+            .expect("status unresolved task");
             let status: serde_json::Value = serde_json::from_slice(&status).expect("status JSON");
             assert_eq!(status["tasks"][0]["live"], false);
             assert_eq!(status["tasks"][0]["liveness"], "unresolved");
@@ -7243,7 +7262,7 @@ mod imp {
             write_task_record(&dir.path, &record).expect("write");
 
             let mut out = Vec::new();
-            execute_task_status(&dir.path, None, &mut out).expect("status");
+            execute_task_status::<UnixServicePlatform>(&dir.path, None, &mut out).expect("status");
             let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
             let tasks = json["tasks"].as_array().unwrap();
             assert_eq!(tasks.len(), 1);
