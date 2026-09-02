@@ -637,13 +637,15 @@ mod imp {
         }
     }
 
-    /// Spawns `baton serve` for `spec` as its own process-group leader
-    /// (`pgid == pid`), detached from this process's stdio except for durable
-    /// stderr capture, and returns the live [`Child`] without waiting on it —
-    /// `Run`'s loop reaps it later.
-    pub(super) fn spawn_serve_child(spec: &SessionSpec, stderr_path: &Path) -> Result<Child> {
-        let exe = current_baton_exe()?;
-        let mut command = Command::new(&exe);
+    /// Builds the `baton serve` child command for `spec`/`program`: its own
+    /// process-group leader (`pgid == pid`), detached from this process's
+    /// stdio except for durable stderr capture.
+    fn serve_command(
+        program: &std::ffi::OsStr,
+        spec: &SessionSpec,
+        stderr_path: &Path,
+    ) -> Result<Command> {
+        let mut command = Command::new(program);
         command.args(serve_argv(spec));
         command.stdin(Stdio::null());
         command.stdout(Stdio::null());
@@ -656,9 +658,56 @@ mod imp {
         // service manages. Safe and stable — deliberately not
         // `pre_exec(setsid)`, which would require `unsafe`.
         command.process_group(0);
-        command
+        Ok(command)
+    }
+
+    /// Spawns `baton serve` for `spec`, returning the live [`Child`] without
+    /// waiting on it — `Run`'s loop reaps it later.
+    ///
+    /// The preferred executable is [`current_baton_exe`] (`/proc/self/exe`).
+    /// On Linux, atomically replacing the running `baton` binary (e.g. an
+    /// in-place upgrade) leaves that path resolving to a since-deleted
+    /// inode, so `spawn()` fails `NotFound` even though the service itself
+    /// is still live. Retrying once with this process's own launch identity
+    /// (`argv[0]`, immutable for the process's lifetime and unaffected by
+    /// the replacement) recovers: an absolute `argv[0]` (a managed service
+    /// definition, e.g. the systemd unit) points straight at the
+    /// replacement; a bare `argv[0]` lets `Command::spawn` re-resolve it
+    /// through the inherited `PATH` at spawn time. Other spawn-failure kinds
+    /// are unrelated to binary replacement and are not retried.
+    pub(super) fn spawn_serve_child(spec: &SessionSpec, stderr_path: &Path) -> Result<Child> {
+        let exe = current_baton_exe()?;
+        let primary = serve_command(exe.as_os_str(), spec, stderr_path)?.spawn();
+        let err = match primary {
+            Ok(child) => return Ok(child),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => err,
+            Err(err) => {
+                return Err(BatonError::Io(format!(
+                    "could not spawn baton serve: {err}"
+                )));
+            }
+        };
+        let Some(argv0) = std::env::args_os().next() else {
+            return Err(BatonError::Io(format!(
+                "could not spawn baton serve: the running executable at {} was replaced \
+                 and no launch identity is available to retry; restart the baton service \
+                 (`baton service teardown` then relaunch `service run`, or \
+                 `systemctl --user restart baton.service` for the packaged unit)",
+                exe.display()
+            )));
+        };
+        serve_command(&argv0, spec, stderr_path)?
             .spawn()
-            .map_err(|err| BatonError::Io(format!("could not spawn baton serve: {err}")))
+            .map_err(|retry_err| {
+                BatonError::Io(format!(
+                    "could not spawn baton serve: the running executable at {} was replaced \
+                 ({err}) and its launch identity {:?} is also unusable ({retry_err}); restart \
+                 the baton service (`baton service teardown` then relaunch `service run`, or \
+                 `systemctl --user restart baton.service` for the packaged unit)",
+                    exe.display(),
+                    argv0
+                ))
+            })
     }
 
     /// Spawns `spec`'s command as its own process-group leader, stdout/stderr

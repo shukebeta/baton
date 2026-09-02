@@ -122,6 +122,11 @@ Consumers stay frozen by pinning a tag, and upgrade by re-pinning a newer tag
 deliberately. Pinning is the churn-control mechanism. [`CHANGELOG.md`](CHANGELOG.md)
 records what each tag bump includes — read it before re-pinning.
 
+Re-pinning and reinstalling over an installed `baton` while `baton service run`
+is still live is safe on Unix — see
+[Upgrading the `baton` binary under a live service](docs/service.md#upgrading-the-baton-binary-under-a-live-service-unix)
+in `docs/service.md`.
+
 The automated release calculation and its no-retagging baseline are documented
 in [docs/versioning.md](docs/versioning.md).
 
