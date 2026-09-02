@@ -431,10 +431,14 @@ Object active-process count continues to define the drain boundary while the
 recorded PID is still live. A missing Job Object no longer changes a matching
 *live* PID to `unresolved`; it only changes termination from tree-wide to
 PID-only, with a descendants-may-survive warning. Once the recorded PID is
-itself gone, a Job Object that no longer resolves means the whole tracked
-tree — including the last handle that kept the object alive — has already
-exited; that is recorded as `failed` with `exit_code: null`, the same as the
-Unix drained-group case, rather than left `unresolved`. State is persisted
+itself gone, a Job Object confirmed destroyed — its name no longer resolves
+because the object itself is gone, not because the probe failed — means the
+whole tracked tree, including the last handle that kept the object alive,
+has already exited; that is recorded as `failed` with `exit_code: null`, the
+same as the Unix drained-group case, rather than left `unresolved`. A
+transient probe failure (e.g. access denied) does not imply the tree
+exited: it stays `unresolved` and retries under the same fail-closed ladder.
+State is persisted
 before the deterministic terminal callback is
 delivered, and a delivery failure leaves the tracker in place to retry the
 same event id under the bounded backoff described in "Event delivery and

@@ -703,23 +703,31 @@ pub(super) fn record_job_available(name: Option<&str>) -> bool {
 }
 
 /// Every call site invokes this only after the recorded PID has already
-/// been corroborated gone (`ProbeResult::Gone`). A Job Object that no
-/// longer resolves by name is therefore not ambiguous: the whole tracked
-/// tree, including the last handle that kept the object alive, has
-/// exited, so the object was destroyed. Treat it as `Dead`, not
-/// `Unresolved` — otherwise a task whose entire tree exits while the
-/// supervisor is down never finalizes after restart.
+/// been corroborated gone (`ProbeResult::Gone`). `open_job`'s `Ok(None)`
+/// means the name was confirmed not to resolve (ERROR_FILE_NOT_FOUND /
+/// ERROR_PATH_NOT_FOUND): the whole tracked tree, including the last handle
+/// that kept the object alive, has exited, so the object was destroyed —
+/// that case is unambiguously `Dead`. `Err(_)` means the probe itself
+/// failed (access denied, handle-quota exhaustion, ...); the object may
+/// still exist with live descendants, so it stays fail-closed
+/// `Unresolved` and retries, matching the rest of the liveness ladder.
+#[cfg(windows)]
+fn classify_job_tree(probe: Result<Option<JobHandle>>) -> Liveness {
+    match probe {
+        Ok(Some(job)) => match active_job_processes(&job) {
+            Ok(0) => Liveness::Dead,
+            Ok(_) => Liveness::Live,
+            Err(_) => Liveness::Unresolved,
+        },
+        Ok(None) => Liveness::Dead,
+        Err(_) => Liveness::Unresolved,
+    }
+}
+
 #[cfg(windows)]
 fn job_tree_liveness(name: Option<&str>) -> Option<Liveness> {
     let name = name?;
-    match open_job(name) {
-        Ok(Some(job)) => match active_job_processes(&job) {
-            Ok(0) => Some(Liveness::Dead),
-            Ok(_) => Some(Liveness::Live),
-            Err(_) => Some(Liveness::Unresolved),
-        },
-        Ok(None) | Err(_) => Some(Liveness::Dead),
-    }
+    Some(classify_job_tree(open_job(name)))
 }
 
 /// Returns a Windows process creation-time key only while the PID still
@@ -1880,6 +1888,14 @@ mod tests {
         assert_eq!(
             job_tree_liveness(Some(&fresh_job_name("missing-tree"))),
             Some(Liveness::Dead)
+        );
+
+        // A transient probe failure (access denied, handle-quota exhaustion,
+        // ...) is not "object destroyed": it must stay fail-closed
+        // `Unresolved` and retry, not finalize the tree as `Dead`.
+        assert_eq!(
+            classify_job_tree(Err(BatonError::Io("probe failed".to_string()))),
+            Liveness::Unresolved
         );
 
         // A gone PID whose Job Object name no longer resolves finalizes as
