@@ -2690,10 +2690,14 @@ fn service_liveness_keys_ignore_supervisor_and_client_environment() {
 #[cfg(target_os = "linux")]
 #[test]
 fn service_start_recovers_after_absolute_path_binary_replacement() {
+    use baton::mailbox;
+    use baton::message::{MessageEnvelope, MessageKind};
+
     let root = TempMailbox::new("service-exe-replace-absolute");
     let control = root.path.join("control");
     let inbox = root.path.join("inbox");
     let outbox = root.path.join("outbox");
+    let agent_started = root.path.join("agent-started");
     let control_str = control.to_str().unwrap().to_string();
 
     let bin_path = root.path.join("baton-under-test");
@@ -2753,7 +2757,11 @@ fn service_start_recovers_after_absolute_path_binary_replacement() {
             "--agent-arg",
             "-c",
             "--agent-arg",
-            "cat >/dev/null; sleep 30",
+            "cat >/dev/null; touch \"$1\"; sleep 30",
+            "--agent-arg",
+            "exe-replace-absolute-agent",
+            "--agent-arg",
+            agent_started.to_str().unwrap(),
         ])
         .output()
         .expect("start session after binary replacement");
@@ -2765,31 +2773,43 @@ fn service_start_recovers_after_absolute_path_binary_replacement() {
     let session_id = String::from_utf8_lossy(&start.stdout).trim().to_string();
     assert!(!session_id.is_empty(), "service start prints a session id");
 
-    let live_deadline = integration_test_deadline();
-    loop {
-        let status = Command::new(env!("CARGO_BIN_EXE_baton"))
-            .args([
-                "service",
-                "status",
-                "--control",
-                control_str.as_str(),
-                "--session",
-                session_id.as_str(),
-            ])
-            .output()
-            .expect("read post-replacement session status");
-        assert!(status.status.success(), "service status should exit 0");
-        let status_json: serde_json::Value =
-            serde_json::from_slice(&status.stdout).expect("status is JSON");
-        if status_json["sessions"][0]["live"] == true {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < live_deadline,
-            "the post-replacement session was never recorded live"
-        );
-        thread::sleep(Duration::from_millis(20));
+    let request = MessageEnvelope::new(
+        "exe-replace-absolute-m1",
+        "exe-replace-absolute-conv",
+        "agent-a",
+        "agent-b",
+        MessageKind::Request,
+        "hold the post-replacement session",
+        1_700_000_000_000,
+    );
+    mailbox::deliver_to(&inbox, &request).expect("deliver post-replacement request");
+    let ready_deadline = integration_test_deadline();
+    while !agent_started.exists() && std::time::Instant::now() < ready_deadline {
+        thread::sleep(Duration::from_millis(10));
     }
+    assert!(
+        agent_started.exists(),
+        "the post-replacement session must reach its agent turn"
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "status",
+            "--control",
+            control_str.as_str(),
+            "--session",
+            session_id.as_str(),
+        ])
+        .output()
+        .expect("read post-replacement session status");
+    assert!(status.status.success(), "service status should exit 0");
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status is JSON");
+    assert_eq!(
+        status_json["sessions"][0]["live"], true,
+        "the post-replacement session is recorded and live"
+    );
 
     let teardown = Command::new(env!("CARGO_BIN_EXE_baton"))
         .args(["service", "teardown", "--control", control_str.as_str()])
@@ -2813,12 +2833,16 @@ fn service_start_recovers_after_absolute_path_binary_replacement() {
 #[cfg(target_os = "linux")]
 #[test]
 fn service_start_recovers_after_bare_invocation_binary_replacement() {
+    use baton::mailbox;
+    use baton::message::{MessageEnvelope, MessageKind};
+
     let root = TempMailbox::new("service-exe-replace-bare");
     let control = root.path.join("control");
     let first_inbox = root.path.join("first-inbox");
     let first_outbox = root.path.join("first-outbox");
     let second_inbox = root.path.join("second-inbox");
     let second_outbox = root.path.join("second-outbox");
+    let agent_started = root.path.join("agent-started");
     let path_dir = root.path.join("bin");
     std::fs::create_dir_all(&path_dir).expect("create PATH directory");
     let bin_path = path_dir.join("baton");
@@ -2885,7 +2909,11 @@ fn service_start_recovers_after_bare_invocation_binary_replacement() {
             "--agent-arg",
             "-c",
             "--agent-arg",
-            "cat >/dev/null; sleep 30",
+            "cat >/dev/null; touch \"$1\"; sleep 30",
+            "--agent-arg",
+            "exe-replace-bare-agent",
+            "--agent-arg",
+            agent_started.to_str().unwrap(),
         ])
         .output()
         .expect("start session after PATH binary replacement");
@@ -2896,6 +2924,47 @@ fn service_start_recovers_after_bare_invocation_binary_replacement() {
     );
     let session_id = String::from_utf8_lossy(&start.stdout).trim().to_string();
     assert!(!session_id.is_empty(), "service start prints a session id");
+
+    let request = MessageEnvelope::new(
+        "exe-replace-bare-m1",
+        "exe-replace-bare-conv",
+        "agent-a",
+        "agent-b",
+        MessageKind::Request,
+        "hold the PATH-recovered session",
+        1_700_000_000_000,
+    );
+    mailbox::deliver_to(&first_inbox, &request).expect("deliver PATH-recovered request");
+    let ready_deadline = integration_test_deadline();
+    while !agent_started.exists() && std::time::Instant::now() < ready_deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        agent_started.exists(),
+        "the PATH-recovered session must reach its agent turn"
+    );
+
+    let first_status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "service",
+            "status",
+            "--control",
+            control_str.as_str(),
+            "--session",
+            session_id.as_str(),
+        ])
+        .output()
+        .expect("read PATH-recovered session status");
+    assert!(
+        first_status.status.success(),
+        "service status should exit 0"
+    );
+    let first_status_json: serde_json::Value =
+        serde_json::from_slice(&first_status.stdout).expect("status is JSON");
+    assert_eq!(
+        first_status_json["sessions"][0]["live"], true,
+        "the PATH-recovered session is recorded and live"
+    );
 
     // Remove the PATH-resolved binary entirely: neither the stale
     // `current_exe()` path nor a fresh `PATH` lookup for "baton" can resolve
