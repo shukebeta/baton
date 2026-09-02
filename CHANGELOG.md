@@ -10,10 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.4.23 … v0.4.22 (2026-09-02)
+## v0.4.24 … v0.4.22 (2026-09-02)
 
 ### Fixes
 - fix(service/windows): finalize tasks whose whole tree exited during downtime (#332)
+- fix(service/windows): keep transient open_job errors fail-closed as Unresolved (#334)
 
 ### Refactors
 - refactor(service): extract client control-plane layer into src/service/control.rs (#331)
