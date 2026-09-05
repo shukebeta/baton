@@ -287,7 +287,7 @@ NODE
 
 test_npm_install_hint() (
     set -euo pipefail
-    local repo version shim home_dir host_platform expected_version marker output
+    local repo version shim home_dir host_platform expected_version marker output dest
     repo="$(mktemp -d)"
     trap 'rm -rf "${repo}"' EXIT
     version="0.6.0"
@@ -387,7 +387,30 @@ pkg.version = '0.6.0';
 fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
 NODE
 
+    # A stale (version-mismatched) executable already at the default
+    # destination must still trigger the hint once, then be throttled.
+    dest="${home_dir}/.local/bin/baton"
+    mkdir -p "$(dirname "${dest}")"
+    printf '#!/bin/sh\nprintf "baton 0.0.1\\n"\n' >"${dest}"
+    chmod +x "${dest}"
     rm -f "${marker}"
+    output="$(node - "${shim}" "${home_dir}" 2>&1 <<'NODE'
+const { maybePrintInstallHint } = require(process.argv[2]);
+maybePrintInstallHint({ homeDir: process.argv[3] });
+NODE
+)"
+    assert_eq 'hint: run "baton install" to put the native binary in ~/.local/bin' "${output}" \
+        "a stale installed binary prints the hint once"
+    assert_eq "${expected_version}" "$(cat "${marker}")" "hint marker records the expected version for a stale binary"
+
+    output="$(node - "${shim}" "${home_dir}" 2>&1 <<'NODE'
+const { maybePrintInstallHint } = require(process.argv[2]);
+maybePrintInstallHint({ homeDir: process.argv[3] });
+NODE
+)"
+    assert_eq "" "${output}" "repeat invocation against the same stale binary stays silent"
+
+    rm -f "${dest}" "${marker}"
     node - "${shim}" "${home_dir}" <<'NODE'
 const fs = require('fs');
 const path = require('path');
