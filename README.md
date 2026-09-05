@@ -87,6 +87,23 @@ Windows x64. Unsupported operating-system or CPU combinations fail with a
 clear platform-not-supported message rather than selecting a wrong-architecture
 binary.
 
+A global install also places the native binary at `~/.local/bin/baton` (this
+runs automatically as part of `npm install -g`; it is skipped for a
+non-global install). Re-run it manually after an upgrade, or whenever the
+lifecycle script didn't run (`--ignore-scripts`, or a package manager that
+blocks install scripts by default, such as pnpm and yarn):
+
+```bash
+baton install               # installs to ~/.local/bin
+baton install --prefix /usr/local/bin
+```
+
+Running the shim without a native binary in place prints a one-time hint to
+re-run `baton install`. Supervised or service deployments (systemd, launchd,
+or a process manager like `mat`) should point at the installed native binary
+directly rather than the shim — it avoids the extra shim process and its
+orphaned-child risk on shutdown.
+
 The primary install path is a prebuilt, checksummed archive from the current
 blessed release. Release assets use this constructible pattern:
 

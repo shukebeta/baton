@@ -441,6 +441,9 @@ release_npm_write_root_manifest() {
   "bin": {
     "baton": "bin/baton.js"
   },
+  "scripts": {
+    "install": "node bin/baton.js install --silent"
+  },
   "files": [
     "bin"
   ],
@@ -531,7 +534,6 @@ function fail(message) {
 if (manifest.name !== expectedName) fail(`name '${manifest.name}' does not match '${expectedName}'`);
 if (manifest.version !== expectedVersion) fail(`version '${manifest.version}' does not match '${expectedVersion}'`);
 if (manifest.license !== 'UNLICENSED') fail("license must be UNLICENSED");
-if (manifest.scripts) fail('scripts are not allowed in registry packages');
 if (!Array.isArray(manifest.files) || manifest.files.length !== 1 || manifest.files[0] !== 'bin') {
   fail('files must contain only bin');
 }
@@ -546,6 +548,9 @@ function sameObject(actual, expected) {
 
 if (kind === 'root') {
   if (manifest.bin?.baton !== 'bin/baton.js') fail('bin.baton must be bin/baton.js');
+  if (!sameObject(manifest.scripts, { install: 'node bin/baton.js install --silent' })) {
+    fail('scripts must contain only the install lifecycle hook');
+  }
   if (JSON.stringify(manifest.os) !== JSON.stringify(['darwin', 'linux', 'win32'])) {
     fail('os matrix is incorrect');
   }
@@ -563,6 +568,7 @@ if (kind === 'root') {
     fail('optionalDependencies must list all five platform packages at the release version');
   }
 } else if (kind === 'platform') {
+  if (manifest.scripts) fail('scripts are not allowed in registry packages');
   if (JSON.stringify(manifest.os) !== JSON.stringify([expectedOs])) fail(`os must be ${expectedOs}`);
   if (JSON.stringify(manifest.cpu) !== JSON.stringify([expectedCpu])) fail(`cpu must be ${expectedCpu}`);
 } else {
