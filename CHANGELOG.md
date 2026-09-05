@@ -10,6 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
+## v0.5.0 (2026-09-05)
+
+### Features
+- feat: publish npm packages per platform (#340)
+
 ## v0.4.25 … v0.4.22 (2026-09-02)
 
 ### Fixes
