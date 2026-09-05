@@ -4482,6 +4482,19 @@ fn service_task_start_response_write_failure_retries_committed_record() {
     )
     .expect("committed task record is JSON");
     assert_eq!(committed["admission"], "committed");
+
+    // The supervisor persists the committed record before
+    // `write_task_start_response` consumes the failure marker, so observing
+    // the committed record does not yet imply the marker has been consumed.
+    // Wait for that boundary before asserting on it.
+    let marker_deadline = integration_test_deadline();
+    while failure_marker.exists() {
+        assert!(
+            std::time::Instant::now() < marker_deadline,
+            "response failure marker was not consumed"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     assert!(
         !failure_marker.exists(),
         "response failure marker is consumed"
