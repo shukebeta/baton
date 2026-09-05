@@ -136,3 +136,11 @@ you go to change it:
 
 A full `CONTRIBUTING.md` is intentionally out of scope for now; this section is
 the orientation, and the module doc-comments carry the detail.
+
+## See also
+
+[`SHUKE-LABS/leg`](https://github.com/SHUKE-LABS/leg) is the standalone CLI
+client split out of baton: a thin front end over the local path (`ask`,
+`session`/`--resume`, `log show`/`log replay`). See leg's
+[`docs/architecture.md`](https://github.com/SHUKE-LABS/leg/blob/main/docs/architecture.md)
+for how it maps onto the concepts above.
