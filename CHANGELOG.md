@@ -10,10 +10,11 @@ versioning.
 
 _Generated from release tags with `bash scripts/release.sh generate-changelog`._
 
-## v0.5.1 … v0.5.0 (2026-09-05)
+## v0.6.0 … v0.5.0 (2026-09-05)
 
 ### Features
 - feat: publish npm packages per platform (#340)
+- feat(npm): add baton install verb with auto-run on npm -g and one-time hint (#343)
 
 ### Fixes
 - fix(test): wait for response-failure marker consumption before asserting (#341)
