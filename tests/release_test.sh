@@ -91,6 +91,19 @@ make_npm_archive_fixture() {
     done < <(release_npm_platform_rows)
 }
 
+link_npm_shim_node_modules() {
+    local repo="${1}" package_key
+
+    mkdir -p "${repo}/npm-packages/baton/node_modules/@shukelabs"
+    for package_key in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+        mkdir -p "${repo}/npm-packages/baton/node_modules/@shukelabs/baton-${package_key}/bin"
+        cp "${repo}/npm-packages/baton-${package_key}/package.json" \
+            "${repo}/npm-packages/baton/node_modules/@shukelabs/baton-${package_key}/package.json"
+        cp "${repo}/npm-packages/baton-${package_key}/bin/"* \
+            "${repo}/npm-packages/baton/node_modules/@shukelabs/baton-${package_key}/bin/"
+    done
+}
+
 test_npm_platform_matrix_and_staging() (
     set -euo pipefail
     local repo version expected output status host_platform resolved
@@ -117,15 +130,11 @@ baton-win32-x64"
     assert_eq "${version}" \
         "$(node -e 'console.log(require(process.argv[1]).version)' "${repo}/npm-packages/baton-linux-x64/package.json")" \
         "platform npm package version"
+    assert_eq "node bin/baton.js install --silent" \
+        "$(node -e 'console.log(require(process.argv[1]).scripts.install)' "${repo}/npm-packages/baton/package.json")" \
+        "root npm package install lifecycle script"
 
-    mkdir -p "${repo}/npm-packages/baton/node_modules/@shukelabs"
-    for package_key in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
-        mkdir -p "${repo}/npm-packages/baton/node_modules/@shukelabs/baton-${package_key}/bin"
-        cp "${repo}/npm-packages/baton-${package_key}/package.json" \
-            "${repo}/npm-packages/baton/node_modules/@shukelabs/baton-${package_key}/package.json"
-        cp "${repo}/npm-packages/baton-${package_key}/bin/"* \
-            "${repo}/npm-packages/baton/node_modules/@shukelabs/baton-${package_key}/bin/"
-    done
+    link_npm_shim_node_modules "${repo}"
     host_platform="$(node -p 'process.platform')"
     if [[ "${host_platform}" == 'win32' ]]; then
         # The fixture's baton.exe is intentionally not a PE binary. On Windows
@@ -142,7 +151,7 @@ NODE
         assert_eq "@shukelabs/baton-win32-x64
 baton.exe" "${resolved}" "Windows npm shim resolves win32-x64 binary"
     else
-        output="$(node "${repo}/npm-packages/baton/bin/baton.js" --version)"
+        output="$(BATON_NO_INSTALL_HINT=1 node "${repo}/npm-packages/baton/bin/baton.js" --version)"
         assert_eq "baton ${version}" "${output}" "npm shim forwards to native binary"
     fi
 
@@ -190,6 +199,181 @@ test_npm_pack_checksums() (
     (cd "${repo}/npm-tarballs" && release_sha256_check ../npm-SHA256SUMS)
     assert_eq "6" "$(find "${repo}/npm-tarballs" -maxdepth 1 -type f -name '*.tgz' | wc -l | tr -d ' ')" \
         "one npm tarball per package"
+)
+
+test_npm_install_verb() (
+    set -euo pipefail
+    local repo version shim host_platform expected_version prefix status output before after
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    version="0.6.0"
+    host_platform="$(node -p 'process.platform')"
+
+    make_npm_archive_fixture "${repo}" "${version}"
+    release_npm_stage_packages "${version}" "${repo}/dist" "${repo}/npm-packages"
+    link_npm_shim_node_modules "${repo}"
+    shim="${repo}/npm-packages/baton/bin/baton.js"
+    expected_version="baton ${version}"
+
+    # The win32 install path is a pure no-op regardless of host platform.
+    output="$(node - "${shim}" "${repo}/winprefix" <<'NODE'
+const { installNativeBinary } = require(process.argv[2]);
+console.log(installNativeBinary([], { platform: 'win32', homeDir: process.argv[3] }));
+NODE
+)"
+    assert_eq "0" "$(printf '%s\n' "${output}" | tail -n1)" "win32 install returns success"
+    if [[ -e "${repo}/winprefix" ]]; then
+        fail "win32 install must not touch the filesystem"
+    fi
+
+    if [[ "${host_platform}" == 'win32' ]]; then
+        return 0
+    fi
+
+    prefix="${repo}/prefix"
+    node - "${shim}" "${prefix}" <<'NODE'
+const { installNativeBinary } = require(process.argv[2]);
+process.exit(installNativeBinary(['--prefix', process.argv[3]]));
+NODE
+    assert_eq "${expected_version}" "$("${prefix}/baton" --version)" \
+        "install copies the native binary to --prefix"
+
+    before="$(stat -c '%Y' "${prefix}/baton" 2>/dev/null || stat -f '%m' "${prefix}/baton")"
+    sleep 1
+    node - "${shim}" "${prefix}" <<'NODE'
+const { installNativeBinary } = require(process.argv[2]);
+process.exit(installNativeBinary(['--prefix', process.argv[3]]));
+NODE
+    after="$(stat -c '%Y' "${prefix}/baton" 2>/dev/null || stat -f '%m' "${prefix}/baton")"
+    assert_eq "${before}" "${after}" "same-version re-install is a no-op"
+
+    printf '#!/bin/sh\nprintf "baton 0.0.1\\n"\n' >"${prefix}/baton"
+    chmod +x "${prefix}/baton"
+    node - "${shim}" "${prefix}" <<'NODE'
+const { installNativeBinary } = require(process.argv[2]);
+process.exit(installNativeBinary(['--prefix', process.argv[3]]));
+NODE
+    assert_eq "${expected_version}" "$("${prefix}/baton" --version)" \
+        "version-mismatched destination is replaced"
+
+    rm -rf "${repo}/silent-prefix"
+    env -u npm_config_global node - "${shim}" "${repo}/silent-prefix" <<'NODE'
+const { installNativeBinary } = require(process.argv[2]);
+process.exit(installNativeBinary(['--silent', '--prefix', process.argv[3]]));
+NODE
+    [[ -e "${repo}/silent-prefix/baton" ]] && \
+        fail "silent install without npm_config_global must not write"
+
+    npm_config_global=true node - "${shim}" "${repo}/silent-prefix" <<'NODE'
+const { installNativeBinary } = require(process.argv[2]);
+process.exit(installNativeBinary(['--silent', '--prefix', process.argv[3]]));
+NODE
+    assert_eq "${expected_version}" "$("${repo}/silent-prefix/baton" --version)" \
+        "silent install with npm_config_global=true writes the binary"
+
+    if [[ "$(id -u)" != "0" ]]; then
+        mkdir -p "${repo}/denied"
+        chmod 000 "${repo}/denied"
+        status=0
+        node - "${shim}" "${repo}/denied/sub" >"${repo}/denied-output" 2>&1 <<'NODE' || status="$?"
+const { installNativeBinary } = require(process.argv[2]);
+process.exit(installNativeBinary(['--prefix', process.argv[3]]));
+NODE
+        chmod 700 "${repo}/denied"
+        assert_rc_nonzero "${status}"
+        grep -q 'sudo' "${repo}/denied-output" || fail "EACCES message mentions sudo"
+    fi
+)
+
+test_npm_install_hint() (
+    set -euo pipefail
+    local repo version shim home_dir host_platform expected_version marker output
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    version="0.6.0"
+    host_platform="$(node -p 'process.platform')"
+
+    make_npm_archive_fixture "${repo}" "${version}"
+    release_npm_stage_packages "${version}" "${repo}/dist" "${repo}/npm-packages"
+    link_npm_shim_node_modules "${repo}"
+    shim="${repo}/npm-packages/baton/bin/baton.js"
+    expected_version="baton ${version}"
+    home_dir="${repo}/home"
+    mkdir -p "${home_dir}"
+    marker="${home_dir}/.local/state/baton/npm-install-hint"
+
+    # win32 hint path is always silent and never touches the marker.
+    output="$(node - "${shim}" "${home_dir}" <<'NODE'
+const { maybePrintInstallHint } = require(process.argv[2]);
+maybePrintInstallHint({ platform: 'win32', homeDir: process.argv[3] });
+NODE
+)"
+    assert_eq "" "${output}" "win32 hint path is silent"
+    if [[ -e "${marker}" ]]; then
+        fail "win32 hint path must not write a marker"
+    fi
+
+    output="$(node - "${shim}" "${home_dir}" 2>&1 <<'NODE'
+const { maybePrintInstallHint } = require(process.argv[2]);
+maybePrintInstallHint({ homeDir: process.argv[3] });
+NODE
+)"
+    assert_eq 'hint: run "baton install" to put the native binary in ~/.local/bin' "${output}" \
+        "missing native binary prints the hint once"
+    assert_eq "${expected_version}" "$(cat "${marker}")" "hint marker records the expected version"
+
+    output="$(node - "${shim}" "${home_dir}" 2>&1 <<'NODE'
+const { maybePrintInstallHint } = require(process.argv[2]);
+maybePrintInstallHint({ homeDir: process.argv[3] });
+NODE
+)"
+    assert_eq "" "${output}" "repeat invocation at the same expected version stays silent"
+
+    printf 'baton 0.6.1' >"${marker}"
+    output="$(node - "${shim}" "${home_dir}" 2>&1 <<'NODE'
+const { maybePrintInstallHint } = require(process.argv[2]);
+maybePrintInstallHint({ homeDir: process.argv[3] });
+NODE
+)"
+    assert_eq 'hint: run "baton install" to put the native binary in ~/.local/bin' "${output}" \
+        "a changed expected version re-arms the hint"
+    assert_eq "${expected_version}" "$(cat "${marker}")" "hint marker tracks the new expected version"
+
+    rm -f "${marker}"
+    output="$(BATON_NO_INSTALL_HINT=1 node - "${shim}" "${home_dir}" 2>&1 <<'NODE'
+const { maybePrintInstallHint } = require(process.argv[2]);
+maybePrintInstallHint({ homeDir: process.argv[3] });
+NODE
+)"
+    assert_eq "" "${output}" "BATON_NO_INSTALL_HINT silences the hint"
+    if [[ -e "${marker}" ]]; then
+        fail "BATON_NO_INSTALL_HINT must not write a marker"
+    fi
+
+    if [[ "${host_platform}" == 'win32' ]]; then
+        return 0
+    fi
+
+    rm -f "${marker}"
+    node - "${shim}" "${home_dir}" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+const { resolvePlatformBinary } = require(process.argv[2]);
+const resolved = resolvePlatformBinary();
+const dest = path.join(process.argv[3], '.local', 'bin', 'baton');
+fs.mkdirSync(path.dirname(dest), { recursive: true });
+fs.copyFileSync(fs.realpathSync(resolved.binaryPath), dest);
+fs.chmodSync(dest, 0o755);
+NODE
+    output="$(node - "${shim}" "${home_dir}" 2>&1 <<'NODE'
+const { maybePrintInstallHint } = require(process.argv[2]);
+maybePrintInstallHint({ homeDir: process.argv[3] });
+NODE
+)"
+    assert_eq "" "${output}" "a matching installed binary stays silent"
+    if [[ -e "${marker}" ]]; then
+        fail "a matching installed binary must not write a marker"
+    fi
 )
 
 test_next_version_baseline_and_empty_repo() (
@@ -674,6 +858,8 @@ tests=(
     test_invalid_tags_and_bump_kinds_fail
     test_npm_platform_matrix_and_staging
     test_npm_pack_checksums
+    test_npm_install_verb
+    test_npm_install_hint
     test_release_docs_consistency_and_stale_detection
     test_existing_v0_1_0_head_is_not_retagged
     test_unreachable_higher_tag_is_ignored
