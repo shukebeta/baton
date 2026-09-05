@@ -146,6 +146,25 @@ baton.exe" "${resolved}" "Windows npm shim resolves win32-x64 binary"
         assert_eq "baton ${version}" "${output}" "npm shim forwards to native binary"
     fi
 
+    resolved="$(node - "${repo}/npm-packages/baton/bin/baton.js" <<'NODE'
+const { resolvePlatformBinary } = require(process.argv[2]);
+const unsupported = [['freebsd', 'x64'], ['linux', 'ppc64']];
+for (const [platform, architecture] of unsupported) {
+  const expected = `platform not supported (${platform}/${architecture})`;
+  try {
+    resolvePlatformBinary(platform, architecture);
+    process.exit(1);
+  } catch (error) {
+    if (error.message !== expected) process.exit(1);
+    console.log(error.message);
+  }
+}
+NODE
+)"
+    assert_eq "platform not supported (freebsd/x64)
+platform not supported (linux/ppc64)" "${resolved}" \
+        "unsupported npm platforms fail clearly"
+
     printf '%s\n' '{"name":"@shukelabs/baton-linux-x64","version":"0.0.1"}' \
         >"${repo}/npm-packages/baton-linux-x64/package.json"
     status=0
