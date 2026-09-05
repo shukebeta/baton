@@ -313,6 +313,24 @@ NODE
         fail "win32 hint path must not write a marker"
     fi
 
+    rm -f "${marker}"
+    output="$(BATON_NO_INSTALL_HINT=1 node - "${shim}" "${home_dir}" 2>&1 <<'NODE'
+const { maybePrintInstallHint } = require(process.argv[2]);
+maybePrintInstallHint({ homeDir: process.argv[3] });
+NODE
+)"
+    assert_eq "" "${output}" "BATON_NO_INSTALL_HINT silences the hint"
+    if [[ -e "${marker}" ]]; then
+        fail "BATON_NO_INSTALL_HINT must not write a marker"
+    fi
+
+    # The remaining assertions exercise the real (non-win32) resolution path
+    # via the default process.platform, so they only apply off Windows.
+    if [[ "${host_platform}" == 'win32' ]]; then
+        return 0
+    fi
+
+    rm -f "${marker}"
     output="$(node - "${shim}" "${home_dir}" 2>&1 <<'NODE'
 const { maybePrintInstallHint } = require(process.argv[2]);
 maybePrintInstallHint({ homeDir: process.argv[3] });
@@ -329,30 +347,45 @@ NODE
 )"
     assert_eq "" "${output}" "repeat invocation at the same expected version stays silent"
 
-    printf 'baton 0.6.1' >"${marker}"
+    # Bump the resolved platform package's own version (not just the marker)
+    # so this exercises a real regression in package-version re-arming.
+    node - "${shim}" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+const { resolvePlatformBinary } = require(process.argv[2]);
+const resolved = resolvePlatformBinary();
+const pkgPath = require.resolve(`${resolved.packageName}/package.json`, { paths: [path.dirname(process.argv[2])] });
+const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+pkg.version = '0.6.1';
+fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
+NODE
     output="$(node - "${shim}" "${home_dir}" 2>&1 <<'NODE'
 const { maybePrintInstallHint } = require(process.argv[2]);
 maybePrintInstallHint({ homeDir: process.argv[3] });
 NODE
 )"
     assert_eq 'hint: run "baton install" to put the native binary in ~/.local/bin' "${output}" \
-        "a changed expected version re-arms the hint"
-    assert_eq "${expected_version}" "$(cat "${marker}")" "hint marker tracks the new expected version"
+        "a bumped package version re-arms the hint"
+    assert_eq "baton 0.6.1" "$(cat "${marker}")" "hint marker tracks the bumped package version"
 
-    rm -f "${marker}"
-    output="$(BATON_NO_INSTALL_HINT=1 node - "${shim}" "${home_dir}" 2>&1 <<'NODE'
+    output="$(node - "${shim}" "${home_dir}" 2>&1 <<'NODE'
 const { maybePrintInstallHint } = require(process.argv[2]);
 maybePrintInstallHint({ homeDir: process.argv[3] });
 NODE
 )"
-    assert_eq "" "${output}" "BATON_NO_INSTALL_HINT silences the hint"
-    if [[ -e "${marker}" ]]; then
-        fail "BATON_NO_INSTALL_HINT must not write a marker"
-    fi
+    assert_eq "" "${output}" "repeat invocation at the bumped version stays silent"
 
-    if [[ "${host_platform}" == 'win32' ]]; then
-        return 0
-    fi
+    # Restore the resolved platform package's version for the remaining assertions.
+    node - "${shim}" <<'NODE'
+const fs = require('fs');
+const path = require('path');
+const { resolvePlatformBinary } = require(process.argv[2]);
+const resolved = resolvePlatformBinary();
+const pkgPath = require.resolve(`${resolved.packageName}/package.json`, { paths: [path.dirname(process.argv[2])] });
+const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+pkg.version = '0.6.0';
+fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
+NODE
 
     rm -f "${marker}"
     node - "${shim}" "${home_dir}" <<'NODE'
