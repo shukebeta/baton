@@ -156,6 +156,16 @@ jobs:
     env:
       RELEASE_TAG: ${{ needs.tag.outputs.tag }}
     steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.tag.outputs.tag }}
+
+      - name: Set up Node.js and npm registry
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
       - name: Download release notes
         uses: actions/download-artifact@v7
         with:
@@ -204,6 +214,85 @@ jobs:
             sha256sum --check ../SHA256SUMS
           )
 
+      - name: Stage npm packages and preflight publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          bash scripts/release.sh stage-npm-packages "${version}" dist npm-packages
+
+          package_dirs=(
+            baton-linux-x64
+            baton-linux-arm64
+            baton-darwin-x64
+            baton-darwin-arm64
+            baton-win32-x64
+            baton
+          )
+          mkdir -p npm-tarballs
+          pack_destination="${PWD}/npm-tarballs"
+          for package_dir in "${package_dirs[@]}"; do
+            (
+              cd "npm-packages/${package_dir}"
+              npm pack --ignore-scripts --pack-destination "${pack_destination}" >/dev/null
+            )
+          done
+
+          bash scripts/release.sh verify-npm-packages "${version}" npm-packages
+          bash scripts/release.sh npm-checksums npm-tarballs npm-SHA256SUMS
+          npm_tarballs=(
+            "shukelabs-baton-linux-x64-${version}.tgz"
+            "shukelabs-baton-linux-arm64-${version}.tgz"
+            "shukelabs-baton-darwin-x64-${version}.tgz"
+            "shukelabs-baton-darwin-arm64-${version}.tgz"
+            "shukelabs-baton-win32-x64-${version}.tgz"
+            "shukelabs-baton-${version}.tgz"
+          )
+          test "$(find npm-tarballs -maxdepth 1 -type f -name '*.tgz' | wc -l)" -eq "${#npm_tarballs[@]}"
+          for tarball in "${npm_tarballs[@]}"; do
+            test -f "npm-tarballs/${tarball}"
+          done
+          (
+            cd npm-tarballs
+            sha256sum --check ../npm-SHA256SUMS
+          )
+
+      - name: Publish npm packages
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          npm_tarballs=(
+            "shukelabs-baton-linux-x64-${version}.tgz"
+            "shukelabs-baton-linux-arm64-${version}.tgz"
+            "shukelabs-baton-darwin-x64-${version}.tgz"
+            "shukelabs-baton-darwin-arm64-${version}.tgz"
+            "shukelabs-baton-win32-x64-${version}.tgz"
+            "shukelabs-baton-${version}.tgz"
+          )
+          test -n "${NODE_AUTH_TOKEN:-}" || {
+            echo '::error::NPM_TOKEN release secret is required to publish npm packages'
+            exit 1
+          }
+
+          # npm has no multi-package transaction. All six packages and their
+          # checksums are preflighted before this loop; publish the root last
+          # so an early failure never exposes an installable root without its
+          # native platform packages. A failure reports exactly what was
+          # published so the release can be repaired without guessing.
+          published=()
+          for tarball in "${npm_tarballs[@]}"; do
+            if npm publish --access public --ignore-scripts "npm-tarballs/${tarball}"; then
+              published+=("${tarball}")
+            else
+              echo "::error::npm publish failed after ${#published[@]} of ${#npm_tarballs[@]} packages"
+              printf 'published before failure: %s\n' "${published[*]:-none}"
+              exit 1
+            fi
+          done
+
       - name: Stage and publish release
         shell: bash
         env:
@@ -218,7 +307,7 @@ jobs:
             "baton-${version}-aarch64-apple-darwin.tar.gz"
             "baton-${version}-x86_64-pc-windows-msvc.zip"
           )
-          upload_paths=(SHA256SUMS)
+          upload_paths=(SHA256SUMS npm-SHA256SUMS)
           for asset in "${assets[@]}"; do
             upload_paths+=("dist/${asset}")
           done
