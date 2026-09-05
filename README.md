@@ -73,6 +73,20 @@ global flags need no Baton configuration or provider credentials.
 
 ## Install
 
+For a registry-native install, use the npm package. The root package contains
+the command shim and selects the matching native package from npm's registry;
+it never downloads a binary from GitHub at install time:
+
+```bash
+npm install --global @shukelabs/baton
+baton --version
+```
+
+The supported npm platforms are Linux x64 and arm64, macOS x64 and arm64, and
+Windows x64. Unsupported operating-system or CPU combinations fail with a
+clear platform-not-supported message rather than selecting a wrong-architecture
+binary.
+
 The primary install path is a prebuilt, checksummed archive from the current
 blessed release. Release assets use this constructible pattern:
 

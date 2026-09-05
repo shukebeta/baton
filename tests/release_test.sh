@@ -53,6 +53,99 @@ make_fixture() {
     git -C "${repo}" tag v0.1.0
 }
 
+make_npm_archive_fixture() {
+    local repo="${1}" version="${2}" package_key target _npm_os _npm_cpu archive binary
+    local archive_dir staging archive_path
+
+    archive_dir="${repo}/dist"
+    mkdir -p "${archive_dir}"
+    while IFS='|' read -r package_key target _npm_os _npm_cpu archive binary; do
+        staging="${repo}/staging-${package_key}"
+        mkdir -p "${staging}"
+        if [[ "${binary}" == 'baton' ]]; then
+            printf '#!/bin/sh\nprintf "baton %s\\n"\n' "${version}" >"${staging}/${binary}"
+            chmod +x "${staging}/${binary}"
+        else
+            printf 'fake windows baton %s\n' "${version}" >"${staging}/${binary}"
+        fi
+        archive_path="${archive_dir}/baton-${version}-${target}.${archive}"
+        case "${archive}" in
+            tar.gz)
+                tar -C "${staging}" -czf "${archive_path}" "${binary}"
+                ;;
+            zip)
+                (cd "${staging}" && zip -q "${archive_path}" "${binary}")
+                ;;
+        esac
+        rm -rf "${staging}"
+    done < <(release_npm_platform_rows)
+}
+
+test_npm_platform_matrix_and_staging() (
+    set -euo pipefail
+    local repo version expected output status
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    version="0.4.25"
+
+    expected="baton
+baton-linux-x64
+baton-linux-arm64
+baton-darwin-x64
+baton-darwin-arm64
+baton-win32-x64"
+    assert_eq "${expected}" "$(release_npm_package_directories)" \
+        "npm package directory matrix"
+
+    make_npm_archive_fixture "${repo}" "${version}"
+    release_npm_stage_packages "${version}" "${repo}/dist" "${repo}/npm-packages"
+    release_npm_validate_package_set "${version}" "${repo}/npm-packages"
+
+    assert_eq '@shukelabs/baton' \
+        "$(node -e 'console.log(require(process.argv[1]).name)' "${repo}/npm-packages/baton/package.json")" \
+        "root npm package name"
+    assert_eq "${version}" \
+        "$(node -e 'console.log(require(process.argv[1]).version)' "${repo}/npm-packages/baton-linux-x64/package.json")" \
+        "platform npm package version"
+
+    mkdir -p "${repo}/npm-packages/baton/node_modules/@shukelabs"
+    for package_key in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+        mkdir -p "${repo}/npm-packages/baton/node_modules/@shukelabs/baton-${package_key}/bin"
+        cp "${repo}/npm-packages/baton-${package_key}/package.json" \
+            "${repo}/npm-packages/baton/node_modules/@shukelabs/baton-${package_key}/package.json"
+        cp "${repo}/npm-packages/baton-${package_key}/bin/"* \
+            "${repo}/npm-packages/baton/node_modules/@shukelabs/baton-${package_key}/bin/"
+    done
+    output="$(node "${repo}/npm-packages/baton/bin/baton.js" --version)"
+    assert_eq "baton ${version}" "${output}" "npm shim forwards to native binary"
+
+    printf '%s\n' '{"name":"@shukelabs/baton-linux-x64","version":"0.0.1"}' \
+        >"${repo}/npm-packages/baton-linux-x64/package.json"
+    status=0
+    release_npm_validate_package_set "${version}" "${repo}/npm-packages" >/dev/null 2>&1 || status="$?"
+    assert_rc_nonzero "${status}"
+)
+
+test_npm_pack_checksums() (
+    set -euo pipefail
+    local repo version package_dir
+    repo="$(mktemp -d)"
+    trap 'rm -rf "${repo}"' EXIT
+    version="0.4.25"
+    make_npm_archive_fixture "${repo}" "${version}"
+    release_npm_stage_packages "${version}" "${repo}/dist" "${repo}/npm-packages"
+
+    mkdir -p "${repo}/npm-tarballs"
+    while read -r package_dir; do
+        (cd "${repo}/npm-packages/${package_dir}" && \
+            npm pack --ignore-scripts --pack-destination "${repo}/npm-tarballs" >/dev/null)
+    done < <(release_npm_package_directories)
+    release_npm_write_checksums "${repo}/npm-tarballs" "${repo}/npm-SHA256SUMS"
+    (cd "${repo}/npm-tarballs" && release_sha256_check ../npm-SHA256SUMS)
+    assert_eq "6" "$(find "${repo}/npm-tarballs" -maxdepth 1 -type f -name '*.tgz' | wc -l | tr -d ' ')" \
+        "one npm tarball per package"
+)
+
 test_next_version_baseline_and_empty_repo() (
     set -euo pipefail
     assert_eq "0.2.0" "$(release_next_version v0.1.0 minor)" \
@@ -533,6 +626,8 @@ tests=(
     test_patch_and_feature_reset_behavior
     test_conventional_commit_classification
     test_invalid_tags_and_bump_kinds_fail
+    test_npm_platform_matrix_and_staging
+    test_npm_pack_checksums
     test_release_docs_consistency_and_stale_detection
     test_existing_v0_1_0_head_is_not_retagged
     test_unreachable_higher_tag_is_ignored

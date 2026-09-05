@@ -401,6 +401,357 @@ release_update_version_files() {
     release_set_lockfile_version "${version}" "${lockfile_path}"
 }
 
+# Keep the npm package matrix next to the Rust target matrix. The fields are
+# package directory, Rust target, npm os, npm cpu, archive type, and binary
+# filename. The publish workflow consumes the same rows through the staging
+# and validation functions below.
+release_npm_platform_rows() {
+    printf '%s\n' \
+        'linux-x64|x86_64-unknown-linux-gnu|linux|x64|tar.gz|baton' \
+        'linux-arm64|aarch64-unknown-linux-gnu|linux|arm64|tar.gz|baton' \
+        'darwin-x64|x86_64-apple-darwin|darwin|x64|tar.gz|baton' \
+        'darwin-arm64|aarch64-apple-darwin|darwin|arm64|tar.gz|baton' \
+        'win32-x64|x86_64-pc-windows-msvc|win32|x64|zip|baton.exe'
+}
+
+release_npm_package_directories() {
+    printf 'baton\n'
+    while IFS='|' read -r package_key _target _os _cpu _archive _binary; do
+        printf 'baton-%s\n' "${package_key}"
+    done < <(release_npm_platform_rows)
+}
+
+release_npm_shim_path() {
+    local release_script_path="${BASH_SOURCE[0]}"
+
+    printf '%s/../packaging/npm/baton.js\n' \
+        "$(cd -- "$(dirname -- "${release_script_path}")" && pwd)"
+}
+
+release_npm_write_root_manifest() {
+    local version="${1:-}"
+
+    release_validate_version "${version}" || return 1
+    cat <<EOF
+{
+  "name": "@shukelabs/baton",
+  "version": "${version}",
+  "description": "An AI-to-AI harness focused on structured agent communication.",
+  "license": "UNLICENSED",
+  "bin": {
+    "baton": "bin/baton.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "optionalDependencies": {
+    "@shukelabs/baton-linux-x64": "${version}",
+    "@shukelabs/baton-linux-arm64": "${version}",
+    "@shukelabs/baton-darwin-x64": "${version}",
+    "@shukelabs/baton-darwin-arm64": "${version}",
+    "@shukelabs/baton-win32-x64": "${version}"
+  }
+}
+EOF
+}
+
+release_npm_write_platform_manifest() {
+    local version="${1:-}" package_key="${2:-}" npm_os="${3:-}" npm_cpu="${4:-}"
+
+    release_validate_version "${version}" || return 1
+    [[ -n "${package_key}" && -n "${npm_os}" && -n "${npm_cpu}" ]] || {
+        printf 'release: incomplete npm platform metadata\n' >&2
+        return 1
+    }
+    cat <<EOF
+{
+  "name": "@shukelabs/baton-${package_key}",
+  "version": "${version}",
+  "description": "Native Baton binary for ${npm_os}/${npm_cpu}.",
+  "license": "UNLICENSED",
+  "files": [
+    "bin"
+  ],
+  "os": [
+    "${npm_os}"
+  ],
+  "cpu": [
+    "${npm_cpu}"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
+EOF
+}
+
+release_npm_validate_manifest() {
+    local manifest_path="${1:-}" expected_name="${2:-}" version="${3:-}"
+    local kind="${4:-}" npm_os="${5:-}" npm_cpu="${6:-}"
+
+    [[ -f "${manifest_path}" ]] || {
+        printf "release: npm manifest not found '%s'\n" "${manifest_path}" >&2
+        return 1
+    }
+    command -v node >/dev/null 2>&1 || {
+        printf 'release: node is required to validate npm manifests\n' >&2
+        return 1
+    }
+
+    node - "${manifest_path}" "${expected_name}" "${version}" "${kind}" \
+        "${npm_os}" "${npm_cpu}" <<'NODE'
+const fs = require('node:fs');
+
+const [, , manifestPath, expectedName, expectedVersion, kind, expectedOs, expectedCpu] = process.argv;
+let manifest;
+try {
+  manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+} catch (error) {
+  console.error(`release: invalid npm manifest ${manifestPath}: ${error.message}`);
+  process.exit(1);
+}
+
+function fail(message) {
+  console.error(`release: ${manifestPath}: ${message}`);
+  process.exit(1);
+}
+
+if (manifest.name !== expectedName) fail(`name '${manifest.name}' does not match '${expectedName}'`);
+if (manifest.version !== expectedVersion) fail(`version '${manifest.version}' does not match '${expectedVersion}'`);
+if (manifest.license !== 'UNLICENSED') fail("license must be UNLICENSED");
+if (manifest.scripts) fail('scripts are not allowed in registry packages');
+if (!Array.isArray(manifest.files) || manifest.files.length !== 1 || manifest.files[0] !== 'bin') {
+  fail('files must contain only bin');
+}
+if (manifest.publishConfig?.access !== 'public') fail('publishConfig.access must be public');
+function sameObject(actual, expected) {
+  if (!actual || typeof actual !== 'object' || Array.isArray(actual)) return false;
+  const actualKeys = Object.keys(actual).sort();
+  const expectedKeys = Object.keys(expected).sort();
+  return actualKeys.length === expectedKeys.length &&
+    actualKeys.every((key, index) => key === expectedKeys[index] && actual[key] === expected[key]);
+}
+
+if (kind === 'root') {
+  if (manifest.bin?.baton !== 'bin/baton.js') fail('bin.baton must be bin/baton.js');
+  if (JSON.stringify(manifest.os) !== JSON.stringify(['darwin', 'linux', 'win32'])) {
+    fail('os matrix is incorrect');
+  }
+  if (JSON.stringify(manifest.cpu) !== JSON.stringify(['x64', 'arm64'])) {
+    fail('cpu matrix is incorrect');
+  }
+  const expectedDependencies = {
+    '@shukelabs/baton-linux-x64': expectedVersion,
+    '@shukelabs/baton-linux-arm64': expectedVersion,
+    '@shukelabs/baton-darwin-x64': expectedVersion,
+    '@shukelabs/baton-darwin-arm64': expectedVersion,
+    '@shukelabs/baton-win32-x64': expectedVersion,
+  };
+  if (!sameObject(manifest.optionalDependencies, expectedDependencies)) {
+    fail('optionalDependencies must list all five platform packages at the release version');
+  }
+} else if (kind === 'platform') {
+  if (JSON.stringify(manifest.os) !== JSON.stringify([expectedOs])) fail(`os must be ${expectedOs}`);
+  if (JSON.stringify(manifest.cpu) !== JSON.stringify([expectedCpu])) fail(`cpu must be ${expectedCpu}`);
+} else {
+  fail(`unknown manifest kind '${kind}'`);
+}
+NODE
+}
+
+release_npm_validate_package_set() {
+    local version="${1:-}" package_root="${2:-}"
+    local package_key target npm_os npm_cpu archive binary package_dir
+    local entry entry_name file_count
+
+    release_validate_version "${version}" || return 1
+    [[ -d "${package_root}" ]] || {
+        printf "release: npm package directory not found '%s'\n" "${package_root}" >&2
+        return 1
+    }
+
+    package_dir="${package_root}/baton"
+    release_npm_validate_manifest "${package_dir}/package.json" \
+        '@shukelabs/baton' "${version}" root || return 1
+    [[ -f "${package_dir}/bin/baton.js" ]] || {
+        printf "release: root npm shim not found in '%s'\n" "${package_dir}" >&2
+        return 1
+    }
+    cmp -s "${package_dir}/bin/baton.js" "$(release_npm_shim_path)" || {
+        printf "release: staged npm shim differs from packaging/npm/baton.js\n" >&2
+        return 1
+    }
+    file_count="$(find "${package_dir}" -type f | wc -l | tr -d ' ')"
+    [[ "${file_count}" == 2 ]] || {
+        printf "release: root npm package must contain exactly package.json and bin/baton.js\n" >&2
+        return 1
+    }
+
+    while IFS='|' read -r package_key target npm_os npm_cpu archive binary; do
+        package_dir="${package_root}/baton-${package_key}"
+        release_npm_validate_manifest "${package_dir}/package.json" \
+            "@shukelabs/baton-${package_key}" "${version}" platform \
+            "${npm_os}" "${npm_cpu}" || return 1
+        [[ -f "${package_dir}/bin/${binary}" ]] || {
+            printf "release: native binary missing from '%s'\n" "${package_dir}" >&2
+            return 1
+        }
+        file_count="$(find "${package_dir}" -type f | wc -l | tr -d ' ')"
+        [[ "${file_count}" == 2 ]] || {
+            printf "release: npm package '%s' contains unexpected files\n" "${package_dir}" >&2
+            return 1
+        }
+    done < <(release_npm_platform_rows)
+
+    for entry in "${package_root}"/*; do
+        [[ -d "${entry}" ]] || {
+            printf "release: unexpected file in npm package staging '%s'\n" "${entry}" >&2
+            return 1
+        }
+        entry_name="${entry##*/}"
+        case "${entry_name}" in
+            baton|baton-linux-x64|baton-linux-arm64|baton-darwin-x64|baton-darwin-arm64|baton-win32-x64) ;;
+            *)
+                printf "release: unexpected npm package directory '%s'\n" "${entry_name}" >&2
+                return 1
+                ;;
+        esac
+    done
+}
+
+release_npm_stage_packages() {
+    local version="${1:-}" archive_dir="${2:-}" output_dir="${3:-}"
+    local staging="" package_key target npm_os npm_cpu archive binary
+    local archive_path package_dir extract_dir extracted_binary
+
+    release_validate_version "${version}" || return 1
+    [[ -d "${archive_dir}" ]] || {
+        printf "release: archive directory not found '%s'\n" "${archive_dir}" >&2
+        return 1
+    }
+    [[ -n "${output_dir}" && ! -e "${output_dir}" ]] || {
+        printf "release: npm staging output must be a new path '%s'\n" "${output_dir}" >&2
+        return 1
+    }
+    [[ -f "$(release_npm_shim_path)" ]] || {
+        printf 'release: npm shim source is missing\n' >&2
+        return 1
+    }
+
+    mkdir -p -- "$(dirname -- "${output_dir}")"
+    staging="$(mktemp -d "${output_dir}.XXXXXX")" || return 1
+    mkdir -p "${staging}/baton/bin"
+    cp -- "$(release_npm_shim_path)" "${staging}/baton/bin/baton.js"
+    chmod +x "${staging}/baton/bin/baton.js"
+    release_npm_write_root_manifest "${version}" >"${staging}/baton/package.json"
+
+    while IFS='|' read -r package_key target npm_os npm_cpu archive binary; do
+        archive_path="${archive_dir}/baton-${version}-${target}.${archive}"
+        package_dir="${staging}/baton-${package_key}"
+        extract_dir="${staging}/.extract-${package_key}"
+        [[ -f "${archive_path}" ]] || {
+            printf "release: target archive not found '%s'\n" "${archive_path}" >&2
+            rm -rf -- "${staging}"
+            return 1
+        }
+        mkdir -p "${package_dir}/bin" "${extract_dir}"
+        case "${archive}" in
+            tar.gz)
+                tar -xzf "${archive_path}" -C "${extract_dir}"
+                ;;
+            zip)
+                unzip -q "${archive_path}" -d "${extract_dir}"
+                ;;
+            *)
+                printf "release: unsupported npm archive type '%s'\n" "${archive}" >&2
+                rm -rf -- "${staging}"
+                return 1
+                ;;
+        esac
+        extracted_binary="${extract_dir}/${binary}"
+        [[ -f "${extracted_binary}" ]] || {
+            printf "release: expected binary '%s' missing from '%s'\n" "${binary}" "${archive_path}" >&2
+            rm -rf -- "${staging}"
+            return 1
+        }
+        cp -- "${extracted_binary}" "${package_dir}/bin/${binary}"
+        [[ "${npm_os}" == 'win32' ]] || chmod +x "${package_dir}/bin/${binary}"
+        release_npm_write_platform_manifest "${version}" "${package_key}" \
+            "${npm_os}" "${npm_cpu}" >"${package_dir}/package.json"
+        rm -rf -- "${extract_dir}"
+    done < <(release_npm_platform_rows)
+
+    if ! release_npm_validate_package_set "${version}" "${staging}"; then
+        rm -rf -- "${staging}"
+        return 1
+    fi
+    mv -- "${staging}" "${output_dir}"
+}
+
+release_sha256_sum() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$@"
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$@"
+    else
+        printf 'release: sha256sum or shasum is required\n' >&2
+        return 1
+    fi
+}
+
+release_sha256_check() {
+    local checksum_path="${1:-}"
+
+    [[ -f "${checksum_path}" ]] || {
+        printf "release: checksum file not found '%s'\n" "${checksum_path}" >&2
+        return 1
+    }
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum --check "${checksum_path}"
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 --check "${checksum_path}"
+    else
+        printf 'release: sha256sum or shasum is required\n' >&2
+        return 1
+    fi
+}
+
+release_npm_write_checksums() {
+    local tarball_dir="${1:-}" checksum_path="${2:-}" checksum_dir="" checksum_name=""
+    local tarball=""
+    local -a tarballs=() tarball_names=()
+
+    [[ -d "${tarball_dir}" && -n "${checksum_path}" ]] || {
+        printf 'release: npm checksum inputs are incomplete\n' >&2
+        return 1
+    }
+    tarballs=("${tarball_dir}"/*.tgz)
+    [[ -f "${tarballs[0]}" ]] || {
+        printf "release: no npm tarballs found in '%s'\n" "${tarball_dir}" >&2
+        return 1
+    }
+    for tarball in "${tarballs[@]}"; do
+        tarball_names+=("${tarball##*/}")
+    done
+    checksum_dir="$(cd -- "$(dirname -- "${checksum_path}")" && pwd)"
+    checksum_name="$(basename -- "${checksum_path}")"
+    (cd -- "${tarball_dir}" && release_sha256_sum -- "${tarball_names[@]}") \
+        >"${checksum_dir}/${checksum_name}"
+    (cd -- "${tarball_dir}" && release_sha256_check "${checksum_dir}/${checksum_name}")
+}
+
 release_create_tag() {
     local current_tag="" latest_tag="" subject="" bump_kind="" next_tag="" version=""
 
@@ -704,6 +1055,10 @@ usage:
   scripts/release.sh manifest-version [path]
   scripts/release.sh lockfile-version [path]
   scripts/release.sh verify-docs [manifest] [lockfile] [README]
+  scripts/release.sh npm-package-directories
+  scripts/release.sh stage-npm-packages <version> <archive-dir> <output-dir>
+  scripts/release.sh verify-npm-packages <version> <package-dir>
+  scripts/release.sh npm-checksums <tarball-dir> <checksum-path>
   scripts/release.sh generate-changelog [output-path]
   scripts/release.sh generate-release-notes <tag>
 EOF
@@ -731,6 +1086,18 @@ release_main() {
             ;;
         verify-docs)
             release_verify_docs "${1:-Cargo.toml}" "${2:-Cargo.lock}" "${3:-README.md}"
+            ;;
+        npm-package-directories)
+            release_npm_package_directories
+            ;;
+        stage-npm-packages)
+            release_npm_stage_packages "${1:-}" "${2:-}" "${3:-}"
+            ;;
+        verify-npm-packages)
+            release_npm_validate_package_set "${1:-}" "${2:-}"
+            ;;
+        npm-checksums)
+            release_npm_write_checksums "${1:-}" "${2:-}"
             ;;
         generate-changelog)
             release_generate_changelog "${1:-CHANGELOG.md}"
