@@ -55,7 +55,7 @@ make_fixture() {
 
 make_npm_archive_fixture() {
     local repo="${1}" version="${2}" package_key target _npm_os _npm_cpu archive binary
-    local archive_dir staging archive_path
+    local archive_dir staging archive_path source_windows archive_windows
 
     archive_dir="${repo}/dist"
     mkdir -p "${archive_dir}"
@@ -74,7 +74,17 @@ make_npm_archive_fixture() {
                 tar -C "${staging}" -czf "${archive_path}" "${binary}"
                 ;;
             zip)
-                (cd "${staging}" && zip -q "${archive_path}" "${binary}")
+                if command -v zip >/dev/null 2>&1; then
+                    (cd "${staging}" && zip -q "${archive_path}" "${binary}")
+                elif command -v powershell.exe >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then
+                    source_windows="$(cygpath -w "${staging}/${binary}")"
+                    archive_windows="$(cygpath -w "${archive_path}")"
+                    powershell.exe -NoProfile -NonInteractive -Command \
+                        "Compress-Archive -LiteralPath '${source_windows}' -DestinationPath '${archive_windows}' -Force"
+                else
+                    printf 'npm archive fixture requires zip or PowerShell Compress-Archive\n' >&2
+                    return 1
+                fi
                 ;;
         esac
         rm -rf "${staging}"
