@@ -93,7 +93,7 @@ make_npm_archive_fixture() {
 
 test_npm_platform_matrix_and_staging() (
     set -euo pipefail
-    local repo version expected output status
+    local repo version expected output status host_platform resolved
     repo="$(mktemp -d)"
     trap 'rm -rf "${repo}"' EXIT
     version="0.4.25"
@@ -126,8 +126,25 @@ baton-win32-x64"
         cp "${repo}/npm-packages/baton-${package_key}/bin/"* \
             "${repo}/npm-packages/baton/node_modules/@shukelabs/baton-${package_key}/bin/"
     done
-    output="$(node "${repo}/npm-packages/baton/bin/baton.js" --version)"
-    assert_eq "baton ${version}" "${output}" "npm shim forwards to native binary"
+    host_platform="$(node -p 'process.platform')"
+    if [[ "${host_platform}" == 'win32' ]]; then
+        # The fixture's baton.exe is intentionally not a PE binary. On Windows
+        # verify the shim's real resolver without trying to execute the text
+        # placeholder; package staging above still covers the win32-x64 row.
+        resolved="$(node - "${repo}/npm-packages/baton/bin/baton.js" <<'NODE'
+const path = require('path');
+const { resolvePlatformBinary } = require(process.argv[2]);
+const result = resolvePlatformBinary('win32', 'x64');
+console.log(result.packageName);
+console.log(path.basename(result.binaryPath));
+NODE
+)"
+        assert_eq "@shukelabs/baton-win32-x64
+baton.exe" "${resolved}" "Windows npm shim resolves win32-x64 binary"
+    else
+        output="$(node "${repo}/npm-packages/baton/bin/baton.js" --version)"
+        assert_eq "baton ${version}" "${output}" "npm shim forwards to native binary"
+    fi
 
     printf '%s\n' '{"name":"@shukelabs/baton-linux-x64","version":"0.0.1"}' \
         >"${repo}/npm-packages/baton-linux-x64/package.json"
